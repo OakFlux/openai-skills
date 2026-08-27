@@ -1,0 +1,400 @@
+name: Temporary Fosun International broker report search
+
+on:
+  push:
+    branches:
+      - tmp/fosun-international-broker-reports-20260828
+    paths:
+      - .github/workflows/tmp-fosun-international-search.yml
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4 PyMuPDF
+      - name: Search and inspect public report sources
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+
+          out = Path('fosun_report_search')
+          pdf_dir = out / 'candidate_pdfs'
+          out.mkdir(exist_ok=True)
+          pdf_dir.mkdir(exist_ok=True)
+
+          targets = [
+              {
+                  'key': 'northeast_20241115',
+                  'date': '2024-11-15',
+                  'terms': ['瘦身健体再出发', '科技创新', '全球化布局驱动成长'],
+                  'sgp_id': 181674,
+              },
+              {
+                  'key': 'deep_20240324',
+                  'date': '2024-03-24',
+                  'terms': ['多领域布局的家庭消费综合产业集团', '创新与全球化驱动未来发展'],
+                  'sgp_id': 157577,
+              },
+              {
+                  'key': 'first_20241219',
+                  'date': '2024-12-19',
+                  'terms': ['聚焦主业资产优化', '公司估值存在改善空间'],
+                  'sgp_id': 187200,
+              },
+              {
+                  'key': 'first_20230508',
+                  'date': '2023-05-08',
+                  'terms': ['瘦身调整聚焦主业', '创新协同提供增量'],
+                  'sgp_id': None,
+              },
+              {
+                  'key': 'dongwu_20230216',
+                  'date': '2023-02-16',
+                  'terms': ['瘦身健体', '全球布局', '综合航母'],
+                  'sgp_id': None,
+              },
+              {
+                  'key': 'first_20230717',
+                  'date': '2023-07-17',
+                  'terms': ['消费旗舰三十年乘风破浪', '聚焦主业再扬帆'],
+                  'sgp_id': None,
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def norm(value: object) -> str:
+              return re.sub(r'[\s，。、“”‘’：:；;（）()\-—_+&/\\]+', '', str(value or '')).lower()
+
+          def target_matches(target: dict, title: str, stock_name: str = '', stock_code: str = '') -> bool:
+              blob = norm(' '.join([title, stock_name, stock_code]))
+              terms = [norm(term) for term in target['terms']]
+              term_hits = sum(bool(term and term in blob) for term in terms)
+              company_hit = '复星国际' in blob or '00656' in blob or '0656' in blob
+              return term_hits >= 1 or (company_hit and term_hits >= 0)
+
+          all_records: list[dict] = []
+          info_codes: dict[str, dict] = {}
+
+          # 1) Search SDYanbao's public catalogue and inspect report details.
+          sd_session = requests.Session()
+          sd_session.headers.update({
+              'User-Agent': session.headers['User-Agent'],
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+          sd_results = []
+          for target in targets:
+              queries = [target['terms'][0], f"复星国际 {target['terms'][0]}", '复星国际 00656']
+              seen_ids = set()
+              for query in queries:
+                  try:
+                      response = sd_session.post(
+                          'https://api.sdyanbao.com/api/file/search',
+                          json={'page': 1, 'pageSize': 100, 'keyword': query},
+                          timeout=60,
+                      )
+                      response.raise_for_status()
+                      files = (response.json().get('data') or {}).get('files') or []
+                  except Exception as exc:
+                      print('SD_SEARCH_ERROR', target['key'], query, repr(exc))
+                      continue
+                  for row in files:
+                      row_id = row.get('id')
+                      if row_id in seen_ids:
+                          continue
+                      seen_ids.add(row_id)
+                      name = str(row.get('name') or '')
+                      if not target_matches(target, name):
+                          continue
+                      detail = None
+                      try:
+                          d = sd_session.post(
+                              'https://api.sdyanbao.com/api/file/detail',
+                              json={'id': row_id},
+                              timeout=60,
+                          )
+                          d.raise_for_status()
+                          payload = d.json()
+                          if payload.get('status') == 1:
+                              detail = payload.get('data') or {}
+                      except Exception as exc:
+                          print('SD_DETAIL_ERROR', row_id, repr(exc))
+                      item = {
+                          'source': 'sdyanbao',
+                          'target': target['key'],
+                          'id': row_id,
+                          'name': name,
+                          'page_count': row.get('page_count'),
+                          'time_text': (detail or {}).get('time_text'),
+                          'organization': ((detail or {}).get('organization') or {}).get('name') or ((row.get('organization') or {}).get('name')),
+                          'stock': (detail or {}).get('stock'),
+                          'data_source_uuid': (detail or {}).get('data_source_uuid') or row.get('data_source_uuid'),
+                          'original_id': (detail or {}).get('original_id') or row.get('original_id'),
+                          'page_url': (detail or {}).get('page_url') or row.get('page_url'),
+                          'online_url': (detail or {}).get('online_url') or row.get('online_url'),
+                          'file_size': (detail or {}).get('file_size') or row.get('file_size'),
+                          'content_prefix': str((detail or {}).get('content') or '')[:1200],
+                      }
+                      sd_results.append(item)
+                      code = str(item.get('data_source_uuid') or '')
+                      if code.startswith('AP'):
+                          info_codes.setdefault(code, {
+                              'infoCode': code,
+                              'title': name,
+                              'orgSName': item.get('organization'),
+                              'attachPages': item.get('page_count'),
+                              'publishDate': item.get('time_text'),
+                              'target': target['key'],
+                              'source': 'sdyanbao',
+                          })
+                      print('SD_MATCH', json.dumps(item, ensure_ascii=False))
+
+          # 2) Search Eastmoney's public catalogue in tight date windows.
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          eastmoney_matches = []
+          for target in targets:
+              center = dt.date.fromisoformat(target['date'])
+              begin = (center - dt.timedelta(days=8)).isoformat()
+              end = (center + dt.timedelta(days=12)).isoformat()
+              for qtype in ['0', '1', '2', '3']:
+                  for code_filter in ['00656', '']:
+                      for page in range(1, 8):
+                          params = {
+                              'industryCode': '*',
+                              'pageSize': '100',
+                              'industry': '*',
+                              'rating': '*',
+                              'ratingChange': '*',
+                              'beginTime': begin,
+                              'endTime': end,
+                              'pageNo': str(page),
+                              'fields': '',
+                              'qType': qtype,
+                              'orgCode': '',
+                              'code': code_filter,
+                              'rcode': '',
+                              'p': str(page),
+                              'pageNum': str(page),
+                              'pageNumber': str(page),
+                          }
+                          try:
+                              response = session.get(endpoint, params=params, timeout=60, headers={'Referer': 'https://data.eastmoney.com/'})
+                              response.raise_for_status()
+                              rows = response.json().get('data') or []
+                          except Exception as exc:
+                              print('EM_ERROR', target['key'], qtype, code_filter, page, repr(exc))
+                              break
+                          print('EM_PAGE', target['key'], qtype, code_filter or 'blank', page, len(rows))
+                          for row in rows:
+                              title = str(row.get('title') or '')
+                              stock_name = str(row.get('stockName') or row.get('name') or '')
+                              stock_code = str(row.get('stockCode') or row.get('code') or '')
+                              if not target_matches(target, title, stock_name, stock_code):
+                                  continue
+                              item = {
+                                  'source': 'eastmoney',
+                                  'target': target['key'],
+                                  'qType': qtype,
+                                  'publishDate': (row.get('publishDate') or '')[:10],
+                                  'title': title,
+                                  'orgSName': row.get('orgSName'),
+                                  'researcher': row.get('researcher'),
+                                  'infoCode': row.get('infoCode'),
+                                  'attachPages': row.get('attachPages'),
+                                  'attachSize': row.get('attachSize'),
+                                  'reportType': row.get('reportType'),
+                                  'stockCode': stock_code,
+                                  'stockName': stock_name,
+                              }
+                              signature = (item.get('infoCode'), item.get('title'))
+                              if not any((x.get('infoCode'), x.get('title')) == signature for x in eastmoney_matches):
+                                  eastmoney_matches.append(item)
+                                  print('EM_MATCH', json.dumps(item, ensure_ascii=False))
+                              if item.get('infoCode'):
+                                  info_codes.setdefault(item['infoCode'], item)
+                          if len(rows) < 100:
+                              break
+
+          # 3) Inspect direct Three-Research-Report download routes and report pages.
+          sgp_results = []
+          for target in targets:
+              report_id = target.get('sgp_id')
+              if not report_id:
+                  continue
+              urls = [
+                  f'https://bg.sgpjbg.com/bgdown/{report_id}.html',
+                  f'https://www.sgpjbg.com/bgdown/{report_id}.html',
+                  f'https://bg.sgpjbg.com/baogao/{report_id}.html',
+                  f'https://www.sgpjbg.com/baogao/{report_id}.html',
+              ]
+              for url in urls:
+                  try:
+                      response = session.get(url, timeout=60, allow_redirects=True)
+                      record = {
+                          'source': 'sgpjbg',
+                          'target': target['key'],
+                          'url': url,
+                          'status': response.status_code,
+                          'final_url': response.url,
+                          'content_type': response.headers.get('content-type'),
+                          'bytes': len(response.content),
+                          'magic': response.content[:12].hex(),
+                      }
+                      if response.content.startswith(b'%PDF') and len(response.content) > 50_000:
+                          candidate_path = pdf_dir / f"sgp_{target['key']}_{report_id}.pdf"
+                          candidate_path.write_bytes(response.content)
+                          document = pymupdf.open(str(candidate_path))
+                          record['pages'] = document.page_count
+                          record['first_text'] = re.sub(r'\s+', ' ', document.load_page(0).get_text('text')).strip()[:1600]
+                          record['last_text'] = re.sub(r'\s+', ' ', document.load_page(document.page_count - 1).get_text('text')).strip()[:600]
+                          record['sha256'] = hashlib.sha256(response.content).hexdigest()
+                          document.close()
+                          record['saved_file'] = candidate_path.name
+                      else:
+                          text = response.text[:2_000_000]
+                          soup = BeautifulSoup(text, 'html.parser')
+                          links = []
+                          for tag in soup.find_all(['a', 'iframe', 'embed', 'object', 'script']):
+                              for attr in ['href', 'src', 'data']:
+                                  value = tag.get(attr)
+                                  if value and any(token in value.lower() for token in ['.pdf', 'download', 'bgdown', 'oss', 'file']):
+                                      links.append(urljoin(response.url, value))
+                          decoded = text.replace('\\/', '/')
+                          links.extend(re.findall(r'https?://[^"\'<>\s]+\.pdf(?:\?[^"\'<>\s]*)?', decoded, flags=re.I))
+                          record['candidate_links'] = sorted(set(links))[:100]
+                          record['html_title'] = soup.title.get_text(' ', strip=True) if soup.title else None
+                      sgp_results.append(record)
+                      print('SGP_RESULT', json.dumps(record, ensure_ascii=False))
+                  except Exception as exc:
+                      print('SGP_ERROR', target['key'], url, repr(exc))
+
+          # Add AP codes found inside SGP HTML links.
+          for record in sgp_results:
+              for link in record.get('candidate_links') or []:
+                  match = re.search(r'(AP\d{15,})', link)
+                  if match:
+                      code = match.group(1)
+                      info_codes.setdefault(code, {
+                          'infoCode': code,
+                          'title': record.get('html_title'),
+                          'orgSName': None,
+                          'attachPages': None,
+                          'publishDate': None,
+                          'target': record.get('target'),
+                          'source': 'sgpjbg_html',
+                      })
+
+          # 4) Download and validate every candidate original PDF.
+          inspected = []
+          timestamp = int(time.time() * 1000)
+          for code, metadata in list(info_codes.items()):
+              variants = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{timestamp}.pdf=',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{timestamp}',
+              ]
+              data = None
+              chosen_url = None
+              attempts = []
+              for url in variants:
+                  try:
+                      response = session.get(url, timeout=90, headers={
+                          'Referer': 'https://data.eastmoney.com/',
+                          'Accept': 'application/pdf,*/*;q=0.8',
+                      })
+                      attempts.append({'url': url, 'status': response.status_code, 'bytes': len(response.content), 'magic': response.content[:8].hex()})
+                      if response.status_code == 200 and response.content.startswith(b'%PDF') and len(response.content) > 50_000:
+                          data = response.content
+                          chosen_url = url
+                          break
+                  except Exception as exc:
+                      attempts.append({'url': url, 'error': repr(exc)})
+              if data is None:
+                  item = {**metadata, 'infoCode': code, 'valid_pdf': False, 'attempts': attempts}
+                  inspected.append(item)
+                  print('PDF_FAIL', json.dumps(item, ensure_ascii=False))
+                  continue
+              path = pdf_dir / f'{code}.pdf'
+              path.write_bytes(data)
+              try:
+                  document = pymupdf.open(str(path))
+                  pages = document.page_count
+                  texts = []
+                  for page_index in range(pages):
+                      texts.append(document.load_page(page_index).get_text('text'))
+                  full_text = '\n'.join(texts)
+                  first_text = re.sub(r'\s+', ' ', texts[0]).strip()[:2400] if texts else ''
+                  last_text = re.sub(r'\s+', ' ', texts[-1]).strip()[:1200] if texts else ''
+                  document.close()
+                  item = {
+                      **metadata,
+                      'infoCode': code,
+                      'valid_pdf': True,
+                      'chosen_url': chosen_url,
+                      'attempts': attempts,
+                      'pages': pages,
+                      'bytes': len(data),
+                      'sha256': hashlib.sha256(data).hexdigest(),
+                      'company_hits': full_text.count('复星国际'),
+                      'code_hits': full_text.count('00656') + full_text.count('0656'),
+                      'first_text': first_text,
+                      'last_text': last_text,
+                      'saved_file': path.name,
+                  }
+              except Exception as exc:
+                  item = {**metadata, 'infoCode': code, 'valid_pdf': False, 'parse_error': repr(exc), 'attempts': attempts}
+              inspected.append(item)
+              print('PDF_INSPECT', json.dumps(item, ensure_ascii=False))
+
+          (out / 'sdyanbao_results.json').write_text(json.dumps(sd_results, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'eastmoney_matches.json').write_text(json.dumps(eastmoney_matches, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'sgpjbg_results.json').write_text(json.dumps(sgp_results, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'pdf_inspection.json').write_text(json.dumps(inspected, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'summary.txt').write_text(
+              '\n'.join([
+                  f'SDYanbao matches: {len(sd_results)}',
+                  f'Eastmoney matches: {len(eastmoney_matches)}',
+                  f'Unique AP codes: {len(info_codes)}',
+                  f'Valid original PDFs: {sum(bool(x.get("valid_pdf")) for x in inspected)}',
+                  '',
+                  *[
+                      f"{x.get('target')} | {x.get('orgSName')} | {x.get('publishDate')} | pages={x.get('pages')} | {x.get('title')} | {x.get('infoCode')}"
+                      for x in inspected if x.get('valid_pdf')
+                  ],
+              ]),
+              encoding='utf-8',
+          )
+          PY
+      - name: Upload search and inspection results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fosun-international-report-search
+          path: fosun_report_search/
+          retention-days: 1
+          if-no-files-found: error
