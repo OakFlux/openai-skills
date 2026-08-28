@@ -1,0 +1,220 @@
+name: Temporary fetch New Hope Service reports from public API
+
+on:
+  push:
+    branches:
+      - tmp/new-hope-service-api-20260828
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install validators
+        run: python -m pip install --quiet requests pypdf
+
+      - name: Query public API and fetch reports
+        shell: bash
+        run: |
+          cat > /tmp/fetch.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import urllib.parse
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          API='https://api.reportify.cn'
+          WEB='https://reportify.cn'
+          OUT=Path('output'); OUT.mkdir(exist_ok=True)
+          S=requests.Session(); S.headers.update({
+              'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36',
+              'Accept':'application/json,text/plain,*/*',
+              'Origin':WEB,
+              'Referer':WEB+'/reports/1105126013194604544',
+          })
+
+          def request_json(path, params=None):
+              url=path if path.startswith('http') else API+path
+              r=S.get(url,params=params,timeout=45,allow_redirects=True)
+              print('JSON_REQ',r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+              print('JSON_HEAD',r.text[:1000].replace('\n',' '))
+              if r.status_code!=200:
+                  return None
+              try:return r.json()
+              except Exception:return None
+
+          exact_id='1105126013194604544'
+          exact_detail=request_json('/reports/'+exact_id)
+          exact_download=request_json('/reports/'+exact_id+'/download')
+          exact_perm=request_json('/reports/'+exact_id+'/permissions')
+          print('EXACT_DETAIL',json.dumps(exact_detail,ensure_ascii=False,indent=2)[:20000])
+          print('EXACT_DOWNLOAD',json.dumps(exact_download,ensure_ascii=False,indent=2)[:10000])
+          print('EXACT_PERMISSION',json.dumps(exact_perm,ensure_ascii=False,indent=2)[:10000])
+
+          found={}
+          def collect(obj, source):
+              if isinstance(obj,dict):
+                  rid=obj.get('report_id') or obj.get('id')
+                  blob=json.dumps(obj,ensure_ascii=False).lower()
+                  if rid and ('新希望服务' in blob or 'new hope service' in blob or re.search(r'(?<!\d)0?3658(?!\d)',blob)):
+                      found[str(rid)]={'row':obj,'source':source}
+                  for v in obj.values(): collect(v,source)
+              elif isinstance(obj,list):
+                  for v in obj: collect(v,source)
+          collect(exact_detail,'exact detail')
+
+          query_sets=[
+              {'query':'新希望服务','page_num':1,'page_size':100},
+              {'keyword':'新希望服务','page_num':1,'page_size':100},
+              {'search':'新希望服务','page_num':1,'page_size':100},
+              {'q':'新希望服务','page_num':1,'page_size':100},
+              {'symbol':'HK:03658','page_num':1,'page_size':100},
+              {'ticker':'03658','page_num':1,'page_size':100},
+              {'company_ticker':'03658','page_num':1,'page_size':100},
+              {'company_name':'新希望服务','page_num':1,'page_size':100},
+              {'institution_id':'8518961636966406','page_num':1,'page_size':200},
+              {'report_type':7,'page_num':1,'page_size':200},
+          ]
+          for params in query_sets:
+              data=request_json('/reports',params)
+              print('QUERY_RESULT',params,json.dumps(data,ensure_ascii=False)[:5000])
+              collect(data,'reports '+json.dumps(params,ensure_ascii=False))
+
+          # Company lookup may reveal the exact internal company id and symbol.
+          for params in [
+              {'query':'新希望服务','page_num':1,'page_size':20},
+              {'query':'03658','page_num':1,'page_size':20},
+          ]:
+              data=request_json('/companies/comprehensive-search',params)
+              print('COMPANY_SEARCH',params,json.dumps(data,ensure_ascii=False)[:10000])
+              company_items=[]
+              if isinstance(data,dict):
+                  d=data.get('data',data)
+                  if isinstance(d,dict): company_items=d.get('items') or d.get('data') or []
+                  elif isinstance(d,list): company_items=d
+              for c in company_items:
+                  blob=json.dumps(c,ensure_ascii=False).lower()
+                  if '新希望服务' not in blob and '03658' not in blob: continue
+                  for key in ['id','company_id','symbol','ticker']:
+                      val=c.get(key) if isinstance(c,dict) else None
+                      if not val: continue
+                      for field in ['company_id','company','symbol','ticker','company_ticker']:
+                          q={field:val,'page_num':1,'page_size':200}
+                          resp=request_json('/reports',q)
+                          print('COMPANY_REPORTS',q,json.dumps(resp,ensure_ascii=False)[:5000])
+                          collect(resp,'company reports '+json.dumps(q,ensure_ascii=False))
+
+          print('FOUND_IDS',json.dumps(found,ensure_ascii=False,indent=2)[:50000])
+          if exact_id not in found:
+              found[exact_id]={'row':(exact_detail or {}).get('data',exact_detail) if isinstance(exact_detail,dict) else {},'source':'known exact report'}
+
+          def unwrap_data(obj):
+              if isinstance(obj,dict) and set(obj).intersection({'code','data','message'}):
+                  return obj.get('data')
+              return obj
+
+          def extract_urls(obj):
+              urls=[]
+              def walk(x):
+                  if isinstance(x,str):
+                      if x.startswith('http'): urls.append(x)
+                  elif isinstance(x,dict):
+                      # Prefer explicit download/pdf/content URL keys first.
+                      for k,v in x.items():
+                          if isinstance(v,str) and v.startswith('http') and any(n in k.lower() for n in ['url','download','pdf','file','content','source']):
+                              urls.insert(0,v)
+                          else: walk(v)
+                  elif isinstance(x,list):
+                      for v in x: walk(v)
+              walk(obj)
+              out=[]
+              for u in urls:
+                  if u not in out: out.append(u)
+              return out
+
+          def download_pdf(url):
+              try:
+                  r=S.get(url,timeout=90,allow_redirects=True,headers={'User-Agent':S.headers['User-Agent'],'Referer':WEB+'/'})
+                  print('PDF_REQ',r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+                  if r.status_code==200 and r.content[:5]==b'%PDF-' and len(r.content)>80000:
+                      return r.content,r.url
+              except Exception as e: print('PDF_ERROR',url,e)
+              return None,url
+
+          valid=[]; hashes=set()
+          for rid,meta in found.items():
+              detail=request_json('/reports/'+rid)
+              d=unwrap_data(detail) or meta.get('row') or {}
+              download=request_json('/reports/'+rid+'/download')
+              urls=extract_urls(download)+extract_urls(d)
+              print('DOWNLOAD_URLS',rid,urls)
+              content=None; final=''
+              for url in urls:
+                  content,final=download_pdf(url)
+                  if content: break
+              if not content:
+                  print('NO_PDF',rid)
+                  continue
+              digest=hashlib.sha256(content).hexdigest()
+              if digest in hashes: continue
+              try:
+                  reader=PdfReader(io.BytesIO(content),strict=False)
+                  pages=len(reader.pages)
+                  text=''
+                  for i in range(min(6,pages)):
+                      try:text+='\n'+(reader.pages[i].extract_text() or '')
+                      except Exception:pass
+                  compact=re.sub(r'\s+','',text).lower()
+                  if '新希望服务' not in compact and 'newhopeservice' not in compact and not re.search(r'(?<!\d)0?3658(?!\d)',compact):
+                      print('IDENTITY_FAIL',rid,text[:1200]); continue
+                  if pages<5:
+                      print('SHORT_FAIL',rid,pages); continue
+              except Exception as e:
+                  print('PARSE_FAIL',rid,e); continue
+              hashes.add(digest)
+              title=(d.get('title') or d.get('report_title') or meta.get('row',{}).get('title') or meta.get('row',{}).get('report_title') or ('新希望服务研究报告 '+rid)) if isinstance(d,dict) else ('新希望服务研究报告 '+rid)
+              institution=(d.get('institution_name') or d.get('org_name') or d.get('broker') or meta.get('row',{}).get('institution_name') or '券商') if isinstance(d,dict) else '券商'
+              pub=d.get('publish_at') if isinstance(d,dict) else None
+              date=''
+              if isinstance(pub,(int,float)):
+                  import datetime
+                  date=datetime.datetime.fromtimestamp(pub/1000,datetime.timezone.utc).date().isoformat()
+              elif pub: date=str(pub)[:10]
+              valid.append({'rid':rid,'content':content,'title':title,'broker':institution,'date':date,'pages':pages,'source':final,'sha256':digest,'size_bytes':len(content)})
+              print('VALID_REPORT',rid,institution,date,title,pages,final)
+
+          print('VALID_META',json.dumps([{k:v for k,v in x.items() if k!='content'} for x in valid],ensure_ascii=False,indent=2))
+          if len(valid)<1:
+              raise RuntimeError('No valid public PDF obtained')
+
+          # Save up to three distinct reports; one valid report is still archived rather than replaced with unrelated material.
+          valid.sort(key=lambda x:(x['date'],x['pages']),reverse=True)
+          manifest=[]
+          def safe(s):return re.sub(r'[\\/:*?"<>|]+','_',str(s)).strip(' .')
+          for idx,item in enumerate(valid[:3],1):
+              date8=item['date'].replace('-','') if item['date'] else '未知日期'
+              fn=safe(f"{idx:02d}_{item['broker']}_{item['title']}_{date8}_{item['pages']}页.pdf")
+              (OUT/fn).write_bytes(item['content'])
+              manifest.append({k:v for k,v in item.items() if k!='content'}|{'filename':fn})
+          (OUT/'报告清单.txt').write_text('新希望服务（03658.HK）券商研究报告\n公开API来源；已验证PDF文件头、公司名称与页数。\n\n'+''.join(f"{i}. {x['broker']}：《{x['title']}》\n   日期：{x['date'] or '未标注'}；页数：{x['pages']}页\n   文件：{x['filename']}\n   来源：{x['source']}\n\n" for i,x in enumerate(manifest,1)),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/fetch.py
+          ls -lh output
+
+      - name: Upload verified reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-hope-service-public-broker-reports
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
