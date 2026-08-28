@@ -1,0 +1,463 @@
+name: Temporary Fosun International final report package
+
+on:
+  push:
+    branches:
+      - tmp/fosun-international-broker-reports-20260828
+    paths:
+      - .github/workflows/tmp-fosun-final-package.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PDF dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4 Pillow img2pdf PyMuPDF pypdf reportlab
+      - name: Download, create, and verify report PDFs
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html as html_lib
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup, Tag
+          from PIL import Image as PILImage, ImageDraw, ImageOps, ImageStat
+          from pypdf import PdfReader
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import cm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+          from reportlab.platypus import (
+              BaseDocTemplate,
+              Frame,
+              Image,
+              PageBreak,
+              PageTemplate,
+              Paragraph,
+              Spacer,
+              Table,
+              TableStyle,
+          )
+
+          root = Path('fosun_final')
+          package_dir = root / 'package'
+          work = root / 'work'
+          render_dir = root / 'verification' / 'renders'
+          article_assets = work / 'zheshang_assets'
+          for path in (package_dir, work, render_dir, article_assets):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def request_bytes(url: str, *, referer: str, min_bytes: int = 10_000) -> bytes:
+              last_error = None
+              for attempt in range(8):
+                  try:
+                      response = session.get(url, headers={'Referer': referer}, timeout=90)
+                      response.raise_for_status()
+                      data = response.content
+                      if len(data) < min_bytes:
+                          raise RuntimeError(f'response too small: {len(data)} bytes')
+                      return data
+                  except Exception as exc:
+                      last_error = exc
+              raise RuntimeError(f'failed to fetch {url}: {last_error}')
+
+          def validate_image_bytes(data: bytes, label: str) -> tuple[int, int, str, float]:
+              with PILImage.open(io.BytesIO(data)) as image:
+                  image.verify()
+              with PILImage.open(io.BytesIO(data)) as image:
+                  image.load()
+                  width, height = image.size
+                  if width < 600 or height < 600:
+                      raise RuntimeError(f'{label}: dimensions too small: {width}x{height}')
+                  gray = image.convert('L')
+                  stddev = float(ImageStat.Stat(gray).stddev[0])
+                  if stddev < 4:
+                      raise RuntimeError(f'{label}: page appears blank, stddev={stddev:.2f}')
+                  return width, height, image.format or 'unknown', stddev
+
+          def build_image_pdf(page_urls: list[str], output: Path, referer: str) -> dict:
+              image_paths: list[Path] = []
+              page_hashes: list[str] = []
+              page_meta: list[dict] = []
+              for index, url in enumerate(page_urls, start=1):
+                  data = request_bytes(url, referer=referer, min_bytes=25_000)
+                  width, height, image_format, stddev = validate_image_bytes(data, f'{output.name} page {index}')
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in page_hashes:
+                      raise RuntimeError(f'{output.name}: duplicate image detected on page {index}')
+                  page_hashes.append(digest)
+                  with PILImage.open(io.BytesIO(data)) as image:
+                      image.load()
+                      converted = image.convert('RGB')
+                      path = work / f'{output.stem}_page_{index:02d}.png'
+                      converted.save(path, format='PNG', optimize=True)
+                  image_paths.append(path)
+                  page_meta.append({
+                      'page': index,
+                      'source_url': url,
+                      'source_sha256': digest,
+                      'width': width,
+                      'height': height,
+                      'format': image_format,
+                      'stddev': round(stddev, 3),
+                  })
+              output.write_bytes(img2pdf.convert([str(path) for path in image_paths]))
+              return {'image_pages': page_meta}
+
+          # Report 1: complete public-text organized edition of the Zheshang Securities first-coverage deep report.
+          article_url = 'https://www.10100.com/article/31874150'
+          article_response = session.get(article_url, timeout=90)
+          article_response.raise_for_status()
+          soup = BeautifulSoup(article_response.text, 'html.parser')
+
+          def is_report_image(tag: Tag) -> bool:
+              src = tag.get('src') or tag.get('data-src') or ''
+              return 'cdn.10100.com/content/' in src
+
+          candidate_nodes = []
+          for tag in soup.find_all(['article', 'main', 'section', 'div']):
+              imgs = [img for img in tag.find_all('img') if is_report_image(img)]
+              if len(imgs) < 25:
+                  continue
+              text = re.sub(r'\s+', ' ', tag.get_text(' ', strip=True))
+              if len(text) < 8_000:
+                  continue
+              candidate_nodes.append((len(imgs), len(str(tag)), len(text), tag))
+          if not candidate_nodes:
+              raise RuntimeError('Unable to locate the public full-text report body')
+          max_images = max(item[0] for item in candidate_nodes)
+          content_node = min((item for item in candidate_nodes if item[0] == max_images), key=lambda item: item[1])[3]
+          report_images = [img for img in content_node.find_all('img') if is_report_image(img)]
+          if len(report_images) < 50:
+              raise RuntimeError(f'Public full-text article image count too low: {len(report_images)}')
+
+          # Download every report figure in article order.
+          image_map: dict[str, Path] = {}
+          image_records: list[dict] = []
+          for index, image_tag in enumerate(report_images, start=1):
+              src = image_tag.get('src') or image_tag.get('data-src')
+              if src in image_map:
+                  continue
+              data = request_bytes(src, referer=article_url, min_bytes=8_000)
+              with PILImage.open(io.BytesIO(data)) as image:
+                  image.load()
+                  width, height = image.size
+                  if width < 450 or height < 200:
+                      raise RuntimeError(f'Unexpectedly small article image {src}: {width}x{height}')
+                  rgb = image.convert('RGB')
+                  path = article_assets / f'{len(image_map)+1:03d}.jpg'
+                  rgb.save(path, format='JPEG', quality=93, optimize=True)
+              digest = hashlib.sha256(data).hexdigest()
+              image_map[src] = path
+              image_records.append({'order': len(image_map), 'source_url': src, 'width': width, 'height': height, 'sha256': digest, 'file': path.name})
+
+          # Build a document-order sequence of paragraphs/headings/figures.
+          allowed = {'h1', 'h2', 'h3', 'h4', 'p', 'li', 'blockquote', 'img'}
+          sequence: list[tuple[str, object]] = []
+          seen_text: set[str] = set()
+          seen_images: set[str] = set()
+          for tag in content_node.find_all(list(allowed)):
+              if tag.name != 'img' and any(isinstance(parent, Tag) and parent.name in allowed and parent is not tag for parent in tag.parents if parent is not content_node):
+                  # Skip nested text blocks to avoid duplication; images remain independent.
+                  continue
+              if tag.name == 'img':
+                  if not is_report_image(tag):
+                      continue
+                  src = tag.get('src') or tag.get('data-src')
+                  if src in seen_images or src not in image_map:
+                      continue
+                  seen_images.add(src)
+                  sequence.append(('image', image_map[src]))
+                  continue
+              text = re.sub(r'\s+', ' ', tag.get_text(' ', strip=True)).strip()
+              if not text or len(text) < 2:
+                  continue
+              normalized = re.sub(r'\s+', '', text)
+              if normalized in seen_text:
+                  continue
+              # Remove site-only prompts while retaining research content and risk disclosures.
+              if any(phrase in text for phrase in ['查看完整报告请点击下方阅读原文', '开展投资者关系维护、信息交流的', '公众平台', '— END —']):
+                  continue
+              if text.startswith('〖声明〗内容源于网络'):
+                  continue
+              seen_text.add(normalized)
+              kind = 'heading' if tag.name in {'h1', 'h2', 'h3', 'h4'} else 'body'
+              if tag.name == 'li':
+                  text = '• ' + text
+              sequence.append((kind, text))
+
+          article_text = '\n'.join(str(value) for kind, value in sequence if kind in {'heading', 'body'})
+          if len(article_text) < 20_000 or '风险提示' not in article_text or '盈利预测' not in article_text:
+              raise RuntimeError(f'Public report body appears incomplete: chars={len(article_text)}')
+          if len(seen_images) != len(image_map):
+              raise RuntimeError(f'Not all public report figures were included: {len(seen_images)} of {len(image_map)}')
+
+          pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+          zheshang_pdf = package_dir / '01_浙商证券_复星国际_消费旗舰三十年乘风破浪_聚焦主业再扬帆_20230717_公开全文整理版.pdf'
+
+          class NumberedDocTemplate(BaseDocTemplate):
+              pass
+
+          doc = NumberedDocTemplate(
+              str(zheshang_pdf),
+              pagesize=A4,
+              leftMargin=1.7*cm,
+              rightMargin=1.7*cm,
+              topMargin=1.8*cm,
+              bottomMargin=1.7*cm,
+              title='复星国际：消费旗舰三十年乘风破浪，聚焦主业再扬帆',
+              author='浙商证券（公开全文整理版）',
+          )
+          frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='normal')
+
+          def page_decorator(canvas, document):
+              canvas.saveState()
+              canvas.setFont('STSong-Light', 8)
+              canvas.setFillColor(colors.HexColor('#555555'))
+              if document.page > 1:
+                  canvas.drawString(doc.leftMargin, 0.9*cm, '浙商证券复星国际首次覆盖报告 - 公开全文整理版')
+              canvas.drawRightString(A4[0] - doc.rightMargin, 0.9*cm, str(document.page))
+              canvas.restoreState()
+
+          doc.addPageTemplates([PageTemplate(id='normal', frames=[frame], onPage=page_decorator)])
+          styles = getSampleStyleSheet()
+          cover_title = ParagraphStyle('CoverTitle', fontName='STSong-Light', fontSize=22, leading=32, alignment=TA_CENTER, spaceAfter=18)
+          cover_meta = ParagraphStyle('CoverMeta', fontName='STSong-Light', fontSize=11, leading=20, alignment=TA_CENTER, spaceAfter=12)
+          cover_note = ParagraphStyle('CoverNote', fontName='STSong-Light', fontSize=9.5, leading=16, alignment=TA_LEFT, leftIndent=10, rightIndent=10, borderColor=colors.HexColor('#AAAAAA'), borderWidth=0.6, borderPadding=10, spaceBefore=15, spaceAfter=15)
+          heading_style = ParagraphStyle('HeadingCN', fontName='STSong-Light', fontSize=14, leading=22, spaceBefore=12, spaceAfter=7, keepWithNext=True)
+          body_style = ParagraphStyle('BodyCN', fontName='STSong-Light', fontSize=10.2, leading=17.2, alignment=TA_JUSTIFY, firstLineIndent=2*10.2, spaceAfter=5)
+          caption_style = ParagraphStyle('CaptionCN', fontName='STSong-Light', fontSize=8.5, leading=13, alignment=TA_CENTER, textColor=colors.HexColor('#666666'), spaceAfter=6)
+
+          story = [
+              Spacer(1, 1.2*cm),
+              Paragraph('复星国际（00656.HK）', cover_meta),
+              Paragraph('消费旗舰三十年乘风破浪，聚焦主业再扬帆', cover_title),
+              Spacer(1, 0.7*cm),
+              Paragraph('浙商证券｜首次覆盖｜2023年7月17日', cover_meta),
+              Paragraph(
+                  '文件说明：本文件依据公开转载页面所展示的完整文字与全部图表重新编排生成，属于“公开全文整理版”，不是券商原始排版PDF。原报告公开索引为39页；本文件因重新排版，实际页数可能不同。文字与图表按公开页面内容整理，不将局部预览冒充原始完整版。',
+                  cover_note,
+              ),
+              PageBreak(),
+          ]
+
+          figure_number = 0
+          for kind, value in sequence:
+              if kind == 'heading':
+                  text = html_lib.escape(str(value))
+                  story.append(Paragraph(text, heading_style))
+              elif kind == 'body':
+                  text = html_lib.escape(str(value))
+                  story.append(Paragraph(text, body_style))
+              else:
+                  figure_number += 1
+                  image_path = Path(value)
+                  with PILImage.open(image_path) as image:
+                      width, height = image.size
+                  max_width = doc.width
+                  max_height = 21.5*cm
+                  scale = min(max_width / width, max_height / height)
+                  draw_width = width * scale
+                  draw_height = height * scale
+                  story.append(Spacer(1, 4))
+                  story.append(Image(str(image_path), width=draw_width, height=draw_height, hAlign='CENTER'))
+                  story.append(Paragraph(f'公开页面图表 {figure_number}', caption_style))
+
+          doc.build(story)
+
+          # Report 2: Huaxi Securities 2025 five-page report - all pages are inside the site's declared free preview.
+          huaxi_base = 'https://file.sgpjbg.com/fileroot2/2025-9/4/47ab7de9-0726-4072-ba85-b9e96d85ad39/47ab7de9-0726-4072-ba85-b9e96d85ad39'
+          huaxi_urls = [f'{huaxi_base}{page}.gif' for page in range(1, 6)]
+          huaxi_pdf = package_dir / '02_华西证券_复星国际_核心产业稳健经营_RWA生态布局稳步推进_20250902_5页_公开完整页面版.pdf'
+          huaxi_extra = build_image_pdf(huaxi_urls, huaxi_pdf, 'https://www.sgpjbg.com/baogao/900669.html')
+
+          # Report 3: Industrial Securities 2023 five-page report - all five public pages assembled in order.
+          xingye_base = 'https://oss.sdyanbao.com/page/2023/4/3/494178'
+          xingye_urls = [f'{xingye_base}/{page}.png' for page in range(5)]
+          xingye_pdf = package_dir / '03_兴业证券_复星国际_财务状况稳健_2023再出发_20230402_5页_公开完整页面版.pdf'
+          xingye_extra = build_image_pdf(xingye_urls, xingye_pdf, 'https://www.sdyanbao.com/')
+
+          reports = [
+              {
+                  'file': zheshang_pdf,
+                  'broker': '浙商证券',
+                  'date': '2023-07-17',
+                  'title': '消费旗舰三十年乘风破浪，聚焦主业再扬帆',
+                  'type': '公司深度/首次覆盖；公开全文整理版',
+                  'source_report_pages': 39,
+                  'public_text_chars': len(article_text),
+                  'public_figure_count': len(image_map),
+              },
+              {
+                  'file': huaxi_pdf,
+                  'broker': '华西证券',
+                  'date': '2025-09-02',
+                  'title': '核心产业稳健经营，RWA生态布局稳步推进',
+                  'type': '港股公司点评；全部公开页面合成版',
+                  **huaxi_extra,
+              },
+              {
+                  'file': xingye_pdf,
+                  'broker': '兴业证券',
+                  'date': '2023-04-02',
+                  'title': '财务状况稳健，2023再出发',
+                  'type': '港股公司跟踪；全部公开页面合成版',
+                  **xingye_extra,
+              },
+          ]
+
+          verification_records = []
+          for report in reports:
+              pdf_path = Path(report['file'])
+              data = pdf_path.read_bytes()
+              if not data.startswith(b'%PDF'):
+                  raise RuntimeError(f'{pdf_path.name}: invalid PDF magic')
+              reader = PdfReader(str(pdf_path))
+              encrypted = bool(reader.is_encrypted)
+              if encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception:
+                      pass
+              pypdf_pages = len(reader.pages)
+              document = pymupdf.open(str(pdf_path))
+              mupdf_pages = document.page_count
+              if pypdf_pages != mupdf_pages:
+                  raise RuntimeError(f'{pdf_path.name}: page-count mismatch')
+              if report['broker'] in {'华西证券', '兴业证券'} and mupdf_pages != 5:
+                  raise RuntimeError(f'{pdf_path.name}: expected five pages, got {mupdf_pages}')
+              if report['broker'] == '浙商证券':
+                  full_text = ''.join(document.load_page(i).get_text('text') for i in range(mupdf_pages))
+                  if mupdf_pages < 30 or len(full_text) < 20_000 or '风险提示' not in full_text:
+                      raise RuntimeError(f'{pdf_path.name}: organized deep-report PDF appears incomplete')
+              render_indices = sorted({0, mupdf_pages // 2, mupdf_pages - 1})
+              render_files = []
+              for page_index in render_indices:
+                  page = document.load_page(page_index)
+                  pixmap = page.get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+                  render_path = render_dir / f'{pdf_path.stem}_page_{page_index+1}.jpg'
+                  pixmap.save(str(render_path))
+                  if render_path.stat().st_size < 15_000:
+                      raise RuntimeError(f'{pdf_path.name}: rendered page too small at {page_index+1}')
+                  render_files.append(render_path.name)
+              document.close()
+              record = {
+                  **{k: v for k, v in report.items() if k != 'file'},
+                  'file': pdf_path.name,
+                  'actual_pages': mupdf_pages,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'encrypted': encrypted,
+                  'render_files': render_files,
+              }
+              verification_records.append(record)
+              print('REPORT_OK', json.dumps(record, ensure_ascii=False))
+
+          # Build a contact sheet from all verification renders.
+          render_paths = sorted(render_dir.glob('*.jpg'))
+          thumbnails = []
+          for render_path in render_paths:
+              with PILImage.open(render_path) as image:
+                  image.load()
+                  thumb = ImageOps.contain(image.convert('RGB'), (260, 340))
+              canvas = PILImage.new('RGB', (290, 390), 'white')
+              canvas.paste(thumb, ((290-thumb.width)//2, 10))
+              draw = ImageDraw.Draw(canvas)
+              label = render_path.stem[-55:]
+              draw.text((8, 360), label, fill='black')
+              thumbnails.append(canvas)
+          columns = 3
+          rows = math.ceil(len(thumbnails) / columns)
+          contact = PILImage.new('RGB', (columns*290, rows*390), 'white')
+          for index, thumb in enumerate(thumbnails):
+              contact.paste(thumb, ((index % columns)*290, (index // columns)*390))
+          contact.save(root / 'verification' / 'contact_sheet.jpg', quality=88)
+
+          total_pages = sum(item['actual_pages'] for item in verification_records)
+          list_lines = [
+              '复星国际（00656.HK）券商研究报告清单',
+              '',
+              f'本压缩包共3份PDF，合计{total_pages}页。',
+              '',
+          ]
+          for index, item in enumerate(verification_records, start=1):
+              list_lines.extend([
+                  f"{index}. {item['broker']}：《{item['title']}》",
+                  f"   日期：{item['date']}；类型：{item['type']}；本文件实际页数：{item['actual_pages']}页",
+                  f"   文件：{item['file']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ])
+          list_lines.extend([
+              '版本说明：',
+              '- 浙商证券报告为公开全文整理版：公开转载页面展示了完整文字和全部图表，本文件据此重新排版；不是券商原始排版PDF。',
+              '- 华西证券与兴业证券报告均依据公开展示的全部原始页面按页序无删减合成为PDF；不是文本摘要，也不含网页快捷方式。',
+              '- 东北证券、开源证券、东吴证券等长篇报告的公开阅读页只开放前15页或要求登录下载，未将缺页预览版收入本包。',
+              '- 三份PDF均已核对文件结构、实际页数和加密状态，并渲染首页、中间页和末页检查。',
+          ])
+          (package_dir / '报告清单与核验说明.txt').write_text('\n'.join(list_lines), encoding='utf-8')
+          (package_dir / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{item['sha256']}  {item['file']}" for item in verification_records) + '\n',
+              encoding='utf-8',
+          )
+          (root / 'verification' / 'verification.json').write_text(
+              json.dumps(verification_records, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          (root / 'verification' / 'zheshang_article_manifest.json').write_text(
+              json.dumps({'source_url': article_url, 'text_chars': len(article_text), 'figures': image_records}, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          zip_path = root / '复星国际_券商深度报告_3份_完整可读版.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(package_dir.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity test failed at {bad}')
+          print('ZIP_OK', zip_path, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest())
+          PY
+      - name: Upload final report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fosun-international-broker-reports-final
+          path: fosun_final/复星国际_券商深度报告_3份_完整可读版.zip
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload verification material
+        uses: actions/upload-artifact@v4
+        with:
+          name: fosun-international-report-verification
+          path: fosun_final/verification/
+          retention-days: 1
+          if-no-files-found: error
