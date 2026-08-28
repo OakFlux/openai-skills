@@ -1,0 +1,205 @@
+name: Temporary Greentown China full-page report rebuild
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-greentown-reports-20260828
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download every public page and rebuild complete PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests pillow img2pdf pypdf
+          python3 <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          PAGE_ROOT = Path('pages')
+          OUT.mkdir(parents=True, exist_ok=True)
+          PAGE_ROOT.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '申万宏源',
+                  'date': '2025-08-18',
+                  'title': '好房子引领者，理顺机制再出发',
+                  'pages': 31,
+                  'base': 'https://oss.sdyanbao.com/page/2025/8/18/1223571',
+              },
+              {
+                  'broker': '华泰证券',
+                  'date': '2025-01-20',
+                  'title': '匠心独运，驭光而行',
+                  'pages': 29,
+                  'base': 'https://oss.sdyanbao.com/page/2025/1/20/1143859',
+              },
+              {
+                  'broker': '开源证券',
+                  'date': '2024-01-22',
+                  'title': '自投代建双核驱动，品质龙头逆势攀升',
+                  'pages': 25,
+                  'base': 'https://oss.sdyanbao.com/page/2024/1/22/924183',
+              },
+          ]
+
+          def safe_name(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|]+', '_', value).strip()
+              value = re.sub(r'\s+', '', value)
+              return value[:100]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+
+          manifest = []
+          failures = []
+
+          for report_index, report in enumerate(reports, start=1):
+              page_dir = PAGE_ROOT / f'{report_index:02d}'
+              page_dir.mkdir(parents=True, exist_ok=True)
+              page_paths = []
+              report_failed = False
+
+              print(f"\n=== {report['broker']} | {report['title']} | {report['pages']} pages ===")
+              for page_index in range(report['pages']):
+                  url = f"{report['base']}/{page_index}.png"
+                  content = None
+                  last_error = None
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(url, timeout=90)
+                          ctype = response.headers.get('content-type', '')
+                          print('page', page_index + 1, '/', report['pages'], response.status_code, ctype, len(response.content), url)
+                          if response.status_code != 200:
+                              raise RuntimeError(f'HTTP {response.status_code}')
+                          if len(response.content) < 10_000:
+                              raise RuntimeError(f'image too small: {len(response.content)} bytes')
+                          image = Image.open(io.BytesIO(response.content))
+                          image.verify()
+                          content = response.content
+                          break
+                      except Exception as exc:
+                          last_error = repr(exc)
+                          time.sleep(attempt)
+                  if content is None:
+                      report_failed = True
+                      failures.append({
+                          'broker': report['broker'],
+                          'title': report['title'],
+                          'page': page_index + 1,
+                          'url': url,
+                          'error': last_error,
+                      })
+                      print('FAILED PAGE:', failures[-1])
+                      break
+
+                  page_path = page_dir / f'{page_index:03d}.png'
+                  page_path.write_bytes(content)
+                  page_paths.append(page_path)
+
+              if report_failed or len(page_paths) != report['pages']:
+                  print('SKIP INCOMPLETE REPORT:', report['title'], len(page_paths), '/', report['pages'])
+                  continue
+
+              filename = (
+                  f"{len(manifest)+1:02d}_{safe_name(report['broker'])}_"
+                  f"{report['date'].replace('-', '')}_绿城中国_{safe_name(report['title'])}_完整页图合成.pdf"
+              )
+              pdf_path = OUT / filename
+              pdf_path.write_bytes(img2pdf.convert([str(path) for path in page_paths]))
+
+              data = pdf_path.read_bytes()
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Generated file is not PDF: {pdf_path}')
+              actual_pages = len(PdfReader(str(pdf_path)).pages)
+              if actual_pages != report['pages']:
+                  raise RuntimeError(
+                      f"Page count mismatch for {pdf_path.name}: {actual_pages} != {report['pages']}"
+                  )
+
+              manifest.append({
+                  **report,
+                  'filename': filename,
+                  'actual_pages': actual_pages,
+                  'size_bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'format_note': '由公开逐页PNG按原顺序合成为完整页图PDF，不是券商原始矢量PDF',
+              })
+
+          (OUT / 'download_failures.json').write_text(
+              json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          if len(manifest) < 2:
+              raise RuntimeError(f'Only {len(manifest)} complete reports rebuilt; need at least 2')
+
+          manifest_path = OUT / 'manifest.json'
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          list_path = OUT / '报告清单.txt'
+          lines = [
+              '绿城中国（03900.HK）券商深度报告清单',
+              '说明：以下PDF由公开逐页图片按原顺序合成，页数完整，但不是券商原始矢量PDF。',
+              '',
+          ]
+          for idx, item in enumerate(manifest, start=1):
+              lines.extend([
+                  f"{idx}. {item['broker']}｜{item['date']}｜{item['title']}",
+                  f"   页数：{item['actual_pages']}页；文件：{item['filename']}",
+                  f"   公开页图基础地址：{item['base']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ])
+          list_path.write_text('\n'.join(lines), encoding='utf-8')
+
+          zip_path = OUT / f"绿城中国_券商深度报告_完整页图合成{len(manifest)}份.zip"
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for item in manifest:
+                  archive.write(OUT / item['filename'], arcname=item['filename'])
+              archive.write(list_path, arcname=list_path.name)
+              archive.write(manifest_path, arcname=manifest_path.name)
+
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP integrity test failed: {bad}')
+
+          print('\nCREATED:', zip_path, zip_path.stat().st_size)
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload rebuilt reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: greentown-full-page-rebuilt-reports
+          path: output/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
