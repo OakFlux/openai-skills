@@ -1,0 +1,234 @@
+name: Greentown Yanbaoke browser network capture
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-greentown-final-20260829
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Capture search, reader, and download network traffic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet playwright requests pypdf
+          python3 -m playwright install --with-deps chromium >/dev/null
+          python3 <<'PY'
+          import asyncio
+          import hashlib
+          import json
+          import re
+          import urllib.parse
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+          from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+          OUT = Path('capture')
+          OUT.mkdir(exist_ok=True)
+          PDFs = OUT / 'pdfs'
+          PDFs.mkdir(exist_ok=True)
+          records = []
+          candidate_urls = set()
+          saved_hashes = set()
+
+          def safe_name(value):
+              value = re.sub(r'[\\/:*?"<>|]+', '_', str(value or '')).strip()
+              return re.sub(r'\s+', '_', value)[:120] or 'file'
+
+          def harvest(obj):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      if isinstance(v, str):
+                          if v.startswith('http') or '.pdf' in v.lower():
+                              candidate_urls.add(v)
+                      harvest(v)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      harvest(v)
+              elif isinstance(obj, str):
+                  for u in re.findall(r'https?://[^\s"\'<>]+', obj):
+                      candidate_urls.add(u.rstrip('),.;'))
+
+          def save_pdf(data, label, source_url):
+              if not data.startswith(b'%PDF-') or len(data) < 100_000:
+                  return None
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in saved_hashes:
+                  return None
+              try:
+                  tmp = PDFs / f'_tmp_{digest[:12]}.pdf'
+                  tmp.write_bytes(data)
+                  pages = len(PdfReader(str(tmp)).pages)
+                  if pages < 18:
+                      tmp.unlink(missing_ok=True)
+                      return None
+                  name = f'{len(saved_hashes)+1:02d}_{safe_name(label)}_{pages}p.pdf'
+                  dest = PDFs / name
+                  tmp.replace(dest)
+                  saved_hashes.add(digest)
+                  records.append({'kind':'pdf','file':name,'pages':pages,'size':len(data),'sha256':digest,'source':source_url})
+                  print('ACCEPT PDF', name, pages, len(data), source_url)
+                  return dest
+              except Exception as exc:
+                  print('PDF validation failed', source_url, repr(exc))
+                  return None
+
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context(
+                      locale='zh-CN',
+                      user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+                      accept_downloads=True,
+                  )
+                  page = await context.new_page()
+                  response_count = 0
+
+                  async def on_response(response):
+                      nonlocal response_count
+                      url = response.url
+                      low = url.lower()
+                      if not any(k in low for k in ['yanbaoke', '/api/', 'report', 'download', 'preview', 'search', 'file']):
+                          return
+                      response_count += 1
+                      rec = {'n':response_count,'url':url,'status':response.status,'headers':await response.all_headers()}
+                      ctype = rec['headers'].get('content-type','')
+                      try:
+                          body = await response.body()
+                          rec['size'] = len(body)
+                          rec['signature'] = repr(body[:40])
+                          if body.startswith(b'%PDF-'):
+                              save_pdf(body, f'network_{response_count}', url)
+                          elif len(body) <= 2_000_000 and ('json' in ctype or 'text' in ctype or 'javascript' in ctype or not ctype):
+                              text = body.decode('utf-8', errors='replace')
+                              rec['body'] = text[:1_500_000]
+                              try:
+                                  obj = json.loads(text)
+                                  harvest(obj)
+                              except Exception:
+                                  harvest(text)
+                      except Exception as exc:
+                          rec['body_error'] = repr(exc)
+                      records.append(rec)
+                      print('RESP', response.status, ctype, url)
+
+                  async def on_download(download):
+                      try:
+                          path = await download.path()
+                          data = Path(path).read_bytes()
+                          save_pdf(data, download.suggested_filename, download.url)
+                      except Exception as exc:
+                          records.append({'kind':'download_error','error':repr(exc),'url':download.url})
+
+                  page.on('response', on_response)
+                  page.on('download', on_download)
+
+                  urls = [
+                      'https://pc.yanbaoke.cn/#/search?keyword=%E7%BB%BF%E5%9F%8E%E4%B8%AD%E5%9B%BD',
+                      'https://pc.yanbaoke.cn/#/read/570154',
+                      'https://pc.yanbaoke.cn/#/read/1223571',
+                      'https://pc.yanbaoke.cn/#/read/1143859',
+                      'https://pc.yanbaoke.cn/#/read/924183',
+                      'https://pc.yanbaoke.cn/#/read/295455',
+                      'https://pc.yanbaoke.cn/#/read/336048',
+                      'https://pc.yanbaoke.cn/#/read/281441',
+                      'https://pc.yanbaoke.cn/#/read/373267',
+                  ]
+
+                  for idx, url in enumerate(urls):
+                      try:
+                          print('\nNAVIGATE', url)
+                          await page.goto(url, wait_until='domcontentloaded', timeout=60_000)
+                          await page.wait_for_timeout(8_000)
+                          (OUT / f'page_{idx}.html').write_text(await page.content(), encoding='utf-8')
+                          (OUT / f'page_{idx}.txt').write_text((await page.locator('body').inner_text())[:500_000], encoding='utf-8')
+                          await page.screenshot(path=str(OUT / f'page_{idx}.png'), full_page=True)
+
+                          # On search page, fill a likely search field and submit.
+                          if idx == 0:
+                              for selector in ['input[placeholder*=搜索]', 'input[type=search]', 'input']:
+                                  try:
+                                      loc = page.locator(selector).first
+                                      if await loc.count():
+                                          await loc.fill('绿城中国')
+                                          await loc.press('Enter')
+                                          await page.wait_for_timeout(8_000)
+                                          break
+                                  except Exception:
+                                      pass
+
+                          # Record links and buttons.
+                          anchors = await page.locator('a').evaluate_all("els => els.map(e => ({text:(e.innerText||'').trim(), href:e.href}))")
+                          buttons = await page.locator('button').evaluate_all("els => els.map(e => ({text:(e.innerText||'').trim(), disabled:e.disabled}))")
+                          (OUT / f'links_{idx}.json').write_text(json.dumps({'anchors':anchors,'buttons':buttons}, ensure_ascii=False, indent=2), encoding='utf-8')
+                          for item in anchors:
+                              if item.get('href'):
+                                  candidate_urls.add(item['href'])
+
+                          # Try visible download controls, without bypassing login or permissions.
+                          for text in ['下载报告', '下载', '原文下载', 'PDF下载']:
+                              loc = page.get_by_text(text, exact=False)
+                              count = min(await loc.count(), 5)
+                              for j in range(count):
+                                  try:
+                                      await loc.nth(j).click(timeout=3_000)
+                                      await page.wait_for_timeout(4_000)
+                                  except Exception:
+                                      pass
+                      except Exception as exc:
+                          records.append({'kind':'navigation_error','url':url,'error':repr(exc)})
+                          print('NAV ERROR', url, repr(exc))
+
+                  state = await context.storage_state()
+                  (OUT / 'storage_state.json').write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+                  await browser.close()
+
+              # Test harvested direct URLs with anonymous browser cookies only.
+              cookies = {}
+              for c in state.get('cookies', []):
+                  cookies[c['name']] = c['value']
+              sess = requests.Session()
+              sess.headers.update({'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36','Referer':'https://pc.yanbaoke.cn/'})
+              sess.cookies.update(cookies)
+              tests = []
+              for url in sorted(candidate_urls):
+                  if not (url.startswith('http') and any(k in url.lower() for k in ['pdf','download','file','report'])):
+                      continue
+                  try:
+                      r = sess.get(url, timeout=60, allow_redirects=True)
+                      test = {'url':url,'status':r.status_code,'final':r.url,'ctype':r.headers.get('content-type'),'size':len(r.content),'signature':repr(r.content[:40])}
+                      tests.append(test)
+                      if r.content.startswith(b'%PDF-'):
+                          save_pdf(r.content, 'candidate_url', r.url)
+                      elif len(r.content) < 2_000_000:
+                          try: harvest(r.json())
+                          except Exception: pass
+                      print('URLTEST', json.dumps(test, ensure_ascii=False))
+                  except Exception as exc:
+                      tests.append({'url':url,'error':repr(exc)})
+              (OUT / 'candidate_tests.json').write_text(json.dumps(tests, ensure_ascii=False, indent=2), encoding='utf-8')
+              (OUT / 'candidate_urls.txt').write_text('\n'.join(sorted(candidate_urls)), encoding='utf-8')
+              (OUT / 'network_records.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          asyncio.run(main())
+          PY
+
+      - name: Upload capture
+        uses: actions/upload-artifact@v4
+        with:
+          name: greentown-yanbaoke-browser-capture
+          path: capture/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
