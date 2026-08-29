@@ -1,0 +1,139 @@
+name: Temporary Pingtan Development report discovery v1
+
+on:
+  push:
+    branches: [tmp/pingtan-development-reports-20260829]
+    paths: [.github/workflows/tmp-pingtan-discover-v1.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet requests pypdf
+      - name: Fetch report list and validate PDFs
+        run: |
+          mkdir -p out/pdfs
+          python - <<'PY'
+          import hashlib, json, re, time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('out'); PDFDIR = OUT / 'pdfs'
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/000592.html',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+          })
+          api = 'https://reportapi.eastmoney.com/report/list'
+          all_rows = []
+          logs = []
+          def note(*args):
+              x = ' '.join(str(a) for a in args)
+              print(x, flush=True); logs.append(x)
+
+          for page in range(1, 8):
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2000-01-01', 'endTime': '2030-01-01',
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': '000592', 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+              try:
+                  r = s.get(api, params=params, timeout=45)
+                  note('LIST', page, r.status_code, len(r.content), r.url)
+                  obj = r.json()
+                  rows = obj.get('data') or []
+                  note('ROWS', len(rows), 'HITS', obj.get('hits'), 'TOTALPAGE', obj.get('TotalPage'))
+                  all_rows.extend(rows)
+                  if not rows or page >= int(obj.get('TotalPage') or 1):
+                      break
+                  time.sleep(1.2)
+              except Exception as e:
+                  note('LIST_ERROR', page, repr(e)); break
+
+          # Dedupe list records.
+          uniq = []
+          seen = set()
+          for x in all_rows:
+              k = x.get('infoCode') or (x.get('title'), x.get('publishDate'), x.get('orgSName'))
+              if k in seen: continue
+              seen.add(k); uniq.append(x)
+          (OUT / 'all_reports.json').write_text(json.dumps(uniq, ensure_ascii=False, indent=2), encoding='utf-8')
+          note('UNIQUE', len(uniq))
+          for x in uniq:
+              note('META', str(x.get('publishDate'))[:10], x.get('orgSName'), x.get('attachPages'), x.get('attachSize'), x.get('title'), x.get('infoCode'))
+
+          def clean(x, n=110):
+              return re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(x or '')).strip(' ._')[:n] or 'report'
+
+          downloaded = []
+          hashes = set()
+          for i, x in enumerate(uniq, 1):
+              info = str(x.get('infoCode') or '').strip()
+              if not info: continue
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',
+              ]
+              for url in urls:
+                  try:
+                      time.sleep(1.1)
+                      r = s.get(url, timeout=90, headers={'Referer':'https://data.eastmoney.com/'})
+                      note('PDF_TRY', i, r.status_code, len(r.content), r.headers.get('content-type'), url)
+                      if r.status_code != 200 or len(r.content) < 1500 or not r.content.lstrip().startswith(b'%PDF'):
+                          continue
+                      h = hashlib.sha256(r.content).hexdigest()
+                      if h in hashes:
+                          break
+                      hashes.add(h)
+                      tmp = PDFDIR / f'_tmp_{h[:12]}.pdf'
+                      tmp.write_bytes(r.content)
+                      try:
+                          rd = PdfReader(str(tmp)); pages = len(rd.pages)
+                          text = ''
+                          for pg in rd.pages[:5]:
+                              try: text += '\n' + (pg.extract_text() or '')
+                              except Exception: pass
+                      except Exception as e:
+                          note('BAD_PDF', url, repr(e)); tmp.unlink(missing_ok=True); continue
+                      date = str(x.get('publishDate') or '')[:10]
+                      org = x.get('orgSName') or x.get('orgName') or '未知机构'
+                      title = x.get('title') or '平潭发展研报'
+                      fn = f'{date}_{clean(org,35)}_{clean(title,95)}_{pages}页.pdf'
+                      final = PDFDIR / fn
+                      tmp.rename(final)
+                      identity = any(k in text for k in ['平潭发展', '中福实业', '福建中福', '000592'])
+                      downloaded.append({
+                          'file': fn, 'date': date, 'org': org, 'title': title,
+                          'pages': pages, 'bytes': len(r.content), 'sha256': h,
+                          'source_url': url, 'identity': identity,
+                          'attachPages': x.get('attachPages'), 'attachSize': x.get('attachSize'),
+                          'rating': x.get('emRatingName'), 'text_prefix': text[:600]
+                      })
+                      note('SAVED', fn, 'IDENTITY', identity)
+                      break
+                  except Exception as e:
+                      note('PDF_ERROR', url, repr(e))
+
+          (OUT / 'downloaded_reports.json').write_text(json.dumps(downloaded, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+          print('DOWNLOADED_COUNT', len(downloaded))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pingtan-report-discovery-v1
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
