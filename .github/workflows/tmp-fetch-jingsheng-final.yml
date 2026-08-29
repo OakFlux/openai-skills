@@ -1,0 +1,251 @@
+name: Temporary Fetch Jingsheng Filings Final
+
+on:
+  push:
+    branches:
+      - tmp/fetch-jingsheng-20260829
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pdfinfo >/dev/null 2>&1 || ! command -v pdftotext >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq poppler-utils
+          fi
+
+      - name: Download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+
+          ROOT = Path('jingsheng_package')
+          PDF_DIR = ROOT / '01_招股说明书及定期报告'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+          documents = [
+              {
+                  'kind': 'prospectus',
+                  'title': '首次公开发行股票并在科创板上市招股说明书',
+                  'disclosure_date': '2023-04-17',
+                  'filename': '01_晶升股份_首次公开发行股票并在科创板上市招股说明书.pdf',
+                  'url': 'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2023/2023-4/2023-04-17/8994049.PDF',
+                  'min_pages': 300,
+                  'title_term': '招股说明书',
+              },
+              {
+                  'kind': 'annual_report',
+                  'title': '2023年年度报告',
+                  'disclosure_date': '2024-04-30',
+                  'filename': '02_晶升股份_2023年年度报告.pdf',
+                  'url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2024/2024-4/2024-04-30/10158356.PDF',
+                  'min_pages': 100,
+                  'title_term': '2023年年度报告',
+              },
+              {
+                  'kind': 'annual_report',
+                  'title': '2024年年度报告',
+                  'disclosure_date': '2025-04-29',
+                  'filename': '03_晶升股份_2024年年度报告.pdf',
+                  'url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2025/2025-4/2025-04-29/11044369.PDF',
+                  'min_pages': 100,
+                  'title_term': '2024年年度报告',
+              },
+              {
+                  'kind': 'annual_report',
+                  'title': '2025年年度报告（更正版）',
+                  'disclosure_date': '2026-08-28',
+                  'filename': '04_晶升股份_2025年年度报告_更正版.pdf',
+                  'url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2026/2026-8/2026-08-28/12563020.PDF',
+                  'min_pages': 100,
+                  'title_term': '2025年年度报告',
+              },
+              {
+                  'kind': 'half_year_report',
+                  'title': '2026年半年度报告',
+                  'disclosure_date': '2026-08-28',
+                  'filename': '05_晶升股份_2026年半年度报告.pdf',
+                  'url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2026/2026-8/2026-08-28/12563011.PDF',
+                  'min_pages': 50,
+                  'title_term': '2026年半年度报告',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://vip.stock.finance.sina.com.cn/',
+          })
+
+          def looks_like_pdf(raw):
+              return len(raw) > 100_000 and raw.lstrip().startswith(b'%PDF') and b'%%EOF' in raw[-16384:]
+
+          def download(url, destination):
+              errors = []
+              for attempt in range(1, 4):
+                  try:
+                      print(f'GET attempt={attempt}: {url}')
+                      with session.get(url, timeout=180, allow_redirects=True, stream=True) as response:
+                          response.raise_for_status()
+                          content = bytearray()
+                          for chunk in response.iter_content(chunk_size=1024 * 256):
+                              if chunk:
+                                  content.extend(chunk)
+                          raw = bytes(content)
+                          status = response.status_code
+                          content_type = response.headers.get('content-type')
+                      if not looks_like_pdf(raw):
+                          raise RuntimeError(
+                              f'not a complete PDF: status={status}, type={content_type}, '
+                              f'bytes={len(raw)}, head={raw[:20]!r}'
+                          )
+                      destination.write_bytes(raw)
+                      return raw
+                  except Exception as exc:
+                      errors.append(f'attempt {attempt}: {exc}')
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'Unable to download {url}:\n' + '\n'.join(errors))
+
+          def page_count(path):
+              completed = subprocess.run(['pdfinfo', str(path)], capture_output=True, text=True, check=True)
+              match = re.search(r'^Pages:\s+(\d+)\s*$', completed.stdout, flags=re.M)
+              if not match:
+                  raise RuntimeError(f'Unable to parse page count for {path}')
+              return int(match.group(1))
+
+          def extract_text(path, first_page, last_page):
+              with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temporary:
+                  output = Path(temporary.name)
+              try:
+                  completed = subprocess.run(
+                      ['pdftotext', '-f', str(first_page), '-l', str(last_page), '-enc', 'UTF-8', str(path), str(output)],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if completed.returncode != 0:
+                      return ''
+                  return output.read_text(encoding='utf-8', errors='ignore')
+              finally:
+                  output.unlink(missing_ok=True)
+
+          manifest = []
+          sha_lines = []
+          for document in documents:
+              path = PDF_DIR / document['filename']
+              raw = download(document['url'], path)
+              pages = page_count(path)
+              if pages < document['min_pages']:
+                  raise RuntimeError(f"Unexpectedly short document: {document['title']} has {pages} pages")
+
+              first_text = extract_text(path, 1, min(30, pages))
+              compact = re.sub(r'\s+', '', first_text)
+              identity_ok = any(term in compact for term in ['南京晶升装备股份有限公司', '晶升股份', '688478'])
+              title_ok = re.sub(r'\s+', '', document['title_term']) in compact
+              if not identity_ok or not title_ok:
+                  raise RuntimeError(
+                      f"Identity/title check failed for {document['title']}: "
+                      f"identity={identity_ok}, title={title_ok}"
+                  )
+              if document['kind'] == 'prospectus':
+                  if '招股意向书' in compact[:20000] or '申报稿' in compact[:20000]:
+                      raise RuntimeError('Prospectus candidate is an intention/application draft')
+
+              sha256 = hashlib.sha256(raw).hexdigest()
+              relative = str(path.relative_to(ROOT))
+              manifest.append({
+                  'document_type': document['kind'],
+                  'title': document['title'],
+                  'disclosure_date': document['disclosure_date'],
+                  'file': relative,
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': sha256,
+                  'source_url': document['url'],
+                  'pdf_header_and_eof_valid': True,
+                  'identity_text_matched': identity_ok,
+                  'title_text_matched': title_ok,
+              })
+              sha_lines.append(f'{sha256}  {relative}')
+              print(f"VERIFIED {document['title']}: pages={pages}, bytes={len(raw)}")
+
+          if len(manifest) != 5:
+              raise RuntimeError(f'Expected five PDF documents, found {len(manifest)}')
+
+          (ROOT / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(sha_lines) + '\n', encoding='utf-8')
+
+          readme = [
+              '南京晶升装备股份有限公司（晶升股份，688478）公开披露文件包',
+              '',
+              '包含文件：',
+              '1. 2023年4月17日正式披露的首次公开发行股票并在科创板上市招股说明书；',
+              '2. 上市以来全部独立年度报告：2023年、2024年、2025年年度报告；',
+              '3. 2025年年度报告采用2026年8月28日重新披露的更正版；',
+              '4. 截至2026年8月29日最新披露的2026年半年度报告。',
+              '',
+              '公司于2023年4月24日在科创板上市，因此不存在单独披露的上市公司2022年年度报告。',
+              '公司上市前的2020—2022年度经审计历史财务资料载于正式招股说明书。',
+              '',
+              '校验项目：PDF文件头与EOF、可解析页数、公司名称与标题文字层、SHA-256、ZIP CRC。',
+              '',
+              '文件清单：',
+          ]
+          for record in manifest:
+              readme.extend([
+                  f"- {record['title']}",
+                  f"  披露日期：{record['disclosure_date']}",
+                  f"  文件：{record['file']}",
+                  f"  页数：{record['pages']}",
+                  f"  大小：{record['bytes']} bytes",
+                  f"  SHA256：{record['sha256']}",
+                  f"  来源：{record['source_url']}",
+              ])
+          (ROOT / 'README_来源与校验.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          zip_name = '晶升股份_688478_全部年报_招股说明书_2026年最新半年报_完整PDF.zip'
+          with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_name, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed at {bad}')
+          print(f'CREATED {zip_name} bytes={Path(zip_name).stat().st_size}')
+          PY
+
+      - name: Upload packaged reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: jingsheng-equipment-filings-final
+          path: 晶升股份_688478_全部年报_招股说明书_2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
