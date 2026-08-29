@@ -1,0 +1,166 @@
+name: Temporary Pingtan Development Sina recovery v3
+
+on:
+  push:
+    branches: [tmp/pingtan-development-reports-20260829]
+    paths: [.github/workflows/tmp-pingtan-sina-download-v3.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet requests beautifulsoup4 pypdf
+      - name: Recover report pages and PDF attachments
+        run: |
+          mkdir -p out/pages out/pdfs
+          python - <<'PY'
+          import base64, hashlib, html, json, re, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, parse_qs, unquote
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          O=Path('out'); P=O/'pdfs'; H=O/'pages'
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.5',
+          })
+          ids=['559561704577','525439760486','499793777917','494407883475','472329343360']
+          logs=[]; records=[]; pdfs=[]; seen_pdf=set()
+          def note(*a):
+              x=' '.join(str(v) for v in a); print(x,flush=True); logs.append(x)
+          def decode(r):
+              enc=r.apparent_encoding or r.encoding or 'utf-8'
+              try:return r.content.decode(enc,'replace')
+              except:return r.content.decode('utf-8','replace')
+          def clean(x,n=100):
+              return re.sub(r'[\\/:*?"<>|\r\n]+','_',str(x or '')).strip(' ._')[:n] or 'report'
+          def save_pdf(content,meta,url):
+              if len(content)<1500 or not content.lstrip().startswith(b'%PDF'): return False
+              h=hashlib.sha256(content).hexdigest()
+              if h in seen_pdf:return True
+              seen_pdf.add(h)
+              tmp=P/f'_tmp_{h[:12]}.pdf'; tmp.write_bytes(content)
+              try:
+                  rd=PdfReader(str(tmp)); pages=len(rd.pages); text=''
+                  for pg in rd.pages[:6]:
+                      try:text+='\n'+(pg.extract_text() or '')
+                      except Exception:pass
+              except Exception as e:
+                  note('BAD_PDF',url,repr(e)); tmp.unlink(missing_ok=True); return False
+              identity=any(k in text for k in ['平潭发展','中福实业','福建中福','000592'])
+              title=meta.get('title') or '平潭发展研报'
+              org=meta.get('org') or '未知机构'
+              date=meta.get('date') or ''
+              fn=f'{date}_{clean(org,35)}_{clean(title,95)}_{pages}页.pdf'
+              final=P/fn
+              if final.exists(): final=P/f'{h[:8]}_{fn}'
+              tmp.rename(final)
+              pdfs.append({'file':final.name,'pages':pages,'bytes':len(content),'sha256':h,'url':url,'identity':identity,'text_prefix':text[:1000],**meta})
+              note('SAVED',final.name,'IDENTITY',identity,url)
+              return True
+          def metadata(text,rid):
+              soup=BeautifulSoup(text,'html.parser')
+              title=''
+              for sel in ['h1','.report-title','.title','title']:
+                  tag=soup.select_one(sel)
+                  if tag:
+                      v=' '.join(tag.stripped_strings)
+                      if v and len(v)>3:title=v; break
+              body=' '.join(soup.stripped_strings)
+              # Prefer explicit report title snippets.
+              pats=[r'报告名称[：:]\s*([^\n]{5,100})',r'<h1[^>]*>(.*?)</h1>',r'<title>(.*?)</title>']
+              for pat in pats:
+                  m=re.search(pat,text,re.I|re.S)
+                  if m:
+                      v=BeautifulSoup(m.group(1),'html.parser').get_text(' ',strip=True)
+                      if v:title=v;break
+              org=''; date=''
+              for pat in [r'(?:研究机构|机构|发布机构)[：:]\s*([^\s<｜|]{2,30})',r'(?:机构名称)[：:]\s*([^\s<｜|]{2,30})']:
+                  m=re.search(pat,body)
+                  if m:org=m.group(1);break
+              for pat in [r'(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})',r'(20\d{6})']:
+                  m=re.search(pat,body)
+                  if m:
+                      v=m.group(1)
+                      date=f'{v[:4]}-{v[4:6]}-{v[6:8]}' if re.fullmatch(r'20\d{6}',v) else v.replace('/','-').replace('.','-')
+                      break
+              return {'rid':rid,'title':title,'org':org,'date':date,'body_prefix':body[:3000]}
+
+          for rid in ids:
+              bases=['https://stock.finance.sina.com.cn','https://vip.stock.finance.sina.com.cn','http://stock.finance.sina.com.cn','http://vip.stock.finance.sina.com.cn']
+              path_variants=[]
+              for kind in ['search','lastest']:
+                  path_variants += [
+                    f'/stock/go.php/vReport_Show/kind/{kind}/rptid/{rid}/index.phtml',
+                    f'/q/go.php/vReport_Show/kind/{kind}/rptid/{rid}/index.phtml',
+                    f'/stock/go.php/vReport_Show/kind/{kind}/rptid/{rid}/url',
+                    f'/q/go.php/vReport_Show/kind/{kind}/rptid/{rid}/url',
+                    f'/stock/go.php/vReport_Show/kind/{kind}/rptid/{rid}/index.phtml/url',
+                    f'/q/go.php/vReport_Show/kind/{kind}/rptid/{rid}/index.phtml/url',
+                  ]
+              queue=[b+p for b in bases for p in path_variants]
+              visited=set(); meta={'rid':rid,'title':'','org':'','date':''}
+              while queue and len(visited)<100:
+                  u=queue.pop(0)
+                  if u in visited:continue
+                  visited.add(u)
+                  try:
+                      r=s.get(u,timeout=55,allow_redirects=True,headers={'Referer':f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml'})
+                      ispdf=r.content.lstrip().startswith(b'%PDF')
+                      note('GET',rid,r.status_code,len(r.content),r.headers.get('content-type'),r.url,'HIST',len(r.history))
+                      if ispdf:
+                          save_pdf(r.content,meta,r.url); continue
+                      text=decode(r)
+                      if r.status_code==200 and len(text)>100:
+                          m=metadata(text,rid)
+                          for k in ['title','org','date']:
+                              if m.get(k) and not meta.get(k):meta[k]=m[k]
+                          (H/f'{rid}_{len(visited)}.html').write_text(text,encoding='utf-8',errors='ignore')
+                          raw=html.unescape(text).replace('\\/','/')
+                          soup=BeautifulSoup(text,'html.parser')
+                          links=set()
+                          for tag in soup.find_all(True):
+                              for a in ['href','src','data','value','action']:
+                                  v=tag.get(a)
+                                  if isinstance(v,str) and v.strip(): links.add(urljoin(r.url,v.strip()))
+                          links.update(re.findall(r'https?://[^\s"\'<>]+',raw,re.I))
+                          # Also recover JS strings such as window.location='...'.
+                          for pat in [r'(?:location(?:\.href)?|url|pdfurl|downloadUrl)\s*[:=]\s*["\']([^"\']+)',r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']']:
+                              for v in re.findall(pat,raw,re.I):links.add(urljoin(r.url,v))
+                          for link in links:
+                              link=html.unescape(link).rstrip('),;')
+                              if link in visited:continue
+                              low=link.lower()
+                              if any(k in low for k in ['.pdf','download','attach','file','rptid','vreport','report_show']) and len(queue)<180:
+                                  queue.append(link)
+                      records.append({'rid':rid,'requested':u,'final':r.url,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'history':[{'status':h.status_code,'url':h.url,'location':h.headers.get('Location')} for h in r.history],'meta':dict(meta),'prefix':'%PDF' if ispdf else text[:1000]})
+                  except Exception as e:
+                      note('ERR',rid,u,repr(e)); records.append({'rid':rid,'requested':u,'error':repr(e),'meta':dict(meta)})
+                  time.sleep(.25)
+              note('META_FINAL',rid,json.dumps(meta,ensure_ascii=False))
+
+          (O/'records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (O/'pdfs.json').write_text(json.dumps(pdfs,ensure_ascii=False,indent=2),encoding='utf-8')
+          (O/'log.txt').write_text('\n'.join(logs),encoding='utf-8')
+          with zipfile.ZipFile(O/'平潭发展_新浪历史研报恢复包.zip','w',zipfile.ZIP_DEFLATED) as z:
+              for f in P.glob('*.pdf'):z.write(f,f.name)
+              z.write(O/'pdfs.json','pdfs.json')
+          note('DONE','PDF_COUNT',len(pdfs))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pingtan-sina-recovery-v3
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
