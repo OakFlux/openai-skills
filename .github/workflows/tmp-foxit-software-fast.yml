@@ -1,0 +1,145 @@
+name: Temporary Foxit Software fast report package
+
+on:
+  push:
+    branches:
+      - tmp/foxit-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-foxit-software-fast.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests Pillow PyMuPDF img2pdf
+      - name: Download and package selected reports
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, time, zipfile
+          from pathlib import Path
+          import img2pdf, pymupdf, requests
+          from PIL import Image
+
+          OUT=Path('foxit_fast'); PDFDIR=OUT/'pdfs'; IMGDIR=OUT/'images'; RENDER=OUT/'renders'
+          for p in (OUT,PDFDIR,IMGDIR,RENDER): p.mkdir(parents=True,exist_ok=True)
+          sess=requests.Session(); sess.headers.update({'User-Agent':'Mozilla/5.0 Chrome/126 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'})
+          sd=requests.Session(); sd.headers.update({'User-Agent':sess.headers['User-Agent'],'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/'})
+          logs=[]; saved=[]
+          def note(*x):
+              s=' '.join(map(str,x)); print(s,flush=True); logs.append(s)
+          def clean(x,n=95): return re.sub(r'[\\/:*?"<>|\r\n]+','_',str(x or '')).strip(' ._')[:n] or 'report'
+          def company(text):
+              t=re.sub(r'\s+','',text or '')
+              return '福昕软件' in t or '688095' in t
+          def save_pdf(data,meta,url,image_compiled=False):
+              if len(data)<20000 or not data.lstrip().startswith(b'%PDF'): return False
+              h=hashlib.sha256(data).hexdigest()
+              if any(x['sha256']==h for x in saved): return True
+              tmp=PDFDIR/f'_tmp_{h[:12]}.pdf'; tmp.write_bytes(data)
+              try:
+                  doc=pymupdf.open(str(tmp)); pages=doc.page_count
+                  if pages<10: raise ValueError(f'only {pages} pages')
+                  ids=[0,pages//2,pages-1]
+                  text='\n'.join(doc.load_page(i).get_text('text') for i in ids)
+                  if not image_compiled and not company(text): raise ValueError('identity not found')
+                  stem=clean(meta['title'],55)
+                  for label,i in zip(['first','middle','last'],ids):
+                      pix=doc.load_page(i).get_pixmap(matrix=pymupdf.Matrix(.7,.7),alpha=False)
+                      pix.save(str(RENDER/f'{stem}_{label}.png'))
+                  doc.close()
+              except Exception as e:
+                  note('VALIDATE_FAIL',meta.get('title'),repr(e)); tmp.unlink(missing_ok=True); return False
+              ver='公开完整页面合成版' if image_compiled else '原始PDF'
+              fn=f"{meta['date']}_{clean(meta['org'],30)}_{clean(meta['title'],90)}_{pages}页_{ver}.pdf"
+              final=PDFDIR/fn; final.unlink(missing_ok=True); tmp.rename(final)
+              saved.append({'file':fn,'title':meta['title'],'org':meta['org'],'date':meta['date'],'pages':pages,'bytes':len(data),'sha256':h,'source_url':url,'image_compiled':image_compiled})
+              note('SAVED',fn,len(data),url); return True
+          def compile_pages(meta):
+              base=str(meta.get('page_url') or ''); count=int(meta.get('page_count') or 0)
+              if not base or count<10: return False
+              d=IMGDIR/str(meta['id']); d.mkdir(exist_ok=True)
+              paths=[]
+              for idx in range(count):
+                  ok=False
+                  for ext in ['png','jpg','jpeg','webp']:
+                      try:
+                          r=sess.get(f"{base.rstrip('/')}/{idx}.{ext}",headers={'Referer':'https://www.sdyanbao.com/'},timeout=40)
+                          if r.status_code!=200 or len(r.content)<8000: continue
+                          with Image.open(io.BytesIO(r.content)) as im:
+                              im.load()
+                              if im.width<650 or im.height<650: continue
+                              rgb=im.convert('RGB'); p=d/f'{idx:03d}.jpg'; rgb.save(p,'JPEG',quality=94,optimize=True); paths.append(p)
+                          ok=True; break
+                      except Exception: pass
+                  if not ok:
+                      note('PAGE_MISSING',meta['title'],idx,count); return False
+              data=img2pdf.convert([str(p) for p in paths])
+              return save_pdf(data,meta,base,True)
+
+          # Public catalogue detail IDs for three established long-form reports.
+          refs=[
+              {'id':891267,'priority':120},
+              {'id':769361,'priority':110},
+              {'id':442728,'priority':100},
+          ]
+          metas=[]
+          for ref in refs:
+              try:
+                  r=sd.post('https://api.sdyanbao.com/api/file/detail',json={'id':ref['id']},timeout=45)
+                  obj=r.json(); detail=obj.get('data') if obj.get('status')==1 else {}
+                  org=((detail.get('organization') or {}).get('name') or '')
+                  meta={'id':ref['id'],'title':detail.get('name') or '', 'org':org,'date':str(detail.get('time_text') or '')[:10], 'page_count':detail.get('page_count'), 'page_url':detail.get('page_url'), 'code':detail.get('data_source_uuid'), 'priority':ref['priority']}
+                  if not company(meta['title']+' '+json.dumps(detail.get('stock') or {},ensure_ascii=False)): raise ValueError('wrong company')
+                  metas.append(meta); note('META',json.dumps(meta,ensure_ascii=False))
+              except Exception as e: note('META_FAIL',ref['id'],repr(e))
+
+          for meta in sorted(metas,key=lambda x:x['priority'],reverse=True):
+              done=False; code=str(meta.get('code') or '')
+              if code.startswith('AP'):
+                  for url in [f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{code}.pdf',f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time()*1000)}.pdf=']:
+                      try:
+                          r=sess.get(url,headers={'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*'},timeout=90)
+                          note('GET',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+                          if r.status_code==200 and save_pdf(r.content,meta,r.url,False): done=True; break
+                      except Exception as e: note('GET_FAIL',url,repr(e))
+              if not done: compile_pages(meta)
+
+          if len(saved)<2: raise RuntimeError(f'only {len(saved)} complete reports')
+          saved=saved[:3]
+          keep={x['file'] for x in saved}
+          for p in PDFDIR.glob('*.pdf'):
+              if p.name not in keep: p.unlink()
+          (OUT/'selected_reports.json').write_text(json.dumps(saved,ensure_ascii=False,indent=2),encoding='utf-8')
+          read=['福昕软件（688095.SH）券商深度报告下载包','',f'完整PDF数量：{len(saved)}份','']
+          for i,x in enumerate(saved,1):
+              v='公开完整页面合成版' if x['image_compiled'] else '公开原始PDF'
+              read.append(f"{i}. {x['date']}｜{x['org']}｜{x['title']}｜{x['pages']}页｜{v}")
+          read += ['', '仅收录10页以上的公司深度或首次覆盖报告，未使用短篇财报点评、网页摘要或缺页预览。','版权归原发布机构及作者所有，仅供研究参考。']
+          (OUT/'README.txt').write_text('\n'.join(read),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in saved)+'\n',encoding='utf-8')
+          (OUT/'log.txt').write_text('\n'.join(logs),encoding='utf-8')
+          zp=OUT/'foxit_software_reports.zip'
+          with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED) as z:
+              for p in PDFDIR.glob('*.pdf'): z.write(p,p.name)
+              for n in ['README.txt','selected_reports.json','SHA256SUMS.txt']: z.write(OUT/n,n)
+          with zipfile.ZipFile(zp) as z:
+              if z.testzip(): raise RuntimeError('ZIP integrity failed')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')])<2: raise RuntimeError('not enough PDFs')
+          print('\n'.join(read)); print('FINAL_ZIP',zp.stat().st_size)
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxit-software-fast-package
+          path: foxit_fast/
+          retention-days: 3
+          if-no-files-found: error
