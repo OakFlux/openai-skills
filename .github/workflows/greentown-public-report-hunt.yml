@@ -1,0 +1,309 @@
+name: Greentown public broker report hunt
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-greentown-final-20260829
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Search public report metadata and direct PDF sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests beautifulsoup4
+          python3 <<'PY'
+          import base64
+          import html
+          import json
+          import re
+          import time
+          import urllib.parse
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT = Path('hunt')
+          OUT.mkdir(exist_ok=True)
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def dump(name, obj):
+              (OUT / name).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # 1) Eastmoney report API with many code/qType parameter variants.
+          em_results = []
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          code_variants = [
+              '03900', '3900', '003900', 'HK03900', '03900.HK', '3900.HK',
+              '116.03900', '11603900', 'HKSE03900', 'HKSE.03900', '03900:HK',
+          ]
+          for qtype in [str(i) for i in range(0, 11)]:
+              for code in code_variants:
+                  params = {
+                      'industryCode': '*', 'pageSize': '500', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*', 'beginTime': '2000-01-01',
+                      'endTime': '2030-01-01', 'pageNo': '1', 'fields': '',
+                      'qType': qtype, 'orgCode': '', 'code': code, 'rcode': '',
+                      'p': '1', 'pageNum': '1', 'pageNumber': '1',
+                  }
+                  try:
+                      r = session.get(endpoint, params=params, timeout=25)
+                      try:
+                          data = r.json()
+                      except Exception:
+                          data = {'raw': r.text[:2000]}
+                      rows = data.get('data') or [] if isinstance(data, dict) else []
+                      hits = [x for x in rows if '绿城中国' in str(x.get('stockName') or '') or '绿城中国' in str(x.get('title') or '')]
+                      rec = {
+                          'qType': qtype, 'code': code, 'status': r.status_code,
+                          'url': r.url, 'count': len(rows), 'hits': hits,
+                          'first': rows[:3],
+                      }
+                      em_results.append(rec)
+                      if hits or len(rows) not in [0, 500]:
+                          print('\nEASTMONEY', json.dumps(rec, ensure_ascii=False, indent=2)[:50000])
+                  except Exception as exc:
+                      em_results.append({'qType': qtype, 'code': code, 'error': repr(exc)})
+          dump('eastmoney_reportapi.json', em_results)
+
+          # 2) Eastmoney HK F10 pages / candidate data-center report names.
+          dc_results = []
+          dc_hosts = [
+              'https://datacenter-web.eastmoney.com/api/data/v1/get',
+              'https://datacenter.eastmoney.com/securities/api/data/v1/get',
+          ]
+          report_names = [
+              'RPT_HKF10_FN_GONGBU', 'RPT_HKF10_RESEARCH_REPORT', 'RPT_HKF10_RESEARCH',
+              'RPT_HK_RESEARCH_REPORT', 'RPT_HK_RESEARCH', 'RPT_HKF10_FN_RESEARCH',
+              'RPT_HKSECURITY_RESEARCHREPORT', 'RPT_HKF10_ORG_RESEARCH', 'RPT_HK_REPORT',
+              'RPT_HKSE_RESEARCH', 'RPT_HKF10_REPORT', 'RPT_HKF10_RESEARCHREPORT',
+              'RPT_HK_REPORT_LIST', 'RPT_HK_ORG_RESEARCH_REPORT', 'RPT_HK_COMPANY_REPORT',
+          ]
+          filters = [
+              '(SECURITY_CODE="03900")', '(SECURITY_CODE="3900")',
+              '(SECUCODE="03900.HK")', '(SECUCODE="3900.HK")',
+              '(SECURITY_CODE="003900")',
+          ]
+          for host in dc_hosts:
+              for report_name in report_names:
+                  for flt in filters:
+                      params = {
+                          'sortColumns': 'REPORT_DATE', 'sortTypes': '-1',
+                          'pageSize': '200', 'pageNumber': '1',
+                          'reportName': report_name, 'columns': 'ALL',
+                          'filter': flt, 'source': 'F10', 'client': 'PC',
+                      }
+                      try:
+                          r = session.get(host, params=params, timeout=20)
+                          try: data = r.json()
+                          except Exception: data = {'raw': r.text[:1000]}
+                          result = data.get('result') if isinstance(data, dict) else None
+                          rows = (result or {}).get('data') if isinstance(result, dict) else None
+                          rec = {'host': host, 'reportName': report_name, 'filter': flt,
+                                 'status': r.status_code, 'success': data.get('success') if isinstance(data, dict) else None,
+                                 'message': data.get('message') if isinstance(data, dict) else None,
+                                 'count': len(rows or []), 'rows': (rows or [])[:20]}
+                          dc_results.append(rec)
+                          if rec['count'] or rec['success']:
+                              print('\nDATACENTER', json.dumps(rec, ensure_ascii=False, indent=2)[:50000])
+                      except Exception as exc:
+                          dc_results.append({'host': host, 'reportName': report_name, 'filter': flt, 'error': repr(exc)})
+          dump('eastmoney_datacenter.json', dc_results)
+
+          # 3) Fetch likely Eastmoney HK F10 / report pages and capture network-like URLs.
+          page_urls = [
+              'https://emweb.securities.eastmoney.com/PC_HKF10/ResearchReport/index?type=web&code=03900',
+              'https://emweb.securities.eastmoney.com/PC_HKF10/CompanyProfile/index?type=web&code=03900',
+              'https://quote.eastmoney.com/hk/03900.html',
+              'https://data.eastmoney.com/report/stock.jshtml?quoteid=116.03900',
+              'https://data.eastmoney.com/report/stock.jshtml?code=03900',
+          ]
+          page_info = []
+          script_urls = []
+          for idx, url in enumerate(page_urls):
+              try:
+                  r = session.get(url, timeout=35, allow_redirects=True)
+                  text = r.text
+                  (OUT / f'eastmoney_page_{idx}.html').write_text(text, encoding='utf-8', errors='replace')
+                  soup = BeautifulSoup(text, 'html.parser')
+                  scripts = [urllib.parse.urljoin(r.url, x.get('src')) for x in soup.select('script[src]') if x.get('src')]
+                  script_urls += scripts
+                  raw_urls = sorted(set(re.findall(r'https?://[^\s"\'<>\\]+', html.unescape(text))))
+                  interesting = [u.rstrip('),.;') for u in raw_urls if any(k in u.lower() for k in ['report', 'research', 'pdf', 'datacenter'])]
+                  rec = {'source': url, 'status': r.status_code, 'final': r.url, 'length': len(r.content),
+                         'title': soup.title.get_text(' ', strip=True) if soup.title else '',
+                         'scripts': scripts, 'interesting_urls': interesting}
+                  page_info.append(rec)
+                  print('\nEM PAGE', json.dumps(rec, ensure_ascii=False, indent=2)[:30000])
+              except Exception as exc:
+                  page_info.append({'source': url, 'error': repr(exc)})
+          dump('eastmoney_pages.json', page_info)
+
+          js_hits = []
+          for url in list(dict.fromkeys(script_urls))[:100]:
+              try:
+                  r = session.get(url, timeout=25)
+                  if r.status_code != 200 or len(r.content) > 10_000_000:
+                      continue
+                  text = r.text
+                  snippets = []
+                  low = text.lower()
+                  for key in ['researchreport', 'report/list', 'reportapi', 'infoCode', 'pdf.dfcfw', 'HKF10']:
+                      p = 0
+                      while True:
+                          p = low.find(key.lower(), p)
+                          if p < 0: break
+                          snippets.append(text[max(0,p-1000):min(len(text),p+3000)])
+                          p += len(key)
+                          if len(snippets) >= 30: break
+                      if len(snippets) >= 30: break
+                  if snippets:
+                      js_hits.append({'url': url, 'length': len(r.content), 'snippets': snippets})
+                      print('\nEM JS', url, '\n', '\n---\n'.join(snippets[:8])[:50000])
+              except Exception:
+                  pass
+          dump('eastmoney_js.json', js_hits)
+
+          # 4) Search engines: exact report titles and direct PDF domains.
+          queries = [
+              '"绿城中国" "融合央企基因，行业品质标杆" pdf',
+              '"绿城中国" "品质匠心代表，优质成长蓝筹" pdf',
+              '"绿城中国" "坚守品质标杆，融资优势+聚焦核心，高质量发展可期" pdf',
+              '"绿城中国" "自投代建双核驱动，品质龙头逆势攀升" pdf',
+              '"绿城中国" "匠心独运，驭光而行" pdf',
+              '"绿城中国" "决胜壁龛市场，挖潜新模式价值" pdf',
+              '"绿城中国" "改善房企标杆" pdf',
+              '"绿城中国" "公司深度" filetype:pdf',
+              'site:pdf.dfcfw.com/pdf/H3_AP "绿城中国"',
+              'site:stock.finance.sina.com.cn "绿城中国" "深度"',
+              'site:images.finet.hk "绿城中国" pdf',
+              'site:reportify-1252068037.cos.ap-beijing.myqcloud.com "绿城中国"',
+              'site:file.iyanbao.com "绿城中国" pdf',
+          ]
+          engines = [
+              ('bing', 'https://www.bing.com/search?q={q}&count=50'),
+              ('google', 'https://www.google.com/search?q={q}&num=50'),
+              ('ddg', 'https://html.duckduckgo.com/html/?q={q}'),
+              ('baidu', 'https://www.baidu.com/s?wd={q}&rn=50'),
+          ]
+
+          def decode_link(href, base_url):
+              href = html.unescape(href or '')
+              if href.startswith('/'):
+                  href = urllib.parse.urljoin(base_url, href)
+              p = urllib.parse.urlparse(href)
+              qs = urllib.parse.parse_qs(p.query)
+              host = p.netloc.lower()
+              if 'google.' in host and p.path == '/url':
+                  return (qs.get('q') or qs.get('url') or [href])[0]
+              if 'duckduckgo.com' in host and p.path.startswith('/l/'):
+                  return (qs.get('uddg') or [href])[0]
+              if 'bing.com' in host and p.path.startswith('/ck/a'):
+                  u = (qs.get('u') or [''])[0]
+                  if u.startswith('a1'):
+                      raw = u[2:] + '=' * (-len(u[2:]) % 4)
+                      try: return base64.urlsafe_b64decode(raw).decode('utf-8', errors='replace')
+                      except Exception: pass
+              return href
+
+          search_results = []
+          for query in queries:
+              for engine, template in engines:
+                  try:
+                      url = template.format(q=urllib.parse.quote(query))
+                      r = session.get(url, timeout=40)
+                      soup = BeautifulSoup(r.text, 'html.parser')
+                      links = []
+                      for a in soup.select('a[href]'):
+                          target = decode_link(a.get('href'), r.url)
+                          label = ' '.join(a.get_text(' ', strip=True).split())
+                          if target.startswith('http') and not any(h in urllib.parse.urlparse(target).netloc for h in ['google.', 'bing.com', 'duckduckgo.com', 'baidu.com']):
+                              links.append({'url': target, 'text': label})
+                      rec = {'engine': engine, 'query': query, 'status': r.status_code, 'url': r.url,
+                             'length': len(r.content), 'links': links[:100]}
+                      search_results.append(rec)
+                      print('\nSEARCH', json.dumps(rec, ensure_ascii=False, indent=2)[:50000])
+                  except Exception as exc:
+                      search_results.append({'engine': engine, 'query': query, 'error': repr(exc)})
+          dump('search_results.json', search_results)
+
+          # 5) Follow relevant search hits and inspect PDFs, download endpoints, and Sina rptid pages.
+          all_links = []
+          for rec in search_results:
+              for link in rec.get('links', []):
+                  all_links.append(link['url'])
+          all_links = list(dict.fromkeys(all_links))
+          relevant = [u for u in all_links if any(k in u.lower() for k in [
+              'sina.com.cn', 'dfcfw.com', 'eastmoney.com', 'pdf', 'report', 'yanbao',
+              'hibor', 'finet.hk', 'myqcloud.com', 'vcbeat', '10jqka', 'vzkoo',
+          ])]
+          follow = []
+          candidate_urls = []
+          for url in relevant[:300]:
+              try:
+                  r = session.get(url, timeout=35, allow_redirects=True)
+                  ctype = r.headers.get('content-type', '')
+                  text = r.text if ('text' in ctype or 'json' in ctype or not ctype) else ''
+                  soup = BeautifulSoup(text, 'html.parser') if text else None
+                  raw_urls = sorted(set(re.findall(r'https?://[^\s"\'<>\\]+', html.unescape(text)))) if text else []
+                  links = []
+                  if soup:
+                      for a in soup.select('a[href],iframe[src],embed[src],object[data],script[src]'):
+                          target = a.get('href') or a.get('src') or a.get('data')
+                          if target:
+                              target = urllib.parse.urljoin(r.url, target)
+                              if any(k in target.lower() for k in ['pdf', 'download', 'report', 'rptid']):
+                                  links.append(target)
+                  found = sorted(set([u.rstrip('),.;') for u in raw_urls + links if any(k in u.lower() for k in ['.pdf', 'download', 'pdf.dfcfw', 'rptid'])]))
+                  candidate_urls += found
+                  rec = {'source': url, 'status': r.status_code, 'final': r.url,
+                         'ctype': ctype, 'length': len(r.content),
+                         'title': soup.title.get_text(' ', strip=True) if soup and soup.title else '',
+                         'found': found[:500]}
+                  follow.append(rec)
+                  if found or 'sina.com.cn' in url:
+                      print('\nFOLLOW', json.dumps(rec, ensure_ascii=False, indent=2)[:50000])
+              except Exception as exc:
+                  follow.append({'source': url, 'error': repr(exc)})
+          dump('follow_results.json', follow)
+          (OUT / 'candidate_urls.txt').write_text('\n'.join(sorted(set(candidate_urls))), encoding='utf-8')
+
+          # 6) Test all direct PDF-like candidates (headers/signature only; no large save).
+          tests = []
+          for url in sorted(set(candidate_urls))[:500]:
+              if not any(k in url.lower() for k in ['.pdf', 'pdf.dfcfw.com', 'download']):
+                  continue
+              try:
+                  r = session.get(url, headers={'User-Agent': session.headers['User-Agent'], 'Range': 'bytes=0-4095'}, timeout=35, allow_redirects=True)
+                  rec = {'url': url, 'status': r.status_code, 'final': r.url,
+                         'ctype': r.headers.get('content-type'), 'length': len(r.content),
+                         'content_range': r.headers.get('content-range'), 'signature': repr(r.content[:32])}
+                  tests.append(rec)
+                  print('PDFTEST', json.dumps(rec, ensure_ascii=False))
+              except Exception as exc:
+                  tests.append({'url': url, 'error': repr(exc)})
+          dump('candidate_tests.json', tests)
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: greentown-public-report-hunt
+          path: hunt/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
