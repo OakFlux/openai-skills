@@ -1,0 +1,121 @@
+name: Temporary Daan Gene historical date-window report search
+
+on:
+  push:
+    branches:
+      - tmp/daan-gene-broker-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-date-window-search.yml
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF
+      - name: Search precise historical date windows and download originals
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time
+          from pathlib import Path
+          import requests, pymupdf
+
+          out=Path('daan_date_window'); pdfdir=out/'pdfs'; out.mkdir(exist_ok=True); pdfdir.mkdir(exist_ok=True)
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64)','Referer':'https://data.eastmoney.com/','Accept-Language':'zh-CN,zh;q=0.9'})
+          windows=[
+            ('2020-01-01','2020-04-30'),
+            ('2020-05-01','2020-07-31'),
+            ('2020-08-01','2020-09-30'),
+            ('2020-10-01','2020-12-31'),
+            ('2021-01-01','2021-06-30'),
+            ('2021-07-01','2021-12-31'),
+            ('2022-01-01','2022-12-31'),
+          ]
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          matches=[]; seen=set()
+          for begin,end in windows:
+            for qtype in ['0','1','2','3']:
+              for page in range(1,15):
+                params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':begin,'endTime':end,'pageNo':str(page),'fields':'','qType':qtype,
+                  'orgCode':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                }
+                try:
+                  r=s.get(endpoint,params=params,timeout=60); r.raise_for_status(); rows=r.json().get('data') or []
+                except Exception as e:
+                  print('PAGE_ERROR',begin,end,qtype,page,repr(e)); break
+                print('PAGE',begin,end,qtype,page,len(rows))
+                for row in rows:
+                  title=str(row.get('title') or '')
+                  stock_name=str(row.get('stockName') or '')
+                  stock_code=str(row.get('stockCode') or '')
+                  blob=re.sub(r'\s+','',' '.join([title,stock_name,stock_code]))
+                  if not ('达安基因' in blob or '002030' in blob): continue
+                  rec={
+                    'window':[begin,end],'qType':qtype,'title':title,'organization':row.get('orgSName'),
+                    'date':str(row.get('publishDate') or '')[:10],'pages':row.get('attachPages'),
+                    'size':row.get('attachSize'),'infoCode':row.get('infoCode'),'reportType':row.get('reportType'),
+                    'stockCode':stock_code,'stockName':stock_name,'researcher':row.get('researcher'),
+                    'rating':row.get('emRatingName') or row.get('rating'),
+                  }
+                  key=(rec['infoCode'],rec['title'])
+                  if key not in seen:
+                    seen.add(key); matches.append(rec); print('MATCH',json.dumps(rec,ensure_ascii=False))
+                if len(rows)<100: break
+
+          inspected=[]
+          for rec in matches:
+            code=str(rec.get('infoCode') or '')
+            if not code.startswith('AP'): continue
+            urls=[f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time()*1000)}.pdf=']
+            data=None; chosen=None; attempts=[]
+            for url in urls:
+              try:
+                r=s.get(url,timeout=120,headers={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*;q=0.8'})
+                attempts.append({'url':url,'status':r.status_code,'bytes':len(r.content),'magic':r.content[:8].hex()})
+                if r.status_code==200 and r.content.startswith(b'%PDF') and len(r.content)>50000:
+                  data=r.content; chosen=url; break
+              except Exception as e: attempts.append({'url':url,'error':repr(e)})
+            item={**rec,'attempts':attempts,'valid_pdf':False}
+            if data:
+              path=pdfdir/f'{code}.pdf'; path.write_bytes(data)
+              try:
+                doc=pymupdf.open(str(path)); pages=doc.page_count; encrypted=bool(doc.needs_pass)
+                full_sample=''
+                for idx in sorted(set([0,min(1,pages-1),pages//2,pages-1])):
+                  full_sample+=doc.load_page(idx).get_text('text')
+                first=re.sub(r'\s+',' ',doc.load_page(0).get_text('text')).strip()[:2500]
+                last=re.sub(r'\s+',' ',doc.load_page(pages-1).get_text('text')).strip()[:900]
+                # render first/middle/last to validate
+                render_sizes=[]
+                for idx in sorted(set([0,pages//2,pages-1])):
+                  pix=doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(0.4,0.4),alpha=False)
+                  render_sizes.append(len(pix.samples))
+                doc.close()
+                blob=re.sub(r'\s+','',full_sample)
+                item.update({'valid_pdf':True,'chosen_url':chosen,'actual_pages':pages,'encrypted':encrypted,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'company_hit':('达安基因' in blob or '002030' in blob),'first_text':first,'last_text':last,'render_sizes':render_sizes,'saved_file':path.name})
+              except Exception as e: item['parse_error']=repr(e)
+            inspected.append(item); print('PDF_RESULT',json.dumps(item,ensure_ascii=False))
+
+          summary={'matches':len(matches),'valid_company_pdfs':sum(1 for x in inspected if x.get('valid_pdf') and x.get('company_hit')),'reports':[{'date':x.get('date'),'organization':x.get('organization'),'title':x.get('title'),'pages':x.get('actual_pages'),'infoCode':x.get('infoCode'),'sha256':x.get('sha256')} for x in inspected if x.get('valid_pdf') and x.get('company_hit')]}
+          (out/'matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'inspection.json').write_text(json.dumps(inspected,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY',json.dumps(summary,ensure_ascii=False))
+          PY
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-date-window-results
+          path: daan_date_window/
+          retention-days: 1
+          if-no-files-found: error
