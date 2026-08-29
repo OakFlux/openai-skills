@@ -1,0 +1,110 @@
+name: Temporary Daan Gene fast report retrieval
+
+on:
+  push:
+    branches:
+      - tmp/daan-gene-broker-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-fast.yml
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF
+      - name: Fetch exact company report metadata and PDFs
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time
+          from pathlib import Path
+          import requests, pymupdf
+
+          out=Path('daan_fast'); pdfdir=out/'pdfs'; out.mkdir(exist_ok=True); pdfdir.mkdir(exist_ok=True)
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept-Language':'zh-CN,zh;q=0.9'})
+          matches=[]; seen=set()
+
+          # Exact stock-code queries only.
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          for qtype in ['0','1','2','3']:
+              for page in range(1,8):
+                  params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':'2015-01-01','endTime':'2026-08-29','pageNo':str(page),'fields':'','qType':qtype,'orgCode':'','code':'002030','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+                  try:
+                      r=s.get(endpoint,params=params,timeout=60); r.raise_for_status(); rows=r.json().get('data') or []
+                  except Exception as e:
+                      print('EM_ERROR',qtype,page,repr(e)); break
+                  print('EM_PAGE',qtype,page,len(rows))
+                  for row in rows:
+                      rec={'source':'eastmoney','qType':qtype,'title':row.get('title'),'organization':row.get('orgSName'),'date':str(row.get('publishDate') or '')[:10],'pages':row.get('attachPages'),'size':row.get('attachSize'),'infoCode':row.get('infoCode'),'stockCode':row.get('stockCode'),'stockName':row.get('stockName'),'researcher':row.get('researcher'),'reportType':row.get('reportType')}
+                      blob=''.join(map(str,[rec['title'],rec['stockName'],rec['stockCode']]))
+                      if '达安基因' not in blob and '002030' not in blob: continue
+                      key=(rec['infoCode'],rec['title'])
+                      if key not in seen: seen.add(key); matches.append(rec); print('EM_MATCH',json.dumps(rec,ensure_ascii=False))
+                  if len(rows)<100: break
+
+          # Exact SDYanbao catalogue as fallback and extra metadata.
+          sd=requests.Session(); sd.headers.update({'User-Agent':'Mozilla/5.0','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/'})
+          for query in ['达安基因','达安基因 002030','达安基因 公司深度','达安基因 首次覆盖']:
+              try:
+                  r=sd.post('https://api.sdyanbao.com/api/file/search',json={'page':1,'pageSize':100,'keyword':query},timeout=60); r.raise_for_status(); rows=(r.json().get('data') or {}).get('files') or []
+              except Exception as e:
+                  print('SD_ERROR',query,repr(e)); continue
+              print('SD_QUERY',query,len(rows))
+              for row in rows:
+                  name=str(row.get('name') or '')
+                  if '达安基因' not in name and '002030' not in name: continue
+                  rid=row.get('id')
+                  try:
+                      d=sd.post('https://api.sdyanbao.com/api/file/detail',json={'id':rid},timeout=60).json(); detail=(d.get('data') or {}) if d.get('status')==1 else {}
+                  except Exception as e: detail={}; print('SD_DETAIL_ERROR',rid,repr(e))
+                  rec={'source':'sdyanbao','id':rid,'title':name,'organization':((detail.get('organization') or {}).get('name') if isinstance(detail.get('organization'),dict) else detail.get('organization')),'date':detail.get('time_text') or row.get('time_text'),'pages':detail.get('page_count') or row.get('page_count'),'size':detail.get('file_size') or row.get('file_size'),'infoCode':detail.get('data_source_uuid') or row.get('data_source_uuid'),'page_url':detail.get('page_url') or row.get('page_url'),'original_id':detail.get('original_id') or row.get('original_id'),'content_prefix':re.sub(r'\s+',' ',str(detail.get('content') or '')).strip()[:1200]}
+                  key=(rec.get('infoCode'),rec['title'])
+                  if key not in seen: seen.add(key); matches.append(rec); print('SD_MATCH',json.dumps(rec,ensure_ascii=False))
+
+          inspected=[]
+          for rec in matches:
+              code=str(rec.get('infoCode') or '')
+              if not code.startswith('AP'): continue
+              urls=[f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time()*1000)}.pdf=']
+              attempts=[]; data=None; chosen=None
+              for url in urls:
+                  try:
+                      r=s.get(url,timeout=120,headers={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*;q=0.8'})
+                      attempts.append({'url':url,'status':r.status_code,'bytes':len(r.content),'magic':r.content[:8].hex()})
+                      if r.status_code==200 and r.content.startswith(b'%PDF') and len(r.content)>50000: data=r.content; chosen=url; break
+                  except Exception as e: attempts.append({'url':url,'error':repr(e)})
+              item={**rec,'attempts':attempts,'valid_pdf':False}
+              if data:
+                  path=pdfdir/f'{code}.pdf'; path.write_bytes(data)
+                  try:
+                      doc=pymupdf.open(str(path)); pages=doc.page_count
+                      first=re.sub(r'\s+',' ',doc.load_page(0).get_text('text')).strip()[:2200]
+                      middle=re.sub(r'\s+',' ',doc.load_page(pages//2).get_text('text')).strip()[:900]
+                      last=re.sub(r'\s+',' ',doc.load_page(pages-1).get_text('text')).strip()[:700]
+                      sample=''.join([first,middle,last]).replace(' ','')
+                      doc.close()
+                      item.update({'valid_pdf':True,'chosen_url':chosen,'actual_pages':pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'company_hit':('达安基因' in sample or '002030' in sample),'first_text':first,'middle_text':middle,'last_text':last,'saved_file':path.name})
+                  except Exception as e: item['parse_error']=repr(e)
+              inspected.append(item); print('PDF_RESULT',json.dumps(item,ensure_ascii=False))
+
+          (out/'matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'inspection.json').write_text(json.dumps(inspected,ensure_ascii=False,indent=2),encoding='utf-8')
+          summary={'matches':len(matches),'valid_company_pdfs':sum(1 for x in inspected if x.get('valid_pdf') and x.get('company_hit')),'reports':[{'date':x.get('date'),'organization':x.get('organization'),'title':x.get('title'),'pages':x.get('actual_pages'),'infoCode':x.get('infoCode'),'sha256':x.get('sha256')} for x in inspected if x.get('valid_pdf') and x.get('company_hit')]}
+          (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY',json.dumps(summary,ensure_ascii=False))
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-fast-results
+          path: daan_fast/
+          retention-days: 1
+          if-no-files-found: error
