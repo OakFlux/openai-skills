@@ -1,0 +1,171 @@
+name: Temporary download public Daan Gene broker reports v3
+
+on:
+  push:
+    branches:
+      - tmp/daan-gene-broker-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-download-reports-v3.yml
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+      - name: Fetch and validate public report PDFs
+        run: |
+          mkdir -p out/pdfs
+          python - <<'PY'
+          import hashlib, json, os, re, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('out'); PDFDIR=OUT/'pdfs'; OUT.mkdir(exist_ok=True); PDFDIR.mkdir(exist_ok=True)
+          lines=[]
+          def note(*a):
+              s=' '.join(str(x) for x in a); print(s,flush=True); lines.append(s)
+          s=requests.Session(); s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/stock.jshtml',
+              'Origin':'https://data.eastmoney.com',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9'
+          })
+          api='https://reportapi.eastmoney.com/report/list2'
+          rows=[]; api_results=[]
+          windows=[('2000-01-01','2030-01-01')]
+          windows += [(f'{y}-01-01',f'{y}-12-31') for y in range(2010,2027)]
+          for begin,end in windows:
+              for page in range(1,4):
+                  body={
+                      'pageSize':100,'pageNo':page,'p':page,'pageNum':page,'pageNumber':page,
+                      'beginTime':begin,'endTime':end,'code':'002030','industryCode':'*',
+                      'rating':None,'ratingChange':None,'orgCode':None,'rcode':''
+                  }
+                  try:
+                      r=s.post(api,json=body,headers={'Content-Type':'application/json'},timeout=60)
+                      rec={'begin':begin,'end':end,'page':page,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'prefix':r.text[:1200]}
+                      try:
+                          obj=r.json(); data=obj.get('data') or []; rec['count']=len(data); rec['keys']=list(obj.keys())
+                      except Exception as e:
+                          rec['error']=repr(e); data=[]
+                      api_results.append(rec)
+                      note('API',begin,end,'PAGE',page,'STATUS',r.status_code,'COUNT',len(data),'BYTES',len(r.content))
+                      rows.extend(data)
+                      total=int((obj.get('TotalPage') or obj.get('totalPage') or 1)) if data else 1
+                      if not data or page>=total: break
+                  except Exception as e:
+                      note('API_ERROR',begin,end,page,repr(e)); api_results.append({'begin':begin,'end':end,'page':page,'error':repr(e)}); break
+
+          def val(r,*ks):
+              for k in ks:
+                  v=r.get(k)
+                  if v not in (None,''): return v
+              return ''
+          unique=[]; seen=set()
+          for r in rows:
+              if not isinstance(r,dict): continue
+              blob=json.dumps(r,ensure_ascii=False)
+              if not ('002030' in blob or '达安基因' in blob): continue
+              info=str(val(r,'infoCode','infocode','info_code')).strip()
+              key=info or (str(val(r,'title')),str(val(r,'publishDate')),str(val(r,'orgSName')))
+              if key in seen: continue
+              seen.add(key); unique.append(r)
+          note('RAW_ROWS',len(rows),'UNIQUE',len(unique))
+          (OUT/'api_results.json').write_text(json.dumps(api_results,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'candidates.json').write_text(json.dumps(unique,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          def clean(x,n=100):
+              x=re.sub(r'[\\/:*?"<>|\r\n]+','_',str(x)).strip(' ._')
+              return (x or 'report')[:n]
+          downloaded=[]
+          for r in unique:
+              info=str(val(r,'infoCode','infocode','info_code')).strip()
+              if not info: continue
+              title=str(val(r,'title','reportTitle','reportName')).strip()
+              org=str(val(r,'orgSName','orgName','organization')).strip() or '未知机构'
+              date=str(val(r,'publishDate','publishTime','date'))[:10]
+              meta_pages=val(r,'attachPages','pages','pageCount')
+              candidates=[
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?{date}',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf'
+              ]
+              for url in candidates:
+                  try:
+                      rr=s.get(url,headers={'Referer':'https://data.eastmoney.com/'},timeout=90)
+                      note('PDF',rr.status_code,len(rr.content),rr.headers.get('content-type'),info,title,url)
+                      if rr.status_code!=200 or len(rr.content)<1500 or not rr.content.lstrip().startswith(b'%PDF'): continue
+                      tmp=PDFDIR/f'tmp_{clean(info,60)}.pdf'; tmp.write_bytes(rr.content)
+                      try:
+                          reader=PdfReader(str(tmp)); pages=len(reader.pages)
+                          cover=''
+                          for p in reader.pages[:3]:
+                              try: cover+='\n'+(p.extract_text() or '')
+                              except Exception: pass
+                      except Exception as e:
+                          note('INVALID',info,repr(e)); tmp.unlink(missing_ok=True); continue
+                      if pages<2: tmp.unlink(missing_ok=True); continue
+                      if '达安基因' not in cover and '002030' not in cover and title and title[:8] not in cover:
+                          note('IDENTITY_WARN',info,'PAGES',pages,'COVER',cover[:250].replace('\n',' '))
+                      fname=f'{date}_{clean(org,35)}_{clean(title,90)}_{pages}页.pdf'
+                      final=PDFDIR/fname; final.unlink(missing_ok=True); tmp.rename(final)
+                      downloaded.append({'file':fname,'title':title,'org':org,'date':date,'pages':pages,'bytes':len(rr.content),'url':url,'infoCode':info,'meta_pages':meta_pages,'sha256':hashlib.sha256(rr.content).hexdigest()})
+                      break
+                  except Exception as e: note('PDF_ERROR',url,repr(e))
+
+          # Remove byte-identical copies.
+          dedup=[]; hset=set()
+          for d in downloaded:
+              if d['sha256'] in hset:
+                  (PDFDIR/d['file']).unlink(missing_ok=True); continue
+              hset.add(d['sha256']); dedup.append(d)
+          downloaded=dedup
+
+          exact_titles=[
+              '分子诊断行业待爆发，龙头达安笑傲江湖',
+              '上半年业绩超预期，公司发展迎里程碑拐点',
+              '后疫情时代新冠筛查从严，下半年业绩持续受益',
+              '三季度业绩超预期，产能扩建有望延续新冠优势',
+              '2018年业绩表现欠佳，公共卫生参与大有可为'
+          ]
+          def rank(d):
+              exact=1 if any(t in d['title'] for t in exact_titles) else 0
+              deep=1 if ('深度' in d['title'] or d['pages']>=20) else 0
+              return (deep,d['pages'],exact,d['date'])
+          downloaded.sort(key=rank,reverse=True)
+          selected=downloaded[:3]
+          keep={d['file'] for d in selected}
+          for p in PDFDIR.glob('*.pdf'):
+              if p.name not in keep: p.unlink()
+          (OUT/'selected_reports.json').write_text(json.dumps(selected,ensure_ascii=False,indent=2),encoding='utf-8')
+          readme=['达安基因（002030）公开券商研报下载包','',f'成功取得并校验 PDF：{len(selected)} 份','']
+          for i,d in enumerate(selected,1): readme.append(f"{i}. {d['date']}｜{d['org']}｜{d['title']}｜{d['pages']}页｜{d['bytes']}字节")
+          readme += ['', '文件来自公开可直接访问的研报附件地址；版权归原发布机构及作者所有，仅供研究参考。']
+          (OUT/'README.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'download_log.txt').write_text('\n'.join(lines),encoding='utf-8')
+          zp=OUT/'达安基因_券商深度报告.zip'
+          with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(PDFDIR.glob('*.pdf')): z.write(p,p.name)
+              z.write(OUT/'README.txt','README.txt')
+              z.write(OUT/'selected_reports.json','selected_reports.json')
+          note('DONE','SELECTED',len(selected),'ZIP',zp.stat().st_size)
+          print((OUT/'README.txt').read_text(encoding='utf-8'))
+          PY
+      - name: Upload package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-public-broker-reports-v3
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
