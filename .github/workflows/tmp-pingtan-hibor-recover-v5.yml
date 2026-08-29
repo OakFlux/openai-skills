@@ -1,0 +1,217 @@
+name: Temporary Pingtan Development Hibor recovery v5
+
+on:
+  push:
+    branches: [tmp/pingtan-development-reports-20260829]
+    paths: [.github/workflows/tmp-pingtan-hibor-recover-v5.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+      - name: Search Hibor archives and recover report files
+        run: |
+          mkdir -p out/pages out/pdfs
+          python - <<'PY'
+          import hashlib, html, json, re, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, parse_qs, unquote
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          O=Path('out'); H=O/'pages'; P=O/'pdfs'
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.5',
+          })
+          months=['201111','201112','201301','201312','201403','201404','201405','201406','201407','201408','201410','201411','201510','201511','201602']
+          target_terms=['中福实业','福建中福','平潭发展','000592','乘平潭开发东风','主业稳健发展','依托林业资产','建设两岸家园','扎根两岸家园','受益平潭实验区']
+          logs=[]; index_records=[]; detail_candidates=[]; detail_records=[]; files=[]; seen_urls=set(); seen_hash=set()
+          def note(*a):
+            x=' '.join(str(v) for v in a); print(x,flush=True); logs.append(x)
+          def decode(r):
+            for enc in [r.apparent_encoding,r.encoding,'gb18030','utf-8']:
+              if not enc: continue
+              try:return r.content.decode(enc,'replace')
+              except:pass
+            return r.content.decode('utf-8','replace')
+          def clean(x,n=100):
+            return re.sub(r'[\\/:*?"<>|\r\n]+','_',str(x or '')).strip(' ._')[:n] or 'report'
+          def save_pdf(content,meta,url):
+            if len(content)<1500 or not content.lstrip().startswith(b'%PDF'): return False
+            h=hashlib.sha256(content).hexdigest()
+            if h in seen_hash:return True
+            seen_hash.add(h)
+            tmp=P/f'_tmp_{h[:12]}.pdf'; tmp.write_bytes(content)
+            try:
+              rd=PdfReader(str(tmp)); pages=len(rd.pages); text=''
+              for pg in rd.pages[:7]:
+                try:text+='\n'+(pg.extract_text() or '')
+                except Exception:pass
+            except Exception as e:
+              note('BADPDF',url,repr(e)); tmp.unlink(missing_ok=True); return False
+            identity=any(k in text for k in ['平潭发展','中福实业','福建中福','000592'])
+            title=meta.get('title') or '平潭发展研报'
+            org=meta.get('org') or '未知机构'; date=meta.get('date') or ''
+            fn=f'{date}_{clean(org,35)}_{clean(title,95)}_{pages}页.pdf'
+            dest=P/fn
+            if dest.exists():dest=P/f'{h[:8]}_{fn}'
+            tmp.rename(dest)
+            files.append({'file':dest.name,'pages':pages,'bytes':len(content),'sha256':h,'url':url,'identity':identity,'text_prefix':text[:1200],**meta})
+            note('SAVED',dest.name,'IDENTITY',identity,url)
+            return True
+
+          archive_urls=[]
+          for m in months:
+            archive_urls += [
+              f'https://p.hibor.com.cn/archiver/{m}.html',
+              f'http://p.hibor.com.cn/archiver/{m}.html',
+              f'https://www.hibor.com.cn/archiver_houtai/{m}.html',
+              f'http://www.hibor.com.cn/archiver_houtai/{m}.html',
+              f'https://wap.hibor.com.cn/archiver_houtai/{m}.html',
+            ]
+          for idx,u in enumerate(archive_urls):
+            try:
+              r=s.get(u,timeout=45,allow_redirects=True)
+              text=decode(r); note('INDEX',r.status_code,len(r.content),r.url)
+              (H/f'index_{idx}.html').write_text(text,encoding='utf-8',errors='ignore')
+              soup=BeautifulSoup(text,'lxml')
+              matches=[]
+              for a in soup.find_all('a',href=True):
+                label=' '.join(a.stripped_strings)
+                href=urljoin(r.url,a['href'])
+                blob=label+' '+href
+                if any(t in blob for t in target_terms):
+                  matches.append({'label':label,'url':href})
+                  if href not in seen_urls:
+                    seen_urls.add(href); detail_candidates.append({'title':label,'url':href,'source':r.url})
+                  note('INDEX_MATCH',label,href)
+              # Some archive HTML embeds text without anchors or JS URLs.
+              raw=html.unescape(text).replace('\\/','/')
+              for m in re.finditer(r'href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',raw,re.I|re.S):
+                label=BeautifulSoup(m.group(2),'html.parser').get_text(' ',strip=True)
+                href=urljoin(r.url,m.group(1))
+                if any(t in label+href for t in target_terms) and href not in seen_urls:
+                  seen_urls.add(href); detail_candidates.append({'title':label,'url':href,'source':r.url}); note('REGEX_MATCH',label,href)
+              index_records.append({'requested':u,'final':r.url,'status':r.status_code,'bytes':len(r.content),'matches':matches})
+            except Exception as e:
+              note('INDEX_ERR',u,repr(e)); index_records.append({'requested':u,'error':repr(e)})
+            time.sleep(.15)
+
+          # Also use Hibor public search URL variants.
+          search_urls=[]
+          queries=['000592','中福实业','平潭发展','依托林业资产','乘平潭开发东风']
+          for q in queries:
+            from urllib.parse import quote_plus
+            qq=quote_plus(q)
+            search_urls += [
+              f'https://www.hibor.com.cn/search?keyword={qq}',
+              f'https://www.hibor.com.cn/search.aspx?keyword={qq}',
+              f'https://wap.hibor.com.cn/search?keyword={qq}',
+              f'https://www.hibor.com.cn/elasticsearch?keyword={qq}',
+            ]
+          for u in search_urls:
+            try:
+              r=s.get(u,timeout=40,allow_redirects=True); text=decode(r); note('SEARCH',r.status_code,len(r.content),r.url)
+              soup=BeautifulSoup(text,'lxml')
+              for a in soup.find_all('a',href=True):
+                label=' '.join(a.stripped_strings); href=urljoin(r.url,a['href'])
+                if any(t in label+href for t in target_terms) and href not in seen_urls:
+                  seen_urls.add(href); detail_candidates.append({'title':label,'url':href,'source':r.url}); note('SEARCH_MATCH',label,href)
+            except Exception as e:note('SEARCH_ERR',u,repr(e))
+
+          # Fetch detail pages and recursively follow plausible original/download endpoints.
+          queue=list(detail_candidates); visited=set()
+          while queue and len(visited)<450:
+            c=queue.pop(0); u=c['url']
+            if u in visited:continue
+            visited.add(u)
+            try:
+              r=s.get(u,timeout=55,allow_redirects=True,headers={'Referer':c.get('source') or 'https://www.hibor.com.cn/'})
+              ispdf=r.content.lstrip().startswith(b'%PDF')
+              note('DETAIL',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+              meta={'title':c.get('title') or '','org':'','date':'','source_page':c.get('source') or ''}
+              if ispdf:
+                save_pdf(r.content,meta,r.url); continue
+              text=decode(r); raw=html.unescape(text).replace('\\/','/')
+              if len(text)>80:
+                (H/f'detail_{len(visited)}.html').write_text(text,encoding='utf-8',errors='ignore')
+              soup=BeautifulSoup(text,'lxml')
+              page_title=soup.title.get_text(' ',strip=True) if soup.title else ''
+              h1=soup.find(['h1','h2'],string=re.compile(r'中福|平潭|000592'))
+              if h1:meta['title']=' '.join(h1.stripped_strings)
+              elif page_title and not meta['title']:meta['title']=page_title
+              body=' '.join(soup.stripped_strings)
+              # Infer institution/date from title and page.
+              for org in ['国海证券','中信建投','宏源证券','海通证券','国泰君安','民生证券','财达证券']:
+                if org in meta['title'] or org in body[:5000]:meta['org']=org;break
+              md=re.search(r'(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})',body)
+              if md:meta['date']=f'{md.group(1)}-{int(md.group(2)):02d}-{int(md.group(3)):02d}'
+              # Extract all possible original file / API / preview links.
+              links=set()
+              for tag in soup.find_all(True):
+                for attr in ['href','src','data','value','action','data-url','data-href','data-src','file','fileurl','pdfurl']:
+                  v=tag.get(attr)
+                  if isinstance(v,str) and v.strip():links.add(urljoin(r.url,v.strip()))
+              links.update(re.findall(r'https?://[^\s"\'<>]+',raw,re.I))
+              for pat in [
+                r'(?:url|pdfurl|fileurl|downloadurl|previewurl|originalurl|sourceurl|reporturl)\s*[:=]\s*["\']([^"\']+)',
+                r'["\']([^"\']+\.(?:pdf|PDF)(?:\?[^"\']*)?)["\']',
+                r'["\']([^"\']*(?:download|preview|original|source|report|showpdf|readpdf)[^"\']*)["\']',
+              ]:
+                for v in re.findall(pat,raw,re.I):links.add(urljoin(r.url,v))
+              # Probe simple endpoint transformations based on repinfodetail/report ids.
+              ids=set(re.findall(r'(?:repinfodetail_|report/|reportid[=/])([a-zA-Z0-9_-]{6,64})',r.url,re.I))
+              ids.update(re.findall(r'(?:repinfodetail_|reportid[=:"\']+)([a-zA-Z0-9_-]{6,64})',raw,re.I))
+              for rid in ids:
+                bases=['https://www.hibor.com.cn','https://wap.hibor.com.cn','https://mb.hibor.com.cn','https://p.hibor.com.cn']
+                for b in bases:
+                  for path in [
+                    f'/repinfodetail_{rid}.html',f'/report/{rid}.html',f'/report/{rid}.pdf',f'/download/{rid}',
+                    f'/api/report/{rid}',f'/api/report/download/{rid}',f'/newweb/Download.aspx?id={rid}',
+                    f'/download.aspx?id={rid}',f'/download?reportid={rid}',f'/report/download?reportid={rid}',
+                  ]:links.add(b+path)
+              followed=0
+              for link in list(links):
+                link=html.unescape(link).rstrip('),;')
+                low=link.lower()
+                if link in visited:continue
+                valuable=any(k in low for k in ['.pdf','download','preview','original','source','report','repinfo','file'])
+                if not valuable:continue
+                # Avoid crawling unrelated search/navigation pages.
+                if any(x in low for x in ['javascript:','login','register','member','weibo','baidu','bing']):continue
+                if len(queue)<650:
+                  queue.append({'title':meta['title'],'url':link,'source':r.url}); followed+=1
+                if followed>=80:break
+              detail_records.append({'requested':u,'final':r.url,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'meta':meta,'links':list(links)[:300],'prefix':text[:1500]})
+            except Exception as e:
+              note('DETAIL_ERR',u,repr(e)); detail_records.append({'requested':u,'error':repr(e)})
+            time.sleep(.12)
+
+          (O/'index_records.json').write_text(json.dumps(index_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (O/'detail_candidates.json').write_text(json.dumps(detail_candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+          (O/'detail_records.json').write_text(json.dumps(detail_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (O/'pdfs.json').write_text(json.dumps(files,ensure_ascii=False,indent=2),encoding='utf-8')
+          (O/'log.txt').write_text('\n'.join(logs),encoding='utf-8')
+          with zipfile.ZipFile(O/'平潭发展_慧博历史研报恢复包.zip','w',zipfile.ZIP_DEFLATED) as z:
+            for f in P.glob('*.pdf'):z.write(f,f.name)
+            z.write(O/'pdfs.json','pdfs.json')
+          note('DONE','CANDIDATES',len(detail_candidates),'VISITED',len(visited),'PDFS',len(files))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pingtan-hibor-recovery-v5
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
