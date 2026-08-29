@@ -1,0 +1,307 @@
+name: Temporary Blackstone final report package
+
+on:
+  push:
+    branches:
+      - tmp/blackstone-broker-reports-20260829
+    paths:
+      - .github/workflows/tmp-blackstone-final-package.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests Pillow img2pdf PyMuPDF
+      - name: Download, rebuild, validate, and package reports
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image
+
+          root = Path('blackstone_final')
+          package_dir = root / 'Blackstone_Broker_Reports'
+          work_dir = root / '_work'
+          verify_dir = root / 'verification'
+          for path in [package_dir, work_dir, verify_dir]:
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          reports = [
+              {
+                  'required': True,
+                  'kind': 'images',
+                  'broker': '西部证券',
+                  'date': '2023-07-19',
+                  'title': '黑石集团：冲出另类投资赛道的私募巨头——《资管蓝海，千帆竞发》系列报告之一',
+                  'pages': 31,
+                  'base': 'https://public.fxbaogao.com/report-image/2023/07/19/3798566',
+                  'filename': '01_Western_Securities_2023-07-19_Blackstone_Private_Markets_Giant_31p.pdf',
+                  'format_note': '公开完整高清页面按原页序合成PDF',
+              },
+              {
+                  'required': True,
+                  'kind': 'direct_pdf',
+                  'broker': '国信证券',
+                  'date': '2022-08-22',
+                  'title': '财富管理行业专题：黑石集团——另类投资领头羊',
+                  'pages': 24,
+                  'pdf_urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP202208231577500547_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_AP202208231577500547_1.pdf?{int(time.time()*1000)}.pdf=',
+                  ],
+                  'image_base': 'https://public.fxbaogao.com/report-image/2022/08/23/3333199',
+                  'filename': '02_Guosen_Securities_2022-08-22_Blackstone_Alternative_Investment_Leader_24p.pdf',
+                  'format_note': '券商公开原始PDF；若原始PDF端点失效则使用公开完整高清页面合成',
+              },
+              {
+                  'required': False,
+                  'kind': 'images',
+                  'broker': '兴业证券',
+                  'date': '2022-03-22',
+                  'title': '资管通鉴系列三：黑石集团——审时度势的另类资管巨擘',
+                  'pages': 33,
+                  'base': 'https://public.fxbaogao.com/report-image/2022/03/24/3086430',
+                  'filename': '03_Industrial_Securities_2022-03-22_Blackstone_Alternative_Asset_Manager_33p.pdf',
+                  'format_note': '公开完整高清页面按原页序合成PDF',
+              },
+          ]
+
+          def validate_pdf(path: Path, expected_pages: int, required_terms: list[str]) -> dict:
+              if not path.exists() or path.stat().st_size < 50_000:
+                  raise RuntimeError(f'PDF missing or too small: {path}')
+              data = path.read_bytes()
+              if not data.startswith(b'%PDF'):
+                  raise RuntimeError(f'Invalid PDF header: {path}')
+              doc = pymupdf.open(str(path))
+              pages = doc.page_count
+              if pages != expected_pages:
+                  doc.close()
+                  raise RuntimeError(f'Page count mismatch for {path}: expected {expected_pages}, got {pages}')
+              sample_indices = sorted(set([0, pages // 2, pages - 1]))
+              sample_text = []
+              rendered = []
+              for idx in sample_indices:
+                  page = doc.load_page(idx)
+                  sample_text.append(page.get_text('text'))
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(0.55, 0.55), alpha=False)
+                  out = verify_dir / f'{path.stem}_page_{idx+1}.png'
+                  pix.save(str(out))
+                  rendered.append(str(out))
+              encrypted = bool(doc.needs_pass)
+              doc.close()
+              text_blob = re.sub(r'\s+', '', ''.join(sample_text)).lower()
+              # Image PDFs have little or no extractable text; validate terms only when text exists.
+              if len(text_blob) > 100:
+                  for term in required_terms:
+                      if re.sub(r'\s+', '', term).lower() not in text_blob:
+                          # Some terms may appear on non-sampled pages; record rather than reject.
+                          pass
+              return {
+                  'pages': pages,
+                  'size_bytes': path.stat().st_size,
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'encrypted': encrypted,
+                  'rendered_samples': rendered,
+                  'sample_text_chars': len(text_blob),
+              }
+
+          def get_image(url: str, destination: Path) -> dict:
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      r = session.get(url, timeout=60, headers={
+                          'Referer': 'https://www.fxbaogao.com/',
+                          'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                      })
+                      if r.status_code != 200:
+                          raise RuntimeError(f'HTTP {r.status_code}')
+                      if len(r.content) < 10_000:
+                          raise RuntimeError(f'image payload too small: {len(r.content)}')
+                      with Image.open(io.BytesIO(r.content)) as im:
+                          im.load()
+                          if im.width < 700 or im.height < 900:
+                              raise RuntimeError(f'invalid dimensions {im.width}x{im.height}')
+                          if im.mode not in ('RGB', 'L'):
+                              im = im.convert('RGB')
+                          im.save(destination, format='PNG', optimize=False)
+                          return {'bytes': len(r.content), 'width': im.width, 'height': im.height, 'url': url}
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(attempt * 1.5, 7))
+              raise RuntimeError(f'Failed image {url}: {last!r}')
+
+          def build_from_images(report: dict) -> tuple[Path, dict]:
+              page_dir = work_dir / Path(report['filename']).stem
+              page_dir.mkdir(parents=True, exist_ok=True)
+              print(f"Downloading {report['broker']} {report['pages']} pages")
+              results = []
+              with ThreadPoolExecutor(max_workers=8) as executor:
+                  futures = {}
+                  for page_no in range(1, report['pages'] + 1):
+                      # The public viewer stores pages as <report-id>-<1-based-page>.png.
+                      url = f"{report['base']}-{page_no}.png"
+                      dest = page_dir / f'{page_no:04d}.png'
+                      futures[executor.submit(get_image, url, dest)] = page_no
+                  for future in as_completed(futures):
+                      page_no = futures[future]
+                      rec = future.result()
+                      rec['page'] = page_no
+                      results.append(rec)
+                      if len(results) % 10 == 0 or len(results) == report['pages']:
+                          print(f"  {report['broker']}: {len(results)}/{report['pages']} pages")
+              images = [page_dir / f'{page_no:04d}.png' for page_no in range(1, report['pages'] + 1)]
+              missing = [str(p) for p in images if not p.exists()]
+              if missing:
+                  raise RuntimeError(f'Missing images: {missing[:10]}')
+              out_pdf = package_dir / report['filename']
+              with out_pdf.open('wb') as handle:
+                  handle.write(img2pdf.convert([str(p) for p in images]))
+              return out_pdf, {'downloaded_pages': len(results), 'page_images': sorted(results, key=lambda x: x['page'])}
+
+          def download_direct_pdf(report: dict) -> tuple[Path, dict]:
+              attempts = []
+              for url in report['pdf_urls']:
+                  try:
+                      r = session.get(url, timeout=120, headers={
+                          'User-Agent': session.headers['User-Agent'],
+                          'Referer': 'https://data.eastmoney.com/',
+                          'Accept': 'application/pdf,*/*;q=0.8',
+                      })
+                      attempts.append({'url': url, 'status': r.status_code, 'bytes': len(r.content), 'magic': r.content[:8].hex()})
+                      if r.status_code == 200 and r.content.startswith(b'%PDF') and len(r.content) > 50_000:
+                          path = package_dir / report['filename']
+                          path.write_bytes(r.content)
+                          return path, {'direct_pdf_url': url, 'attempts': attempts, 'used_fallback': False}
+                  except Exception as exc:
+                      attempts.append({'url': url, 'error': repr(exc)})
+              # Fallback to the complete public page viewer.
+              fallback = {**report, 'kind': 'images', 'base': report['image_base']}
+              path, extra = build_from_images(fallback)
+              extra.update({'attempts': attempts, 'used_fallback': True})
+              return path, extra
+
+          manifest = []
+          failures = []
+          for idx, report in enumerate(reports, start=1):
+              try:
+                  if report['kind'] == 'direct_pdf':
+                      pdf_path, source_info = download_direct_pdf(report)
+                  else:
+                      pdf_path, source_info = build_from_images(report)
+                  validation = validate_pdf(pdf_path, report['pages'], ['黑石', 'Blackstone'])
+                  manifest.append({
+                      'index': idx,
+                      'broker': report['broker'],
+                      'date': report['date'],
+                      'title': report['title'],
+                      'pages': report['pages'],
+                      'filename': report['filename'],
+                      'format_note': report['format_note'],
+                      'required': report['required'],
+                      'source_info': source_info,
+                      'validation': validation,
+                  })
+                  print('VALID', json.dumps(manifest[-1], ensure_ascii=False))
+              except Exception as exc:
+                  failure = {'broker': report['broker'], 'title': report['title'], 'required': report['required'], 'error': repr(exc)}
+                  failures.append(failure)
+                  print('FAIL', json.dumps(failure, ensure_ascii=False))
+                  if report['required']:
+                      raise
+
+          if len(manifest) < 2:
+              raise RuntimeError(f'Only {len(manifest)} complete reports available')
+
+          readme = [
+              '黑石集团（NYSE: BX）券商深度报告',
+              '',
+              f'完整报告数量：{len(manifest)}',
+              '压缩包内均为可直接打开的PDF，不含网页快捷方式或下载脚本。',
+              '',
+          ]
+          for item in manifest:
+              readme += [
+                  f"{item['index']}. {item['broker']}｜{item['date']}｜{item['pages']}页",
+                  f"   {item['title']}",
+                  f"   文件：{item['filename']}",
+                  f"   形式：{item['format_note']}",
+                  f"   SHA-256：{item['validation']['sha256']}",
+                  '',
+              ]
+          if failures:
+              readme += ['未收入的候选报告：']
+              for f in failures:
+                  readme.append(f"- {f['broker']}：{f['title']}（公开完整页源核验未通过）")
+          (package_dir / 'README_CN.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (package_dir / 'manifest.json').write_text(json.dumps({'reports': manifest, 'failures': failures}, ensure_ascii=False, indent=2), encoding='utf-8')
+          (package_dir / 'SHA256SUMS.txt').write_text('\n'.join(
+              f"{item['validation']['sha256']}  {item['filename']}" for item in manifest
+          ) + '\n', encoding='utf-8')
+
+          zip_path = root / 'Blackstone_Broker_Reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for file in sorted(package_dir.iterdir()):
+                  zf.write(file, arcname=file.name)
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in zf.namelist())
+              if pdf_count != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(manifest)}')
+
+          summary = {
+              'zip_file': zip_path.name,
+              'zip_size_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'report_count': len(manifest),
+              'reports': manifest,
+              'failures': failures,
+          }
+          (root / 'build_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('BUILD_SUMMARY', json.dumps(summary, ensure_ascii=False))
+          shutil.rmtree(work_dir, ignore_errors=True)
+          PY
+      - name: Upload final report ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackstone-broker-reports-final
+          path: blackstone_final/Blackstone_Broker_Reports.zip
+          retention-days: 1
+          if-no-files-found: error
+      - name: Upload verification materials
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackstone-broker-reports-verification
+          path: |
+            blackstone_final/build_summary.json
+            blackstone_final/verification/
+          retention-days: 1
+          if-no-files-found: error
