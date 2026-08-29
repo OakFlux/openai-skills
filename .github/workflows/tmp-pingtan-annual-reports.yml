@@ -1,0 +1,299 @@
+name: Temporary Pingtan Development annual report collection
+
+on:
+  push:
+    branches:
+      - tmp/pingtan-annual-reports-20260829
+    paths:
+      - .github/workflows/tmp-pingtan-annual-reports.yml
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF
+      - name: Query official CNINFO, download, validate, and package reports
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+
+          OUT = Path('pingtan_reports')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Accept': 'application/json, text/javascript, */*; q=0.01',
+              'Origin': 'https://www.cninfo.com.cn',
+              'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=000592&orgId=gssz0000592',
+              'X-Requested-With': 'XMLHttpRequest',
+          })
+
+          logs: list[str] = []
+          def note(*parts):
+              text = ' '.join(str(x) for x in parts)
+              print(text, flush=True)
+              logs.append(text)
+
+          def clean_title(title: str) -> str:
+              return re.sub(r'<[^>]+>', '', title or '').replace('&nbsp;', ' ').strip()
+
+          # Warm up cookies and verify the organization identifier.
+          org_id = 'gssz0000592'
+          try:
+              session.get('https://www.cninfo.com.cn/new/index', timeout=30)
+              top = session.get(
+                  'https://www.cninfo.com.cn/new/information/topSearch/query',
+                  params={'keyWord': '000592', 'maxSecNum': 10, 'maxListNum': 5},
+                  timeout=30,
+              )
+              note('TOP_SEARCH', top.status_code, len(top.content), top.text[:500])
+              if top.ok:
+                  obj = top.json()
+                  for row in obj:
+                      if str(row.get('code') or row.get('secCode') or '') == '000592':
+                          org_id = row.get('orgId') or row.get('orgid') or org_id
+                          break
+          except Exception as exc:
+              note('TOP_SEARCH_ERROR', repr(exc))
+          note('ORG_ID', org_id)
+
+          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          all_announcements: list[dict] = []
+
+          def query_announcements(category: str, searchkey: str = ''):
+              for page_num in range(1, 15):
+                  data = {
+                      'pageNum': str(page_num),
+                      'pageSize': '100',
+                      'column': 'szse',
+                      'tabName': 'fulltext',
+                      'plate': 'sz',
+                      'stock': f'000592,{org_id}',
+                      'searchkey': searchkey,
+                      'secid': '',
+                      'category': category,
+                      'trade': '',
+                      'seDate': '2020-01-01~2026-08-29',
+                      'sortName': 'time',
+                      'sortType': 'desc',
+                      'isHLtitle': 'true',
+                  }
+                  try:
+                      response = session.post(endpoint, data=data, timeout=60)
+                      note('QUERY', category or 'ALL', searchkey or '-', page_num, response.status_code, len(response.content), response.text[:120])
+                      response.raise_for_status()
+                      obj = response.json()
+                      rows = obj.get('announcements') or []
+                      total_pages = int(obj.get('totalpages') or obj.get('totalPages') or 1)
+                      for row in rows:
+                          if str(row.get('secCode') or '') == '000592':
+                              all_announcements.append(row)
+                      if page_num >= total_pages or not rows:
+                          break
+                      time.sleep(0.4)
+                  except Exception as exc:
+                      note('QUERY_ERROR', category, searchkey, page_num, repr(exc))
+                      break
+
+          # Category-specific queries plus exact-keyword fallbacks.
+          query_announcements('category_ndbg_szsh;')
+          query_announcements('category_bndbg_szsh;')
+          query_announcements('', '年度报告')
+          query_announcements('', '半年度报告')
+
+          # Deduplicate announcement metadata.
+          deduped = []
+          seen = set()
+          for row in all_announcements:
+              key = (row.get('announcementId'), row.get('adjunctUrl'), clean_title(row.get('announcementTitle') or ''))
+              if key in seen:
+                  continue
+              seen.add(key)
+              deduped.append(row)
+          all_announcements = deduped
+          (OUT / 'cninfo_announcements.json').write_text(json.dumps(all_announcements, ensure_ascii=False, indent=2), encoding='utf-8')
+          note('ANNOUNCEMENT_COUNT', len(all_announcements))
+          for row in all_announcements:
+              note('ANN', row.get('announcementTime'), clean_title(row.get('announcementTitle') or ''), row.get('adjunctUrl'))
+
+          required = [
+              {'kind': 'annual', 'year': year, 'label': f'{year}年年度报告'}
+              for year in range(2020, 2026)
+          ] + [
+              {'kind': 'interim', 'year': 2026, 'label': '2026年半年度报告'}
+          ]
+
+          def eligible(row: dict, req: dict) -> bool:
+              title = clean_title(row.get('announcementTitle') or '')
+              target = req['label']
+              if target not in title:
+                  return False
+              bad = ['摘要', '英文版', '取消', '更正公告', '提示性公告', '审计报告', '问询函', '回复']
+              if any(word in title for word in bad):
+                  return False
+              if req['kind'] == 'annual' and '年度报告' not in title:
+                  return False
+              if req['kind'] == 'interim' and '半年度报告' not in title:
+                  return False
+              return bool(row.get('adjunctUrl'))
+
+          def announcement_rank(row: dict) -> tuple:
+              title = clean_title(row.get('announcementTitle') or '')
+              revised = 1 if any(x in title for x in ['修订', '更新']) else 0
+              timestamp = int(row.get('announcementTime') or 0)
+              return (revised, timestamp)
+
+          selections = []
+          for req in required:
+              matches = [row for row in all_announcements if eligible(row, req)]
+              matches.sort(key=announcement_rank, reverse=True)
+              if not matches:
+                  raise RuntimeError(f"Missing official announcement: {req['label']}")
+              chosen = matches[0]
+              selections.append({**req, 'announcement': chosen})
+              note('SELECT', req['label'], clean_title(chosen.get('announcementTitle') or ''), chosen.get('adjunctUrl'))
+
+          records = []
+          for item in selections:
+              req = item
+              row = item['announcement']
+              adjunct = str(row.get('adjunctUrl') or '').lstrip('/')
+              urls = [
+                  f'https://static.cninfo.com.cn/{adjunct}',
+                  f'http://static.cninfo.com.cn/{adjunct}',
+              ]
+              data = None
+              source_url = None
+              attempts = []
+              for url in urls:
+                  try:
+                      response = session.get(url, timeout=120, headers={
+                          'Referer': 'https://www.cninfo.com.cn/',
+                          'Accept': 'application/pdf,*/*;q=0.8',
+                      }, allow_redirects=True)
+                      attempts.append({'url': url, 'status': response.status_code, 'bytes': len(response.content), 'type': response.headers.get('content-type')})
+                      note('DOWNLOAD', item['label'], response.status_code, len(response.content), response.headers.get('content-type'), response.url)
+                      if response.status_code == 200 and response.content.lstrip().startswith(b'%PDF') and len(response.content) > 100_000:
+                          data = response.content
+                          source_url = response.url
+                          break
+                  except Exception as exc:
+                      attempts.append({'url': url, 'error': repr(exc)})
+                      note('DOWNLOAD_ERROR', item['label'], url, repr(exc))
+              if data is None:
+                  raise RuntimeError(f"Failed to download {item['label']}: {attempts}")
+
+              filename = f"平潭发展_{item['label']}.pdf"
+              path = PDFDIR / filename
+              path.write_bytes(data)
+              try:
+                  doc = pymupdf.open(str(path))
+                  pages = doc.page_count
+                  if pages < 30:
+                      raise ValueError(f'Unexpectedly short report: {pages} pages')
+                  sample_indices = sorted(set([0, 1, min(5, pages - 1), pages // 2, pages - 1]))
+                  text = '\n'.join(doc.load_page(idx).get_text('text') for idx in sample_indices)
+                  compact = re.sub(r'\s+', '', text)
+                  if not any(key in compact for key in ['平潭发展', '中福海峡（平潭）发展', '中福海峡(平潭)发展', '000592']):
+                      raise ValueError('Company identity not found in sampled pages')
+                  if str(item['year']) not in compact[:15000]:
+                      note('YEAR_TEXT_WARNING', item['label'])
+                  # Render first and last pages to verify document integrity.
+                  for label, idx in [('first', 0), ('last', pages - 1)]:
+                      pix = doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(0.8, 0.8), alpha=False)
+                      pix.save(str(RENDERDIR / f"{item['year']}_{item['kind']}_{label}.png"))
+                  encrypted = bool(doc.is_encrypted)
+                  doc.close()
+              except Exception:
+                  path.unlink(missing_ok=True)
+                  raise
+
+              record = {
+                  'file': filename,
+                  'type': item['kind'],
+                  'report_year': item['year'],
+                  'title': clean_title(row.get('announcementTitle') or ''),
+                  'announcement_date': dt.datetime.fromtimestamp(int(row.get('announcementTime') or 0) / 1000, tz=dt.timezone(dt.timedelta(hours=8))).strftime('%Y-%m-%d') if row.get('announcementTime') else '',
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'encrypted': encrypted,
+                  'source_url': source_url,
+                  'adjunct_url': adjunct,
+              }
+              records.append(record)
+              note('VALIDATED', json.dumps(record, ensure_ascii=False))
+
+          # Confirm all seven required reports are present and unique.
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 reports, got {len(records)}')
+          if len({record['sha256'] for record in records}) != 7:
+              raise RuntimeError('Duplicate PDF content detected')
+
+          records.sort(key=lambda x: (x['report_year'], 0 if x['type'] == 'annual' else 1))
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '平潭发展（000592.SZ）2020—2025年年度报告及最新半年报',
+              '',
+              '文件数量：7份完整PDF',
+              '来源：巨潮资讯网官方公告附件',
+              '',
+          ]
+          for i, record in enumerate(records, 1):
+              readme.append(f"{i}. {record['title']}｜公告日期：{record['announcement_date']}｜{record['pages']}页")
+          readme += [
+              '',
+              '核验：已检查PDF文件头、实际页数、报告主体、加密状态及首尾页渲染；ZIP完整性测试通过。',
+              '版权归上市公司及公告发布平台所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['file']}" for r in records) + '\n', encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / 'pingtan_development_annual_reports_2020_2025_and_2026H1.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  zf.write(path, path.name)
+              for name in ['README.txt', 'manifest.json', 'SHA256SUMS.txt']:
+                  zf.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 7')
+          note('FINAL_ZIP', zip_path, zip_path.stat().st_size)
+          print((OUT / 'README.txt').read_text(encoding='utf-8'))
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pingtan-development-annual-reports
+          path: pingtan_reports/
+          retention-days: 3
+          if-no-files-found: error
