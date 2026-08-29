@@ -1,0 +1,148 @@
+name: Greentown Yanbaoke static API analysis
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-greentown-yanbaoke-20260829
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch frontend chunks and extract public endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests beautifulsoup4
+          python3 <<'PY'
+          import html
+          import json
+          import re
+          import urllib.parse
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT = Path('out')
+          CHUNKS = OUT / 'chunks'
+          OUT.mkdir(exist_ok=True)
+          CHUNKS.mkdir(exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          root = 'https://pc.yanbaoke.cn/'
+          r = s.get(root, timeout=45)
+          r.raise_for_status()
+          soup = BeautifulSoup(r.text, 'html.parser')
+          scripts = [urllib.parse.urljoin(r.url, x.get('src')) for x in soup.select('script[src]') if x.get('src')]
+          print('ROOT SCRIPTS', scripts)
+
+          queue = list(scripts)
+          fetched = {}
+          while queue and len(fetched) < 160:
+              url = queue.pop(0)
+              if url in fetched:
+                  continue
+              try:
+                  rr = s.get(url, timeout=45)
+                  print('FETCH', rr.status_code, len(rr.content), url)
+                  if rr.status_code != 200 or len(rr.content) > 20_000_000:
+                      continue
+                  text = rr.text
+                  fetched[url] = text
+                  name = urllib.parse.urlparse(url).path.rsplit('/', 1)[-1] or f'chunk_{len(fetched)}.js'
+                  (CHUNKS / name).write_text(text, encoding='utf-8', errors='replace')
+                  # Nuxt/Vite relative chunk references.
+                  for rel in re.findall(r'["\'](\./[^"\']+?\.js)["\']', text):
+                      child = urllib.parse.urljoin(url, rel)
+                      if child not in fetched and child not in queue:
+                          queue.append(child)
+                  for rel in re.findall(r'["\']([^"\']+?\.js)["\']', text):
+                      if rel.startswith('http'):
+                          child = rel
+                      elif rel.startswith('./') or rel.startswith('../'):
+                          child = urllib.parse.urljoin(url, rel)
+                      else:
+                          continue
+                      if 'pc.yanbaoke.cn' in child and child not in fetched and child not in queue:
+                          queue.append(child)
+              except Exception as exc:
+                  print('FETCH ERROR', url, repr(exc))
+
+          endpoints = set()
+          urls = set()
+          snippets = []
+          literal_patterns = [
+              r'["\'](/[^"\']{1,220})["\']',
+              r'https?://[^\s"\'<>\\]{5,400}',
+          ]
+          keys = [
+              'download', 'useDownload', '下载', 'fileUrl', 'file_url', 'downloadUrl',
+              'download_url', 'pdfUrl', 'pdf_url', 'originalUrl', 'sourceUrl',
+              'search', 'keyword', 'report', '/info/', 'baseURL', 'apiBase', 'apiHost',
+              'getInfo', 'detail', 'preview', 'oss', 'cos.', 'minio', '绿城中国',
+          ]
+
+          for url, text in fetched.items():
+              for pat in literal_patterns:
+                  for m in re.findall(pat, text):
+                      value = html.unescape(m).replace('\\/','/')
+                      low = value.lower()
+                      if any(k.lower() in low for k in ['api', 'download', 'report', 'pdf', 'search', 'info', 'yanbaoke', 'oss', 'cos.', 'file']):
+                          if value.startswith('http'):
+                              urls.add(value.rstrip('),.;'))
+                          else:
+                              endpoints.add(value)
+              low = text.lower()
+              for key in keys:
+                  pos = 0
+                  while True:
+                      pos = low.find(key.lower(), pos)
+                      if pos < 0:
+                          break
+                      snippets.append({
+                          'chunk': url,
+                          'key': key,
+                          'snippet': text[max(0, pos-1800):min(len(text), pos+6500)],
+                      })
+                      pos += max(1, len(key))
+                      if len(snippets) >= 1200:
+                          break
+                  if len(snippets) >= 1200:
+                      break
+              if len(snippets) >= 1200:
+                  break
+
+          print('\nENDPOINTS')
+          for x in sorted(endpoints):
+              print(x)
+          print('\nURLS')
+          for x in sorted(urls):
+              print(x)
+
+          (OUT/'fetched.json').write_text(json.dumps({'scripts': scripts, 'files': list(fetched)}, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT/'endpoints.txt').write_text('\n'.join(sorted(endpoints)), encoding='utf-8')
+          (OUT/'urls.txt').write_text('\n'.join(sorted(urls)), encoding='utf-8')
+          (OUT/'snippets.json').write_text(json.dumps(snippets, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: greentown-yanbaoke-static
+          path: out/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
