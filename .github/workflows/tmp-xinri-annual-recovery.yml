@@ -1,0 +1,267 @@
+name: Temporary Xinri annual report recovery
+
+on:
+  push:
+    branches:
+      - tmp/xinri-annual-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-annual-recovery.yml
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF
+      - name: Search official announcements without relying on orgId
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+
+          OUT = Path('xinri_recovered')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for p in (OUT, PDFDIR, RENDERDIR):
+              p.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Origin': 'https://www.cninfo.com.cn',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'X-Requested-With': 'XMLHttpRequest',
+          })
+          logs = []
+          def note(*parts):
+              line = ' '.join(str(x) for x in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def clean_title(title):
+              return re.sub(r'<[^>]+>', '', title or '').replace('&nbsp;', ' ').strip()
+
+          # Probe public stock-list resources to recover the exact organization id where available.
+          org_ids = set()
+          stock_list_urls = [
+              'https://www.cninfo.com.cn/new/data/sse_stock.json',
+              'https://www.cninfo.com.cn/new/data/sh_stock.json',
+              'https://www.cninfo.com.cn/new/data/stock.json',
+              'https://www.cninfo.com.cn/new/data/szse_stock.json',
+          ]
+          for url in stock_list_urls:
+              try:
+                  r = s.get(url, timeout=30)
+                  note('STOCK_LIST', r.status_code, len(r.content), r.headers.get('content-type'), url)
+                  if not r.ok or len(r.content) < 20:
+                      continue
+                  obj = r.json()
+                  stack = obj if isinstance(obj, list) else list(obj.values()) if isinstance(obj, dict) else []
+                  # Flatten one level when data is nested under keys.
+                  rows = []
+                  for item in stack:
+                      if isinstance(item, list): rows.extend(item)
+                      elif isinstance(item, dict): rows.append(item)
+                  for row in rows:
+                      blob = json.dumps(row, ensure_ascii=False)
+                      if '603787' in blob:
+                          for key in ['orgId', 'orgid', 'org_id']:
+                              value = row.get(key)
+                              if value: org_ids.add(str(value))
+                          note('STOCK_MATCH', blob[:1200])
+              except Exception as exc:
+                  note('STOCK_LIST_ERROR', url, repr(exc))
+
+          stock_variants = ['', '603787', '603787,gssh0603787'] + [f'603787,{x}' for x in sorted(org_ids)]
+          stock_variants = list(dict.fromkeys(stock_variants))
+          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          collected = []
+          attempts = []
+
+          searches = [
+              ('category_ndbg_szsh;', '603787'),
+              ('category_bndbg_szsh;', '603787'),
+              ('category_ndbg_szsh;', '新日股份'),
+              ('category_bndbg_szsh;', '新日股份'),
+              ('', '603787 年度报告'),
+              ('', '603787 半年度报告'),
+              ('', '新日股份 年度报告'),
+              ('', '新日股份 半年度报告'),
+              ('', '江苏新日 年度报告'),
+              ('', '江苏新日 半年度报告'),
+          ]
+          columns = [('sse', 'sh'), ('shse', 'sh'), ('szse', 'sh')]
+
+          for column, plate in columns:
+              for stock in stock_variants:
+                  for category, keyword in searches:
+                      data = {
+                          'pageNum': '1', 'pageSize': '100',
+                          'column': column, 'tabName': 'fulltext', 'plate': plate,
+                          'stock': stock, 'searchkey': keyword, 'secid': '',
+                          'category': category, 'trade': '',
+                          'seDate': '2020-01-01~2026-08-29',
+                          'sortName': 'time', 'sortType': 'desc', 'isHLtitle': 'true',
+                      }
+                      try:
+                          r = s.post(endpoint, data=data, timeout=60)
+                          text_prefix = r.text[:160]
+                          note('QUERY', column, plate, stock or 'EMPTY', category or 'ALL', keyword, r.status_code, len(r.content), text_prefix)
+                          rows = []
+                          if r.ok:
+                              obj = r.json(); rows = obj.get('announcements') or []
+                          attempts.append({'column':column,'plate':plate,'stock':stock,'category':category,'keyword':keyword,'status':r.status_code,'count':len(rows)})
+                          for row in rows:
+                              if str(row.get('secCode') or '') == '603787' or '新日股份' in str(row.get('secName') or ''):
+                                  collected.append(row)
+                          if len({(x.get('adjunctUrl'), clean_title(x.get('announcementTitle') or '')) for x in collected}) >= 14:
+                              break
+                      except Exception as exc:
+                          note('QUERY_ERROR', column, stock, category, keyword, repr(exc))
+                  if len({(x.get('adjunctUrl'), clean_title(x.get('announcementTitle') or '')) for x in collected}) >= 14:
+                      break
+              if len({(x.get('adjunctUrl'), clean_title(x.get('announcementTitle') or '')) for x in collected}) >= 14:
+                  break
+
+          # Last fallback: query by title only, without a stock filter, in smaller date windows.
+          if len(collected) < 7:
+              for year in range(2020, 2027):
+                  for phrase in [f'{year}年年度报告', f'{year}年半年度报告']:
+                      data = {
+                          'pageNum': '1', 'pageSize': '100', 'column': 'sse',
+                          'tabName': 'fulltext', 'plate': 'sh', 'stock': '',
+                          'searchkey': f'新日股份 {phrase}', 'secid': '', 'category': '', 'trade': '',
+                          'seDate': f'{year}-01-01~{min(year+1, 2026)}-12-31',
+                          'sortName': 'time', 'sortType': 'desc', 'isHLtitle': 'true',
+                      }
+                      try:
+                          r = s.post(endpoint, data=data, timeout=60)
+                          rows = r.json().get('announcements') or [] if r.ok else []
+                          note('FALLBACK_QUERY', year, phrase, r.status_code, len(rows))
+                          for row in rows:
+                              if str(row.get('secCode') or '') == '603787' or '新日股份' in str(row.get('secName') or ''):
+                                  collected.append(row)
+                      except Exception as exc:
+                          note('FALLBACK_ERROR', year, phrase, repr(exc))
+
+          deduped = []
+          seen = set()
+          for row in collected:
+              key = (row.get('adjunctUrl'), clean_title(row.get('announcementTitle') or ''))
+              if key in seen: continue
+              seen.add(key); deduped.append(row)
+          collected = deduped
+          (OUT / 'query_attempts.json').write_text(json.dumps(attempts, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'announcements.json').write_text(json.dumps(collected, ensure_ascii=False, indent=2), encoding='utf-8')
+          note('MATCHED_ANNOUNCEMENTS', len(collected))
+          for row in collected:
+              note('ANN', row.get('secCode'), row.get('secName'), row.get('announcementTime'), clean_title(row.get('announcementTitle') or ''), row.get('adjunctUrl'))
+
+          bad = ['摘要','英文版','取消','更正公告','提示性公告','审计报告','问询函','回复','董事会','监事会']
+          def is_full(row, label, kind):
+              title = clean_title(row.get('announcementTitle') or '')
+              if label not in title or any(x in title for x in bad) or not row.get('adjunctUrl'):
+                  return False
+              return ('年度报告' in title) if kind == 'annual' else ('半年度报告' in title)
+          def rank(row):
+              title = clean_title(row.get('announcementTitle') or '')
+              revised = 1 if any(x in title for x in ['修订','更新']) else 0
+              return (revised, int(row.get('announcementTime') or 0))
+
+          selected = []
+          for year in range(2020, 2026):
+              label = f'{year}年年度报告'
+              rows = [x for x in collected if is_full(x, label, 'annual')]
+              rows.sort(key=rank, reverse=True)
+              if not rows: raise RuntimeError(f'Missing {label}; matched={len(collected)}')
+              selected.append({'kind':'annual','year':year,'label':label,'row':rows[0]})
+              note('SELECT', label, clean_title(rows[0].get('announcementTitle') or ''), rows[0].get('adjunctUrl'))
+
+          interim = []
+          for row in collected:
+              title = clean_title(row.get('announcementTitle') or '')
+              m = re.search(r'(20\d{2})年半年度报告', title)
+              if m and not any(x in title for x in bad) and row.get('adjunctUrl'):
+                  interim.append((int(m.group(1)), row))
+          if not interim: raise RuntimeError('No full half-year report found')
+          latest_year = max(y for y,_ in interim)
+          latest_rows = [r for y,r in interim if y == latest_year]
+          latest_rows.sort(key=rank, reverse=True)
+          selected.append({'kind':'interim','year':latest_year,'label':f'{latest_year}年半年度报告','row':latest_rows[0]})
+          note('SELECT_LATEST_INTERIM', latest_year, clean_title(latest_rows[0].get('announcementTitle') or ''), latest_rows[0].get('adjunctUrl'))
+
+          records = []
+          for item in selected:
+              row = item['row']; adjunct = str(row.get('adjunctUrl') or '').lstrip('/')
+              data = None; source = None
+              for url in [f'https://static.cninfo.com.cn/{adjunct}', f'http://static.cninfo.com.cn/{adjunct}']:
+                  try:
+                      r = s.get(url, timeout=120, headers={'Referer':'https://www.cninfo.com.cn/','Accept':'application/pdf,*/*'}, allow_redirects=True)
+                      note('DOWNLOAD', item['label'], r.status_code, len(r.content), r.headers.get('content-type'), r.url)
+                      if r.status_code == 200 and r.content.lstrip().startswith(b'%PDF') and len(r.content) > 100000:
+                          data = r.content; source = r.url; break
+                  except Exception as exc:
+                      note('DOWNLOAD_ERROR', item['label'], url, repr(exc))
+              if data is None: raise RuntimeError(f'Download failed: {item["label"]}')
+              filename = f'新日股份_{item["label"]}.pdf'; path = PDFDIR / filename; path.write_bytes(data)
+              doc = pymupdf.open(str(path)); pages = doc.page_count
+              if pages < 30: raise RuntimeError(f'{filename} too short: {pages}')
+              indices = sorted(set([0,1,min(5,pages-1),pages//2,pages-1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in indices)
+              compact = re.sub(r'\s+','',text)
+              if not any(k in compact for k in ['新日股份','江苏新日电动车股份有限公司','江苏新日','603787']):
+                  raise RuntimeError(f'Identity check failed: {filename}')
+              for label,idx in [('first',0),('last',pages-1)]:
+                  pix=doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(.8,.8),alpha=False)
+                  pix.save(str(RENDERDIR/f'{item["year"]}_{item["kind"]}_{label}.png'))
+              encrypted=bool(doc.is_encrypted); doc.close()
+              ts=int(row.get('announcementTime') or 0)
+              ann_date=dt.datetime.fromtimestamp(ts/1000,tz=dt.timezone(dt.timedelta(hours=8))).strftime('%Y-%m-%d') if ts else ''
+              rec={'file':filename,'type':item['kind'],'report_year':item['year'],'title':clean_title(row.get('announcementTitle') or ''),'announcement_date':ann_date,'pages':pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'encrypted':encrypted,'source_url':source}
+              records.append(rec); note('VALIDATED',json.dumps(rec,ensure_ascii=False))
+
+          if len(records)!=7 or len({x['sha256'] for x in records})!=7:
+              raise RuntimeError(f'Record validation failed: {len(records)}')
+          records.sort(key=lambda x:(x['report_year'],0 if x['type']=='annual' else 1))
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          read=['新日股份（603787.SH）2020—2025年年度报告及最新半年度报告','',f'文件数量：{len(records)}份完整PDF','来源：巨潮资讯网官方公告附件','']
+          for i,r in enumerate(records,1): read.append(f"{i}. {r['title']}｜公告日期：{r['announcement_date']}｜{r['pages']}页")
+          read += ['','核验：已检查PDF文件头、实际页数、报告主体、加密状态及首尾页渲染；ZIP完整性测试通过。','版权归上市公司及公告发布平台所有，仅供研究参考。']
+          (OUT/'README.txt').write_text('\n'.join(read),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['file']}" for r in records)+'\n',encoding='utf-8')
+          (OUT/'download_log.txt').write_text('\n'.join(logs),encoding='utf-8')
+          zp=OUT/f'xinri_reports_2020_2025_{latest_year}H1.zip'
+          with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(PDFDIR.glob('*.pdf')): z.write(p,p.name)
+              for n in ['README.txt','manifest.json','SHA256SUMS.txt']: z.write(OUT/n,n)
+          with zipfile.ZipFile(zp) as z:
+              if z.testzip(): raise RuntimeError('ZIP integrity failure')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')]) != 7: raise RuntimeError('ZIP PDF count failure')
+          note('FINAL_ZIP',zp,zp.stat().st_size)
+          print('\n'.join(read))
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinri-annual-reports-recovered
+          path: xinri_recovered/
+          retention-days: 3
+          if-no-files-found: error
