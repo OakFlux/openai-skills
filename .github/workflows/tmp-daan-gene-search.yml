@@ -1,0 +1,270 @@
+name: Temporary Daan Gene broker report search
+
+on:
+  push:
+    branches:
+      - tmp/daan-gene-broker-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-search.yml
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF
+      - name: Search catalogues and download candidate original PDFs
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import time
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+
+          out = Path('daan_gene_search')
+          pdf_dir = out / 'valid_pdfs'
+          out.mkdir(exist_ok=True)
+          pdf_dir.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def norm(value: object) -> str:
+              return re.sub(r'[\s，。、“”‘’：:；;（）()\-—_+&/\\]+', '', str(value or '')).lower()
+
+          candidates: list[dict] = []
+          seen_keys = set()
+
+          # 1) Public SDYanbao catalogue.
+          sd = requests.Session()
+          sd.headers.update({
+              'User-Agent': session.headers['User-Agent'],
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+          queries = [
+              '达安基因',
+              '达安基因 002030',
+              '达安基因 公司深度',
+              '达安基因 首次覆盖',
+              '达安基因 分子诊断',
+              '达安基因 核酸检测',
+          ]
+          for query in queries:
+              try:
+                  response = sd.post(
+                      'https://api.sdyanbao.com/api/file/search',
+                      json={'page': 1, 'pageSize': 100, 'keyword': query},
+                      timeout=60,
+                  )
+                  response.raise_for_status()
+                  rows = (response.json().get('data') or {}).get('files') or []
+                  print('SD_QUERY', query, 'COUNT', len(rows))
+              except Exception as exc:
+                  print('SD_QUERY_ERROR', query, repr(exc))
+                  continue
+              for row in rows:
+                  name = str(row.get('name') or '')
+                  if '达安基因' not in name and '002030' not in name:
+                      continue
+                  rid = row.get('id')
+                  try:
+                      d = sd.post('https://api.sdyanbao.com/api/file/detail', json={'id': rid}, timeout=60)
+                      d.raise_for_status()
+                      payload = d.json()
+                      detail = (payload.get('data') or {}) if payload.get('status') == 1 else {}
+                  except Exception as exc:
+                      print('SD_DETAIL_ERROR', rid, repr(exc))
+                      detail = {}
+                  item = {
+                      'source': 'sdyanbao',
+                      'id': rid,
+                      'title': name,
+                      'organization': ((detail.get('organization') or {}).get('name') if isinstance(detail.get('organization'), dict) else detail.get('organization')) or ((row.get('organization') or {}).get('name') if isinstance(row.get('organization'), dict) else row.get('organization')),
+                      'date': detail.get('time_text') or row.get('time_text'),
+                      'pages': detail.get('page_count') or row.get('page_count'),
+                      'file_size': detail.get('file_size') or row.get('file_size'),
+                      'data_source_uuid': detail.get('data_source_uuid') or row.get('data_source_uuid'),
+                      'original_id': detail.get('original_id') or row.get('original_id'),
+                      'page_url': detail.get('page_url') or row.get('page_url'),
+                      'stock': detail.get('stock'),
+                      'content_prefix': re.sub(r'\s+', ' ', str(detail.get('content') or '')).strip()[:1200],
+                  }
+                  key = ('sd', item['id'])
+                  if key not in seen_keys:
+                      seen_keys.add(key)
+                      candidates.append(item)
+                      print('SD_MATCH', json.dumps(item, ensure_ascii=False))
+
+          # 2) Eastmoney report catalogue by stock code, all report types.
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          for qtype in ['0', '1', '2', '3']:
+              for code_filter in ['002030', '']:
+                  for page in range(1, 30):
+                      params = {
+                          'industryCode': '*',
+                          'pageSize': '100',
+                          'industry': '*',
+                          'rating': '*',
+                          'ratingChange': '*',
+                          'beginTime': '2015-01-01',
+                          'endTime': '2026-08-29',
+                          'pageNo': str(page),
+                          'fields': '',
+                          'qType': qtype,
+                          'orgCode': '',
+                          'code': code_filter,
+                          'rcode': '',
+                          'p': str(page),
+                          'pageNum': str(page),
+                          'pageNumber': str(page),
+                      }
+                      try:
+                          r = session.get(endpoint, params=params, timeout=60, headers={'Referer': 'https://data.eastmoney.com/'})
+                          r.raise_for_status()
+                          rows = r.json().get('data') or []
+                      except Exception as exc:
+                          print('EM_PAGE_ERROR', qtype, code_filter or 'blank', page, repr(exc))
+                          break
+                      print('EM_PAGE', qtype, code_filter or 'blank', page, len(rows))
+                      for row in rows:
+                          title = str(row.get('title') or '')
+                          stock_name = str(row.get('stockName') or '')
+                          stock_code = str(row.get('stockCode') or '')
+                          blob = norm(' '.join([title, stock_name, stock_code]))
+                          if not ('达安基因' in blob or '002030' in blob):
+                              continue
+                          item = {
+                              'source': 'eastmoney',
+                              'qType': qtype,
+                              'title': title,
+                              'organization': row.get('orgSName'),
+                              'date': str(row.get('publishDate') or '')[:10],
+                              'pages': row.get('attachPages'),
+                              'file_size': row.get('attachSize'),
+                              'infoCode': row.get('infoCode'),
+                              'reportType': row.get('reportType'),
+                              'stockCode': stock_code,
+                              'stockName': stock_name,
+                              'researcher': row.get('researcher'),
+                              'rating': row.get('emRatingName') or row.get('rating'),
+                          }
+                          key = ('em', item.get('infoCode'), item.get('title'))
+                          if key not in seen_keys:
+                              seen_keys.add(key)
+                              candidates.append(item)
+                              print('EM_MATCH', json.dumps(item, ensure_ascii=False))
+                      if len(rows) < 100:
+                          break
+                  if code_filter:
+                      # The stock-code query is normally sufficient; blank query is only a fallback.
+                      pass
+
+          # 3) Collect AP codes and test original PDF endpoint.
+          ap_records = {}
+          for item in candidates:
+              code = str(item.get('infoCode') or item.get('data_source_uuid') or '')
+              if code.startswith('AP'):
+                  ap_records.setdefault(code, item)
+
+          inspected = []
+          now = int(time.time() * 1000)
+          for code, metadata in ap_records.items():
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{now}.pdf=',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{now}',
+              ]
+              data = None
+              chosen = None
+              attempts = []
+              for url in urls:
+                  try:
+                      r = session.get(url, timeout=120, headers={
+                          'User-Agent': session.headers['User-Agent'],
+                          'Referer': 'https://data.eastmoney.com/',
+                          'Accept': 'application/pdf,*/*;q=0.8',
+                      })
+                      attempts.append({'url': url, 'status': r.status_code, 'bytes': len(r.content), 'magic': r.content[:8].hex()})
+                      if r.status_code == 200 and r.content.startswith(b'%PDF') and len(r.content) > 50_000:
+                          data = r.content
+                          chosen = url
+                          break
+                  except Exception as exc:
+                      attempts.append({'url': url, 'error': repr(exc)})
+              record = {**metadata, 'infoCode': code, 'attempts': attempts, 'valid_pdf': False}
+              if data is not None:
+                  path = pdf_dir / f'{code}.pdf'
+                  path.write_bytes(data)
+                  try:
+                      doc = pymupdf.open(str(path))
+                      page_count = doc.page_count
+                      texts = []
+                      for idx in sorted(set([0, min(1, page_count - 1), page_count // 2, page_count - 1])):
+                          texts.append(doc.load_page(idx).get_text('text'))
+                      first_text = re.sub(r'\s+', ' ', doc.load_page(0).get_text('text')).strip()[:2200]
+                      last_text = re.sub(r'\s+', ' ', doc.load_page(page_count - 1).get_text('text')).strip()[:800]
+                      doc.close()
+                      sample_blob = re.sub(r'\s+', '', ''.join(texts))
+                      record.update({
+                          'valid_pdf': True,
+                          'chosen_url': chosen,
+                          'actual_pages': page_count,
+                          'bytes': len(data),
+                          'sha256': hashlib.sha256(data).hexdigest(),
+                          'company_hit': ('达安基因' in sample_blob or '002030' in sample_blob),
+                          'first_text': first_text,
+                          'last_text': last_text,
+                          'saved_file': path.name,
+                      })
+                  except Exception as exc:
+                      record['parse_error'] = repr(exc)
+              inspected.append(record)
+              print('PDF_RESULT', json.dumps(record, ensure_ascii=False))
+
+          (out / 'candidates.json').write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'pdf_inspection.json').write_text(json.dumps(inspected, ensure_ascii=False, indent=2), encoding='utf-8')
+          summary = {
+              'candidate_count': len(candidates),
+              'ap_code_count': len(ap_records),
+              'valid_pdf_count': sum(1 for x in inspected if x.get('valid_pdf')),
+              'valid_company_pdf_count': sum(1 for x in inspected if x.get('valid_pdf') and x.get('company_hit')),
+              'valid_reports': [
+                  {
+                      'date': x.get('date'),
+                      'organization': x.get('organization'),
+                      'title': x.get('title'),
+                      'pages': x.get('actual_pages'),
+                      'infoCode': x.get('infoCode'),
+                      'sha256': x.get('sha256'),
+                  }
+                  for x in inspected if x.get('valid_pdf') and x.get('company_hit')
+              ],
+          }
+          (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('SUMMARY', json.dumps(summary, ensure_ascii=False))
+          PY
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-report-search
+          path: daan_gene_search/
+          retention-days: 1
+          if-no-files-found: error
