@@ -1,0 +1,137 @@
+name: Temporary Blackstone Eastmoney report search
+
+on:
+  push:
+    branches:
+      - tmp/blackstone-broker-reports-20260829
+    paths:
+      - .github/workflows/tmp-blackstone-eastmoney-search.yml
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF
+      - name: Search metadata and test original PDFs
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import time
+          from pathlib import Path
+          import requests
+          import pymupdf
+
+          targets = [
+              {'key':'western','date':'2023-07-19','terms':['黑石集团','冲出另类投资赛道的私募巨头']},
+              {'key':'orient','date':'2022-06-10','terms':['黑石集团','光阴卌载','全球资本之王']},
+              {'key':'guosen','date':'2022-08-22','terms':['黑石集团','另类投资领头羊']},
+              {'key':'xingye','date':'2022-03-22','terms':['黑石集团','审时度势的另类资管巨擘']},
+              {'key':'cicc','date':'2020-11-25','terms':['黑石集团','全球领先的另类资管巨头']},
+          ]
+          out=Path('blackstone_eastmoney_search')
+          pdfdir=out/'pdfs'
+          out.mkdir(exist_ok=True); pdfdir.mkdir(exist_ok=True)
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept-Language':'zh-CN,zh;q=0.9'})
+
+          def norm(x):
+              return re.sub(r'[\s，。、“”‘’：:；;（）()\-—_+&/\\]+','',str(x or '')).lower()
+
+          matches=[]
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          for target in targets:
+              center=dt.date.fromisoformat(target['date'])
+              begin=(center-dt.timedelta(days=10)).isoformat()
+              end=(center+dt.timedelta(days=15)).isoformat()
+              target_norm=[norm(t) for t in target['terms']]
+              for qtype in ['0','1','2','3']:
+                  for page in range(1,31):
+                      params={
+                          'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                          'beginTime':begin,'endTime':end,'pageNo':str(page),'fields':'','qType':qtype,
+                          'orgCode':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                      }
+                      try:
+                          r=s.get(endpoint,params=params,timeout=60)
+                          r.raise_for_status()
+                          rows=r.json().get('data') or []
+                      except Exception as exc:
+                          print('PAGE_ERROR',target['key'],qtype,page,repr(exc)); break
+                      print('PAGE',target['key'],qtype,page,len(rows))
+                      for row in rows:
+                          title=str(row.get('title') or '')
+                          blob=norm(' '.join([title,str(row.get('stockName') or ''),str(row.get('stockCode') or ''),str(row.get('orgSName') or '')]))
+                          term_hits=sum(1 for t in target_norm if t and t in blob)
+                          company_hit=('黑石' in blob or 'blackstone' in blob or 'bxus' in blob)
+                          if not (company_hit and term_hits >= 1) and term_hits < 2:
+                              continue
+                          rec={
+                              'target':target['key'],'qType':qtype,'title':title,'orgSName':row.get('orgSName'),
+                              'publishDate':str(row.get('publishDate') or '')[:10],'infoCode':row.get('infoCode'),
+                              'attachPages':row.get('attachPages'),'attachSize':row.get('attachSize'),
+                              'reportType':row.get('reportType'),'stockCode':row.get('stockCode'),'stockName':row.get('stockName'),
+                              'researcher':row.get('researcher'),
+                          }
+                          sig=(rec['infoCode'],rec['title'])
+                          if not any((x.get('infoCode'),x.get('title'))==sig for x in matches):
+                              matches.append(rec); print('MATCH',json.dumps(rec,ensure_ascii=False))
+                      if len(rows)<100: break
+
+          # Include known Guosen AP code even if API search misses it.
+          matches.append({'target':'guosen_known','qType':None,'title':'财富管理行业专题：黑石集团：另类投资领头羊','orgSName':'国信证券','publishDate':'2022-08-22','infoCode':'AP202208231577500547','attachPages':24})
+
+          inspected=[]
+          seen=set()
+          for rec in matches:
+              code=str(rec.get('infoCode') or '')
+              if not code.startswith('AP') or code in seen: continue
+              seen.add(code)
+              variants=[
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time()*1000)}.pdf=',
+              ]
+              data=None; chosen=None; attempts=[]
+              for url in variants:
+                  try:
+                      rr=s.get(url,timeout=90,headers={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*;q=0.8'})
+                      attempts.append({'url':url,'status':rr.status_code,'bytes':len(rr.content),'magic':rr.content[:8].hex()})
+                      if rr.status_code==200 and rr.content.startswith(b'%PDF') and len(rr.content)>50000:
+                          data=rr.content; chosen=url; break
+                  except Exception as exc:
+                      attempts.append({'url':url,'error':repr(exc)})
+              item={**rec,'attempts':attempts,'valid_pdf':False}
+              if data:
+                  path=pdfdir/f'{code}.pdf'; path.write_bytes(data)
+                  try:
+                      doc=pymupdf.open(str(path)); pages=doc.page_count
+                      first=re.sub(r'\s+',' ',doc.load_page(0).get_text('text')).strip()[:1800]
+                      last=re.sub(r'\s+',' ',doc.load_page(pages-1).get_text('text')).strip()[:600]
+                      doc.close()
+                      item.update({'valid_pdf':True,'chosen_url':chosen,'pages':pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'first_text':first,'last_text':last,'saved_file':path.name})
+                  except Exception as exc:
+                      item['parse_error']=repr(exc)
+              inspected.append(item); print('PDF',json.dumps(item,ensure_ascii=False))
+
+          (out/'matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'inspection.json').write_text(json.dumps(inspected,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY',json.dumps({'matches':len(matches),'ap_codes':len(seen),'valid_pdfs':sum(1 for x in inspected if x.get('valid_pdf'))},ensure_ascii=False))
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackstone-eastmoney-search
+          path: blackstone_eastmoney_search/
+          retention-days: 1
+          if-no-files-found: error
