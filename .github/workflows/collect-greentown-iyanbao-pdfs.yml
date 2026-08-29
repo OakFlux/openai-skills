@@ -1,0 +1,331 @@
+name: Collect public complete Greentown China broker PDFs
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-greentown-collect-20260829
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Discover and download public original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests beautifulsoup4 pypdf
+          python3 <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import unicodedata
+          import urllib.parse
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          OUT.mkdir(exist_ok=True)
+          DIAG = Path('diagnostics')
+          DIAG.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def norm(value):
+              value = unicodedata.normalize('NFKC', str(value or ''))
+              return re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]+', '', value).lower()
+
+          def clean(value):
+              value = re.sub(r'[\\/:*?"<>|]+', '_', str(value or '')).strip()
+              value = re.sub(r'\s+', '', value)
+              return value[:110] or 'report'
+
+          keywords = [
+              '绿城中国',
+              '绿城中国 首次覆盖',
+              '绿城中国 公司深度',
+              '绿城中国 03900',
+              '绿城中国 3900',
+              '自投代建双核驱动 品质龙头逆势攀升',
+              '高质量加速发展的理想生活综合服务商',
+              '融合央企基因 行业品质标杆',
+              '品质标杆房企 逆流而上未来可期',
+              '品质匠心代表 优质成长蓝筹',
+              '深耕高能级城市结硕果 融资能力强稳中有进',
+              '品质龙头重返行业前十 聚焦核心 提质增效',
+              '匠心独运 驭光而行',
+              '好房子引领者 理顺机制再出发',
+              '改善房企标杆 龙头战法 聚焦核心',
+              '用品质铸就 穿越周期的力量',
+              '坚守品质标杆 融资优势 聚焦核心 高质量发展可期',
+          ]
+
+          all_entries = []
+          build_ids = set()
+          search_diagnostics = []
+          for keyword in keywords:
+              url = 'https://www.iyanbao.com/search?keyword=' + urllib.parse.quote(keyword)
+              try:
+                  r = session.get(url, timeout=60, allow_redirects=True)
+                  print('SEARCH', keyword, r.status_code, len(r.content), r.url)
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  node = soup.select_one('#__NEXT_DATA__')
+                  if not node:
+                      search_diagnostics.append({'keyword': keyword, 'status': r.status_code, 'url': r.url, 'error': 'no NEXT_DATA'})
+                      continue
+                  payload = json.loads(node.get_text())
+                  build_id = payload.get('buildId')
+                  if build_id:
+                      build_ids.add(build_id)
+                  props = ((payload.get('props') or {}).get('pageProps') or {})
+                  rows = props.get('searchList') or []
+                  search_diagnostics.append({
+                      'keyword': keyword, 'status': r.status_code, 'url': r.url,
+                      'buildId': build_id, 'searchTotal': props.get('searchTotal'),
+                      'entries': rows,
+                  })
+                  for row in rows:
+                      if isinstance(row, dict) and row.get('id'):
+                          row = dict(row)
+                          row['_search_keyword'] = keyword
+                          row['_build_id'] = build_id
+                          all_entries.append(row)
+              except Exception as exc:
+                  search_diagnostics.append({'keyword': keyword, 'error': repr(exc)})
+                  print('SEARCH ERROR', keyword, repr(exc))
+              time.sleep(0.2)
+
+          (DIAG / 'search_results.json').write_text(json.dumps(search_diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('BUILD IDS', build_ids)
+
+          # Deduplicate entries by report ID and keep the richest record.
+          by_id = {}
+          for row in all_entries:
+              rid = str(row.get('id'))
+              score = len(json.dumps(row, ensure_ascii=False)) + (100000 if row.get('pdfUrl') else 0)
+              if rid not in by_id or score > by_id[rid][0]:
+                  by_id[rid] = (score, row)
+          entries = [v[1] for v in by_id.values()]
+
+          # Follow report detail pages and Next.js JSON routes to fill missing PDF URLs.
+          detail_diagnostics = []
+          for row in entries:
+              hay = norm((row.get('title') or '') + ' ' + (row.get('content') or '')[:3000])
+              if '绿城中国' not in hay and 'greentown' not in hay:
+                  continue
+              rid = str(row.get('id'))
+              probes = [f'https://www.iyanbao.com/detail/{rid}']
+              build_candidates = [row.get('_build_id')] + list(build_ids)
+              for build_id in build_candidates:
+                  if build_id:
+                      probes.extend([
+                          f'https://www.iyanbao.com/_next/data/{build_id}/detail/{rid}.json?id={rid}',
+                          f'https://www.iyanbao.com/_next/data/{build_id}/detail/{rid}.json',
+                      ])
+              seen = set()
+              for url in probes:
+                  if url in seen:
+                      continue
+                  seen.add(url)
+                  try:
+                      r = session.get(url, timeout=45, headers={'Accept': 'application/json,text/html,*/*'})
+                      rec = {'id': rid, 'url': url, 'status': r.status_code, 'final': r.url, 'ctype': r.headers.get('content-type'), 'length': len(r.content)}
+                      if 'json' in (r.headers.get('content-type') or '').lower() or url.endswith('.json') or '.json?' in url:
+                          try:
+                              data = r.json()
+                              rec['json'] = data
+                              stack = [data]
+                              while stack:
+                                  obj = stack.pop()
+                                  if isinstance(obj, dict):
+                                      for key in ['pdfUrl', 'pdf_url', 'fileUrl', 'file_url', 'downloadUrl', 'download_url']:
+                                          value = obj.get(key)
+                                          if isinstance(value, str) and value.startswith('http') and '.pdf' in value.lower():
+                                              row['pdfUrl'] = value
+                                      stack.extend(obj.values())
+                                  elif isinstance(obj, list):
+                                      stack.extend(obj)
+                          except Exception:
+                              rec['text'] = r.text[:10000]
+                      else:
+                          soup = BeautifulSoup(r.text, 'html.parser')
+                          nd = soup.select_one('#__NEXT_DATA__')
+                          if nd:
+                              try:
+                                  data = json.loads(nd.get_text())
+                                  rec['nextData'] = data
+                                  stack = [data]
+                                  while stack:
+                                      obj = stack.pop()
+                                      if isinstance(obj, dict):
+                                          for key in ['pdfUrl', 'pdf_url', 'fileUrl', 'file_url', 'downloadUrl', 'download_url']:
+                                              value = obj.get(key)
+                                              if isinstance(value, str) and value.startswith('http') and '.pdf' in value.lower():
+                                                  row['pdfUrl'] = value
+                                          stack.extend(obj.values())
+                                      elif isinstance(obj, list):
+                                          stack.extend(obj)
+                              except Exception:
+                                  pass
+                          # Also accept directly embedded public PDF URLs.
+                          for match in re.findall(r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?', r.text, re.I):
+                              if 'iyanbao' in match or 'gelonghui' in match:
+                                  row['pdfUrl'] = match.replace('&amp;', '&')
+                      detail_diagnostics.append(rec)
+                      print('DETAIL', rid, r.status_code, r.url, 'pdf=', row.get('pdfUrl'))
+                  except Exception as exc:
+                      detail_diagnostics.append({'id': rid, 'url': url, 'error': repr(exc)})
+                  if row.get('pdfUrl'):
+                      break
+          (DIAG / 'detail_results.json').write_text(json.dumps(detail_diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+          (DIAG / 'entries_enriched.json').write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Score company-level deep / first-coverage reports. Exclude short updates, morning meetings and industry dailies.
+          exclude = ['日报', '周报', '晨会', '点评', '年报点评', '半年报点评', '业绩点评', '事件点评', '月报']
+          candidates = []
+          for row in entries:
+              title = str(row.get('title') or '')
+              content = str(row.get('content') or '')
+              hay = norm(title + ' ' + content[:5000])
+              if '绿城中国' not in hay and 'greentown' not in hay:
+                  continue
+              pages = int(row.get('pages') or 0)
+              pdf_url = row.get('pdfUrl')
+              if not isinstance(pdf_url, str) or not pdf_url.startswith('http') or '.pdf' not in pdf_url.lower():
+                  continue
+              if pages < 18:
+                  continue
+              if any(term in title for term in exclude):
+                  continue
+              score = pages * 5
+              if '首次覆盖' in title or '深度' in title or '公司研究' in title:
+                  score += 500
+              if '绿城中国' in title:
+                  score += 300
+              ts = int(row.get('publishTimestamp') or 0)
+              score += min(200, max(0, (datetime.fromtimestamp(ts, timezone.utc).year - 2019) * 25)) if ts else 0
+              candidates.append((score, row))
+          candidates.sort(key=lambda x: x[0], reverse=True)
+          print('CANDIDATES')
+          for score, row in candidates:
+              print(score, row.get('id'), row.get('pages'), row.get('title'), row.get('pdfUrl'))
+
+          # Download and strictly validate up to 3 distinct public original PDFs.
+          manifest = []
+          used_urls = set()
+          used_titles = set()
+          for score, row in candidates:
+              if len(manifest) >= 3:
+                  break
+              url = row.get('pdfUrl')
+              title = str(row.get('title') or '')
+              if url in used_urls or norm(title) in used_titles:
+                  continue
+              try:
+                  r = session.get(url, timeout=180, allow_redirects=True, headers={
+                      'User-Agent': session.headers['User-Agent'],
+                      'Referer': 'https://www.iyanbao.com/',
+                      'Accept': 'application/pdf,application/octet-stream,*/*',
+                  })
+                  print('DOWNLOAD', url, r.status_code, r.url, r.headers.get('content-type'), len(r.content), repr(r.content[:16]))
+                  if r.status_code != 200 or not r.content.startswith(b'%PDF-') or len(r.content) < 200000:
+                      continue
+                  reader = PdfReader(io.BytesIO(r.content))
+                  actual_pages = len(reader.pages)
+                  expected_pages = int(row.get('pages') or 0)
+                  if actual_pages < 18:
+                      continue
+                  if expected_pages and abs(actual_pages - expected_pages) > 2:
+                      print('REJECT page mismatch', expected_pages, actual_pages)
+                      continue
+                  text = ''
+                  try:
+                      for page_no in list(range(min(3, actual_pages))) + ([actual_pages - 1] if actual_pages > 3 else []):
+                          text += reader.pages[page_no].extract_text() or ''
+                  except Exception as exc:
+                      print('TEXT EXTRACTION WARNING', repr(exc))
+                  if '绿城' not in text and 'Greentown' not in text:
+                      print('REJECT company mismatch')
+                      continue
+                  institution = row.get('institution')
+                  if isinstance(institution, dict):
+                      institution = institution.get('value')
+                  institution = institution or '券商'
+                  ts = int(row.get('publishTimestamp') or 0)
+                  date = datetime.fromtimestamp(ts, timezone.utc).date().isoformat() if ts else '未知日期'
+                  filename = f"{len(manifest)+1:02d}_{clean(institution)}_{date.replace('-', '')}_绿城中国_{clean(title)}_完整原始PDF.pdf"
+                  path = OUT / filename
+                  path.write_bytes(r.content)
+                  record = {
+                      'id': row.get('id'), 'institution': institution, 'date': date,
+                      'title': title, 'expected_pages': expected_pages,
+                      'actual_pages': actual_pages, 'filename': filename,
+                      'size_bytes': len(r.content), 'sha256': hashlib.sha256(r.content).hexdigest(),
+                      'source_pdf': r.url, 'text_layer_chars_sample': len(text),
+                  }
+                  manifest.append(record)
+                  used_urls.add(url)
+                  used_titles.add(norm(title))
+                  print('ACCEPT', json.dumps(record, ensure_ascii=False))
+              except Exception as exc:
+                  print('DOWNLOAD ERROR', url, repr(exc))
+
+          if len(manifest) < 2:
+              raise RuntimeError(f'Only {len(manifest)} complete public PDFs validated; need at least 2')
+
+          listing = OUT / '报告清单.txt'
+          lines = ['绿城中国（03900.HK）完整券商深度报告清单', '']
+          for idx, item in enumerate(manifest, 1):
+              lines += [
+                  f"{idx}. {item['institution']}｜{item['date']}｜{item['title']}",
+                  f"   实际页数：{item['actual_pages']}页；文件：{item['filename']}",
+                  f"   SHA-256：{item['sha256']}",
+                  f"   公开原始PDF：{item['source_pdf']}",
+                  '',
+              ]
+          listing.write_text('\n'.join(lines), encoding='utf-8')
+          manifest_path = OUT / 'manifest.json'
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = OUT / f"Greentown_China_Full_Broker_Reports_{len(manifest)}_20260829.zip"
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for item in manifest:
+                  zf.write(OUT / item['filename'], arcname=item['filename'])
+              zf.write(listing, arcname=listing.name)
+              zf.write(manifest_path, arcname=manifest_path.name)
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+          print('FINAL ZIP', zip_path, zip_path.stat().st_size)
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload validated complete report package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: greentown-complete-original-pdfs
+          path: |
+            output/*
+            diagnostics/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
