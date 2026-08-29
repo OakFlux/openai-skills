@@ -1,0 +1,117 @@
+name: Temporary Daan Gene Wayback recovery v8
+
+on:
+  push:
+    branches: [tmp/daan-gene-broker-reports-20260829]
+    paths: [.github/workflows/tmp-daan-wayback-recover-v8.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m pip install --quiet requests pypdf beautifulsoup4
+      - name: Query archive indexes and recover PDFs
+        run: |
+          mkdir -p out/pdfs out/responses
+          python - <<'PY'
+          import json,re,html,hashlib,zipfile,time
+          from pathlib import Path
+          from urllib.parse import quote,urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          O=Path('out'); P=O/'pdfs'; D=O/'responses'
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/126 Safari/537.36'})
+          reports=[
+            ('3124306','2016-02-16','广州广证恒生证券','分子诊断行业待爆发，龙头达安笑傲江湖'),
+            ('648229670402','2020-07-16','国海证券','上半年业绩超预期，公司发展迎里程碑拐点'),
+            ('684425869377','2020-09-01','国海证券','后疫情时代新冠筛查从严，下半年业绩持续受益')]
+          logs=[]; recs=[]; pdfs=[]
+          def note(*a): x=' '.join(map(str,a)); print(x,flush=True); logs.append(x)
+          def clean(x,n=100): return re.sub(r'[\\/:*?"<>|\r\n]+','_',str(x)).strip(' ._')[:n]
+          def save(content,m,u):
+            if len(content)<1500 or not content.lstrip().startswith(b'%PDF'): return False
+            h=hashlib.sha256(content).hexdigest()
+            if any(x['sha256']==h for x in pdfs): return True
+            t=P/f'tmp_{h[:10]}.pdf'; t.write_bytes(content)
+            try:
+              rd=PdfReader(str(t)); pages=len(rd.pages); text=''
+              for pg in rd.pages[:4]:
+                try:text+='\n'+(pg.extract_text() or '')
+                except:pass
+            except Exception as e: note('BADPDF',u,repr(e)); t.unlink(missing_ok=True); return False
+            fn=f"{m['date']}_{clean(m['org'],30)}_{clean(m['title'])}_{pages}页.pdf"; t.rename(P/fn)
+            pdfs.append({'file':fn,'pages':pages,'bytes':len(content),'sha256':h,'url':u,'identity':('达安基因' in text or '002030' in text),**m}); note('SAVED',fn,u); return True
+          for rid,date,org,title in reports:
+            m={'rid':rid,'date':date,'org':org,'title':title}
+            patterns=[
+              f'vip.stock.finance.sina.com.cn/q/go.php/vReport_Show/kind/lastest/rptid/{rid}/*',
+              f'stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/lastest/rptid/{rid}/*',
+              f'*{rid}*',
+            ]
+            captures=[]
+            for pat in patterns:
+              cdx='https://web.archive.org/cdx/search/cdx?url='+quote(pat,safe='')+'&output=json&fl=timestamp,original,mimetype,statuscode,digest,length&filter=statuscode:200&collapse=digest&from=2015&to=2026&limit=500'
+              try:
+                r=s.get(cdx,timeout=60); note('CDX',rid,r.status_code,len(r.content),pat)
+                (D/f'cdx_{rid}_{len(captures)}.txt').write_bytes(r.content)
+                data=r.json()
+                for row in data[1:] if isinstance(data,list) and data else []:
+                  if len(row)>=4: captures.append(row)
+              except Exception as e: note('CDXERR',rid,pat,repr(e))
+            # dedupe and prioritize pdf/url snapshots
+            seen=set(); uniq=[]
+            for row in captures:
+              k=(row[0],row[1]);
+              if k in seen: continue
+              seen.add(k); uniq.append(row)
+            uniq.sort(key=lambda r:(0 if ('pdf' in str(r[2]).lower() or str(r[1]).lower().endswith('.pdf')) else 1, r[0]))
+            recs.append({'rid':rid,'captures':uniq[:500]})
+            for row in uniq[:120]:
+              ts,orig,mime,status=row[:4]
+              wa=f'https://web.archive.org/web/{ts}id_/{orig}'
+              try:
+                q=s.get(wa,timeout=90,allow_redirects=True); note('ARCH',rid,q.status_code,len(q.content),q.headers.get('content-type'),q.url)
+                if q.status_code==200 and save(q.content,m,q.url): continue
+                txt=html.unescape(q.text).replace('\\/','/') if not q.content.lstrip().startswith(b'%PDF') else ''
+                if txt:
+                  (D/f'archive_{rid}_{ts}.txt').write_text(txt[:300000],encoding='utf-8',errors='ignore')
+                  links=set(re.findall(r'https?://[^\s"\'<>]+',txt,re.I))
+                  try:
+                    soup=BeautifulSoup(txt,'html.parser')
+                    for tag in soup.find_all(True):
+                      for a in ['href','src','data','value','action']:
+                        v=tag.get(a)
+                        if isinstance(v,str): links.add(urljoin(orig,v))
+                  except: pass
+                  for link in links:
+                    link=link.rstrip('),;')
+                    if not any(k in link.lower() for k in ['.pdf','download','attach','report','rpt']): continue
+                    # Query closest archived form directly first.
+                    au=f'https://web.archive.org/web/{ts}id_/{link}'
+                    try:
+                      z=s.get(au,timeout=90,allow_redirects=True); note('FOLLOW',rid,z.status_code,len(z.content),z.url)
+                      if z.status_code==200 and save(z.content,m,z.url): break
+                    except Exception as e: note('FOLLOWERR',rid,link,repr(e))
+              except Exception as e: note('ARCHERR',rid,wa,repr(e))
+              if len(pdfs)>=3: break
+          (O/'captures.json').write_text(json.dumps(recs,ensure_ascii=False,indent=2),encoding='utf-8')
+          (O/'pdfs.json').write_text(json.dumps(pdfs,ensure_ascii=False,indent=2),encoding='utf-8')
+          (O/'log.txt').write_text('\n'.join(logs),encoding='utf-8')
+          with zipfile.ZipFile(O/'达安基因_券商深度报告.zip','w',zipfile.ZIP_DEFLATED) as z:
+            for f in P.glob('*.pdf'): z.write(f,f.name)
+            z.write(O/'pdfs.json','pdfs.json')
+          note('DONE',len(pdfs))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: daan-wayback-recover-v8
+          path: out/
+          retention-days: 3
