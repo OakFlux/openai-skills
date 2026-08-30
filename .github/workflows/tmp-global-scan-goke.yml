@@ -1,0 +1,304 @@
+name: Temporary global scan for Goke Micro deep reports
+
+on:
+  push:
+    branches:
+      - tmp-goke-global-scan-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  scan-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Prepare tools
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+
+      - name: Scan public report catalog, download original PDFs, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          API = "https://reportapi.eastmoney.com/report/list"
+          STOCK_CODE = "300672"
+          STOCK_NAME = "国科微"
+          WINDOWS = [
+              ("20260414", "20260416"),
+              ("20240615", "20240619"),
+              ("20231126", "20231128"),
+              ("20230527", "20230531"),
+              ("20210712", "20210716"),
+              ("20200117", "20200120"),
+              ("20180725", "20180728"),
+              ("20170809", "20170815"),
+          ]
+          TARGET_PHRASES = [
+              "AI赋能视显SoC基本盘",
+              "四大业务齐发力",
+              "长期深耕视频编解码芯片",
+              "行业复苏与产品迭代共振",
+              "技术积累雄厚，固态存储控制器芯片发展迅速",
+              "技术积累雄厚",
+              "存储控制芯片潜力巨大",
+              "广播电视与智能监控芯片主流厂商",
+              "主业高速增长",
+          ]
+
+          out = Path("output")
+          pdf_dir = out / "pdfs"
+          selected_dir = out / "selected"
+          pdf_dir.mkdir(parents=True, exist_ok=True)
+          selected_dir.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept": "application/json,text/plain,*/*",
+              "Referer": "https://data.eastmoney.com/report/",
+          })
+
+          def fetch_page(begin: str, end: str, page: int, mode: str) -> dict:
+              params = {
+                  "beginTime": begin,
+                  "endTime": end,
+                  "qType": "0",
+                  "pageSize": "100",
+                  "pageNo": str(page),
+              }
+              if mode == "blank":
+                  params["code"] = ""
+              elif mode == "star":
+                  params["code"] = "*"
+              # mode=omit deliberately omits code
+              r = s.get(API, params=params, timeout=60)
+              print("API", begin, end, mode, page, r.status_code, len(r.content), r.url)
+              r.raise_for_status()
+              return r.json()
+
+          found_rows: dict[str, dict] = {}
+          for begin, end in WINDOWS:
+              first = None
+              mode_used = None
+              for mode in ("omit", "blank", "star"):
+                  try:
+                      candidate = fetch_page(begin, end, 1, mode)
+                      if isinstance(candidate, dict) and isinstance(candidate.get("data"), list):
+                          first = candidate
+                          mode_used = mode
+                          break
+                  except Exception as exc:
+                      print("FIRST_PAGE_MODE_FAILED", begin, end, mode, repr(exc))
+              if first is None:
+                  print("WINDOW_FAILED", begin, end)
+                  continue
+
+              hits = int(first.get("hits") or 0)
+              total_pages = int(first.get("TotalPage") or math.ceil(hits / 100) or 1)
+              total_pages = min(total_pages, 100)
+              print("WINDOW", begin, end, "hits", hits, "pages", total_pages, "mode", mode_used)
+              for page in range(1, total_pages + 1):
+                  try:
+                      obj = first if page == 1 else fetch_page(begin, end, page, mode_used)
+                  except Exception as exc:
+                      print("PAGE_FAILED", begin, end, page, repr(exc))
+                      continue
+                  for row in obj.get("data") or []:
+                      title = str(row.get("title") or "").strip()
+                      stock_code = str(row.get("stockCode") or "").strip()
+                      stock_name = str(row.get("stockName") or "").strip()
+                      blob = f"{title} {stock_code} {stock_name}"
+                      if stock_code == STOCK_CODE or STOCK_NAME in blob or any(p in title for p in TARGET_PHRASES):
+                          info = row.get("infoCode")
+                          if not info:
+                              continue
+                          found_rows[str(info)] = row
+                          print("MATCH", json.dumps({
+                              "date": str(row.get("publishDate") or "")[:10],
+                              "broker": row.get("orgSName") or row.get("orgName"),
+                              "title": title,
+                              "pages_meta": row.get("attachPages"),
+                              "infoCode": info,
+                              "stockCode": stock_code,
+                              "stockName": stock_name,
+                          }, ensure_ascii=False))
+                  time.sleep(0.05)
+
+          # Add known current-catalog deep report as a guaranteed valid baseline.
+          known = {
+              "AP202311271612384726": {
+                  "infoCode": "AP202311271612384726",
+                  "title": "长期深耕视频编解码芯片，高清化与智能化趋势明确",
+                  "orgSName": "国金证券",
+                  "publishDate": "2023-11-27",
+                  "stockCode": STOCK_CODE,
+                  "stockName": STOCK_NAME,
+                  "attachPages": 30,
+              }
+          }
+          for info, row in known.items():
+              found_rows.setdefault(info, row)
+
+          print("FOUND_METADATA_COUNT", len(found_rows))
+          all_meta = []
+          valid = []
+          for info, row in found_rows.items():
+              title = str(row.get("title") or "").strip()
+              broker = str(row.get("orgSName") or row.get("orgName") or "Unknown").strip()
+              publish_date = str(row.get("publishDate") or "")[:10]
+              meta = {
+                  "title": title,
+                  "broker": broker,
+                  "publish_date": publish_date,
+                  "info_code": info,
+                  "pages_meta": int(row.get("attachPages") or 0),
+                  "stock_code": str(row.get("stockCode") or STOCK_CODE),
+                  "stock_name": str(row.get("stockName") or STOCK_NAME),
+              }
+              all_meta.append(meta)
+              url = f"https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf"
+              dest = pdf_dir / f"{publish_date.replace('-', '')}_{info}.pdf"
+              try:
+                  r = s.get(url, timeout=120, allow_redirects=True, headers={"Accept": "application/pdf,*/*"})
+                  print("PDF", info, r.status_code, len(r.content), r.headers.get("content-type"), title)
+                  r.raise_for_status()
+                  if not r.content.startswith(b"%PDF-") or len(r.content) < 100000:
+                      raise RuntimeError("response is not a substantive PDF")
+                  dest.write_bytes(r.content)
+                  reader = PdfReader(str(dest), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 10:
+                      raise RuntimeError(f"too short for deep-report pool: {pages} pages")
+                  text = ""
+                  for page in reader.pages[:min(6, pages)]:
+                      try:
+                          text += page.extract_text() or ""
+                      except Exception:
+                          pass
+                  normalized = re.sub(r"\s+", "", text)
+                  if STOCK_NAME not in normalized and STOCK_CODE not in normalized:
+                      raise RuntimeError("company identity check failed")
+                  sha = hashlib.sha256(r.content).hexdigest()
+              except Exception as exc:
+                  print("PDF_FAILED", info, repr(exc))
+                  try:
+                      dest.unlink()
+                  except FileNotFoundError:
+                      pass
+                  continue
+
+              score = pages * 10
+              if any(k in title for k in ["深度", "首次覆盖", "首次覆盖报告", "公司深度"]):
+                  score += 500
+              phrase_priority = {
+                  "AI赋能视显SoC基本盘": 500,
+                  "四大业务齐发力": 480,
+                  "行业复苏与产品迭代共振": 460,
+                  "长期深耕视频编解码芯片": 440,
+                  "存储控制芯片潜力巨大": 420,
+                  "广播电视与智能监控芯片主流厂商": 400,
+                  "技术积累雄厚": 380,
+                  "主业高速增长": 360,
+              }
+              for phrase, bonus in phrase_priority.items():
+                  if phrase in title:
+                      score += bonus
+              year = int(publish_date[:4]) if publish_date[:4].isdigit() else 0
+              score += max(0, year - 2017) * 15
+              valid.append({
+                  **meta,
+                  "pages": pages,
+                  "bytes": len(r.content),
+                  "pdf_url": url,
+                  "path": str(dest),
+                  "sha256": sha,
+                  "score": score,
+              })
+
+          valid.sort(key=lambda x: (x["score"], x["pages"], x["publish_date"]), reverse=True)
+          print("VALID_COUNT", len(valid))
+          for v in valid:
+              print("VALID", v["score"], v["pages"], v["broker"], v["publish_date"], v["title"], v["info_code"])
+
+          if len(valid) < 2:
+              raise RuntimeError(f"Only {len(valid)} public long-form original PDFs were found")
+
+          # Select 3 where possible, preferring distinct brokerages and not duplicating near-identical titles.
+          chosen = []
+          used_brokers = set()
+          for v in valid:
+              if len(chosen) >= 3:
+                  break
+              if v["broker"] in used_brokers and len(valid) > 3:
+                  continue
+              chosen.append(v)
+              used_brokers.add(v["broker"])
+          if len(chosen) < 2:
+              chosen = valid[:2]
+
+          manifest = []
+          for i, v in enumerate(chosen, 1):
+              broker_ascii = re.sub(r"[^A-Za-z0-9_-]+", "_", v["broker"]).strip("_") or "Broker"
+              final_name = f"Goke_Micro_Deep_Report_{i}_{v['publish_date'].replace('-', '')}_{broker_ascii}_{v['pages']}p.pdf"
+              src = Path(v["path"])
+              dst = selected_dir / final_name
+              dst.write_bytes(src.read_bytes())
+              item = dict(v)
+              item["package_filename"] = final_name
+              manifest.append(item)
+
+          readme = [
+              "国科微（300672）券商深度报告下载包",
+              "",
+              "均为公开原始PDF，已核验文件头、实际页数、公司名称/股票代码及SHA-256。",
+              "",
+          ]
+          for i, m in enumerate(manifest, 1):
+              readme.extend([
+                  f"{i}. {m['broker']}｜{m['publish_date']}｜{m['pages']}页",
+                  f"   标题：{m['title']}",
+                  f"   文件：{m['package_filename']}",
+                  f"   来源：{m['pdf_url']}",
+                  f"   SHA-256：{m['sha256']}",
+                  "",
+              ])
+          (out / "README_报告清单.txt").write_text("\n".join(readme), encoding="utf-8")
+          (out / "selected_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          (out / "all_scanned_metadata.json").write_text(json.dumps(all_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          package = Path("Goke_Micro_Deep_Reports_Final.zip")
+          with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for p in sorted(selected_dir.glob("*.pdf")):
+                  zf.write(p, arcname=p.name)
+              zf.write(out / "README_报告清单.txt", arcname="README_报告清单.txt")
+              zf.write(out / "selected_manifest.json", arcname="selected_manifest.json")
+          with zipfile.ZipFile(package, "r") as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+          print("FINAL_PACKAGE", package, package.stat().st_size)
+          print("FINAL_SELECTION", json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Goke_Micro_Deep_Reports_Final
+          path: Goke_Micro_Deep_Reports_Final.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
