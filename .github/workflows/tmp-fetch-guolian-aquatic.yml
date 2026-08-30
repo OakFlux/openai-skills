@@ -1,0 +1,349 @@
+name: Temporary Fetch Guolian Aquatic Filings
+
+on:
+  push:
+    branches:
+      - tmp/fetch-guolian-aquatic-20260830
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure PDF validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pdfinfo >/dev/null 2>&1 || ! command -v pdftotext >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq poppler-utils
+          fi
+
+      - name: Download, verify, and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import unquote
+
+          import requests
+
+          STOCK_ID = '300094'
+          COMPANY_SHORT = '国联水产'
+          COMPANY_FULL = '湛江国联水产开发股份有限公司'
+          ROOT = Path('guolian_aquatic_package')
+          PDF_DIR = ROOT / '01_年度报告及半年度报告'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://vip.stock.finance.sina.com.cn/',
+          })
+
+          def decode_response(response):
+              raw = response.content
+              for encoding in ('utf-8', 'gb18030', 'gbk'):
+                  try:
+                      return raw.decode(encoding)
+                  except UnicodeDecodeError:
+                      continue
+              return raw.decode('utf-8', errors='ignore')
+
+          def clean_visible(value):
+              value = re.sub(r'<script\b[^>]*>.*?</script>', ' ', value, flags=re.I | re.S)
+              value = re.sub(r'<style\b[^>]*>.*?</style>', ' ', value, flags=re.I | re.S)
+              value = re.sub(r'<[^>]+>', ' ', value)
+              return re.sub(r'\s+', ' ', html.unescape(value)).strip()
+
+          def parse_anchors(page_url):
+              response = session.get(page_url, timeout=60)
+              response.raise_for_status()
+              text = html.unescape(decode_response(response)).replace('\\/', '/')
+              results = []
+              for match in re.finditer(r'<a\b[^>]*href=[\"\']([^\"\']+)[\"\'][^>]*>(.*?)</a>', text, flags=re.I | re.S):
+                  href = match.group(1)
+                  title = clean_visible(match.group(2))
+                  if not title:
+                      continue
+                  id_match = re.search(r'(?:[?&]|%3F|%26)id(?:=|%3D)(\d+)', href, flags=re.I)
+                  if not id_match:
+                      id_match = re.search(r'id/(\d+)', href, flags=re.I)
+                  if not id_match:
+                      continue
+                  bulletin_id = id_match.group(1)
+                  if bulletin_id == STOCK_ID:
+                      continue
+                  results.append({'title': title, 'bulletin_id': bulletin_id, 'href': href, 'page_url': page_url})
+              return results
+
+          annual_page = f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_ID}/page_type/ndbg.phtml'
+          all_page = f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{STOCK_ID}.phtml'
+          anchors = parse_anchors(annual_page) + parse_anchors(all_page)
+
+          deduped = []
+          seen = set()
+          for item in anchors:
+              key = (item['title'], item['bulletin_id'])
+              if key not in seen:
+                  seen.add(key)
+                  deduped.append(item)
+          anchors = deduped
+
+          def normalized_title(title):
+              return re.sub(r'\s+', '', title).replace('(', '（').replace(')', '）')
+
+          def is_noise(title):
+              blocked = ['摘要', '说明会', '预告', '问询', '回复', '提示性', '决议', '审议', '取消', '延期', '英文版']
+              return any(term in title for term in blocked)
+
+          annual_candidates = {str(year): [] for year in range(2020, 2026)}
+          half_year_candidates = []
+
+          for item in anchors:
+              title = normalized_title(item['title'])
+              if is_noise(title):
+                  continue
+
+              annual_match = re.search(r'(20\d{2})年年度报告(?:全文)?(?:（[^）]*(?:修订|更正|更新)[^）]*）)?$', title)
+              if annual_match and annual_match.group(1) in annual_candidates:
+                  candidate = dict(item)
+                  candidate['report_year'] = annual_match.group(1)
+                  candidate['revision'] = any(term in title for term in ['修订', '更正', '更新'])
+                  annual_candidates[annual_match.group(1)].append(candidate)
+                  continue
+
+              half_match = re.search(r'(20\d{2})年半年度报告(?:全文)?(?:（[^）]*(?:修订|更正|更新)[^）]*）)?$', title)
+              if half_match:
+                  candidate = dict(item)
+                  candidate['report_year'] = half_match.group(1)
+                  candidate['revision'] = any(term in title for term in ['修订', '更正', '更新'])
+                  half_year_candidates.append(candidate)
+
+          missing = [year for year, values in annual_candidates.items() if not values]
+          if missing:
+              print('AVAILABLE ANCHORS:', json.dumps(anchors, ensure_ascii=False, indent=2), file=sys.stderr)
+              raise RuntimeError(f'Missing annual report candidates for years: {missing}')
+          if not half_year_candidates:
+              print('AVAILABLE ANCHORS:', json.dumps(anchors, ensure_ascii=False, indent=2), file=sys.stderr)
+              raise RuntimeError('No complete half-year report candidate found')
+
+          def choose_best(candidates):
+              return sorted(
+                  candidates,
+                  key=lambda item: (bool(item.get('revision')), int(item['bulletin_id'])),
+                  reverse=True,
+              )[0]
+
+          selected = []
+          for index, year in enumerate([str(y) for y in range(2020, 2026)], start=1):
+              item = choose_best(annual_candidates[year])
+              suffix = '_修订或更正版' if item.get('revision') else ''
+              item.update({
+                  'document_type': 'annual_report',
+                  'standard_title': f'{year}年年度报告',
+                  'filename': f'{index:02d}_国联水产_{year}年年度报告{suffix}.pdf',
+                  'min_pages': 70,
+              })
+              selected.append(item)
+
+          latest_half = sorted(
+              half_year_candidates,
+              key=lambda item: (int(item['report_year']), bool(item.get('revision')), int(item['bulletin_id'])),
+              reverse=True,
+          )[0]
+          latest_half.update({
+              'document_type': 'half_year_report',
+              'standard_title': f"{latest_half['report_year']}年半年度报告",
+              'filename': f"07_国联水产_{latest_half['report_year']}年半年度报告.pdf",
+              'min_pages': 40,
+          })
+          selected.append(latest_half)
+
+          def detail_url(bulletin_id):
+              return f'https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id={bulletin_id}&stockid={STOCK_ID}'
+
+          def extract_pdf_urls(detail_html):
+              text = html.unescape(detail_html).replace('\\/', '/')
+              urls = []
+              for match in re.findall(r'https?://[^\s\"\'<>]+?\.PDF', text, flags=re.I):
+                  url = unquote(match)
+                  if url not in urls:
+                      urls.append(url)
+              return urls
+
+          def looks_like_pdf(raw):
+              return len(raw) > 100_000 and raw.lstrip().startswith(b'%PDF')
+
+          def download_pdf(item):
+              detail = detail_url(item['bulletin_id'])
+              response = session.get(detail, timeout=60)
+              response.raise_for_status()
+              detail_html = decode_response(response)
+              pdf_urls = extract_pdf_urls(detail_html)
+              if not pdf_urls:
+                  raise RuntimeError(f'No PDF URL found for {item["title"]}: {detail}')
+
+              errors = []
+              for pdf_url in pdf_urls:
+                  for attempt in range(1, 4):
+                      try:
+                          print(f'GET {item["title"]} attempt={attempt}: {pdf_url}')
+                          with session.get(pdf_url, timeout=180, allow_redirects=True, stream=True) as pdf_response:
+                              pdf_response.raise_for_status()
+                              chunks = bytearray()
+                              for chunk in pdf_response.iter_content(chunk_size=1024 * 256):
+                                  if chunk:
+                                      chunks.extend(chunk)
+                              raw = bytes(chunks)
+                          if not looks_like_pdf(raw):
+                              raise RuntimeError(f'not a PDF; bytes={len(raw)}, head={raw[:20]!r}')
+                          path = PDF_DIR / item['filename']
+                          path.write_bytes(raw)
+                          item['detail_url'] = detail
+                          item['source_url'] = pdf_url
+                          date_match = re.search(r'(20\d{2}-\d{2}-\d{2})', pdf_url)
+                          item['disclosure_date'] = date_match.group(1) if date_match else ''
+                          return path
+                      except Exception as exc:
+                          errors.append(f'{pdf_url} attempt {attempt}: {exc}')
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'Unable to download {item["title"]}:\n' + '\n'.join(errors))
+
+          def pdf_page_count(path):
+              completed = subprocess.run(['pdfinfo', str(path)], capture_output=True, text=True, check=True)
+              match = re.search(r'^Pages:\s+(\d+)\s*$', completed.stdout, flags=re.M)
+              if not match:
+                  raise RuntimeError(f'Unable to parse page count for {path}')
+              return int(match.group(1))
+
+          def extract_text(path, first_page, last_page):
+              with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
+                  output = Path(temp.name)
+              try:
+                  completed = subprocess.run(
+                      ['pdftotext', '-f', str(first_page), '-l', str(last_page), '-enc', 'UTF-8', str(path), str(output)],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if completed.returncode != 0:
+                      return ''
+                  return output.read_text(encoding='utf-8', errors='ignore')
+              finally:
+                  output.unlink(missing_ok=True)
+
+          manifest = []
+          sha_lines = []
+          for item in selected:
+              path = download_pdf(item)
+              raw = path.read_bytes()
+              pages = pdf_page_count(path)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f'Unexpectedly short document: {item["title"]} has {pages} pages')
+
+              text = extract_text(path, 1, min(40, pages))
+              normalized = re.sub(r'\s+', '', text)
+              identity_ok = any(term in normalized for term in [COMPANY_SHORT, COMPANY_FULL, STOCK_ID])
+              year_ok = item['report_year'] in normalized
+              if item['document_type'] == 'annual_report':
+                  title_ok = ('年度报告' in normalized) and year_ok
+              else:
+                  title_ok = ('半年度报告' in normalized) and year_ok
+
+              if not identity_ok or not title_ok:
+                  raise RuntimeError(
+                      f'Identity/title check failed for {item["title"]}: '
+                      f'identity={identity_ok}, year={year_ok}, title={title_ok}'
+                  )
+
+              sha = hashlib.sha256(raw).hexdigest()
+              rel = str(path.relative_to(ROOT))
+              record = {
+                  'document_type': item['document_type'],
+                  'report_year': item['report_year'],
+                  'title': item['standard_title'],
+                  'source_page_title': item['title'],
+                  'bulletin_id': item['bulletin_id'],
+                  'disclosure_date': item['disclosure_date'],
+                  'file': rel,
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': sha,
+                  'detail_url': item['detail_url'],
+                  'source_url': item['source_url'],
+                  'pdf_header_valid': True,
+                  'identity_text_matched': identity_ok,
+                  'year_text_matched': year_ok,
+                  'title_text_matched': title_ok,
+              }
+              manifest.append(record)
+              sha_lines.append(f'{sha}  {rel}')
+              print(f'VERIFIED {item["title"]}: pages={pages}, bytes={len(raw)}')
+
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(sha_lines) + '\n', encoding='utf-8')
+
+          readme = [
+              '湛江国联水产开发股份有限公司（国联水产，300094）公开披露文件包',
+              '',
+              '内容范围：',
+              '1. 2020—2025年六份完整年度报告；',
+              f'2. 截至打包日公告列表中最新的完整半年度报告：{latest_half["report_year"]}年半年度报告。',
+              '',
+              '版本规则：若同一年度存在修订版、更正版或更新版，优先采用后续版本；不收录摘要、业绩说明会公告等非报告全文。',
+              '校验项目：PDF文件头、pdfinfo可解析页数、公司名称/证券代码、报告年份与类型、逐份SHA-256、ZIP CRC。',
+              '',
+              '文件清单：',
+          ]
+          for record in manifest:
+              readme.extend([
+                  f'- {record["source_page_title"]}',
+                  f'  披露日期：{record["disclosure_date"]}',
+                  f'  文件：{record["file"]}',
+                  f'  页数：{record["pages"]}',
+                  f'  大小：{record["bytes"]} bytes',
+                  f'  SHA256：{record["sha256"]}',
+                  f'  公告详情：{record["detail_url"]}',
+                  f'  PDF来源：{record["source_url"]}',
+              ])
+          (ROOT / 'README_来源与校验.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          zip_name = f'国联水产_300094_2020-2025年报_{latest_half["report_year"]}年最新半年报_完整PDF.zip'
+          with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_name, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed at {bad}')
+          print(f'CREATED {zip_name} bytes={Path(zip_name).stat().st_size}')
+          PY
+
+      - name: Upload packaged reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: guolian-aquatic-filings-final
+          path: 国联水产_300094_2020-2025年报_*年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
