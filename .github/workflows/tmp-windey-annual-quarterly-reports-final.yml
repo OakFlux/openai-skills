@@ -1,0 +1,191 @@
+name: Temporary Windey exact annual and latest quarterly package
+
+on:
+  push:
+    branches:
+      - tmp/windey-annual-quarterly-reports-20260830
+    paths:
+      - .github/workflows/tmp-windey-annual-quarterly-reports-final.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF Pillow
+      - name: Download, validate, and package exact official reports
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          reports = [
+              {'title': '运达股份2020年年度报告', 'type': '年度报告', 'date': '2021-04-24', 'id': '1209797272', 'pages': 198},
+              {'title': '运达股份2021年年度报告', 'type': '年度报告', 'date': '2022-03-08', 'id': '1212522777', 'pages': 210},
+              {'title': '运达股份2022年年度报告', 'type': '年度报告', 'date': '2023-04-19', 'id': '1216457533', 'pages': 206},
+              {'title': '运达股份2023年年度报告', 'type': '年度报告', 'date': '2024-04-19', 'id': '1219669940', 'pages': 231},
+              {'title': '运达股份2024年年度报告', 'type': '年度报告', 'date': '2025-03-29', 'id': '1222946476', 'pages': 242},
+              {'title': '运达股份2025年年度报告', 'type': '年度报告', 'date': '2026-03-24', 'id': '1225025722', 'pages': 260},
+              {'title': '运达股份2026年一季度报告', 'type': '最新季报', 'date': '2026-04-25', 'id': '1225186668', 'pages': 11},
+          ]
+
+          OUT = Path('windey_final_reports')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://www.cninfo.com.cn/',
+          })
+
+          records = []
+          hashes = set()
+          render_entries = []
+
+          def clean_filename(value: str, limit: int = 110) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value).strip(' ._')
+              return text[:limit]
+
+          for meta in reports:
+              urls = [
+                  f"https://static.cninfo.com.cn/finalpage/{meta['date']}/{meta['id']}.PDF",
+                  f"https://static.cninfo.com.cn/finalpage/{meta['date']}/{meta['id']}.pdf",
+              ]
+              data = None
+              source_url = None
+              for url in urls:
+                  response = session.get(url, timeout=120, allow_redirects=True, headers={'Accept': 'application/pdf,*/*;q=0.8'})
+                  print('DOWNLOAD', response.status_code, len(response.content), response.headers.get('content-type'), response.url, flush=True)
+                  if response.status_code == 200 and len(response.content) > 50_000 and response.content.lstrip().startswith(b'%PDF'):
+                      data = response.content
+                      source_url = response.url
+                      break
+              if data is None:
+                  raise RuntimeError(f"Failed to download {meta['title']}")
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f"Duplicate file detected: {meta['title']}")
+              hashes.add(digest)
+
+              temp = PDFDIR / f'_tmp_{digest[:12]}.pdf'
+              temp.write_bytes(data)
+              doc = pymupdf.open(str(temp))
+              actual_pages = doc.page_count
+              if actual_pages != meta['pages']:
+                  raise RuntimeError(f"Unexpected page count for {meta['title']}: {actual_pages}, expected {meta['pages']}")
+              sample = sorted(set([0, 1, min(5, actual_pages - 1), actual_pages // 2, actual_pages - 1]))
+              text = '\n'.join(doc.load_page(index).get_text('text') for index in sample)
+              compact = re.sub(r'\s+', '', text)
+              if not any(key in compact for key in ['运达股份', '300772', '运达能源科技集团股份有限公司', '浙江运达风电股份有限公司']):
+                  raise RuntimeError(f"Company identity validation failed: {meta['title']}")
+              for label, index in [('first', 0), ('middle', actual_pages // 2), ('last', actual_pages - 1)]:
+                  pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.65, 0.65), alpha=False)
+                  render_path = RENDERDIR / f"{clean_filename(meta['title'], 55)}_{label}.png"
+                  pix.save(str(render_path))
+                  render_entries.append((f"{meta['title']}-{label}", render_path))
+              encrypted = bool(doc.is_encrypted)
+              doc.close()
+
+              filename = f"{meta['title']}_{actual_pages}页_巨潮资讯网官方PDF.pdf"
+              final = PDFDIR / filename
+              final.unlink(missing_ok=True)
+              temp.rename(final)
+              record = {
+                  **meta,
+                  'file': filename,
+                  'actual_pages': actual_pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'encrypted': encrypted,
+                  'source_url': source_url,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 files, got {len(records)}')
+
+          thumbnails = []
+          for label, image_path in render_entries:
+              with Image.open(image_path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((260, 340))
+                  canvas = Image.new('RGB', (280, 380), 'white')
+                  canvas.paste(image, ((280 - image.width) // 2, 8))
+                  ImageDraw.Draw(canvas).text((8, 356), label[:44], fill='black')
+                  thumbnails.append(canvas)
+          columns = 3
+          rows = (len(thumbnails) + columns - 1) // columns
+          sheet = Image.new('RGB', (columns * 280, rows * 380), 'white')
+          for index, thumbnail in enumerate(thumbnails):
+              sheet.paste(thumbnail, ((index % columns) * 280, (index // columns) * 380))
+          sheet.save(OUT / 'contact_sheet.jpg', quality=88)
+
+          total_pages = sum(x['actual_pages'] for x in records)
+          readme = [
+              '运达股份（300772.SZ）2020—2025年年度报告及最新季报下载包',
+              '',
+              '完整PDF数量：7份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for index, item in enumerate(records, 1):
+              readme.append(f"{index}. {item['title']}｜公告日期：{item['date']}｜{item['actual_pages']}页｜巨潮资讯网官方PDF")
+          readme += [
+              '',
+              '年度报告均为完整正文，未混入年度报告摘要。',
+              '截至2026-08-30，最新季报为2026年一季度报告，公告日期为2026-04-25。',
+              '全部PDF均直接下载自static.cninfo.com.cn巨潮资讯网官方附件地址。',
+              '已核验公司名称及证券代码300772、PDF文件头、实际页数和加密状态，并检查每份文件的首页、中间页与末页；ZIP完整性测试通过。',
+              '版权归上市公司及公告平台所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'selected_reports.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in records) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'windey_2020_2025_annual_and_2026Q1_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              if len([name for name in archive.namelist() if name.lower().endswith('.pdf')]) != 7:
+                  raise RuntimeError('ZIP PDF count failed')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / 'ZIP_SHA256.txt').write_text(f'{zip_sha}  {zip_path.name}\n', encoding='utf-8')
+          print((OUT / 'README.txt').read_text(encoding='utf-8'))
+          print('FINAL_ZIP', zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windey-final-annual-quarterly-reports
+          path: windey_final_reports/
+          retention-days: 3
+          if-no-files-found: error
