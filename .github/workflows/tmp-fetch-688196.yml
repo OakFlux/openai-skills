@@ -1,0 +1,219 @@
+name: Temporary Zhuoyue New Energy report fetch
+
+on:
+  push:
+    branches:
+      - tmp-report-fetch-688196-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-reports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Prepare Python
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+
+      - name: Fetch, validate, select, and package public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/fetch_reports.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = "688196"
+          COMPANY = "卓越新能"
+          OUT = Path("output")
+          ALL = OUT / "all_valid"
+          SELECTED = OUT / "selected"
+          OUT.mkdir(exist_ok=True)
+          ALL.mkdir(exist_ok=True)
+          SELECTED.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept": "application/json,text/plain,*/*",
+              "Referer": "https://data.eastmoney.com/report/stock.jshtml?stockcode=688196",
+          })
+
+          api = "https://reportapi.eastmoney.com/report/list"
+          params = {
+              "code": STOCK_CODE,
+              "beginTime": "20190101",
+              "endTime": "20261231",
+              "qType": "0",
+              "pageSize": "100",
+              "pageNo": "1",
+          }
+          resp = session.get(api, params=params, timeout=40)
+          print("reportapi status:", resp.status_code, resp.url)
+          resp.raise_for_status()
+          payload = resp.json()
+          rows = payload.get("data") or []
+          print("report rows:", len(rows))
+
+          candidates = []
+          for row in rows:
+              info = row.get("infoCode")
+              title = (row.get("title") or "").strip()
+              broker = (row.get("orgSName") or row.get("orgName") or "Unknown").strip()
+              publish = (row.get("publishDate") or "").split(" ", 1)[0]
+              listed_pages = int(row.get("attachPages") or 0)
+              if not info:
+                  continue
+
+              pdf_url = f"https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf"
+              dest = ALL / f"{publish.replace('-', '')}_{info}.pdf"
+              try:
+                  r = session.get(pdf_url, timeout=80, allow_redirects=True)
+                  print("download:", r.status_code, len(r.content), listed_pages, broker, publish, title)
+                  r.raise_for_status()
+                  if not r.content.startswith(b"%PDF-") or len(r.content) < 50000:
+                      continue
+                  dest.write_bytes(r.content)
+                  reader = PdfReader(str(dest), strict=False)
+                  pages = len(reader.pages)
+                  if pages <= 0:
+                      raise ValueError("zero-page PDF")
+                  text = ""
+                  for page in reader.pages[: min(3, pages)]:
+                      try:
+                          text += page.extract_text() or ""
+                      except Exception:
+                          pass
+                  normalized = re.sub(r"\s+", "", text)
+                  identity_ok = COMPANY in normalized or STOCK_CODE in normalized
+                  sha256 = hashlib.sha256(r.content).hexdigest()
+              except Exception as exc:
+                  print("failed:", title, repr(exc))
+                  dest.unlink(missing_ok=True)
+                  continue
+
+              deep_terms = [
+                  "深度", "首次覆盖", "首次覆盖报告", "公司首次覆盖", "公司深度",
+                  "龙头", "成长可期", "价值重估", "行业专题"
+              ]
+              score = pages * 8
+              if any(term in title for term in deep_terms):
+                  score += 300
+              if pages >= 15:
+                  score += 200
+              if pages >= 25:
+                  score += 150
+              if publish >= "2024-01-01":
+                  score += 60
+              elif publish >= "2022-01-01":
+                  score += 30
+              if identity_ok:
+                  score += 30
+
+              candidates.append({
+                  "title": title,
+                  "broker": broker,
+                  "publish_date": publish,
+                  "info_code": info,
+                  "pdf_url": pdf_url,
+                  "pages": pages,
+                  "listed_pages": listed_pages,
+                  "bytes": len(r.content),
+                  "sha256": sha256,
+                  "identity_ok": identity_ok,
+                  "score": score,
+                  "path": str(dest),
+              })
+              time.sleep(0.2)
+
+          candidates.sort(key=lambda x: (x["score"], x["pages"], x["publish_date"]), reverse=True)
+          print("valid candidates:", len(candidates))
+          for c in candidates:
+              print("candidate:", c["pages"], c["broker"], c["publish_date"], c["title"], c["info_code"], c["score"], "identity", c["identity_ok"])
+
+          substantial = [c for c in candidates if c["pages"] >= 12]
+          pool = substantial if len(substantial) >= 2 else candidates
+          chosen = []
+          used_brokers = set()
+          for c in pool:
+              if len(chosen) >= 3:
+                  break
+              if c["broker"] in used_brokers and len(pool) > 3:
+                  continue
+              chosen.append(c)
+              used_brokers.add(c["broker"])
+          if len(chosen) < 2:
+              for c in candidates:
+                  if c not in chosen:
+                      chosen.append(c)
+                  if len(chosen) >= 2:
+                      break
+          if not chosen:
+              raise RuntimeError("No valid public PDF reports were downloaded")
+
+          selected_manifest = []
+          for n, c in enumerate(chosen, start=1):
+              final_name = f"Zhuoyue_New_Energy_Report_{n}_{c['publish_date'].replace('-', '')}.pdf"
+              src = Path(c["path"])
+              dst = SELECTED / final_name
+              dst.write_bytes(src.read_bytes())
+              item = dict(c)
+              item["package_filename"] = final_name
+              selected_manifest.append(item)
+
+          (OUT / "selected_manifest.json").write_text(
+              json.dumps(selected_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          (OUT / "all_candidates.json").write_text(
+              json.dumps(candidates, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+
+          readme = [
+              "卓越新能（688196）券商深度报告下载包",
+              "",
+              "文件均从东方财富公开PDF入口取得，并核验PDF文件头、实际页数和SHA-256。",
+              "",
+          ]
+          for n, c in enumerate(selected_manifest, start=1):
+              readme += [
+                  f"{n}. {c['broker']}｜{c['publish_date']}｜{c['pages']}页",
+                  f"   标题：{c['title']}",
+                  f"   文件：{c['package_filename']}",
+                  f"   SHA-256：{c['sha256']}",
+                  "",
+              ]
+          (OUT / "README_报告清单.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          package = Path("Zhuoyue_New_Energy_Broker_Deep_Reports.zip")
+          with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for pdf in sorted(SELECTED.glob("*.pdf")):
+                  zf.write(pdf, arcname=pdf.name)
+              zf.write(OUT / "README_报告清单.txt", arcname="README_报告清单.txt")
+              zf.write(OUT / "selected_manifest.json", arcname="selected_manifest.json")
+          with zipfile.ZipFile(package, "r") as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+          print("FINAL PACKAGE:", package, package.stat().st_size)
+          print(json.dumps(selected_manifest, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/fetch_reports.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zhuoyue_New_Energy_Broker_Deep_Reports
+          path: Zhuoyue_New_Energy_Broker_Deep_Reports.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
