@@ -1,0 +1,403 @@
+name: Temporary Windey annual and quarterly report collection v2
+
+on:
+  push:
+    branches:
+      - tmp/windey-annual-quarterly-reports-20260830
+    paths:
+      - .github/workflows/tmp-windey-annual-quarterly-reports-v2.yml
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF Pillow
+      - name: Locate catalogue entries and download official CNINFO PDFs
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          CODE = '300772'
+          COMPANY = '运达股份'
+          COMPANY_NAMES = [
+              '运达能源科技集团股份有限公司',
+              '浙江运达风电股份有限公司',
+              '浙江运达风电股份',
+              '运达能源科技集团股份',
+          ]
+          YEARS = list(range(2020, 2026))
+
+          OUT = Path('windey_financial_reports_v2')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+          })
+          catalogue = requests.Session()
+          catalogue.headers.update({
+              'User-Agent': session.headers['User-Agent'],
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+
+          logs: list[str] = []
+
+          def note(*parts):
+              line = ' '.join(str(part) for part in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def clean_filename(value: object, limit: int = 110) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(value or '')).strip(' ._')
+              return (text or 'report')[:limit]
+
+          def compact(value: object) -> str:
+              return re.sub(r'\s+', '', str(value or ''))
+
+          def identity_match(text: str) -> bool:
+              value = compact(text)
+              return CODE in value or COMPANY in value or any(name in value for name in COMPANY_NAMES)
+
+          def normalize_date(value: object) -> str:
+              text = str(value or '')
+              match = re.search(r'(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})', text)
+              if not match:
+                  return ''
+              return f'{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}'
+
+          # Use the public catalogue only to resolve announcement IDs and dates.
+          raw_rows: dict[object, dict] = {}
+          for query in [COMPANY, CODE, '浙江运达风电', '运达能源科技']:
+              for page in range(1, 4):
+                  try:
+                      response = catalogue.post(
+                          'https://api.sdyanbao.com/api/file/search',
+                          json={'page': page, 'pageSize': 100, 'keyword': query},
+                          timeout=50,
+                      )
+                      rows = (response.json().get('data') or {}).get('files') or []
+                      note('CATALOGUE_SEARCH', query, page, response.status_code, len(rows))
+                  except Exception as exc:
+                      note('CATALOGUE_SEARCH_ERROR', query, page, repr(exc))
+                      break
+                  for row in rows:
+                      rid = row.get('id')
+                      if rid is not None:
+                          raw_rows[rid] = row
+                  if len(rows) < 100:
+                      break
+
+          note('RAW_ROW_COUNT', len(raw_rows))
+          items: list[dict] = []
+          for index, row in enumerate(raw_rows.values(), 1):
+              initial_name = str(row.get('name') or '')
+              initial_stock = row.get('stock') or {}
+              initial_code = str(initial_stock.get('code') or '') if isinstance(initial_stock, dict) else ''
+              # Fetch details for plausible filings and all company-coded rows.
+              if initial_code != CODE and not any(key in initial_name for key in ['年度报告', '季度报告', '第一季度', '第三季度']):
+                  continue
+              detail = {}
+              try:
+                  response = catalogue.post(
+                      'https://api.sdyanbao.com/api/file/detail',
+                      json={'id': row.get('id')},
+                      timeout=50,
+                  )
+                  payload = response.json()
+                  if payload.get('status') == 1:
+                      detail = payload.get('data') or {}
+              except Exception as exc:
+                  note('CATALOGUE_DETAIL_ERROR', row.get('id'), repr(exc))
+
+              stock = detail.get('stock') or row.get('stock') or {}
+              stock_code = str(stock.get('code') or '') if isinstance(stock, dict) else ''
+              stock_name = str(stock.get('name') or '') if isinstance(stock, dict) else ''
+              title = compact(detail.get('name') or row.get('name') or '')
+              identity_blob = title + stock_code + stock_name
+              if stock_code != CODE and not identity_match(identity_blob):
+                  continue
+
+              item = {
+                  'catalogue_id': row.get('id'),
+                  'title': title,
+                  'date': normalize_date(detail.get('time_text') or row.get('time_text')),
+                  'page_count_meta': int(detail.get('page_count') or row.get('page_count') or 0),
+                  'announcement_id': str(detail.get('data_source_uuid') or row.get('data_source_uuid') or ''),
+                  'page_url': detail.get('page_url') or row.get('page_url'),
+                  'online_url': detail.get('online_url') or row.get('online_url'),
+                  'stock_code': stock_code,
+                  'stock_name': stock_name,
+              }
+              items.append(item)
+              note('CATALOGUE_ITEM', json.dumps(item, ensure_ascii=False))
+
+          # Deduplicate catalogue records.
+          deduped: list[dict] = []
+          seen_keys = set()
+          for item in items:
+              key = (item['announcement_id'], item['title'], item['date'])
+              if key in seen_keys:
+                  continue
+              seen_keys.add(key)
+              deduped.append(item)
+          items = deduped
+          note('ITEM_COUNT', len(items))
+
+          def annual_rank(item: dict, year: int) -> tuple:
+              title = item['title']
+              revised = any(word in title for word in ['修订', '更正后', '更新后'])
+              exact = title in {
+                  f'{year}年年度报告',
+                  f'运达股份{year}年年度报告',
+                  f'浙江运达风电股份有限公司{year}年年度报告',
+              }
+              return (1 if revised else 0, 1 if exact else 0, item['date'], item['page_count_meta'])
+
+          annual_candidates: dict[int, list[dict]] = {}
+          for year in YEARS:
+              candidates = []
+              for item in items:
+                  title = item['title']
+                  if f'{year}年年度报告' not in title:
+                      continue
+                  if any(word in title for word in ['摘要', '英文版', '审计报告', '问询函', '回复', '内部控制']):
+                      continue
+                  candidates.append(item)
+              candidates.sort(key=lambda x: annual_rank(x, year), reverse=True)
+              annual_candidates[year] = candidates
+              note('ANNUAL_CANDIDATES', year, json.dumps(candidates, ensure_ascii=False))
+
+          quarterly_candidates = []
+          for item in items:
+              title = item['title']
+              match = re.search(r'(20\d{2})年(第一|第三)季度报告', title)
+              if not match or any(word in title for word in ['摘要', '英文版']):
+                  continue
+              item = dict(item)
+              item['period_year'] = int(match.group(1))
+              item['period_quarter'] = 1 if match.group(2) == '第一' else 3
+              quarterly_candidates.append(item)
+          quarterly_candidates.sort(
+              key=lambda x: (x['period_year'], x['period_quarter'], x['date'], x['page_count_meta']),
+              reverse=True,
+          )
+          note('QUARTERLY_CANDIDATES', json.dumps(quarterly_candidates, ensure_ascii=False))
+
+          records: list[dict] = []
+          used_hashes = set()
+          render_entries: list[tuple[str, Path]] = []
+
+          def source_urls(item: dict) -> list[str]:
+              date = item['date']
+              aid = item['announcement_id']
+              urls = []
+              if date and aid and aid.isdigit():
+                  urls.extend([
+                      f'https://static.cninfo.com.cn/finalpage/{date}/{aid}.PDF',
+                      f'https://static.cninfo.com.cn/finalpage/{date}/{aid}.pdf',
+                  ])
+              online = str(item.get('online_url') or '')
+              if online.startswith('http'):
+                  urls.append(online)
+              # Preserve order while removing duplicates.
+              result = []
+              for url in urls:
+                  if url not in result:
+                      result.append(url)
+              return result
+
+          def download_validate(item: dict, report_type: str, expected_year: int) -> dict | None:
+              data = None
+              source_url = None
+              attempts = []
+              for url in source_urls(item):
+                  try:
+                      response = session.get(
+                          url,
+                          timeout=120,
+                          allow_redirects=True,
+                          headers={'Referer': 'https://www.cninfo.com.cn/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                      )
+                      attempts.append({
+                          'url': url,
+                          'status': response.status_code,
+                          'bytes': len(response.content),
+                          'type': response.headers.get('content-type'),
+                          'magic': response.content[:8].hex(),
+                      })
+                      note('PDF_GET', json.dumps(attempts[-1], ensure_ascii=False))
+                      if response.status_code == 200 and len(response.content) > 50_000 and response.content.lstrip().startswith(b'%PDF'):
+                          data = response.content
+                          source_url = response.url
+                          break
+                  except Exception as exc:
+                      attempts.append({'url': url, 'error': repr(exc)})
+                      note('PDF_GET_ERROR', url, repr(exc))
+              if data is None:
+                  note('NO_PDF', item['title'], json.dumps(attempts, ensure_ascii=False))
+                  return None
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in used_hashes:
+                  note('DUPLICATE', item['title'])
+                  return None
+              temp = PDFDIR / f'_tmp_{digest[:12]}.pdf'
+              temp.write_bytes(data)
+              try:
+                  doc = pymupdf.open(str(temp))
+                  pages = doc.page_count
+                  minimum_pages = 60 if report_type == 'annual' else 8
+                  if pages < minimum_pages:
+                      raise ValueError(f'only {pages} pages')
+                  sample = sorted(set([0, 1, min(5, pages - 1), pages // 2, pages - 1]))
+                  text = '\n'.join(doc.load_page(index).get_text('text') for index in sample)
+                  if not identity_match(text):
+                      raise ValueError('company identity not found')
+                  stem = clean_filename(item['title'], 55)
+                  for label, index in [('first', 0), ('middle', pages // 2), ('last', pages - 1)]:
+                      pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.65, 0.65), alpha=False)
+                      path = RENDERDIR / f'{stem}_{label}.png'
+                      pix.save(str(path))
+                      render_entries.append((f'{stem}-{label}', path))
+                  encrypted = bool(doc.is_encrypted)
+                  doc.close()
+              except Exception as exc:
+                  note('VALIDATION_ERROR', item['title'], repr(exc))
+                  temp.unlink(missing_ok=True)
+                  return None
+
+              used_hashes.add(digest)
+              filename = f"{item['title']}_{pages}页_巨潮资讯网官方PDF.pdf"
+              final = PDFDIR / filename
+              final.unlink(missing_ok=True)
+              temp.rename(final)
+              record = {
+                  'title': item['title'],
+                  'type': report_type,
+                  'report_year': expected_year,
+                  'announcement_date': item['date'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'encrypted': encrypted,
+                  'file': filename,
+                  'source_url': source_url,
+                  'announcement_id': item['announcement_id'],
+                  'catalogue_id': item['catalogue_id'],
+              }
+              note('VALIDATED', json.dumps(record, ensure_ascii=False))
+              return record
+
+          for year in YEARS:
+              record = None
+              for item in annual_candidates.get(year) or []:
+                  record = download_validate(item, 'annual', year)
+                  if record:
+                      break
+              if record is None:
+                  raise RuntimeError(f'Could not obtain {year} annual report')
+              records.append(record)
+
+          quarterly_record = None
+          for item in quarterly_candidates:
+              quarterly_record = download_validate(item, 'quarterly', item['period_year'])
+              if quarterly_record:
+                  quarterly_record['period_quarter'] = item['period_quarter']
+                  break
+          if quarterly_record is None:
+              raise RuntimeError('Could not obtain latest quarterly report')
+          records.append(quarterly_record)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 reports, got {len(records)}')
+
+          # Visual QA sheet.
+          thumbnails = []
+          for label, image_path in render_entries:
+              with Image.open(image_path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((260, 340))
+                  canvas = Image.new('RGB', (280, 380), 'white')
+                  canvas.paste(image, ((280 - image.width) // 2, 8))
+                  ImageDraw.Draw(canvas).text((8, 356), label[:44], fill='black')
+                  thumbnails.append(canvas)
+          columns = 3
+          rows_count = (len(thumbnails) + columns - 1) // columns
+          sheet = Image.new('RGB', (columns * 280, rows_count * 380), 'white')
+          for index, thumbnail in enumerate(thumbnails):
+              sheet.paste(thumbnail, ((index % columns) * 280, (index // columns) * 380))
+          sheet.save(OUT / 'contact_sheet.jpg', quality=88)
+
+          total_pages = sum(item['pages'] for item in records)
+          (OUT / 'selected_reports.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '运达股份（300772.SZ）2020—2025年年度报告及最新季报下载包',
+              '',
+              f'完整PDF数量：{len(records)}份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for index, item in enumerate(records, 1):
+              readme.append(f"{index}. {item['title']}｜公告日期：{item['announcement_date']}｜{item['pages']}页｜巨潮资讯网官方PDF")
+          readme += [
+              '',
+              '年度报告均为完整正文，未混入摘要；如同年度存在修订或更正版本，优先采用后续披露且通过校验的版本。',
+              '最新季报按报告期间排序，在第一季度报告与第三季度报告中选取截至2026-08-30最新一期。',
+              '公告目录仅用于定位公告编号；压缩包内全部PDF均直接下载自static.cninfo.com.cn巨潮资讯网官方附件地址。',
+              '已核验公司名称及证券代码300772、PDF文件头、实际页数和加密状态，并检查每份文件的首页、中间页与末页；ZIP完整性测试通过。',
+              '版权归上市公司及公告平台所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in records) + '\n', encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / 'windey_2020_2025_annual_and_latest_quarterly_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / 'ZIP_SHA256.txt').write_text(f'{zip_sha}  {zip_path.name}\n', encoding='utf-8')
+          print((OUT / 'README.txt').read_text(encoding='utf-8'))
+          print('FINAL_ZIP', zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windey-annual-quarterly-reports-v2
+          path: windey_financial_reports_v2/
+          retention-days: 3
+          if-no-files-found: error
