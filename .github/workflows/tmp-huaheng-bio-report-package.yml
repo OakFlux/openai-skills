@@ -1,0 +1,139 @@
+name: Temporary Huaheng Biotech broker report package
+
+on:
+  push:
+    branches:
+      - tmp-huaheng-bio-reports-20260830
+    paths:
+      - .github/workflows/tmp-huaheng-bio-report-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Prepare PDF tools
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+      - name: Select, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          CODE='688639'; NAME='华恒生物'
+          out=Path('华恒生物_券商深度报告'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/report/{CODE}.html',
+              'Accept':'application/json,text/plain,*/*'
+          })
+          body={'pageSize':300,'pageNo':1,'p':1,'pageNum':1,'pageNumber':1,'beginTime':'2020-01-01','endTime':'2026-08-30','code':CODE,'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''}
+          r=s.post('https://reportapi.eastmoney.com/report/list2',json=body,headers={'Referer':'https://data.eastmoney.com/','Content-Type':'application/json','Accept':'application/json,text/plain,*/*'},timeout=90)
+          print('API',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+          r.raise_for_status(); rows=r.json().get('data') or []
+          print('ROWS',len(rows))
+
+          candidates=[]
+          for row in rows:
+              info=row.get('infoCode'); title=str(row.get('title') or '').strip(); broker=str(row.get('orgSName') or row.get('orgName') or '').strip(); date=str(row.get('publishDate') or '')[:10]
+              meta_pages=int(row.get('attachPages') or 0)
+              if not info: continue
+              url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              try:
+                  x=s.get(url,headers={'Accept':'application/pdf,*/*','Referer':'https://data.eastmoney.com/'},timeout=90,allow_redirects=True)
+                  print('TEST',date,broker,title,'meta_pages=',meta_pages,'HTTP=',x.status_code,'bytes=',len(x.content),'type=',x.headers.get('content-type'))
+                  if x.status_code!=200 or not x.content.startswith(b'%PDF-') or len(x.content)<100000:
+                      continue
+                  temp=out/f'_tmp_{info}.pdf'; temp.write_bytes(x.content)
+                  reader=PdfReader(str(temp),strict=False); pages=len(reader.pages)
+                  text=''
+                  for pg in reader.pages[:min(5,pages)]:
+                      try:text += pg.extract_text() or ''
+                      except Exception:pass
+                  compact=re.sub(r'\s+','',text)
+                  if NAME not in compact and CODE not in compact:
+                      print('IDENTITY_FAIL',info); temp.unlink(missing_ok=True); continue
+                  sha=hashlib.sha256(x.content).hexdigest()
+                  score=0
+                  if any(k in title for k in ['深度','首次覆盖','公司首次覆盖','首次覆盖报告','公司深度']): score+=500
+                  if any(k in title for k in ['平台型','龙头','成长曲线','合成生物','新材料','产品矩阵']): score+=150
+                  score += min(pages,80)*8
+                  year=int(date[:4]) if date[:4].isdigit() else 2000
+                  score += max(0,year-2020)*8
+                  if pages<12: score-=500
+                  candidates.append({'date':date,'broker':broker,'title':title,'info_code':info,'url':x.url,'pages':pages,'bytes':len(x.content),'sha256':sha,'score':score,'temp':str(temp),'rating':row.get('emRatingName') or row.get('sRatingName'),'researcher':row.get('researcher')})
+              except Exception as exc:
+                  print('ERROR',info,repr(exc))
+              time.sleep(.15)
+
+          candidates.sort(key=lambda z:(z['score'],z['pages'],z['date']),reverse=True)
+          print('CANDIDATES')
+          for c in candidates: print(json.dumps({k:v for k,v in c.items() if k!='temp'},ensure_ascii=False))
+
+          # Prefer substantial, deep/first-coverage reports and different brokerages.
+          preferred=[c for c in candidates if c['pages']>=15 and any(k in c['title'] for k in ['深度','首次覆盖','平台型','龙头','成长曲线'])]
+          if len(preferred)<2: preferred=[c for c in candidates if c['pages']>=12]
+          chosen=[]; used_brokers=set(); used_titles=set()
+          for c in preferred:
+              if c['title'] in used_titles: continue
+              if c['broker'] in used_brokers and len(preferred)>=4: continue
+              chosen.append(c); used_brokers.add(c['broker']); used_titles.add(c['title'])
+              if len(chosen)>=3: break
+          if len(chosen)<2:
+              for c in candidates:
+                  if c in chosen or c['pages']<10: continue
+                  chosen.append(c)
+                  if len(chosen)>=2: break
+          if len(chosen)<2:
+              raise RuntimeError(f'Only {len(chosen)} substantial public reports available')
+
+          manifest=[]
+          for i,c in enumerate(chosen,1):
+              safe_title=re.sub(r'[\\/:*?"<>|]+','_',c['title']).strip()[:75]
+              final_name=f"{i:02d}_{c['date']}_{c['broker']}_{safe_title}_{c['pages']}页.pdf"
+              src=Path(c['temp']); dst=out/final_name; src.replace(dst)
+              item={k:v for k,v in c.items() if k!='temp'}; item['filename']=final_name; manifest.append(item)
+
+          # Remove unselected temporary files.
+          for p in out.glob('_tmp_*.pdf'): p.unlink(missing_ok=True)
+
+          readme=['华恒生物（688639）券商深度报告下载包','',f'收录报告数量：{len(manifest)}份','', '筛选原则：公司深度/首次覆盖优先，排除短篇业绩点评；PDF均来自公开原始文件入口。','']
+          for i,m in enumerate(manifest,1):
+              readme += [f"{i}. {m['broker']}｜{m['date']}｜{m['pages']}页",f"   标题：{m['title']}",f"   文件：{m['filename']}",f"   评级：{m.get('rating') or '未标注'}",f"   分析师：{m.get('researcher') or '未标注'}",f"   来源：{m['url']}",f"   SHA-256：{m['sha256']}",'']
+          readme += ['核验项目：PDF文件头、实际页数、公司名称/证券代码、文本可解析性、ZIP完整性。','资料仅供研究参考，不构成投资建议。']
+          (out/'README_报告清单与核验信息.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          with (out/'SHA256SUMS.txt').open('w',encoding='utf-8') as f:
+              for m in manifest:f.write(f"{m['sha256']}  {m['filename']}\n")
+
+          for zp in [Path('huaheng_biotech_broker_deep_reports.zip'),Path('华恒生物_券商深度报告.zip')]:
+              with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+                  for p in sorted(out.iterdir()): z.write(p,arcname=f'{out.name}/{p.name}')
+              with zipfile.ZipFile(zp) as z:
+                  bad=z.testzip()
+                  if bad: raise RuntimeError(f'ZIP failure {zp}: {bad}')
+              print('ZIP_OK',zp,zp.stat().st_size)
+          print('FINAL_SELECTION',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Huaheng_Biotech_Broker_Deep_Reports
+          path: |
+            huaheng_biotech_broker_deep_reports.zip
+            华恒生物_券商深度报告.zip
+            华恒生物_券商深度报告/*.pdf
+            华恒生物_券商深度报告/*.txt
+            华恒生物_券商深度报告/manifest.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
