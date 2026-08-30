@@ -1,0 +1,213 @@
+name: Temporary Xihua official filing package
+
+on:
+  push:
+    branches: [tmp-xihua-official-filings-20260830]
+    paths: [.github/workflows/tmp-xihua-official-package.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Prepare PDF validation tools
+        run: |
+          python -m pip install --disable-pip-version-check --quiet requests pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download, validate and package official SSE PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          reports = [
+              {
+                  'category': '招股说明书',
+                  'disclosure_date': '2025-12-18',
+                  'title': '锡华科技首次公开发行股票并在主板上市招股说明书',
+                  'relative_url': '/disclosure/listedinfo/announcement/c/new/2025-12-18/603248_20251218_OKF0.pdf',
+                  'filename': '01_锡华科技_首次公开发行股票并在主板上市招股说明书_20251218.pdf',
+                  'min_pages': 300,
+              },
+              {
+                  'category': '年度报告',
+                  'disclosure_date': '2026-04-23',
+                  'title': '锡华科技2025年年度报告',
+                  'relative_url': '/disclosure/listedinfo/announcement/c/new/2026-04-23/603248_20260423_SAM1.pdf',
+                  'filename': '02_锡华科技_2025年年度报告_20260423.pdf',
+                  'min_pages': 150,
+              },
+              {
+                  'category': '季度报告',
+                  'disclosure_date': '2026-04-23',
+                  'title': '锡华科技2026年第一季度报告',
+                  'relative_url': '/disclosure/listedinfo/announcement/c/new/2026-04-23/603248_20260423_R1T2.pdf',
+                  'filename': '03_锡华科技_2026年第一季度报告_20260423.pdf',
+                  'min_pages': 8,
+              },
+              {
+                  'category': '补充-最新定期报告',
+                  'disclosure_date': '2026-08-26',
+                  'title': '锡华科技2026年半年度报告',
+                  'relative_url': '/disclosure/listedinfo/announcement/c/new/2026-08-26/603248_20260826_VEFX.pdf',
+                  'filename': '04_锡华科技_2026年半年度报告_20260826_补充.pdf',
+                  'min_pages': 120,
+              },
+          ]
+
+          root = Path('锡华科技_官方披露文件')
+          verify = Path('verification')
+          root.mkdir(exist_ok=True)
+          verify.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Referer': 'https://www.sse.com.cn/assortment/stock/list/info/announcement/index.shtml?productId=603248',
+              'Accept': 'application/pdf,*/*',
+          })
+
+          manifest = []
+          for index, item in enumerate(reports, 1):
+              candidates = [
+                  'https://static.sse.com.cn' + item['relative_url'],
+                  'https://www.sse.com.cn' + item['relative_url'],
+              ]
+              content = None
+              used_url = None
+              last = None
+              for url in candidates:
+                  try:
+                      response = session.get(url, timeout=(30, 240), allow_redirects=True)
+                      last = f"status={response.status_code}, bytes={len(response.content)}, type={response.headers.get('content-type')}"
+                      print('DOWNLOAD_TEST', url, last, 'final=', response.url)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 100_000:
+                          content = response.content
+                          used_url = response.url
+                          break
+                  except Exception as exc:
+                      last = repr(exc)
+              if content is None:
+                  raise RuntimeError(f"无法下载 {item['title']}: {last}")
+
+              path = root / item['filename']
+              path.write_bytes(content)
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f"页数异常 {item['title']}: {pages} < {item['min_pages']}")
+
+              text_parts = []
+              for page in reader.pages[: min(8, pages)]:
+                  try:
+                      text_parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', '\n'.join(text_parts))
+              if '锡华' not in compact and '江苏锡华新能源科技股份有限公司' not in compact:
+                  raise RuntimeError(f"公司名称核验失败: {item['title']}")
+              # Annual and periodic reports should include the listed stock code; the prospectus may place it later.
+              if item['category'] != '招股说明书' and '603248' not in compact:
+                  raise RuntimeError(f"证券代码核验失败: {item['title']}")
+
+              sha256 = hashlib.sha256(content).hexdigest()
+              encrypted = bool(reader.is_encrypted)
+              manifest.append({
+                  **item,
+                  'pages': pages,
+                  'bytes': len(content),
+                  'sha256': sha256,
+                  'source_url': used_url,
+                  'encrypted': encrypted,
+                  'validation': '通过：PDF文件头、页数、公司名称、证券代码（适用时）、文本可解析性',
+              })
+
+              # Render first and last pages as verification evidence; not included in final user ZIP.
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90',
+                  str(path), str(verify / f'{index:02d}_first')
+              ], check=True)
+              subprocess.run([
+                  'pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '72',
+                  str(path), str(verify / f'{index:02d}_last')
+              ], check=True)
+              print('VALID', item['title'], 'pages=', pages, 'bytes=', len(content), 'sha256=', sha256)
+
+          readme_lines = [
+              '锡华科技（603248）官方披露文件清单',
+              '',
+              '本包以上海证券交易所正式披露PDF为准，未收录摘要版、提示性公告或第三方重新排版文件。',
+              '',
+              '收录范围：',
+              '1. 正式招股说明书；',
+              '2. 上市以来全部完整年度报告（目前仅2025年年度报告）；',
+              '3. 最新季度报告（2026年第一季度报告）；',
+              '4. 补充收录当前更新的定期报告（2026年半年度报告）。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme_lines += [
+                  f"{i}. {item['category']}｜{item['disclosure_date']}｜{item['pages']}页",
+                  f"   标题：{item['title']}",
+                  f"   文件：{item['filename']}",
+                  f"   来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          readme_lines += [
+              '核验结果：4份PDF均可解析，首页与末页均成功渲染，压缩包完整性测试通过。',
+              '资料仅供研究和存档使用。',
+          ]
+          (root / 'README_文件清单与核验信息.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (root / 'SHA256SUMS.txt').open('w', encoding='utf-8') as f:
+              for item in manifest:
+                  f.write(f"{item['sha256']}  {item['filename']}\n")
+
+          zip_cn = Path('锡华科技_所有年报_招股说明书_最新季报.zip')
+          zip_en = Path('xihua_technology_official_filings.zip')
+          for zip_path in [zip_cn, zip_en]:
+              with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+                  for p in sorted(root.iterdir()):
+                      z.write(p, arcname=f'{root.name}/{p.name}')
+              with zipfile.ZipFile(zip_path, 'r') as z:
+                  bad = z.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP完整性失败 {zip_path}: {bad}')
+              print('ZIP_OK', zip_path, zip_path.stat().st_size)
+
+          Path('final_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Upload final ZIPs and direct PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xihua_Technology_Official_Filings
+          path: |
+            锡华科技_所有年报_招股说明书_最新季报.zip
+            xihua_technology_official_filings.zip
+            锡华科技_官方披露文件/*.pdf
+            锡华科技_官方披露文件/README_文件清单与核验信息.txt
+            锡华科技_官方披露文件/manifest.json
+            锡华科技_官方披露文件/SHA256SUMS.txt
+            final_manifest.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
