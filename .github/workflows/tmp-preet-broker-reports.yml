@@ -1,0 +1,416 @@
+name: Temporary Preet broker report collection
+
+on:
+  push:
+    branches:
+      - tmp/preet-broker-reports-20260830
+    paths:
+      - .github/workflows/tmp-preet-broker-reports.yml
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF Pillow
+      - name: Discover, download, validate, and package reports
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          CODE = '002324'
+          COMPANY = '普利特'
+          FULL_NAMES = ['上海普利特复合材料股份有限公司', '上海普利特复合材料股份']
+
+          OUT = Path('preet_reports')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+          })
+          sd = requests.Session()
+          sd.headers.update({
+              'User-Agent': session.headers['User-Agent'],
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+
+          logs: list[str] = []
+          candidates: list[dict] = []
+          downloaded: list[dict] = []
+          render_entries: list[tuple[str, Path]] = []
+
+          def note(*parts):
+              line = ' '.join(str(part) for part in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def clean(value, limit=100):
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(value or '')).strip(' ._')
+              return (text or 'report')[:limit]
+
+          def norm(value):
+              return re.sub(r'[\W_]+', '', str(value or ''), flags=re.UNICODE).lower()
+
+          def company_match(value):
+              text = re.sub(r'\s+', '', str(value or ''))
+              return COMPANY in text or CODE in text or any(name in text for name in FULL_NAMES)
+
+          def score_candidate(item):
+              title = str(item.get('title') or '')
+              pages = int(item.get('pages_meta') or 0)
+              score = min(pages, 80) * 1.8
+              if any(key in title for key in ['公司深度报告', '公司深度', '深度报告', '深度研究', '投资价值研究']):
+                  score += 150
+              elif '深度' in title:
+                  score += 100
+              if any(key in title for key in ['首次覆盖', '首次评级', '首次推荐']):
+                  score += 110
+              if any(key in title for key in ['改性材料', '复合材料', '新能源', '储能', '锂电', '电池', 'LCP', '特种材料', '国产替代', '龙头']):
+                  score += 25
+              if any(key in title for key in ['点评', '季报', '中报', '年报', '业绩快报', '事件点评']):
+                  score -= 100
+              try:
+                  year = int(str(item.get('date') or '')[:4])
+                  score += max(0, year - 2020) * 7
+              except Exception:
+                  pass
+              return score
+
+          def add_candidate(item):
+              title = str(item.get('title') or '')
+              identity_blob = ' '.join([
+                  title,
+                  str(item.get('stockName') or ''),
+                  str(item.get('stockCode') or ''),
+                  json.dumps(item.get('stock') or {}, ensure_ascii=False),
+              ])
+              if not company_match(identity_blob):
+                  return
+              blocked = ['年度报告', '半年度报告', '季度报告', '招股说明书', '上市公告书', '调研纪要', '会议纪要', '摘要', '问询函']
+              if any(word in title for word in blocked):
+                  return
+              pages = int(item.get('pages_meta') or 0)
+              if pages and pages < 10:
+                  return
+              code = str(item.get('code') or '')
+              if not code.startswith('AP'):
+                  return
+              key = (code, norm(title))
+              if any(existing['_key'] == key for existing in candidates):
+                  return
+              item['_key'] = key
+              item['_score'] = score_candidate(item)
+              candidates.append(item)
+              note('CANDIDATE', json.dumps(item, ensure_ascii=False))
+
+          # Eastmoney public catalogue, split into smaller windows for reliability.
+          em_api = 'https://reportapi.eastmoney.com/report/list2'
+          windows = [
+              ('2020-01-01', '2021-12-31'),
+              ('2022-01-01', '2023-12-31'),
+              ('2024-01-01', '2025-12-31'),
+              ('2026-01-01', '2026-08-30'),
+          ]
+          for begin, end in windows:
+              for page in range(1, 8):
+                  body = {
+                      'beginTime': begin,
+                      'endTime': end,
+                      'industryCode': '*',
+                      'ratingChange': '*',
+                      'rating': '*',
+                      'orgCode': '*',
+                      'code': CODE,
+                      'rcode': '',
+                      'pageSize': 100,
+                      'pageNo': page,
+                      'p': page,
+                      'pageNum': page,
+                      'pageNumber': page,
+                      'qType': 0,
+                  }
+                  try:
+                      response = session.post(
+                          em_api,
+                          json=body,
+                          timeout=45,
+                          headers={
+                              'Content-Type': 'application/json',
+                              'Origin': 'https://data.eastmoney.com',
+                              'Referer': 'https://data.eastmoney.com/report/stock.jshtml',
+                          },
+                      )
+                      result = response.json()
+                      rows = result.get('data') or []
+                      total_pages = int(result.get('TotalPage') or result.get('totalPage') or 1)
+                      note('EM_SEARCH', begin, end, page, len(rows), total_pages, response.status_code)
+                  except Exception as exc:
+                      note('EM_SEARCH_ERROR', begin, end, page, repr(exc))
+                      break
+                  for row in rows:
+                      add_candidate({
+                          'source': 'eastmoney',
+                          'title': row.get('title') or '',
+                          'org': row.get('orgSName') or row.get('orgName') or '',
+                          'date': str(row.get('publishDate') or '')[:10],
+                          'pages_meta': row.get('attachPages'),
+                          'code': row.get('infoCode'),
+                          'stockCode': row.get('stockCode') or row.get('code'),
+                          'stockName': row.get('stockName') or row.get('name'),
+                      })
+                  if page >= total_pages or not rows:
+                      break
+                  time.sleep(0.25)
+
+          # SDYanbao public catalogue helps recover additional AP attachment codes.
+          queries = [
+              COMPANY,
+              CODE,
+              f'{COMPANY} 深度报告',
+              f'{COMPANY} 首次覆盖',
+              f'{COMPANY} 改性材料',
+              f'{COMPANY} 新能源',
+          ]
+          for query in queries:
+              for page in range(1, 4):
+                  try:
+                      response = sd.post(
+                          'https://api.sdyanbao.com/api/file/search',
+                          json={'page': page, 'pageSize': 100, 'keyword': query},
+                          timeout=45,
+                      )
+                      rows = (response.json().get('data') or {}).get('files') or []
+                      note('SD_SEARCH', query, page, len(rows))
+                  except Exception as exc:
+                      note('SD_SEARCH_ERROR', query, page, repr(exc))
+                      break
+                  if not rows:
+                      break
+                  for row in rows:
+                      if not company_match((row.get('name') or '') + ' ' + json.dumps(row, ensure_ascii=False)):
+                          continue
+                      detail = {}
+                      try:
+                          detail_response = sd.post(
+                              'https://api.sdyanbao.com/api/file/detail',
+                              json={'id': row.get('id')},
+                              timeout=45,
+                          ).json()
+                          if detail_response.get('status') == 1:
+                              detail = detail_response.get('data') or {}
+                      except Exception as exc:
+                          note('SD_DETAIL_ERROR', row.get('id'), repr(exc))
+                      add_candidate({
+                          'source': 'sdyanbao',
+                          'title': detail.get('name') or row.get('name') or '',
+                          'org': ((detail.get('organization') or {}).get('name')
+                                  or (row.get('organization') or {}).get('name')
+                                  or ''),
+                          'date': str(detail.get('time_text') or row.get('time_text') or '')[:10],
+                          'pages_meta': detail.get('page_count') or row.get('page_count'),
+                          'code': detail.get('data_source_uuid') or row.get('data_source_uuid'),
+                          'stock': detail.get('stock') or row.get('stock'),
+                      })
+                  if len(rows) < 100:
+                      break
+
+          candidates.sort(key=lambda item: (item['_score'], str(item.get('date') or ''), int(item.get('pages_meta') or 0)), reverse=True)
+          (OUT / 'candidates.json').write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+          note('CANDIDATE_COUNT', len(candidates))
+
+          hashes = set()
+          for meta in candidates:
+              if len(downloaded) >= 10:
+                  break
+              code = meta['code']
+              data = None
+              source_url = None
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time() * 1000)}.pdf=',
+              ]
+              for url in urls:
+                  try:
+                      response = session.get(
+                          url,
+                          timeout=90,
+                          allow_redirects=True,
+                          headers={'Referer': 'https://data.eastmoney.com/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                      )
+                      note('PDF_GET', response.status_code, len(response.content), response.headers.get('content-type'), response.url)
+                      if response.status_code == 200 and len(response.content) > 50_000 and response.content.lstrip().startswith(b'%PDF'):
+                          data = response.content
+                          source_url = response.url
+                          break
+                  except Exception as exc:
+                      note('PDF_GET_ERROR', url, repr(exc))
+              if data is None:
+                  continue
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  continue
+              temp = PDFDIR / f'_tmp_{digest[:12]}.pdf'
+              temp.write_bytes(data)
+              try:
+                  doc = pymupdf.open(str(temp))
+                  pages = doc.page_count
+                  if pages < 10:
+                      raise ValueError(f'only {pages} pages')
+                  sample_indices = sorted(set([0, 1, min(5, pages - 1), pages // 2, pages - 1]))
+                  text = '\n'.join(doc.load_page(index).get_text('text') for index in sample_indices)
+                  if not company_match(text):
+                      raise ValueError('company identity not found')
+                  stem = clean(meta['title'], 50)
+                  for label, index in [('first', 0), ('middle', pages // 2), ('last', pages - 1)]:
+                      pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.8, 0.8), alpha=False)
+                      render_path = RENDERDIR / f'{stem}_{label}.png'
+                      pix.save(str(render_path))
+                      render_entries.append((f'{stem}-{label}', render_path))
+                  encrypted = bool(doc.is_encrypted)
+                  doc.close()
+              except Exception as exc:
+                  note('VALIDATION_ERROR', meta['title'], repr(exc))
+                  temp.unlink(missing_ok=True)
+                  continue
+
+              hashes.add(digest)
+              filename = f"{meta['date']}_{clean(meta['org'], 30)}_{clean(meta['title'], 90)}_{pages}页_原始PDF.pdf"
+              final = PDFDIR / filename
+              final.unlink(missing_ok=True)
+              temp.rename(final)
+              downloaded.append({
+                  'file': filename,
+                  'title': meta['title'],
+                  'org': meta['org'],
+                  'date': meta['date'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'encrypted': encrypted,
+                  'source_url': source_url,
+                  'score': meta['_score'],
+              })
+              note('SAVED', filename)
+
+          # Deduplicate titles and choose three distinct brokers where possible.
+          unique = []
+          seen_titles = set()
+          for item in sorted(downloaded, key=lambda x: (x['score'], x['pages'], x['date']), reverse=True):
+              title_key = norm(item['title'])
+              if title_key in seen_titles:
+                  continue
+              seen_titles.add(title_key)
+              unique.append(item)
+
+          selected = []
+          used_orgs = set()
+          for item in unique:
+              if len(selected) >= 3:
+                  break
+              if item['org'] in used_orgs:
+                  continue
+              selected.append(item)
+              used_orgs.add(item['org'])
+          if len(selected) < 3:
+              for item in unique:
+                  if item not in selected:
+                      selected.append(item)
+                  if len(selected) >= 3:
+                      break
+          selected = selected[:3]
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} complete original PDFs obtained')
+
+          keep = {item['file'] for item in selected}
+          for path in PDFDIR.glob('*.pdf'):
+              if path.name not in keep:
+                  path.unlink()
+
+          # Contact sheet for visual QA.
+          thumbnails = []
+          for label, image_path in render_entries:
+              if not image_path.exists():
+                  continue
+              with Image.open(image_path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((280, 365))
+                  canvas = Image.new('RGB', (300, 405), 'white')
+                  canvas.paste(image, ((300 - image.width) // 2, 10))
+                  ImageDraw.Draw(canvas).text((8, 382), label[:48], fill='black')
+                  thumbnails.append(canvas)
+          if thumbnails:
+              columns = 3
+              rows = (len(thumbnails) + columns - 1) // columns
+              sheet = Image.new('RGB', (columns * 300, rows * 405), 'white')
+              for index, thumbnail in enumerate(thumbnails):
+                  sheet.paste(thumbnail, ((index % columns) * 300, (index // columns) * 405))
+              sheet.save(OUT / 'contact_sheet.jpg', quality=88)
+
+          (OUT / 'selected_reports.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '普利特（002324.SZ）券商深度报告下载包',
+              '',
+              f'完整原始PDF数量：{len(selected)}份',
+              '',
+          ]
+          for index, item in enumerate(selected, 1):
+              readme.append(f"{index}. {item['date']}｜{item['org']}｜{item['title']}｜{item['pages']}页")
+          readme += [
+              '',
+              '优先收录篇幅较完整的公司深度、首次覆盖或系统性研究报告；未使用网页摘要或缺页预览。',
+              '已核验PDF文件头、公司主体、实际页数，并检查首页、中间页和末页；ZIP完整性测试通过。',
+              '版权归原发布机构及作者所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{item['sha256']}  {item['file']}" for item in selected) + '\n', encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / 'preet_broker_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != len(selected):
+                  raise RuntimeError(f'ZIP contains {len(pdf_names)} PDFs, expected {len(selected)}')
+          note('FINAL_ZIP', zip_path, zip_path.stat().st_size)
+          print((OUT / 'README.txt').read_text(encoding='utf-8'))
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: preet-broker-reports
+          path: preet_reports/
+          retention-days: 3
+          if-no-files-found: error
