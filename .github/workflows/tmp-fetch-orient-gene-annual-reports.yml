@@ -1,0 +1,374 @@
+name: Temporary Fetch Orient Gene Annual Reports
+
+on:
+  push:
+    branches:
+      - tmp/orient-gene-annual-reports-20260830
+    paths:
+      - .github/workflows/tmp-fetch-orient-gene-annual-reports.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pdfinfo >/dev/null 2>&1 || ! command -v pdftotext >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq poppler-utils
+          fi
+
+      - name: Discover, download, verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+
+          STOCK_ID = '688298'
+          COMPANY_NAMES = [
+              '东方生物',
+              '东方基因生物',
+              '东方基因',
+              '浙江东方基因生物制品股份有限公司',
+          ]
+          ROOT = Path('orient_gene_package')
+          PDF_DIR = ROOT / '01_年度报告及季度报告'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://vip.stock.finance.sina.com.cn/',
+          })
+
+          def decode_response(response):
+              raw = response.content
+              for encoding in ('utf-8', 'gb18030', 'gbk'):
+                  try:
+                      return raw.decode(encoding)
+                  except UnicodeDecodeError:
+                      continue
+              return raw.decode('utf-8', errors='ignore')
+
+          def visible_text(fragment):
+              text = re.sub(r'<script\b[^>]*>.*?</script>', ' ', fragment, flags=re.I | re.S)
+              text = re.sub(r'<style\b[^>]*>.*?</style>', ' ', text, flags=re.I | re.S)
+              text = re.sub(r'<[^>]+>', ' ', text)
+              return re.sub(r'\s+', ' ', html.unescape(text)).strip()
+
+          def normalize(text):
+              return re.sub(r'\s+', '', text or '')
+
+          def extract_bulletin_id(href):
+              decoded = html.unescape(unquote(href))
+              patterns = [
+                  r'(?:[?&]|%3F|%26)id(?:=|%3D)(\d+)',
+                  r'/id/(\d+)',
+                  r'AllBulletinDetail\.php[^\"\'<>]*?(\d{6,12})',
+              ]
+              for pattern in patterns:
+                  match = re.search(pattern, decoded, flags=re.I)
+                  if match:
+                      return match.group(1)
+              return None
+
+          def collect_listing_entries(url):
+              response = session.get(url, timeout=60)
+              response.raise_for_status()
+              page = html.unescape(decode_response(response)).replace('\\/', '/')
+              entries = []
+              for match in re.finditer(r'<a\b[^>]*href=[\"\']([^\"\']+)[\"\'][^>]*>(.*?)</a>', page, flags=re.I | re.S):
+                  href = match.group(1)
+                  title = visible_text(match.group(2))
+                  bulletin_id = extract_bulletin_id(href)
+                  if bulletin_id and title:
+                      entries.append({
+                          'title': title,
+                          'href': urljoin(response.url, href),
+                          'id': bulletin_id,
+                          'listing_url': response.url,
+                      })
+              return entries
+
+          listing_urls = [
+              f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_ID}/page_type/ndbg.phtml',
+              f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_ID}/page_type/ndbg.phtml',
+              f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{STOCK_ID}.phtml',
+          ]
+          for page_no in range(1, 11):
+              listing_urls.extend([
+                  f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_ID}/page_type/ndbg.phtml?Page={page_no}',
+                  f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{STOCK_ID}.phtml?Page={page_no}',
+              ])
+
+          all_entries = []
+          seen = set()
+          for url in listing_urls:
+              try:
+                  entries = collect_listing_entries(url)
+                  print(f'LIST {url} entries={len(entries)}')
+                  for entry in entries:
+                      key = (entry['id'], entry['title'])
+                      if key not in seen:
+                          seen.add(key)
+                          all_entries.append(entry)
+              except Exception as exc:
+                  print(f'LISTING WARNING {url}: {exc}')
+
+          if not all_entries:
+              raise RuntimeError('No Sina bulletin entries were discovered')
+
+          def annual_score(title, year):
+              compact = normalize(title)
+              target = f'{year}年年度报告'
+              if target not in compact:
+                  return None
+              forbidden = ['摘要', '业绩说明会', '问询函', '回复', '审计报告', '董事会', '提示性公告', '更正公告']
+              if any(word in compact for word in forbidden):
+                  return None
+              score = 100
+              if any(word in compact for word in ['更新后', '修订版', '更正版', '修订稿']):
+                  score += 25
+              if compact.endswith(target) or compact == target:
+                  score += 10
+              if '全文' in compact:
+                  score += 5
+              return score
+
+          selected = []
+          for year in map(str, range(2020, 2026)):
+              candidates = []
+              for entry in all_entries:
+                  score = annual_score(entry['title'], year)
+                  if score is not None:
+                      candidates.append((score, int(entry['id']), entry))
+              if not candidates:
+                  related = [e['title'] for e in all_entries if year in e['title']]
+                  raise RuntimeError(f'No annual report candidate found for {year}; related={related[:100]}')
+              candidates.sort(reverse=True)
+              chosen = dict(candidates[0][2])
+              chosen.update({'report_year': year, 'document_type': 'annual_report'})
+              selected.append(chosen)
+              print('ANNUAL_SELECTED=' + json.dumps(chosen, ensure_ascii=False))
+
+          quarter_candidates = []
+          for entry in all_entries:
+              compact = normalize(entry['title'])
+              if ('2026年第一季度报告' in compact or '2026年一季度报告' in compact):
+                  if not any(word in compact for word in ['摘要', '说明会', '更正公告', '提示性公告', '业绩预告']):
+                      score = 100
+                      if '第一季度报告' in compact:
+                          score += 5
+                      if any(word in compact for word in ['更新后', '修订版', '更正版']):
+                          score += 20
+                      quarter_candidates.append((score, int(entry['id']), entry))
+          if not quarter_candidates:
+              related = [e['title'] for e in all_entries if '2026' in e['title'] and ('季度' in e['title'] or '一季' in e['title'])]
+              raise RuntimeError(f'No 2026 Q1 report candidate found; related={related[:100]}')
+          quarter_candidates.sort(reverse=True)
+          quarter = dict(quarter_candidates[0][2])
+          quarter.update({'report_year': '2026', 'document_type': 'quarterly_report'})
+          selected.append(quarter)
+          print('QUARTER_SELECTED=' + json.dumps(quarter, ensure_ascii=False))
+
+          if len(selected) != 7 or len({item['id'] for item in selected}) != 7:
+              raise RuntimeError('The selected filing set is incomplete or contains duplicate IDs')
+
+          def detail_url(bulletin_id):
+              return f'https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id={bulletin_id}&stockid={STOCK_ID}'
+
+          def extract_pdf_urls(detail_html, base_url):
+              text = html.unescape(detail_html).replace('\\/', '/')
+              urls = []
+              patterns = [
+                  r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+?\.PDF',
+                  r'https?://[^\"\'<>\s]+?\.PDF',
+                  r'(?:href|src)=[\"\']([^\"\']+?\.PDF)[\"\']',
+              ]
+              for pattern in patterns:
+                  for value in re.findall(pattern, text, flags=re.I):
+                      if isinstance(value, tuple):
+                          value = value[0]
+                      url = unquote(urljoin(base_url, value))
+                      if url not in urls:
+                          urls.append(url)
+              return urls
+
+          def download_pdf(item, destination):
+              detail = detail_url(item['id'])
+              response = session.get(detail, timeout=60)
+              response.raise_for_status()
+              candidates = extract_pdf_urls(decode_response(response), detail)
+              if not candidates:
+                  raise RuntimeError(f'No PDF URL found for {item["title"]}: {detail}')
+              errors = []
+              for pdf_url in candidates:
+                  for attempt in range(1, 4):
+                      try:
+                          print(f'GET {item["title"]} attempt={attempt}: {pdf_url}')
+                          with session.get(pdf_url, timeout=150, allow_redirects=True, stream=True) as pdf_response:
+                              pdf_response.raise_for_status()
+                              raw = b''.join(chunk for chunk in pdf_response.iter_content(1024 * 256) if chunk)
+                          if len(raw) < 50_000 or not raw.lstrip().startswith(b'%PDF'):
+                              raise RuntimeError(f'not a substantial PDF: bytes={len(raw)}, head={raw[:20]!r}')
+                          destination.write_bytes(raw)
+                          item['detail_url'] = detail
+                          item['source_url'] = pdf_url
+                          return
+                      except Exception as exc:
+                          errors.append(f'{pdf_url} attempt {attempt}: {exc}')
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'Unable to download {item["title"]}:\n' + '\n'.join(errors))
+
+          def pdf_page_count(path):
+              completed = subprocess.run(['pdfinfo', str(path)], capture_output=True, text=True, check=True)
+              match = re.search(r'^Pages:\s+(\d+)\s*$', completed.stdout, flags=re.M)
+              if not match:
+                  raise RuntimeError(f'Unable to parse page count for {path}')
+              return int(match.group(1))
+
+          def extract_text(path, first_page, last_page):
+              with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
+                  output = Path(temp.name)
+              try:
+                  completed = subprocess.run(
+                      ['pdftotext', '-f', str(first_page), '-l', str(last_page), '-enc', 'UTF-8', str(path), str(output)],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if completed.returncode != 0 or not output.exists():
+                      return ''
+                  return output.read_text(encoding='utf-8', errors='ignore')
+              finally:
+                  output.unlink(missing_ok=True)
+
+          manifest = []
+          sha_lines = []
+          for index, item in enumerate(selected, start=1):
+              if item['document_type'] == 'annual_report':
+                  filename = f'{index:02d}_东方生物_{item["report_year"]}年年度报告.pdf'
+              else:
+                  filename = f'{index:02d}_东方生物_2026年第一季度报告.pdf'
+              path = PDF_DIR / filename
+              download_pdf(item, path)
+
+              raw = path.read_bytes()
+              pages = pdf_page_count(path)
+              minimum_pages = 80 if item['document_type'] == 'annual_report' else 5
+              if pages < minimum_pages:
+                  raise RuntimeError(f'Unexpectedly short report: {item["title"]}, pages={pages}')
+
+              middle_page = max(1, pages // 2)
+              sampled_text = (
+                  extract_text(path, 1, min(30, pages)) + '\n' +
+                  extract_text(path, middle_page, middle_page) + '\n' +
+                  extract_text(path, pages, pages)
+              )
+              compact = normalize(sampled_text)
+              identity_ok = STOCK_ID in compact or any(normalize(name) in compact for name in COMPANY_NAMES)
+              year_ok = item['report_year'] in compact
+              if item['document_type'] == 'annual_report':
+                  title_ok = f'{item["report_year"]}年年度报告' in compact
+              else:
+                  title_ok = ('2026年第一季度报告' in compact or '2026年一季度报告' in compact)
+              if not identity_ok or not year_ok or not title_ok:
+                  raise RuntimeError(
+                      f'Identity/year/title check failed for {item["title"]}: '
+                      f'identity={identity_ok}, year={year_ok}, title={title_ok}'
+                  )
+
+              sha = hashlib.sha256(raw).hexdigest()
+              relative = str(path.relative_to(ROOT))
+              record = {
+                  'document_type': item['document_type'],
+                  'report_year': item['report_year'],
+                  'source_page_title': item['title'],
+                  'bulletin_id': item['id'],
+                  'file': relative,
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': sha,
+                  'detail_url': item['detail_url'],
+                  'source_url': item['source_url'],
+                  'pdf_header_valid': True,
+                  'identity_text_matched': identity_ok,
+                  'year_text_matched': year_ok,
+                  'title_text_matched': title_ok,
+              }
+              manifest.append(record)
+              sha_lines.append(f'{sha}  {relative}')
+              print(f'VERIFIED {item["title"]}: pages={pages}, bytes={len(raw)}')
+
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(sha_lines) + '\n', encoding='utf-8')
+
+          readme = [
+              '浙江东方基因生物制品股份有限公司（东方生物，688298）公开披露文件包',
+              '',
+              '内容范围：',
+              '1. 2020—2025年六份完整年度报告；',
+              '2. 截至2026年8月30日最新季度报告：2026年第一季度报告；',
+              '3. 不包含年度报告摘要、季度报告摘要、业绩预告或业绩说明会公告。',
+              '',
+              '说明：2026年半年度报告披露时间更晚，但属于半年度报告；本包按照“最新季报”的通常口径收录2026年第一季度报告。',
+              '',
+              '校验项目：PDF文件头、可解析页数、公司名称/证券代码、报告年份与标题、SHA-256、ZIP CRC。',
+              '',
+              '文件清单：',
+          ]
+          for record in manifest:
+              readme.extend([
+                  f'- {record["source_page_title"]}',
+                  f'  文件：{record["file"]}',
+                  f'  页数：{record["pages"]}',
+                  f'  大小：{record["bytes"]} bytes',
+                  f'  SHA256：{record["sha256"]}',
+                  f'  公告详情：{record["detail_url"]}',
+                  f'  PDF来源：{record["source_url"]}',
+              ])
+          (ROOT / 'README_来源与校验.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          zip_name = '东方生物_688298_2020-2025年报_2026年最新季报_完整PDF.zip'
+          with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_name, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed at {bad}')
+              pdf_count = len([name for name in archive.namelist() if name.lower().endswith('.pdf')])
+              if pdf_count != 7:
+                  raise RuntimeError(f'Expected 7 PDFs in ZIP, found {pdf_count}')
+          print(f'CREATED {zip_name} bytes={Path(zip_name).stat().st_size}')
+          PY
+
+      - name: Upload packaged reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: orient-gene-annual-reports-final
+          path: 东方生物_688298_2020-2025年报_2026年最新季报_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
