@@ -1,0 +1,287 @@
+name: Temporary Tianshun Wind Energy Broker Report Bundle
+
+on:
+  push:
+    branches:
+      - tmp/tianshun-wind-reports-20260830
+    paths:
+      - .github/workflows/tmp-tianshun-wind-report-bundle.yml
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Discover, verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('out')
+          PDF_DIR = OUT / 'pdfs'
+          OUT.mkdir(exist_ok=True)
+          PDF_DIR.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/002531.html',
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://reportapi.eastmoney.com/report/list'
+          rows = []
+          for page_no in range(1, 12):
+              params = {
+                  'industryCode': '*',
+                  'pageSize': '100',
+                  'industry': '*',
+                  'rating': '',
+                  'ratingchange': '*',
+                  'beginTime': '2018-01-01',
+                  'endTime': '2026-08-30',
+                  'pageNo': str(page_no),
+                  'fields': '',
+                  'qType': '0',
+                  'orgCode': '',
+                  'code': '002531',
+                  'rcode': '',
+                  '_': str(int(time.time() * 1000)),
+              }
+              r = session.get(api, params=params, timeout=60)
+              r.raise_for_status()
+              payload = r.json()
+              page_rows = payload.get('data') or []
+              if not page_rows:
+                  break
+              rows.extend(page_rows)
+              if len(page_rows) < 100:
+                  break
+
+          def pick(row, *names):
+              for name in names:
+                  if row.get(name) not in (None, ''):
+                      return row.get(name)
+              lower = {str(k).lower(): v for k, v in row.items()}
+              for name in names:
+                  v = lower.get(name.lower())
+                  if v not in (None, ''):
+                      return v
+              return ''
+
+          def clean_text(x):
+              return re.sub(r'\s+', ' ', str(x or '')).strip()
+
+          def safe_name(x):
+              x = re.sub(r'[\\/:*?"<>|\r\n]+', '_', clean_text(x))
+              x = re.sub(r'\s+', ' ', x).strip(' ._')
+              return x[:110] or 'report'
+
+          verified = []
+          seen_codes = set()
+          for idx, row in enumerate(rows, 1):
+              code = clean_text(pick(row, 'infoCode', 'INFOCODE', 'info_code', 'reportId', 'id'))
+              if not code or code in seen_codes:
+                  continue
+              seen_codes.add(code)
+              title = clean_text(pick(row, 'title', 'TITLE', 'reportTitle'))
+              org = clean_text(pick(row, 'orgSName', 'orgName', 'ORG_SNAME', 'source'))
+              date_raw = clean_text(pick(row, 'publishDate', 'publish_date', 'date', 'PUBLISHDATE'))
+              researcher = clean_text(pick(row, 'researcher', 'author', 'researcherName'))
+              rating = clean_text(pick(row, 'ratingName', 'rating', 'emRatingName'))
+              try:
+                  date = date_raw[:10]
+                  year = int(date[:4])
+              except Exception:
+                  date = date_raw[:10]
+                  year = 0
+
+              candidates = []
+              for key in ('attachUrl', 'pdfUrl', 'downloadUrl', 'fileUrl', 'url'):
+                  u = pick(row, key)
+                  if isinstance(u, str) and '.pdf' in u.lower():
+                      candidates.append(u.replace('http://', 'https://', 1))
+              candidates.extend([
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time()*1000)}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{code}.pdf',
+              ])
+
+              pdf_bytes = None
+              final_url = ''
+              error = ''
+              for url in dict.fromkeys(candidates):
+                  try:
+                      q = session.get(url, timeout=60, allow_redirects=True)
+                      body = q.content
+                      if q.status_code == 200 and body[:4] == b'%PDF' and len(body) > 20000:
+                          pdf_bytes = body
+                          final_url = q.url
+                          break
+                  except Exception as exc:
+                      error = repr(exc)
+              if pdf_bytes is None:
+                  continue
+
+              try:
+                  reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+                  if reader.is_encrypted:
+                      try:
+                          reader.decrypt('')
+                      except Exception:
+                          pass
+                  pages = len(reader.pages)
+                  if pages <= 0:
+                      continue
+                  first_text = ''
+                  try:
+                      first_text = clean_text(reader.pages[0].extract_text())[:500]
+                  except Exception:
+                      pass
+              except Exception as exc:
+                  continue
+
+              title_l = title.lower()
+              positive = ['深度', '首次覆盖', '初次覆盖', '公司深度', '成长空间', '专题', '海工', '海上风电', '价值重估', '转型']
+              negative = ['点评', '年报', '季报', '中报', '业绩', '快报', '事件', '公告', '三季报', '一季报', '半年报']
+              score = pages * 5
+              score += max(0, year - 2020) * 5
+              score += sum(45 for k in positive if k in title_l)
+              score -= sum(70 for k in negative if k in title_l)
+              if pages >= 20:
+                  score += 90
+              elif pages >= 15:
+                  score += 55
+              elif pages >= 10:
+                  score += 20
+              else:
+                  score -= 80
+
+              filename = f'{date}_{safe_name(org)}_{safe_name(title)}_{pages}页.pdf'
+              path = PDF_DIR / filename
+              path.write_bytes(pdf_bytes)
+              verified.append({
+                  'infoCode': code,
+                  'title': title,
+                  'broker': org,
+                  'date': date,
+                  'year': year,
+                  'researcher': researcher,
+                  'rating': rating,
+                  'pages': pages,
+                  'bytes': len(pdf_bytes),
+                  'score': score,
+                  'url': final_url,
+                  'filename': filename,
+                  'first_page_text': first_text,
+              })
+
+          verified.sort(key=lambda x: (x['score'], x['year'], x['pages']), reverse=True)
+
+          # Select up to three genuine long-form reports, preferring different brokers.
+          selected = []
+          used_brokers = set()
+          for item in verified:
+              bad_title = any(k in item['title'] for k in ['点评', '年报', '季报', '中报', '业绩快报', '三季报', '一季报', '半年报'])
+              if item['pages'] < 10 or bad_title:
+                  continue
+              broker_key = item['broker'] or item['infoCode']
+              if broker_key in used_brokers:
+                  continue
+              selected.append(item)
+              used_brokers.add(broker_key)
+              if len(selected) == 3:
+                  break
+
+          # Relax only the title filter if necessary, while keeping substantial page length and broker diversity.
+          if len(selected) < 3:
+              for item in verified:
+                  if item in selected or item['pages'] < 10:
+                      continue
+                  broker_key = item['broker'] or item['infoCode']
+                  if broker_key in used_brokers:
+                      continue
+                  selected.append(item)
+                  used_brokers.add(broker_key)
+                  if len(selected) == 3:
+                      break
+
+          # Last resort: accept 8+ pages, still excluding very short notes.
+          if len(selected) < 2:
+              for item in verified:
+                  if item in selected or item['pages'] < 8:
+                      continue
+                  broker_key = item['broker'] or item['infoCode']
+                  if broker_key in used_brokers:
+                      continue
+                  selected.append(item)
+                  used_brokers.add(broker_key)
+                  if len(selected) == 3:
+                      break
+
+          manifest = {
+              'company': '天顺风能',
+              'stock_code': '002531',
+              'generated_at_utc': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+              'api_rows': len(rows),
+              'verified_pdf_count': len(verified),
+              'selected_count': len(selected),
+              'selected': selected,
+              'top_verified': verified[:40],
+          }
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          readme_lines = [
+              '天顺风能（002531）券商深度报告',
+              '',
+              f'本包共收录 {len(selected)} 份经PDF格式及页数核验的券商报告。',
+              '筛选标准：优先公司深度/首次覆盖/专题报告、不同券商、页数较完整；排除短篇业绩点评。',
+              '',
+          ]
+          for i, item in enumerate(selected, 1):
+              readme_lines.append(f"{i}. {item['broker']}｜{item['date']}｜{item['title']}｜{item['pages']}页｜{item['researcher']}")
+          (OUT / '说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+
+          bundle_path = OUT / f'天顺风能_券商深度报告_{len(selected)}份.zip'
+          with zipfile.ZipFile(bundle_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for i, item in enumerate(selected, 1):
+                  src = PDF_DIR / item['filename']
+                  arc = f"{i:02d}_{safe_name(item['broker'])}_{safe_name(item['title'])}_{item['date']}_{item['pages']}页.pdf"
+                  zf.write(src, arc)
+              zf.write(OUT / '说明.txt', '说明.txt')
+              zf.write(OUT / 'manifest.json', 'manifest.json')
+
+          print('DISCOVERY_SUMMARY=' + json.dumps({
+              'api_rows': len(rows),
+              'verified': len(verified),
+              'selected': selected,
+              'bundle': str(bundle_path),
+          }, ensure_ascii=False), flush=True)
+          print('TOP_CANDIDATES=' + json.dumps(verified[:20], ensure_ascii=False), flush=True)
+          PY
+      - name: Upload report bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: tianshun-wind-broker-reports
+          path: |
+            out/天顺风能_券商深度报告_*份.zip
+            out/manifest.json
+            out/说明.txt
+          if-no-files-found: error
+          retention-days: 3
