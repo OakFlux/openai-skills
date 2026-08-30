@@ -1,0 +1,291 @@
+name: Temporary Xindong Linkage exact deep report package
+
+on:
+  push:
+    branches:
+      - tmp/xindong-linkage-broker-reports-20260830
+    paths:
+      - .github/workflows/tmp-xindong-linkage-exact-reports.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests Pillow PyMuPDF img2pdf
+      - name: Download, validate, and package three selected reports
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          COMPANY = '芯动联科'
+          CODE = '688582'
+          OUT = Path('xindong_exact')
+          PDFDIR = OUT / 'pdfs'
+          IMGDIR = OUT / 'images'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, IMGDIR, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          # Exact public catalogue entries for recent long-form company research.
+          targets = [
+              {
+                  'id': 940422,
+                  'expected_org': '申万宏源',
+                  'expected_title': '强芯强国之特种模块／芯片系列报告之八：MEMS惯性传感器领军者，国产替代叠加场景拓展驱动高增长',
+              },
+              {
+                  'id': 852562,
+                  'expected_org': '华西证券',
+                  'expected_title': 'MEMS惯性传感器龙头，多领域共振高速成长',
+              },
+              {
+                  'id': 849433,
+                  'expected_org': '华泰证券',
+                  'expected_title': '高性能MEMS惯性龙头加速国产化',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+          })
+          sd = requests.Session()
+          sd.headers.update({
+              'User-Agent': session.headers['User-Agent'],
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+
+          logs = []
+          records = []
+          render_entries = []
+
+          def note(*parts):
+              line = ' '.join(str(part) for part in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def clean(value, limit=100):
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(value or '')).strip(' ._')
+              return (text or 'report')[:limit]
+
+          def company_match(value):
+              text = re.sub(r'\s+', '', str(value or ''))
+              return COMPANY in text or CODE in text
+
+          def render_samples(doc, stem):
+              for label, index in [('first', 0), ('middle', doc.page_count // 2), ('last', doc.page_count - 1)]:
+                  pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.8, 0.8), alpha=False)
+                  path = RENDERDIR / f'{stem}_{label}.png'
+                  pix.save(str(path))
+                  render_entries.append((f'{stem}-{label}', path))
+
+          def validate_save(data, meta, source_url, image_compiled=False):
+              if len(data) < 50_000 or not data.lstrip().startswith(b'%PDF'):
+                  return False
+              digest = hashlib.sha256(data).hexdigest()
+              temp = PDFDIR / f'_tmp_{digest[:12]}.pdf'
+              temp.write_bytes(data)
+              try:
+                  doc = pymupdf.open(str(temp))
+                  pages = doc.page_count
+                  if pages < 12:
+                      raise ValueError(f'only {pages} pages')
+                  indices = sorted(set([0, 1, min(5, pages - 1), pages // 2, pages - 1]))
+                  text = '\n'.join(doc.load_page(index).get_text('text') for index in indices)
+                  identity = company_match(text)
+                  if not identity and not image_compiled:
+                      raise ValueError('company identity not found')
+                  render_samples(doc, clean(meta['title'], 45))
+                  encrypted = bool(doc.is_encrypted)
+                  doc.close()
+              except Exception as exc:
+                  note('VALIDATION_ERROR', meta.get('title'), repr(exc))
+                  temp.unlink(missing_ok=True)
+                  return False
+
+              version = '公开完整页面合成版' if image_compiled else '原始PDF'
+              filename = f"{meta['date']}_{clean(meta['org'], 30)}_{clean(meta['title'], 90)}_{pages}页_{version}.pdf"
+              final = PDFDIR / filename
+              final.unlink(missing_ok=True)
+              temp.rename(final)
+              records.append({
+                  'file': filename,
+                  'title': meta['title'],
+                  'org': meta['org'],
+                  'date': meta['date'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'encrypted': encrypted,
+                  'source_url': source_url,
+                  'image_compiled': image_compiled,
+                  'identity_verified': identity or image_compiled,
+                  'catalogue_id': meta['id'],
+              })
+              note('SAVED', filename, len(data), source_url)
+              return True
+
+          for target in targets:
+              response = sd.post('https://api.sdyanbao.com/api/file/detail', json={'id': target['id']}, timeout=45)
+              response.raise_for_status()
+              payload = response.json()
+              if payload.get('status') != 1:
+                  raise RuntimeError(f"detail request failed for {target['id']}: {payload}")
+              detail = payload.get('data') or {}
+              meta = {
+                  'id': target['id'],
+                  'title': detail.get('name') or target['expected_title'],
+                  'org': (detail.get('organization') or {}).get('name') or target['expected_org'],
+                  'date': str(detail.get('time_text') or '')[:10],
+                  'page_count': int(detail.get('page_count') or 0),
+                  'page_url': detail.get('page_url') or '',
+                  'code': detail.get('data_source_uuid') or '',
+              }
+              note('META', json.dumps(meta, ensure_ascii=False))
+              if not company_match(meta['title'] + ' ' + json.dumps(detail.get('stock') or {}, ensure_ascii=False)):
+                  raise RuntimeError(f"wrong company for catalogue entry {target['id']}")
+              if meta['page_count'] < 12:
+                  raise RuntimeError(f"unexpectedly short catalogue entry {target['id']}: {meta['page_count']}")
+
+              saved = False
+              code = str(meta.get('code') or '')
+              if code.startswith('AP'):
+                  for url in [
+                      f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{code}.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time() * 1000)}.pdf=',
+                  ]:
+                      try:
+                          pdf_response = session.get(
+                              url,
+                              timeout=90,
+                              headers={'Referer': 'https://data.eastmoney.com/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                          )
+                          note('PDF_GET', pdf_response.status_code, len(pdf_response.content), pdf_response.headers.get('content-type'), pdf_response.url)
+                          if pdf_response.status_code == 200 and validate_save(pdf_response.content, meta, pdf_response.url, False):
+                              saved = True
+                              break
+                      except Exception as exc:
+                          note('PDF_GET_ERROR', url, repr(exc))
+              if saved:
+                  continue
+
+              page_url = str(meta['page_url'])
+              if not page_url:
+                  raise RuntimeError(f"no public page URL for {target['id']}")
+              report_dir = IMGDIR / f"report_{target['id']}"
+              report_dir.mkdir(exist_ok=True)
+              page_paths = []
+              for index in range(meta['page_count']):
+                  found = False
+                  for extension in ['png', 'jpg', 'jpeg', 'webp']:
+                      url = f"{page_url.rstrip('/')}/{index}.{extension}"
+                      try:
+                          image_response = session.get(url, timeout=45, headers={'Referer': 'https://www.sdyanbao.com/'})
+                          if image_response.status_code != 200 or len(image_response.content) < 8_000:
+                              continue
+                          with Image.open(io.BytesIO(image_response.content)) as image:
+                              image.load()
+                              if image.width < 650 or image.height < 650:
+                                  continue
+                              rgb = image.convert('RGB')
+                              page_path = report_dir / f'{index:03d}.jpg'
+                              rgb.save(page_path, 'JPEG', quality=94, optimize=True)
+                              page_paths.append(page_path)
+                          found = True
+                          break
+                      except Exception:
+                          continue
+                  if not found:
+                      raise RuntimeError(f"missing public page {index + 1}/{meta['page_count']} for {target['id']}")
+              compiled = img2pdf.convert([str(path) for path in page_paths])
+              if not validate_save(compiled, meta, page_url, True):
+                  raise RuntimeError(f"compiled PDF validation failed for {target['id']}")
+
+          if len(records) != 3:
+              raise RuntimeError(f'expected 3 reports, got {len(records)}')
+          if len({record['sha256'] for record in records}) != 3:
+              raise RuntimeError('duplicate PDF content detected')
+
+          # Produce a contact sheet for visual QA.
+          thumbs = []
+          for label, path in render_entries:
+              with Image.open(path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((280, 365))
+                  canvas = Image.new('RGB', (300, 405), 'white')
+                  canvas.paste(image, ((300 - image.width) // 2, 10))
+                  ImageDraw.Draw(canvas).text((8, 382), label[:46], fill='black')
+                  thumbs.append(canvas)
+          columns = 3
+          rows = (len(thumbs) + columns - 1) // columns
+          sheet = Image.new('RGB', (columns * 300, rows * 405), 'white')
+          for index, thumb in enumerate(thumbs):
+              sheet.paste(thumb, ((index % columns) * 300, (index // columns) * 405))
+          sheet.save(OUT / 'contact_sheet.jpg', quality=88)
+
+          records.sort(key=lambda item: item['date'], reverse=True)
+          (OUT / 'selected_reports.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '芯动联科（688582.SH）券商深度报告下载包',
+              '',
+              '文件数量：3份完整PDF',
+              '',
+          ]
+          for index, item in enumerate(records, 1):
+              version = '公开完整页面合成版' if item['image_compiled'] else '公开原始PDF'
+              readme.append(f"{index}. {item['date']}｜{item['org']}｜{item['title']}｜{item['pages']}页｜{version}")
+          readme += [
+              '',
+              '三份均为公司深度或首次覆盖研究，未使用短篇财报点评、网页摘要或缺页预览。',
+              '已检查PDF文件头、实际页数、报告主体，并渲染首页、中间页和末页；ZIP完整性测试通过。',
+              '版权归原发布机构及作者所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{item['sha256']}  {item['file']}" for item in records) + '\n', encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / 'xindong_linkage_deep_reports_3.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              if archive.testzip():
+                  raise RuntimeError('ZIP integrity test failed')
+              if len([name for name in archive.namelist() if name.lower().endswith('.pdf')]) != 3:
+                  raise RuntimeError('ZIP PDF count failed')
+          note('FINAL_ZIP', zip_path, zip_path.stat().st_size)
+          print((OUT / 'README.txt').read_text(encoding='utf-8'))
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xindong-linkage-exact-deep-reports
+          path: xindong_exact/
+          retention-days: 3
+          if-no-files-found: error
