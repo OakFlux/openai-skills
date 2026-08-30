@@ -1,0 +1,330 @@
+name: Temporary PRET annual report collection
+
+on:
+  push:
+    branches:
+      - tmp/preet-annual-reports-20260830
+    paths:
+      - .github/workflows/tmp-preet-annual-reports.yml
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF
+      - name: Query CNINFO, download, validate, and package reports
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+
+          CODE = '002324'
+          SHORT_NAME = '普利特'
+          FULL_NAME = '上海普利特复合材料股份有限公司'
+          END_DATE = '2026-08-30'
+
+          OUT = Path('preet_reports')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Origin': 'https://www.cninfo.com.cn',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'X-Requested-With': 'XMLHttpRequest',
+          })
+
+          logs: list[str] = []
+
+          def note(*parts):
+              line = ' '.join(str(x) for x in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def clean_title(title: str) -> str:
+              return re.sub(r'<[^>]+>', '', title or '').replace('&nbsp;', ' ').strip()
+
+          # Resolve the official CNINFO organization id from the public stock list.
+          org_id = ''
+          try:
+              response = session.get('https://www.cninfo.com.cn/new/data/szse_stock.json', timeout=45)
+              response.raise_for_status()
+              obj = response.json()
+              rows = []
+              if isinstance(obj, dict):
+                  for value in obj.values():
+                      if isinstance(value, list):
+                          rows.extend(value)
+                      elif isinstance(value, dict):
+                          rows.append(value)
+              elif isinstance(obj, list):
+                  rows = obj
+              for row in rows:
+                  if str(row.get('code') or '') == CODE:
+                      org_id = str(row.get('orgId') or row.get('orgid') or '')
+                      note('STOCK_MATCH', json.dumps(row, ensure_ascii=False))
+                      break
+          except Exception as exc:
+              note('STOCK_LIST_ERROR', repr(exc))
+          if not org_id:
+              raise RuntimeError(f'Unable to resolve CNINFO orgId for {CODE}')
+          note('ORG_ID', org_id)
+
+          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          announcements: list[dict] = []
+
+          def query(category: str, keyword: str = '', date_range: str = f'2020-01-01~{END_DATE}'):
+              data = {
+                  'pageNum': '1',
+                  'pageSize': '100',
+                  'column': 'szse',
+                  'tabName': 'fulltext',
+                  'plate': 'sz',
+                  'stock': f'{CODE},{org_id}',
+                  'searchkey': keyword,
+                  'secid': '',
+                  'category': category,
+                  'trade': '',
+                  'seDate': date_range,
+                  'sortName': 'time',
+                  'sortType': 'desc',
+                  'isHLtitle': 'true',
+              }
+              response = session.post(endpoint, data=data, timeout=60)
+              note('QUERY', category or 'ALL', keyword or '-', date_range, response.status_code, len(response.content), response.text[:140])
+              response.raise_for_status()
+              obj = response.json()
+              rows = obj.get('announcements') or []
+              total_pages = int(obj.get('totalpages') or obj.get('totalPages') or 1)
+              for row in rows:
+                  if str(row.get('secCode') or '') == CODE:
+                      announcements.append(row)
+              for page_num in range(2, min(total_pages, 8) + 1):
+                  time.sleep(0.3)
+                  data['pageNum'] = str(page_num)
+                  response = session.post(endpoint, data=data, timeout=60)
+                  response.raise_for_status()
+                  page_rows = response.json().get('announcements') or []
+                  note('QUERY_PAGE', page_num, len(page_rows))
+                  for row in page_rows:
+                      if str(row.get('secCode') or '') == CODE:
+                          announcements.append(row)
+
+          # Broad and exact-period searches.
+          query('category_ndbg_szsh;')
+          query('category_bndbg_szsh;')
+          query('', '年度报告')
+          query('', '半年度报告')
+          for year in range(2020, 2026):
+              query('', f'{year}年年度报告', f'{year + 1}-01-01~{year + 1}-07-31')
+              query('', f'{year}年年报', f'{year + 1}-01-01~{year + 1}-07-31')
+          for year in range(2020, 2027):
+              query('', f'{year}年半年度报告', f'{year}-07-01~{year}-10-31')
+              query('', f'{year}年半年报', f'{year}-07-01~{year}-10-31')
+
+          # Deduplicate metadata.
+          deduped = []
+          seen = set()
+          for row in announcements:
+              key = (row.get('adjunctUrl'), clean_title(row.get('announcementTitle') or ''))
+              if key in seen:
+                  continue
+              seen.add(key)
+              deduped.append(row)
+          announcements = deduped
+          (OUT / 'cninfo_announcements.json').write_text(json.dumps(announcements, ensure_ascii=False, indent=2), encoding='utf-8')
+          note('ANNOUNCEMENT_COUNT', len(announcements))
+          for row in announcements:
+              note('ANN', row.get('announcementTime'), clean_title(row.get('announcementTitle') or ''), row.get('adjunctUrl'))
+
+          bad_words = [
+              '摘要', '英文版', '取消', '更正公告', '提示性公告', '审计报告',
+              '问询函', '回复', '董事会', '监事会', '决议公告', '独立意见',
+              '专项说明', '内部控制', '社会责任', '环境报告', 'ESG', '预约披露',
+          ]
+
+          def rank(row: dict) -> tuple:
+              title = clean_title(row.get('announcementTitle') or '')
+              version_score = 0
+              if any(word in title for word in ['修订版', '修订稿']):
+                  version_score = 5
+              elif any(word in title for word in ['更正后', '更正版']):
+                  version_score = 4
+              elif any(word in title for word in ['更新后', '更新版']):
+                  version_score = 3
+              elif any(word in title for word in ['调整后', '重述']):
+                  version_score = 2
+              return version_score, int(row.get('announcementTime') or 0)
+
+          def annual_match(row: dict, year: int) -> bool:
+              title = clean_title(row.get('announcementTitle') or '')
+              if any(word in title for word in bad_words) or not row.get('adjunctUrl'):
+                  return False
+              return (f'{year}年年度报告' in title) or (f'{year}年年报' in title)
+
+          selected = []
+          for year in range(2020, 2026):
+              matches = [row for row in announcements if annual_match(row, year)]
+              matches.sort(key=rank, reverse=True)
+              if not matches:
+                  raise RuntimeError(f'Missing official full annual report: {year}')
+              title = clean_title(matches[0].get('announcementTitle') or '')
+              selected.append({'kind': 'annual', 'year': year, 'label': title, 'row': matches[0]})
+              note('SELECT', year, title, matches[0].get('adjunctUrl'))
+
+          interim_candidates = []
+          for row in announcements:
+              title = clean_title(row.get('announcementTitle') or '')
+              match = re.search(r'(20\d{2})年(?:半年度报告|半年报(?:报告)?)', title)
+              if not match or any(word in title for word in bad_words) or not row.get('adjunctUrl'):
+                  continue
+              interim_candidates.append((int(match.group(1)), row))
+          if not interim_candidates:
+              raise RuntimeError('No full interim report found')
+          latest_interim_year = max(year for year, _ in interim_candidates)
+          latest_rows = [row for year, row in interim_candidates if year == latest_interim_year]
+          latest_rows.sort(key=rank, reverse=True)
+          latest_title = clean_title(latest_rows[0].get('announcementTitle') or '')
+          selected.append({'kind': 'interim', 'year': latest_interim_year, 'label': latest_title, 'row': latest_rows[0]})
+          note('SELECT_LATEST_INTERIM', latest_interim_year, latest_title, latest_rows[0].get('adjunctUrl'))
+
+          records = []
+          for item in selected:
+              row = item['row']
+              adjunct = str(row.get('adjunctUrl') or '').lstrip('/')
+              data = None
+              source_url = None
+              attempts = []
+              for url in [f'https://static.cninfo.com.cn/{adjunct}', f'http://static.cninfo.com.cn/{adjunct}']:
+                  try:
+                      response = session.get(url, timeout=120, allow_redirects=True, headers={
+                          'Referer': 'https://www.cninfo.com.cn/',
+                          'Accept': 'application/pdf,*/*;q=0.8',
+                      })
+                      attempts.append({'url': url, 'status': response.status_code, 'bytes': len(response.content), 'type': response.headers.get('content-type')})
+                      note('DOWNLOAD', item['year'], item['kind'], response.status_code, len(response.content), response.headers.get('content-type'), response.url)
+                      if response.status_code == 200 and response.content.lstrip().startswith(b'%PDF') and len(response.content) > 100_000:
+                          data = response.content
+                          source_url = response.url
+                          break
+                  except Exception as exc:
+                      attempts.append({'url': url, 'error': repr(exc)})
+                      note('DOWNLOAD_ERROR', item['year'], item['kind'], url, repr(exc))
+              if data is None:
+                  raise RuntimeError(f"Failed to download {item['label']}: {attempts}")
+
+              filename = f"普利特_{item['year']}年{'年度报告' if item['kind'] == 'annual' else '半年度报告'}.pdf"
+              path = PDFDIR / filename
+              path.write_bytes(data)
+              try:
+                  doc = pymupdf.open(str(path))
+                  pages = doc.page_count
+                  if pages < 25:
+                      raise ValueError(f'Unexpectedly short report: {pages} pages')
+                  sample_indices = sorted(set([0, 1, min(5, pages - 1), pages // 2, pages - 1]))
+                  text = '\n'.join(doc.load_page(index).get_text('text') for index in sample_indices)
+                  compact = re.sub(r'\s+', '', text)
+                  if not any(key in compact for key in [SHORT_NAME, FULL_NAME, CODE]):
+                      raise ValueError('Company identity not found in sampled pages')
+                  for label, index in [('first', 0), ('middle', pages // 2), ('last', pages - 1)]:
+                      pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.8, 0.8), alpha=False)
+                      pix.save(str(RENDERDIR / f"{item['year']}_{item['kind']}_{label}.png"))
+                  encrypted = bool(doc.is_encrypted)
+                  doc.close()
+              except Exception:
+                  path.unlink(missing_ok=True)
+                  raise
+
+              timestamp = int(row.get('announcementTime') or 0)
+              announcement_date = dt.datetime.fromtimestamp(
+                  timestamp / 1000,
+                  tz=dt.timezone(dt.timedelta(hours=8)),
+              ).strftime('%Y-%m-%d') if timestamp else ''
+              record = {
+                  'file': filename,
+                  'type': item['kind'],
+                  'report_year': item['year'],
+                  'official_title': item['label'],
+                  'announcement_date': announcement_date,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'encrypted': encrypted,
+                  'source_url': source_url,
+                  'adjunct_url': adjunct,
+              }
+              records.append(record)
+              note('VALIDATED', json.dumps(record, ensure_ascii=False))
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 reports, got {len(records)}')
+          if len({record['sha256'] for record in records}) != 7:
+              raise RuntimeError('Duplicate PDF content detected')
+
+          records.sort(key=lambda record: (record['report_year'], 0 if record['type'] == 'annual' else 1))
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '普利特（002324.SZ）2020—2025年年度报告及最新半年度报告',
+              '',
+              f'文件数量：{len(records)}份完整PDF',
+              '来源：巨潮资讯网官方公告附件',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              suffix = '' if record['official_title'] in [f"{record['report_year']}年年度报告", f"{record['report_year']}年半年度报告"] else f"｜官方标题：{record['official_title']}"
+              readme.append(f"{index}. {record['file']}｜公告日期：{record['announcement_date']}｜{record['pages']}页{suffix}")
+          readme += [
+              '',
+              '说明：若同一报告存在修订、更正或更新版本，优先采用公司后续披露的最新版。',
+              '核验：已检查PDF文件头、实际页数、报告主体、加密状态及首页、中间页、末页渲染；ZIP完整性测试通过。',
+              '版权归上市公司及公告发布平台所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{record['sha256']}  {record['file']}" for record in records) + '\n', encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / f'preet_reports_2020_2025_{latest_interim_year}H1.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'manifest.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 7')
+          note('FINAL_ZIP', zip_path, zip_path.stat().st_size)
+          print((OUT / 'README.txt').read_text(encoding='utf-8'))
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: preet-final-reports
+          path: preet_reports/
+          retention-days: 3
+          if-no-files-found: error
