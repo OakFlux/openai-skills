@@ -1,0 +1,215 @@
+name: Temporary probe for public Goke Micro report links
+
+on:
+  push:
+    branches:
+      - tmp-goke-sgpjbg-probe-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Prepare tools
+        run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4 pypdf
+
+      - name: Inspect explicit public links and package any original PDFs found
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import urllib.parse
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          START_URLS = [
+              "https://www.sgpjbg.com.cn/labels/cunchuxinpian.html",
+              "https://www.sgpjbg.com/labels/guoxinpianshichang.html",
+              "https://www.sgpjbg.com.cn/labels/cunchuxinpianzhonglei.html",
+              "https://www.sgpjbg.com/labels/weilaishichangfazhankongjianjuda.html",
+              "https://www.sgpjbg.com/labels/cunchupingtai.html",
+              "https://www.sgpjbg.com.cn/zhuanti/gongyejikongzhixinpian.html",
+          ]
+          KEYWORDS = [
+              "国科微",
+              "存储控制芯片潜力巨大",
+              "广播电视与智能监控芯片主流厂商",
+              "行业复苏与产品迭代共振",
+              "技术积累雄厚",
+          ]
+
+          s = requests.Session()
+          s.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/json,application/pdf,*/*;q=0.8",
+          })
+          out = Path("output")
+          out.mkdir(exist_ok=True)
+          discovered_pages = set()
+
+          def relevant(text: str) -> bool:
+              compact = re.sub(r"\s+", "", text or "")
+              return any(re.sub(r"\s+", "", k) in compact for k in KEYWORDS)
+
+          for url in START_URLS:
+              try:
+                  r = s.get(url, timeout=90, allow_redirects=True)
+                  print("START", url, r.status_code, len(r.content), r.headers.get("content-type"), r.url)
+                  if r.status_code != 200:
+                      continue
+                  html = r.text
+                  soup = BeautifulSoup(html, "html.parser")
+                  for a in soup.find_all("a", href=True):
+                      label = " ".join(a.get_text(" ", strip=True).split())
+                      href = urllib.parse.urljoin(r.url, a["href"])
+                      if relevant(label + " " + a.get("title", "") + " " + href):
+                          discovered_pages.add(href)
+                          print("LINK", json.dumps({"label": label, "href": href}, ensure_ascii=False))
+                  # Also inspect raw contexts where title is present and extract nearby report URLs.
+                  for keyword in KEYWORDS:
+                      for match in list(re.finditer(re.escape(keyword), html, re.I))[:20]:
+                          p = match.start()
+                          context = html[max(0, p-2500):p+2500]
+                          print("CONTEXT", keyword, context.replace("\n", " ")[:5000])
+                          for m in re.findall(r"(?:https?://[^\s\"'<>]+|/[^\s\"'<>]+)", context):
+                              full = urllib.parse.urljoin(r.url, m.strip("\\\"'(),;"))
+                              if any(x in full for x in ["/baogao/", "/reports/", "/report/", "/document/"]):
+                                  discovered_pages.add(full)
+              except Exception as exc:
+                  print("START_ERR", url, repr(exc))
+
+          print("DISCOVERED_PAGES", len(discovered_pages))
+          for p in sorted(discovered_pages):
+              print("PAGE_CANDIDATE", p)
+
+          explicit_candidates = set()
+          relevant_pages = []
+          for url in sorted(discovered_pages):
+              try:
+                  r = s.get(url, timeout=90, allow_redirects=True)
+                  print("PAGE", url, r.status_code, len(r.content), r.headers.get("content-type"), r.url)
+                  if r.status_code != 200:
+                      continue
+                  html = r.text
+                  soup = BeautifulSoup(html, "html.parser")
+                  title = soup.title.get_text(" ", strip=True) if soup.title else ""
+                  visible = " ".join(soup.get_text(" ", strip=True).split())
+                  if not relevant(title + " " + visible[:10000] + " " + url):
+                      continue
+                  relevant_pages.append(r.url)
+                  print("RELEVANT_PAGE", title, r.url)
+                  print("VISIBLE_HEAD", visible[:4000])
+
+                  for tag in soup.find_all(["a", "button", "iframe", "embed", "object", "source", "input"]):
+                      blob = str(tag)
+                      if any(k in blob.lower() for k in ["download", "pdf", "file", "附件", "下载", "原文"]):
+                          attrs = {}
+                          for attr in ["href", "src", "data", "data-url", "data-href", "data-file", "data-download", "onclick", "value", "action"]:
+                              val = tag.get(attr)
+                              if val:
+                                  attrs[attr] = val
+                                  # Only collect literal URL/path values present in the public HTML.
+                                  for u in re.findall(r"https?://[^\s\"'<>]+|/[A-Za-z0-9_./?=&%:+-]+", str(val)):
+                                      explicit_candidates.add(urllib.parse.urljoin(r.url, u.strip("\\\"'(),;")))
+                          if attrs:
+                              print("DOWNLOAD_TAG", json.dumps({"tag": tag.name, "text": tag.get_text(" ", strip=True)[:300], "attrs": attrs}, ensure_ascii=False)[:5000])
+
+                  patterns = [
+                      r"https?://[^\s\"'<>]+\.pdf(?:\?[^\s\"'<>]*)?",
+                      r"https?://[^\s\"'<>]+(?:download|down|file|attachment)[^\s\"'<>]*",
+                      r"/[A-Za-z0-9_./?=&%:+-]*(?:download|down|file|attachment)[A-Za-z0-9_./?=&%:+-]*",
+                  ]
+                  for pat in patterns:
+                      for m in re.findall(pat, html, re.I):
+                          explicit_candidates.add(urllib.parse.urljoin(r.url, m.strip("\\\"'(),;")))
+
+                  # Inspect public JS only for literal URLs/endpoints; no guessing or auth bypass.
+                  for script in soup.find_all("script", src=True):
+                      js_url = urllib.parse.urljoin(r.url, script["src"])
+                      try:
+                          jr = s.get(js_url, timeout=45)
+                          js = jr.text
+                          if any(k in js.lower() for k in ["download", ".pdf", "attachment", "fileurl"]):
+                              print("SCRIPT", js_url, jr.status_code, len(jr.content))
+                              for pat in patterns:
+                                  for m in re.findall(pat, js, re.I):
+                                      explicit_candidates.add(urllib.parse.urljoin(r.url, m.strip("\\\"'(),;")))
+                      except Exception as exc:
+                          print("SCRIPT_ERR", js_url, repr(exc))
+              except Exception as exc:
+                  print("PAGE_ERR", url, repr(exc))
+
+          print("EXPLICIT_CANDIDATES", len(explicit_candidates))
+          found = []
+          for url in sorted(explicit_candidates):
+              # Do not test login/account/payment endpoints as file sources.
+              low = url.lower()
+              if any(k in low for k in ["login", "signin", "register", "vip", "pay", "order"]):
+                  continue
+              try:
+                  r = s.get(url, timeout=90, allow_redirects=True, headers={"Referer": relevant_pages[0] if relevant_pages else START_URLS[0]})
+                  print("TEST", url, r.status_code, len(r.content), r.headers.get("content-type"), r.url, r.content[:10])
+                  if r.status_code == 200 and r.content.startswith(b"%PDF-") and len(r.content) > 100000:
+                      tmp = out / f"candidate_{len(found)+1}.pdf"
+                      tmp.write_bytes(r.content)
+                      reader = PdfReader(str(tmp), strict=False)
+                      pages = len(reader.pages)
+                      text = ""
+                      for page in reader.pages[:min(5, pages)]:
+                          try:
+                              text += page.extract_text() or ""
+                          except Exception:
+                              pass
+                      compact = re.sub(r"\s+", "", text)
+                      if "国科微" not in compact and "300672" not in compact:
+                          tmp.unlink()
+                          continue
+                      found.append({
+                          "path": str(tmp),
+                          "url": r.url,
+                          "pages": pages,
+                          "bytes": len(r.content),
+                          "sha256": hashlib.sha256(r.content).hexdigest(),
+                      })
+                      print("FOUND_PDF", json.dumps(found[-1], ensure_ascii=False))
+              except Exception as exc:
+                  print("TEST_ERR", url, repr(exc))
+
+          (out / "probe_results.json").write_text(json.dumps({
+              "relevant_pages": relevant_pages,
+              "explicit_candidates": sorted(explicit_candidates),
+              "found": found,
+          }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          # Always upload diagnostic text. If at least one report is found, make a PDF package too.
+          if found:
+              package = Path("Goke_Micro_Public_Reports_From_Explicit_Links.zip")
+              with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                  for i, item in enumerate(found, 1):
+                      zf.write(item["path"], arcname=f"Goke_Micro_Public_Report_{i}_{item['pages']}p.pdf")
+                  zf.write(out / "probe_results.json", arcname="probe_results.json")
+              print("PACKAGE", package, package.stat().st_size)
+          PY
+
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Goke_Micro_SGPJBG_Probe
+          path: |
+            output/probe_results.json
+            Goke_Micro_Public_Reports_From_Explicit_Links.zip
+          if-no-files-found: warn
+          retention-days: 1
