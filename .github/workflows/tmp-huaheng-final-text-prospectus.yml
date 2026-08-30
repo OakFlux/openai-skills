@@ -1,0 +1,329 @@
+name: Temporary Huaheng final searchable prospectus package
+
+on:
+  push:
+    branches:
+      - tmp/huaheng-biotech-filings-20260830
+    paths:
+      - .github/workflows/tmp-huaheng-final-text-prospectus.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF Pillow beautifulsoup4 lxml
+      - name: Download, build, validate, and package filings
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import unicodedata
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageDraw
+
+          COMPANY = '华恒生物'
+          CODE = '688639'
+          FULL_NAME = '安徽华恒生物科技股份有限公司'
+
+          OUT = Path('huaheng_complete')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for p in (OUT, PDFDIR, RENDERDIR):
+              p.mkdir(parents=True, exist_ok=True)
+
+          official_reports = [
+              {'title': f'{FULL_NAME}2021年年度报告', 'kind': '年度报告', 'year': 2021, 'date': '2022-04-20', 'id': '1212974136', 'pages': 216},
+              {'title': f'{FULL_NAME}2022年年度报告', 'kind': '年度报告', 'year': 2022, 'date': '2023-04-26', 'id': '1216597583', 'pages': 237},
+              {'title': f'{FULL_NAME}2023年年度报告', 'kind': '年度报告', 'year': 2023, 'date': '2024-04-22', 'id': '1219728812', 'pages': 246},
+              {'title': f'{FULL_NAME}2024年年度报告', 'kind': '年度报告', 'year': 2024, 'date': '2025-04-23', 'id': '1223220282', 'pages': 259},
+              {'title': f'{FULL_NAME}2025年年度报告', 'kind': '年度报告', 'year': 2025, 'date': '2026-03-18', 'id': '1225015010', 'pages': 320},
+              {'title': f'{FULL_NAME}2026年第一季度报告', 'kind': '最新季报', 'year': 2026, 'date': '2026-04-23', 'id': '1225148576', 'pages': 12},
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+          })
+
+          records = []
+          hashes = set()
+          render_entries = []
+          logs = []
+
+          def note(*parts):
+              line = ' '.join(str(x) for x in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def clean(value: object, limit: int = 110) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(value or '')).strip(' ._')
+              return (text or 'report')[:limit]
+
+          def compact(value: object) -> str:
+              return re.sub(r'\s+', '', str(value or ''))
+
+          def identity_match(value: object) -> bool:
+              text = compact(value)
+              return CODE in text or COMPANY in text or FULL_NAME in text
+
+          def render_samples(doc: pymupdf.Document, stem: str):
+              count = doc.page_count
+              for label, index in [('first', 0), ('middle', count // 2), ('last', count - 1)]:
+                  pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.65, 0.65), alpha=False)
+                  path = RENDERDIR / f'{stem}_{label}.png'
+                  pix.save(str(path))
+                  render_entries.append((f'{stem}-{label}', path))
+
+          # Download original official PDFs from CNINFO.
+          for meta in official_reports:
+              data = None
+              source_url = None
+              for suffix in ['PDF', 'pdf']:
+                  url = f"https://static.cninfo.com.cn/finalpage/{meta['date']}/{meta['id']}.{suffix}"
+                  response = session.get(
+                      url,
+                      timeout=150,
+                      allow_redirects=True,
+                      headers={'Referer': 'https://www.cninfo.com.cn/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                  )
+                  note('DOWNLOAD', response.status_code, len(response.content), response.headers.get('content-type'), response.url)
+                  if response.status_code == 200 and len(response.content) > 50_000 and response.content.lstrip().startswith(b'%PDF'):
+                      data = response.content
+                      source_url = response.url
+                      break
+              if data is None:
+                  raise RuntimeError(f"Failed to download {meta['title']}")
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f"Duplicate PDF: {meta['title']}")
+              hashes.add(digest)
+              filename = f"{clean(meta['title'])}_{meta['pages']}页_巨潮资讯网官方PDF.pdf"
+              path = PDFDIR / filename
+              path.write_bytes(data)
+              doc = pymupdf.open(str(path))
+              if doc.page_count != meta['pages']:
+                  raise RuntimeError(f"Unexpected pages for {meta['title']}: {doc.page_count}")
+              sample = sorted(set([0, 1, min(5, doc.page_count - 1), doc.page_count // 2, doc.page_count - 1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in sample)
+              if not identity_match(text):
+                  raise RuntimeError(f"Company identity missing: {meta['title']}")
+              normalized = compact(text)
+              if meta['kind'] == '年度报告' and str(meta['year']) not in normalized:
+                  raise RuntimeError(f"Year missing: {meta['title']}")
+              if meta['kind'] == '最新季报' and '季度报告' not in normalized:
+                  raise RuntimeError('Quarterly title missing')
+              encrypted = bool(doc.is_encrypted)
+              render_samples(doc, clean(meta['title'], 55))
+              doc.close()
+              record = {
+                  **meta,
+                  'file': filename,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'encrypted': encrypted,
+                  'source_url': source_url,
+                  'version': '巨潮资讯网官方原始PDF',
+              }
+              records.append(record)
+              note('VALIDATED', json.dumps(record, ensure_ascii=False))
+
+          # Fetch the complete formal prospectus text. The source preserves original PDF
+          # form-feed page breaks: one cover page plus numbered pages 1-1-1 through 1-1-408.
+          prospectus_url = 'https://vip.stock.finance.sina.com.cn/corp/view/vISSUE_RaiseExplanationDetail.php?id=7052638&stockid=688639'
+          response = session.get(
+              prospectus_url,
+              timeout=150,
+              headers={'User-Agent': session.headers['User-Agent'], 'Accept-Language': 'zh-CN,zh;q=0.9'},
+          )
+          response.raise_for_status()
+          response.encoding = response.apparent_encoding or 'gb18030'
+          soup = BeautifulSoup(response.text, 'lxml')
+          content = soup.select_one('#content')
+          if content is None:
+              raise RuntimeError('Prospectus content node not found')
+          raw_text = content.get_text('', strip=False).replace('\r\n', '\n').replace('\r', '\n')
+          source_pages = raw_text.split('\x0c')
+          if len(source_pages) != 409:
+              raise RuntimeError(f'Prospectus source has {len(source_pages)} pages instead of 409')
+          page_numbers = [int(x.split('-')[-1]) for x in re.findall(r'1-1-\d+', raw_text)]
+          if not page_numbers or max(page_numbers) != 408:
+              raise RuntimeError(f'Prospectus last numbered page is {max(page_numbers or [0])}')
+          if '首次公开发行股票并在科创板上市' not in raw_text or '招股说明书签署日期' not in raw_text:
+              raise RuntimeError('Formal prospectus identity markers missing')
+          note('PROSPECTUS_SOURCE', len(raw_text), len(source_pages), max(page_numbers))
+
+          def weighted_length(line: str) -> float:
+              total = 0.0
+              for ch in line.expandtabs(4):
+                  width = unicodedata.east_asian_width(ch)
+                  total += 1.0 if width in {'W', 'F'} else 0.54
+              return max(total, 1.0)
+
+          prospectus_path = PDFDIR / f'{FULL_NAME}首次公开发行股票并在科创板上市招股说明书_409页_公开完整正文可检索版.pdf'
+          out_doc = pymupdf.open()
+          out_doc.set_metadata({
+              'title': f'{FULL_NAME}首次公开发行股票并在科创板上市招股说明书',
+              'author': FULL_NAME,
+              'subject': '2021年4月16日正式发行版本；依据公开完整正文按原PDF分页符重排',
+              'keywords': '华恒生物 688639 招股说明书 科创板',
+          })
+          for page_index, source_page in enumerate(source_pages):
+              lines = source_page.replace('\u00a0', ' ').split('\n')
+              while lines and not lines[0].strip():
+                  lines.pop(0)
+              while lines and not lines[-1].strip():
+                  lines.pop()
+              if not lines:
+                  lines = ['']
+              max_width = max(weighted_length(line) for line in lines)
+              # A4 portrait, compact typesetting to preserve one original source page per PDF page.
+              page_width, page_height = 595.0, 842.0
+              left, right, top, bottom = 18.0, 18.0, 16.0, 16.0
+              width_size = (page_width - left - right) / max_width
+              height_size = (page_height - top - bottom) / (max(len(lines), 1) * 1.24)
+              font_size = min(7.2, width_size, height_size)
+              font_size = max(2.8, font_size)
+              line_height = font_size * 1.24
+              page = out_doc.new_page(width=page_width, height=page_height)
+              y = top + font_size
+              for line in lines:
+                  if y > page_height - bottom:
+                      break
+                  # Reserved CJK font in MuPDF; keeps the generated PDF self-contained.
+                  page.insert_text(
+                      (left, y),
+                      line.expandtabs(4),
+                      fontsize=font_size,
+                      fontname='china-s',
+                      encoding=pymupdf.TEXT_ENCODING_CYRILLIC,
+                  )
+                  y += line_height
+              if (page_index + 1) % 50 == 0 or page_index + 1 == len(source_pages):
+                  note('PROSPECTUS_BUILD', page_index + 1, '/', len(source_pages), 'FONT', round(font_size, 2))
+          out_doc.save(str(prospectus_path), garbage=4, deflate=True, clean=True)
+          out_doc.close()
+
+          pdoc = pymupdf.open(str(prospectus_path))
+          if pdoc.page_count != 409:
+              raise RuntimeError(f'Generated prospectus has {pdoc.page_count} pages')
+          first_text = pdoc.load_page(0).get_text('text')
+          second_text = pdoc.load_page(1).get_text('text')
+          last_text = pdoc.load_page(408).get_text('text')
+          if not identity_match(first_text + second_text):
+              raise RuntimeError('Generated prospectus company identity missing')
+          if '招股说明书' not in compact(first_text + second_text):
+              raise RuntimeError('Generated prospectus title missing')
+          if '1-1-408' not in compact(last_text):
+              raise RuntimeError('Generated prospectus last page marker missing')
+          render_samples(pdoc, '华恒生物_正式招股说明书')
+          prospectus_encrypted = bool(pdoc.is_encrypted)
+          pdoc.close()
+
+          prospectus_data = prospectus_path.read_bytes()
+          prospectus_digest = hashlib.sha256(prospectus_data).hexdigest()
+          if prospectus_digest in hashes:
+              raise RuntimeError('Prospectus duplicate hash')
+          hashes.add(prospectus_digest)
+          prospectus_record = {
+              'title': f'{FULL_NAME}首次公开发行股票并在科创板上市招股说明书',
+              'kind': '正式招股说明书',
+              'year': 2021,
+              'date': '2021-04-16',
+              'pages': 409,
+              'file': prospectus_path.name,
+              'bytes': len(prospectus_data),
+              'sha256': prospectus_digest,
+              'encrypted': prospectus_encrypted,
+              'source_url': prospectus_url,
+              'version': '公开完整正文可检索重排版（按原PDF分页符）',
+          }
+          records.append(prospectus_record)
+          note('VALIDATED', json.dumps(prospectus_record, ensure_ascii=False))
+
+          if len(records) != 7 or len(hashes) != 7:
+              raise RuntimeError(f'Count check failed: {len(records)}, {len(hashes)}')
+
+          # Contact sheet for visual QA.
+          thumbs = []
+          for label, image_path in render_entries:
+              with Image.open(image_path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((250, 330))
+                  canvas = Image.new('RGB', (270, 370), 'white')
+                  canvas.paste(image, ((270 - image.width) // 2, 8))
+                  ImageDraw.Draw(canvas).text((8, 348), label[:42], fill='black')
+                  thumbs.append(canvas)
+          cols = 3
+          rows = (len(thumbs) + cols - 1) // cols
+          sheet = Image.new('RGB', (cols * 270, rows * 370), 'white')
+          for i, thumb in enumerate(thumbs):
+              sheet.paste(thumb, ((i % cols) * 270, (i // cols) * 370))
+          sheet.save(OUT / 'contact_sheet.jpg', quality=88)
+
+          records.sort(key=lambda x: (0 if x['kind'] == '年度报告' else 1 if x['kind'] == '正式招股说明书' else 2, x['year']))
+          total_pages = sum(x['pages'] for x in records)
+          (OUT / 'selected_reports.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '华恒生物（688639.SH）全部年度报告、正式招股说明书及最新季报下载包',
+              '',
+              f'完整PDF数量：{len(records)}份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for i, item in enumerate(records, 1):
+              readme.append(f"{i}. {item['title']}｜{item['date']}｜{item['pages']}页｜{item['version']}")
+          readme += [
+              '',
+              '公司于2021年上市，因此上市以来公开披露的完整年度报告为2021—2025年五份，不存在上市公司2020年年度报告。',
+              '五份年度报告及2026年第一季度报告均为巨潮资讯网官方原始PDF，未混入报告摘要。',
+              '招股说明书为2021年4月16日正式发行版本。公开公告库提供完整正文并保留原PDF分页符，本包据此生成409页可检索重排版；它不是原始版式扫描件。',
+              '截至2026年8月30日，最新季度报告为2026年第一季度报告；2026年半年度报告属于中期报告，未作为季度报告重复收录。',
+              '已核验PDF文件头、公司名称及证券代码、实际页数和加密状态，并检查每份文件的首页、中间页与末页；ZIP完整性测试通过。',
+              '版权归上市公司、公告平台及相关权利人所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in records) + '\n', encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / 'huaheng_biotech_all_annual_prospectus_2026Q1.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 7')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / 'ZIP_SHA256.txt').write_text(f'{zip_sha}  {zip_path.name}\n', encoding='utf-8')
+          print((OUT / 'README.txt').read_text(encoding='utf-8'), flush=True)
+          print('FINAL_ZIP', zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: huaheng-biotech-complete-filings
+          path: huaheng_complete/
+          retention-days: 3
+          if-no-files-found: error
