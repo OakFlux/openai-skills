@@ -1,0 +1,304 @@
+name: Temporary Dongfang Biotech broker report package
+
+on:
+  push:
+    branches:
+      - tmp-dongfang-bio-reports-20260830
+    paths:
+      - .github/workflows/tmp-dongfang-bio-report-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Prepare PDF tools
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+
+      - name: Discover, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '688298'
+          NAME = '东方生物'
+          ALT_NAME = '浙江东方基因生物制品股份有限公司'
+          out = Path('东方生物_券商深度报告')
+          out.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Referer': f'https://data.eastmoney.com/report/{CODE}.html',
+              'Accept': 'application/json,text/plain,*/*',
+          })
+
+          body = {
+              'pageSize': 300, 'pageNo': 1, 'p': 1, 'pageNum': 1, 'pageNumber': 1,
+              'beginTime': '2018-01-01', 'endTime': '2026-08-30',
+              'code': CODE, 'industryCode': '*', 'rating': None,
+              'ratingChange': None, 'orgCode': None, 'rcode': ''
+          }
+          response = session.post(
+              'https://reportapi.eastmoney.com/report/list2',
+              json=body,
+              headers={
+                  'Referer': 'https://data.eastmoney.com/',
+                  'Content-Type': 'application/json',
+                  'Accept': 'application/json,text/plain,*/*'
+              },
+              timeout=90,
+          )
+          print('API', response.status_code, len(response.content), response.headers.get('content-type'))
+          response.raise_for_status()
+          rows = response.json().get('data') or []
+          print('ROWS', len(rows))
+
+          deep_terms = ['深度', '首次覆盖', '首次覆盖报告', '公司首次覆盖', '公司深度', '首次评级']
+          topic_terms = ['体外诊断', 'POCT', '抗原', '诊断', '全球化', '全球', '出海', '龙头', '平台', '疫情']
+
+          def metadata_score(row: dict) -> int:
+              title = str(row.get('title') or '')
+              pages = int(row.get('attachPages') or 0)
+              date = str(row.get('publishDate') or '')[:10]
+              score = pages * 12
+              if any(term in title for term in deep_terms):
+                  score += 900
+              if any(term in title for term in topic_terms):
+                  score += 120
+              if pages >= 15:
+                  score += 250
+              if pages >= 25:
+                  score += 180
+              if pages < 8:
+                  score -= 800
+              if date[:4].isdigit():
+                  score += max(0, int(date[:4]) - 2019) * 8
+              return score
+
+          metadata = []
+          for row in rows:
+              item = {
+                  'date': str(row.get('publishDate') or '')[:10],
+                  'broker': str(row.get('orgSName') or row.get('orgName') or '').strip(),
+                  'title': str(row.get('title') or '').strip(),
+                  'meta_pages': int(row.get('attachPages') or 0),
+                  'info_code': row.get('infoCode'),
+                  'rating': row.get('emRatingName') or row.get('sRatingName'),
+                  'researcher': row.get('researcher'),
+                  'metadata_score': metadata_score(row),
+              }
+              metadata.append(item)
+              print('META', json.dumps(item, ensure_ascii=False))
+
+          # Download only the strongest substantial candidates first.
+          ranked_rows = sorted(
+              [r for r in rows if r.get('infoCode') and int(r.get('attachPages') or 0) >= 8],
+              key=metadata_score,
+              reverse=True,
+          )[:18]
+          print('RANKED_FOR_DOWNLOAD', len(ranked_rows))
+
+          candidates = []
+          for rank, row in enumerate(ranked_rows, 1):
+              info = row.get('infoCode')
+              title = str(row.get('title') or '').strip()
+              broker = str(row.get('orgSName') or row.get('orgName') or '').strip()
+              date = str(row.get('publishDate') or '')[:10]
+              meta_pages = int(row.get('attachPages') or 0)
+              url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              content = None
+              last_error = None
+              for attempt in range(1, 5):
+                  try:
+                      r = session.get(
+                          url,
+                          headers={'Accept': 'application/pdf,*/*', 'Referer': 'https://data.eastmoney.com/'},
+                          timeout=(20, 120),
+                          allow_redirects=True,
+                      )
+                      print('DOWNLOAD', rank, attempt, date, broker, meta_pages, title, r.status_code, len(r.content), r.headers.get('content-type'))
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 100_000:
+                          content = r.content
+                          url = r.url
+                          break
+                      last_error = f'status={r.status_code}, bytes={len(r.content)}, type={r.headers.get("content-type")}'
+                  except Exception as exc:
+                      last_error = repr(exc)
+                  time.sleep(attempt)
+              if content is None:
+                  print('SKIP_DOWNLOAD_FAILED', info, last_error)
+                  continue
+
+              temp = out / f'_tmp_{info}.pdf'
+              temp.write_bytes(content)
+              try:
+                  reader = PdfReader(str(temp), strict=False)
+                  pages = len(reader.pages)
+                  text = ''
+                  for pg in reader.pages[:min(8, pages)]:
+                      try:
+                          text += pg.extract_text() or ''
+                      except Exception:
+                          pass
+                  compact = re.sub(r'\s+', '', text)
+                  if NAME not in compact and CODE not in compact and ALT_NAME not in compact and '东方基因' not in compact:
+                      print('IDENTITY_FAIL', info, title)
+                      temp.unlink(missing_ok=True)
+                      continue
+                  sha = hashlib.sha256(content).hexdigest()
+              except Exception as exc:
+                  print('PDF_VALIDATE_FAIL', info, repr(exc))
+                  temp.unlink(missing_ok=True)
+                  continue
+
+              score = pages * 12
+              if any(term in title for term in deep_terms):
+                  score += 900
+              if any(term in title for term in topic_terms):
+                  score += 120
+              if pages >= 15:
+                  score += 250
+              if pages >= 25:
+                  score += 180
+              if pages < 10:
+                  score -= 1000
+              if date[:4].isdigit():
+                  score += max(0, int(date[:4]) - 2019) * 8
+              candidates.append({
+                  'date': date,
+                  'broker': broker,
+                  'title': title,
+                  'info_code': info,
+                  'url': url,
+                  'pages': pages,
+                  'bytes': len(content),
+                  'sha256': sha,
+                  'score': score,
+                  'rating': row.get('emRatingName') or row.get('sRatingName'),
+                  'researcher': row.get('researcher'),
+                  'temp': str(temp),
+              })
+
+          candidates.sort(key=lambda x: (x['score'], x['pages'], x['date']), reverse=True)
+          print('VALID_CANDIDATES', len(candidates))
+          for c in candidates:
+              print('CANDIDATE', json.dumps({k: v for k, v in c.items() if k != 'temp'}, ensure_ascii=False))
+
+          # Prefer long company-depth / first-coverage reports and brokerage diversity.
+          preferred = [c for c in candidates if c['pages'] >= 15 and (any(t in c['title'] for t in deep_terms) or c['pages'] >= 20)]
+          if len(preferred) < 2:
+              preferred = [c for c in candidates if c['pages'] >= 12]
+
+          chosen = []
+          used_brokers = set()
+          used_titles = set()
+          for c in preferred:
+              if c['title'] in used_titles:
+                  continue
+              if c['broker'] in used_brokers and len(preferred) >= 4:
+                  continue
+              chosen.append(c)
+              used_brokers.add(c['broker'])
+              used_titles.add(c['title'])
+              if len(chosen) >= 3:
+                  break
+
+          if len(chosen) < 2:
+              for c in candidates:
+                  if c in chosen or c['pages'] < 10:
+                      continue
+                  chosen.append(c)
+                  if len(chosen) >= 2:
+                      break
+
+          if len(chosen) < 2:
+              raise RuntimeError(f'Only {len(chosen)} substantial public reports available')
+
+          manifest = []
+          for i, c in enumerate(chosen, 1):
+              safe_title = re.sub(r'[\\/:*?"<>|]+', '_', c['title']).strip()[:80]
+              final_name = f"{i:02d}_{c['date']}_{c['broker']}_{safe_title}_{c['pages']}页.pdf"
+              src = Path(c['temp'])
+              dst = out / final_name
+              src.replace(dst)
+              item = {k: v for k, v in c.items() if k != 'temp'}
+              item['filename'] = final_name
+              manifest.append(item)
+
+          for p in out.glob('_tmp_*.pdf'):
+              p.unlink(missing_ok=True)
+
+          readme = [
+              '东方生物（688298）券商深度报告下载包',
+              '',
+              f'收录报告数量：{len(manifest)}份',
+              '',
+              '筛选原则：公司深度、首次覆盖和长篇系统研究优先；排除短篇财报点评。',
+              'PDF均来自公开原始文件入口，并完成文件头、页数、公司名称/证券代码及文本可解析性检查。',
+              '',
+          ]
+          for i, m in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {m['broker']}｜{m['date']}｜{m['pages']}页",
+                  f"   标题：{m['title']}",
+                  f"   文件：{m['filename']}",
+                  f"   评级：{m.get('rating') or '未标注'}",
+                  f"   分析师：{m.get('researcher') or '未标注'}",
+                  f"   来源：{m['url']}",
+                  f"   SHA-256：{m['sha256']}",
+                  '',
+              ]
+          readme += ['资料仅供研究参考，不构成投资建议。']
+          (out / 'README_报告清单与核验信息.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (out / 'SHA256SUMS.txt').open('w', encoding='utf-8') as f:
+              for m in manifest:
+                  f.write(f"{m['sha256']}  {m['filename']}\n")
+
+          zip_cn = Path(f'东方生物_券商深度报告_{len(manifest)}份.zip')
+          zip_en = Path(f'dongfang_biotech_broker_deep_reports_{len(manifest)}.zip')
+          for zp in [zip_cn, zip_en]:
+              with zipfile.ZipFile(zp, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+                  for p in sorted(out.iterdir()):
+                      z.write(p, arcname=f'{out.name}/{p.name}')
+              with zipfile.ZipFile(zp, 'r') as z:
+                  bad = z.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP integrity failure {zp}: {bad}')
+              print('ZIP_OK', zp, zp.stat().st_size)
+
+          Path('selected_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SELECTION', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dongfang_Biotech_Broker_Deep_Reports
+          path: |
+            dongfang_biotech_broker_deep_reports_*.zip
+            东方生物_券商深度报告_*.zip
+            东方生物_券商深度报告/*.pdf
+            东方生物_券商深度报告/*.txt
+            东方生物_券商深度报告/manifest.json
+            selected_manifest.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
