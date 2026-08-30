@@ -1,0 +1,195 @@
+name: Temporary Package Mengtai Deep Reports From Public Archive
+
+on:
+  push:
+    branches: [tmp/fetch-mengtai-reports-20260830]
+    paths: [.github/workflows/tmp-package-mengtai-from-archive.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pillow pypdf
+      - name: Locate, reconstruct, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.parse import quote,urljoin,urlparse,parse_qs,unquote
+          import base64, hashlib, html, io, json, re, time, zipfile
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY='蒙泰高新'; CODE='300876'
+          targets=[
+            {'num':1,'date':'2023-06-13','broker':'东北证券','title':'丙纶长丝行业领跑者，双基地强势进军碳纤维','keywords':['丙纶长丝行业领跑者','双基地强势进军碳纤维'],'known_id':'141130'},
+            {'num':2,'date':'2023-04-25','broker':'东北证券','title':'丙纶景气触底，布局碳纤维打开新增量','keywords':['丙纶景气触底','布局碳纤维打开新增量'],'known_id':None},
+            {'num':3,'date':'2021-06-23','broker':'海通证券','title':'国内丙纶长丝龙头，募投扩产助力成长','keywords':['国内丙纶长丝龙头','募投扩产助力成长'],'known_id':None},
+          ]
+          root=Path('mengtai_package'); pdfdir=root/'PDF'; imgdir=root/'source_pages'; previewdir=root/'previews'
+          for d in (pdfdir,imgdir,previewdir):d.mkdir(parents=True,exist_ok=True)
+          s=requests.Session();s.headers.update({'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151.0 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Referer':'https://www.sgpjbg.com/'})
+
+          def clean_visible(text):
+            x=re.sub(r'<script\b[^>]*>.*?</script>',' ',text,flags=re.I|re.S);x=re.sub(r'<style\b[^>]*>.*?</style>',' ',x,flags=re.I|re.S);x=re.sub(r'<[^>]+>',' ',x);return re.sub(r'\s+',' ',html.unescape(x)).strip()
+          def add_page(store,url,source=''):
+            if not url:return
+            url=html.unescape(unquote(url))
+            m=re.search(r'https?://(?:www\.)?sgpjbg\.com/baogao/(\d+)\.html',url,re.I)
+            if m:store.setdefault(m.group(1),{'id':m.group(1),'url':f'https://www.sgpjbg.com/baogao/{m.group(1)}.html','sources':[]})['sources'].append(source)
+          pages={}
+          add_page(pages,'https://www.sgpjbg.com/baogao/141130.html','known')
+          # SGPJBG own search, using the site's form field names.
+          for term in ['蒙泰高新','300876','丙纶景气触底','国内丙纶长丝龙头']:
+            for method in ('get','post'):
+              for cd in ('0','1','2','3',''):
+                data={'cx':'partner-pub-9256112255354802:2221863025','cd':cd,'keywords':term}
+                try:
+                  r=s.get('https://www.sgpjbg.com/search.html',params=data,timeout=45) if method=='get' else s.post('https://www.sgpjbg.com/search.html',data=data,timeout=45)
+                  text=html.unescape(r.text).replace('\\/','/')
+                  for raw in re.findall(r'https?://[^"\'<>\s]+',text,re.I):add_page(pages,raw,f'site-{term}')
+                  soup=BeautifulSoup(text,'html.parser')
+                  for a in soup.find_all('a',href=True):add_page(pages,urljoin(r.url,a['href']),f'site-{term}')
+                except Exception:pass
+          # Search engine fallback for exact titles.
+          for t in targets:
+            query=f'site:sgpjbg.com/baogao/ "{COMPANY}" "{t["keywords"][0]}"'
+            for engine,u in [
+              ('bing',f'https://www.bing.com/search?q={quote(query)}'),
+              ('baidu',f'https://www.baidu.com/s?wd={quote(query)}'),
+              ('sogou',f'https://www.sogou.com/web?query={quote(query)}')]:
+              try:
+                r=s.get(u,timeout=45);text=html.unescape(r.text).replace('\\/','/')
+                for raw in re.findall(r'https?://[^"\'<>\s]+',text,re.I):add_page(pages,raw,engine)
+                soup=BeautifulSoup(text,'html.parser')
+                for a in soup.find_all('a',href=True):add_page(pages,urljoin(r.url,a['href']),engine)
+              except Exception:pass
+          print('CANDIDATE_IDS',sorted(pages))
+          # Fetch and describe candidate pages.
+          descriptions=[]
+          for pid,item in list(pages.items()):
+            try:
+              r=s.get(item['url'],timeout=60);r.raise_for_status();text=html.unescape(r.text).replace('\\/','/')
+              visible=clean_visible(text);soup=BeautifulSoup(text,'html.parser')
+              if COMPANY not in visible and CODE not in visible:continue
+              title=soup.title.get_text(' ',strip=True) if soup.title else ''
+              descriptions.append({**item,'html':text,'visible':visible,'page_title':title})
+              print('PAGE_JSON='+json.dumps({'id':pid,'title':title,'visible_head':visible[:600]},ensure_ascii=False))
+            except Exception as e:print('PAGE_ERROR',pid,repr(e))
+
+          def score(desc,target):
+            blob=re.sub(r'\s+','',desc['page_title']+' '+desc['visible'])
+            value=0
+            if target.get('known_id')==desc['id']:value+=100
+            if COMPANY in blob or CODE in blob:value+=10
+            if target['broker'] in blob:value+=12
+            for kw in target['keywords']:
+              norm=re.sub(r'[，,。；;：:\s]','',kw)
+              if norm in re.sub(r'[，,。；;：:\s]','',blob):value+=35
+              else:
+                parts=[p for p in re.split(r'[，,。；;：:\s]+',kw) if len(p)>=4]
+                value+=sum(8 for p in parts if p in blob)
+            if target['date'][:4] in blob:value+=3
+            return value
+          selected=[];used=set()
+          for target in targets:
+            ranked=sorted(((score(d,target),d) for d in descriptions if d['id'] not in used),key=lambda x:x[0],reverse=True)
+            if ranked and ranked[0][0]>=40:
+              val,desc=ranked[0];used.add(desc['id']);selected.append((target,desc,val));print('SELECTED',target['title'],desc['id'],val)
+          if len(selected)<2:raise RuntimeError(f'Only {len(selected)} suitable archive report pages located; candidates={[(d["id"],d["page_title"]) for d in descriptions]}')
+          selected=selected[:3]
+
+          def page_count(desc):
+            for pat in [r'报告页数[：:]\s*(\d+)\s*页',r'页数[：:]\s*(\d+)\s*页',r'共\s*(\d+)\s*页']:
+              m=re.search(pat,desc['visible']);
+              if m:return int(m.group(1))
+            # Infer from numbered image URLs in HTML.
+            nums=[]
+            for u in re.findall(r'https?://[^"\'<>\s]+?\.(?:gif|png|jpe?g|webp)',desc['html'],re.I):
+              m=re.search(r'(\d+)\.(?:gif|png|jpe?g|webp)(?:\?|$)',u,re.I)
+              if m:nums.append(int(m.group(1)))
+            return max(nums) if nums else 0
+          def image_template(desc):
+            urls=[]
+            soup=BeautifulSoup(desc['html'],'html.parser')
+            for tag in soup.find_all(['img','source']):
+              for key in ['src','data-src','data-original','data-lazy-src','data-url']:
+                v=tag.get(key)
+                if isinstance(v,str):urls.append(urljoin(desc['url'],v))
+            urls+=re.findall(r'https?://[^"\'<>\s]+?\.(?:gif|png|jpe?g|webp)(?:\?[^"\'<>\s]*)?',desc['html'],re.I)
+            for u in urls:
+              if '/uploads/' not in u and 'mkt_info' not in u:continue
+              m=re.search(r'^(.*?)(\d+)(\.(?:gif|png|jpe?g|webp))(?:\?.*)?$',u,re.I)
+              if m:
+                n=int(m.group(2))
+                if 1<=n<=20:return m.group(1),m.group(3).lower(),u
+            raise RuntimeError(f'No sequential page image template found for {desc["id"]}')
+          manifest=[]
+          for target,desc,selection_score in selected:
+            count=page_count(desc);prefix,ext,first_url=image_template(desc)
+            if count<10 or count>120:raise RuntimeError(f'Invalid page count {count} for {desc["id"]}')
+            report_imgdir=imgdir/f'{target["num"]:02d}_{desc["id"]}';report_imgdir.mkdir(exist_ok=True)
+            images=[];source_urls=[]
+            for page_no in range(1,count+1):
+              attempts=[prefix+str(page_no)+ext]
+              # Some archives switch extension; test common alternatives.
+              for alt in ['.gif','.jpg','.jpeg','.png','.webp']:
+                u=prefix+str(page_no)+alt
+                if u not in attempts:attempts.append(u)
+              raw=None;chosen=None
+              for u in attempts:
+                try:
+                  rr=s.get(u,timeout=60,headers={'Referer':desc['url'],'User-Agent':s.headers['User-Agent']})
+                  if rr.status_code==200 and len(rr.content)>5000:
+                    im=Image.open(io.BytesIO(rr.content));im.load()
+                    if im.width>=500 and im.height>=500:raw=rr.content;chosen=u;break
+                except Exception:pass
+              if raw is None:raise RuntimeError(f'Missing page {page_no}/{count} for archive {desc["id"]}')
+              ip=report_imgdir/f'{page_no:03d}{Path(urlparse(chosen).path).suffix.lower()}';ip.write_bytes(raw)
+              im=Image.open(io.BytesIO(raw)).convert('RGB')
+              images.append(im.copy());source_urls.append(chosen)
+            safe=re.sub(r'[\\/:*?"<>|，。；：、（）()【】《》\s]+','_',target['title']).strip('_')
+            filename=f'{target["num"]:02d}_{target["broker"]}_{COMPANY}_{safe}_{target["date"].replace("-","")}_{count}页.pdf'
+            pdfpath=pdfdir/filename
+            images[0].save(pdfpath,'PDF',resolution=150.0,save_all=True,append_images=images[1:])
+            reader=PdfReader(str(pdfpath),strict=False)
+            if len(reader.pages)!=count:raise RuntimeError(f'Generated PDF page mismatch: {filename}')
+            rawpdf=pdfpath.read_bytes()
+            if not rawpdf.startswith(b'%PDF') or b'%%EOF' not in rawpdf[-32768:]:raise RuntimeError(f'Generated PDF structure invalid: {filename}')
+            # Preserve representative source pages for visual verification.
+            for pno in sorted(set([1,count//2,count])):
+              src=next(report_imgdir.glob(f'{pno:03d}.*'))
+              (previewdir/f'{target["num"]:02d}_{pno:03d}{src.suffix}').write_bytes(src.read_bytes())
+            item={'num':target['num'],'broker':target['broker'],'date':target['date'],'title':target['title'],'archive_page_id':desc['id'],'archive_url':desc['url'],'source_representation':'public sequential report page images assembled without content modification','pages':count,'bytes':len(rawpdf),'sha256':hashlib.sha256(rawpdf).hexdigest(),'filename':filename,'source_image_first':source_urls[0],'source_image_last':source_urls[-1],'selection_score':selection_score}
+            manifest.append(item);print('BUILT_JSON='+json.dumps(item,ensure_ascii=False))
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          lines=['蒙泰高新（300876）券商深度报告','生成日期：2026-08-30','说明：原始 PDF 下载口被公开归档站限制，包内 PDF 由其公开逐页原文图像按原页序无改动合成；未使用摘要或网页文本冒充报告。','']
+          for x in manifest:lines += [f"{x['num']}. {x['broker']}｜{x['date']}｜{x['title']}",f"   {x['pages']}页｜{x['filename']}",f"   归档页：{x['archive_url']}",f"   SHA-256：{x['sha256']}",'']
+          (root/'来源与校验.txt').write_text('\n'.join(lines),encoding='utf-8')
+          zipname='蒙泰高新_300876_券商深度报告_完整PDF.zip';zpath=Path(zipname)
+          with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(pdfdir.glob('*.pdf')):z.write(p,arcname=p.name)
+            z.write(root/'来源与校验.txt',arcname='来源与校验.txt');z.write(root/'manifest.json',arcname='manifest.json')
+          with zipfile.ZipFile(zpath) as z:
+            bad=z.testzip()
+            if bad:raise RuntimeError('ZIP CRC failed: '+bad)
+          print('PACKAGE_JSON='+json.dumps({'zip':zipname,'reports':len(manifest),'pages':sum(x['pages'] for x in manifest),'bytes':zpath.stat().st_size,'sha256':hashlib.sha256(zpath.read_bytes()).hexdigest()},ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mengtai-deep-reports-package
+          path: |
+            蒙泰高新_300876_券商深度报告_完整PDF.zip
+            mengtai_package/manifest.json
+            mengtai_package/来源与校验.txt
+            mengtai_package/previews/*
+          retention-days: 3
+          if-no-files-found: error
