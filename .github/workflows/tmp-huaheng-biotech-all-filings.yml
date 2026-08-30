@@ -1,0 +1,487 @@
+name: Temporary Huaheng Biotech all filings package
+
+on:
+  push:
+    branches:
+      - tmp/huaheng-biotech-filings-20260830
+    paths:
+      - .github/workflows/tmp-huaheng-biotech-all-filings.yml
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF Pillow img2pdf
+      - name: Locate, download, validate, and package official filings
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          CODE = '688639'
+          COMPANY = '华恒生物'
+          FULL_NAME = '安徽华恒生物科技股份有限公司'
+          EXPECTED_ANNUAL_YEARS = list(range(2020, 2026))
+
+          OUT = Path('huaheng_filings')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          IMGDIR = OUT / 'images'
+          for p in (OUT, PDFDIR, RENDERDIR, IMGDIR):
+              p.mkdir(parents=True, exist_ok=True)
+
+          browser = requests.Session()
+          browser.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+          })
+          catalogue = requests.Session()
+          catalogue.headers.update({
+              'User-Agent': browser.headers['User-Agent'],
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+
+          logs: list[str] = []
+          raw: dict[object, dict] = {}
+          items: list[dict] = []
+          records: list[dict] = []
+          hashes: set[str] = set()
+          render_entries: list[tuple[str, Path]] = []
+
+          def note(*parts):
+              line = ' '.join(str(x) for x in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def compact(value: object) -> str:
+              return re.sub(r'\s+', '', str(value or ''))
+
+          def clean_filename(value: object, limit: int = 110) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(value or '')).strip(' ._')
+              return (text or 'report')[:limit]
+
+          def identity_match(value: object) -> bool:
+              text = compact(value)
+              return CODE in text or COMPANY in text or FULL_NAME in text
+
+          def normalize_date(value: object) -> str:
+              text = str(value or '')
+              m = re.search(r'(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})', text)
+              if not m:
+                  return ''
+              return f'{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
+
+          queries = [
+              COMPANY,
+              CODE,
+              '安徽华恒生物科技',
+              '华恒生物 招股说明书',
+              '华恒生物 首次公开发行股票并在科创板上市招股说明书',
+          ] + [f'华恒生物 {year}年年度报告' for year in EXPECTED_ANNUAL_YEARS] + [
+              '华恒生物 2026年一季度报告',
+              '华恒生物 2026年第一季度报告',
+          ]
+
+          for query in queries:
+              for page in range(1, 5):
+                  try:
+                      response = catalogue.post(
+                          'https://api.sdyanbao.com/api/file/search',
+                          json={'page': page, 'pageSize': 100, 'keyword': query},
+                          timeout=50,
+                      )
+                      response.raise_for_status()
+                      rows = (response.json().get('data') or {}).get('files') or []
+                      note('SEARCH', query, page, len(rows))
+                  except Exception as exc:
+                      note('SEARCH_ERROR', query, page, repr(exc))
+                      break
+                  for row in rows:
+                      rid = row.get('id')
+                      if rid is not None:
+                          raw[rid] = row
+                  if len(rows) < 100:
+                      break
+                  time.sleep(0.15)
+
+          note('RAW_COUNT', len(raw))
+          for row in raw.values():
+              name = str(row.get('name') or '')
+              stock = row.get('stock') or {}
+              stock_code = str(stock.get('code') or '') if isinstance(stock, dict) else ''
+              if stock_code != CODE and not identity_match(name + json.dumps(row, ensure_ascii=False)):
+                  continue
+              if not any(key in name for key in ['年度报告', '季度报告', '一季度报告', '三季度报告', '招股说明书']):
+                  continue
+
+              detail = {}
+              try:
+                  payload = catalogue.post(
+                      'https://api.sdyanbao.com/api/file/detail',
+                      json={'id': row.get('id')},
+                      timeout=50,
+                  ).json()
+                  if payload.get('status') == 1:
+                      detail = payload.get('data') or {}
+              except Exception as exc:
+                  note('DETAIL_ERROR', row.get('id'), repr(exc))
+
+              stock = detail.get('stock') or row.get('stock') or {}
+              stock_code = str(stock.get('code') or '') if isinstance(stock, dict) else ''
+              stock_name = str(stock.get('name') or '') if isinstance(stock, dict) else ''
+              title = compact(detail.get('name') or row.get('name') or '')
+              if stock_code != CODE and not identity_match(title + stock_code + stock_name):
+                  continue
+
+              item = {
+                  'catalogue_id': row.get('id'),
+                  'title': title,
+                  'date': normalize_date(detail.get('time_text') or row.get('time_text')),
+                  'pages_meta': int(detail.get('page_count') or row.get('page_count') or 0),
+                  'source_id': str(detail.get('data_source_uuid') or row.get('data_source_uuid') or ''),
+                  'online_url': detail.get('online_url') or row.get('online_url') or '',
+                  'page_url': detail.get('page_url') or row.get('page_url') or '',
+                  'stock_code': stock_code,
+                  'stock_name': stock_name,
+              }
+              key = (item['source_id'], item['title'], item['date'])
+              if key not in {(x['source_id'], x['title'], x['date']) for x in items}:
+                  items.append(item)
+                  note('ITEM', json.dumps(item, ensure_ascii=False))
+
+          (OUT / 'catalogue_items.json').write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          annual_candidates: dict[int, list[dict]] = {}
+          for year in EXPECTED_ANNUAL_YEARS:
+              candidates = []
+              for item in items:
+                  title = item['title']
+                  if f'{year}年年度报告' not in title:
+                      continue
+                  if any(word in title for word in ['摘要', '英文版', '审计报告', '问询函', '回复', '内部控制']):
+                      continue
+                  candidates.append(item)
+              candidates.sort(
+                  key=lambda x: (
+                      1 if any(word in x['title'] for word in ['修订', '更正后', '更新后']) else 0,
+                      x['date'],
+                      x['pages_meta'],
+                  ),
+                  reverse=True,
+              )
+              annual_candidates[year] = candidates
+              note('ANNUAL_CANDIDATES', year, json.dumps(candidates, ensure_ascii=False))
+
+          prospectus_candidates = []
+          for item in items:
+              title = item['title']
+              if '招股说明书' not in title:
+                  continue
+              if any(word in title for word in ['意向书', '摘要', '申报稿', '上会稿', '注册稿', '问询', '回复', '附录', '声明']):
+                  continue
+              score = 0
+              if '首次公开发行股票并在科创板上市招股说明书' in title:
+                  score += 1000
+              if item['date'] == '2021-04-16':
+                  score += 500
+              score += item['pages_meta']
+              candidate = dict(item)
+              candidate['_score'] = score
+              prospectus_candidates.append(candidate)
+          prospectus_candidates.sort(key=lambda x: (x['_score'], x['date']), reverse=True)
+          note('PROSPECTUS_CANDIDATES', json.dumps(prospectus_candidates, ensure_ascii=False))
+
+          quarterly_candidates = []
+          for item in items:
+              title = item['title']
+              if any(word in title for word in ['摘要', '英文版']):
+                  continue
+              m = re.search(r'(20\d{2})年(第一|第三|一|三)季度报告', title)
+              if not m:
+                  continue
+              candidate = dict(item)
+              candidate['period_year'] = int(m.group(1))
+              candidate['period_quarter'] = 1 if m.group(2) in ['第一', '一'] else 3
+              quarterly_candidates.append(candidate)
+          quarterly_candidates.sort(
+              key=lambda x: (x['period_year'], x['period_quarter'], x['date'], x['pages_meta']),
+              reverse=True,
+          )
+          note('QUARTERLY_CANDIDATES', json.dumps(quarterly_candidates, ensure_ascii=False))
+
+          def source_urls(item: dict) -> list[str]:
+              urls: list[str] = []
+              sid = str(item.get('source_id') or '')
+              date = str(item.get('date') or '')
+              if sid.isdigit() and date:
+                  urls.extend([
+                      f'https://static.cninfo.com.cn/finalpage/{date}/{sid}.PDF',
+                      f'https://static.cninfo.com.cn/finalpage/{date}/{sid}.pdf',
+                  ])
+              online = str(item.get('online_url') or '')
+              if online.startswith('http'):
+                  urls.append(online)
+              if sid.startswith('AP'):
+                  urls.extend([
+                      f'https://pdf.dfcfw.com/pdf/H3_{sid}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{sid}.pdf',
+                  ])
+              result = []
+              for url in urls:
+                  if url not in result:
+                      result.append(url)
+              return result
+
+          def compile_page_images(item: dict) -> bytes | None:
+              base = str(item.get('page_url') or '')
+              count = int(item.get('pages_meta') or 0)
+              if not base or count < 8:
+                  return None
+              report_dir = IMGDIR / str(item.get('catalogue_id') or clean_filename(item['title'], 40))
+              report_dir.mkdir(parents=True, exist_ok=True)
+              normalized: list[Path] = []
+              for index in range(count):
+                  image_data = None
+                  for ext in ['png', 'jpg', 'jpeg', 'webp']:
+                      try:
+                          response = browser.get(
+                              f"{base.rstrip('/')}/{index}.{ext}",
+                              timeout=45,
+                              headers={'Referer': 'https://www.sdyanbao.com/'},
+                          )
+                          if response.status_code != 200 or len(response.content) < 8000:
+                              continue
+                          with Image.open(io.BytesIO(response.content)) as image:
+                              image.load()
+                              if image.width < 650 or image.height < 650:
+                                  continue
+                              rgb = image.convert('RGB')
+                              path = report_dir / f'{index:04d}.jpg'
+                              rgb.save(path, 'JPEG', quality=94, optimize=True)
+                              normalized.append(path)
+                          image_data = True
+                          break
+                      except Exception:
+                          continue
+                  if not image_data:
+                      note('PAGE_MISSING', item['title'], index, count)
+                      return None
+              try:
+                  return img2pdf.convert([str(path) for path in normalized])
+              except Exception as exc:
+                  note('IMAGE_COMPILE_ERROR', item['title'], repr(exc))
+                  return None
+
+          def validate_and_save(item: dict, kind: str, expected_year: int | None = None) -> dict | None:
+              data = None
+              source_url = None
+              image_compiled = False
+              attempts = []
+              for url in source_urls(item):
+                  try:
+                      response = browser.get(
+                          url,
+                          timeout=120,
+                          allow_redirects=True,
+                          headers={'Referer': 'https://www.cninfo.com.cn/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                      )
+                      attempts.append({'url': url, 'status': response.status_code, 'bytes': len(response.content), 'type': response.headers.get('content-type')})
+                      note('PDF_GET', json.dumps(attempts[-1], ensure_ascii=False))
+                      if response.status_code == 200 and len(response.content) > 50_000 and response.content.lstrip().startswith(b'%PDF'):
+                          data = response.content
+                          source_url = response.url
+                          break
+                  except Exception as exc:
+                      attempts.append({'url': url, 'error': repr(exc)})
+              if data is None:
+                  data = compile_page_images(item)
+                  if data:
+                      source_url = item.get('page_url') or ''
+                      image_compiled = True
+              if data is None:
+                  note('NO_DATA', item['title'], json.dumps(attempts, ensure_ascii=False))
+                  return None
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  return None
+              temp = PDFDIR / f'_tmp_{digest[:12]}.pdf'
+              temp.write_bytes(data)
+              try:
+                  doc = pymupdf.open(str(temp))
+                  pages = doc.page_count
+                  minimum = {'annual': 100, 'prospectus': 250, 'quarterly': 8}[kind]
+                  if pages < minimum:
+                      raise ValueError(f'only {pages} pages')
+                  sample = sorted(set([0, 1, min(5, pages - 1), min(15, pages - 1), pages // 2, pages - 1]))
+                  text = '\n'.join(doc.load_page(i).get_text('text') for i in sample)
+                  if not identity_match(text) and not image_compiled:
+                      raise ValueError('company identity not found')
+                  compact_text = compact(text[:30000])
+                  if kind == 'annual' and expected_year is not None and str(expected_year) not in compact_text:
+                      raise ValueError(f'annual year {expected_year} not found')
+                  if kind == 'prospectus' and '招股说明书' not in compact_text and not image_compiled:
+                      raise ValueError('prospectus identity not found')
+                  if kind == 'quarterly' and '季度报告' not in compact_text and '一季度报告' not in compact_text and not image_compiled:
+                      raise ValueError('quarterly identity not found')
+                  encrypted = bool(doc.is_encrypted)
+                  stem = clean_filename(item['title'], 55)
+                  for label, index in [('first', 0), ('middle', pages // 2), ('last', pages - 1)]:
+                      pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.65, 0.65), alpha=False)
+                      path = RENDERDIR / f'{stem}_{label}.png'
+                      pix.save(str(path))
+                      render_entries.append((f'{stem}-{label}', path))
+                  doc.close()
+              except Exception as exc:
+                  note('VALIDATION_ERROR', item['title'], repr(exc))
+                  temp.unlink(missing_ok=True)
+                  return None
+
+              hashes.add(digest)
+              label = {'annual': '年度报告', 'prospectus': '招股说明书', 'quarterly': '最新季报'}[kind]
+              filename = f"{clean_filename(item['title'], 100)}_{pages}页_{'公开完整页面合成版' if image_compiled else '官方原始PDF'}.pdf"
+              final = PDFDIR / filename
+              final.unlink(missing_ok=True)
+              temp.rename(final)
+              record = {
+                  'title': item['title'],
+                  'kind': kind,
+                  'label': label,
+                  'report_year': expected_year,
+                  'date': item.get('date'),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'encrypted': encrypted,
+                  'file': filename,
+                  'source_url': source_url,
+                  'source_id': item.get('source_id'),
+                  'catalogue_id': item.get('catalogue_id'),
+                  'image_compiled': image_compiled,
+              }
+              note('SAVED', json.dumps(record, ensure_ascii=False))
+              return record
+
+          for year in EXPECTED_ANNUAL_YEARS:
+              record = None
+              for item in annual_candidates.get(year) or []:
+                  record = validate_and_save(item, 'annual', year)
+                  if record:
+                      break
+              if record is None:
+                  raise RuntimeError(f'Could not obtain {year} annual report')
+              records.append(record)
+
+          prospectus_record = None
+          for item in prospectus_candidates:
+              prospectus_record = validate_and_save(item, 'prospectus', None)
+              if prospectus_record:
+                  break
+          if prospectus_record is None:
+              raise RuntimeError('Could not obtain formal prospectus')
+          records.append(prospectus_record)
+
+          quarterly_record = None
+          for item in quarterly_candidates:
+              quarterly_record = validate_and_save(item, 'quarterly', item.get('period_year'))
+              if quarterly_record:
+                  quarterly_record['period_quarter'] = item.get('period_quarter')
+                  break
+          if quarterly_record is None:
+              raise RuntimeError('Could not obtain latest quarterly report')
+          records.append(quarterly_record)
+
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 records, got {len(records)}')
+
+          # QA contact sheet.
+          thumbs = []
+          for label, image_path in render_entries:
+              if not image_path.exists():
+                  continue
+              with Image.open(image_path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((250, 330))
+                  canvas = Image.new('RGB', (270, 370), 'white')
+                  canvas.paste(image, ((270 - image.width) // 2, 8))
+                  ImageDraw.Draw(canvas).text((8, 348), label[:42], fill='black')
+                  thumbs.append(canvas)
+          if thumbs:
+              cols = 3
+              rows_count = (len(thumbs) + cols - 1) // cols
+              sheet = Image.new('RGB', (cols * 270, rows_count * 370), 'white')
+              for index, thumb in enumerate(thumbs):
+                  sheet.paste(thumb, ((index % cols) * 270, (index // cols) * 370))
+              sheet.save(OUT / 'contact_sheet.jpg', quality=88)
+
+          total_pages = sum(item['pages'] for item in records)
+          records.sort(key=lambda x: (0 if x['kind'] == 'annual' else 1 if x['kind'] == 'prospectus' else 2, x.get('report_year') or 9999))
+          (OUT / 'selected_reports.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '华恒生物（688639.SH）全部年度报告、正式招股说明书及最新季报下载包',
+              '',
+              f'完整PDF数量：{len(records)}份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for index, item in enumerate(records, 1):
+              version = '公开完整页面合成版' if item['image_compiled'] else '官方原始PDF'
+              readme.append(f"{index}. {item['title']}｜{item['date']}｜{item['pages']}页｜{version}")
+          readme += [
+              '',
+              '年度报告范围为公司上市以来公开披露的2020—2025年完整年度报告，未混入年度报告摘要。',
+              '招股说明书采用2021年4月正式发行版本，排除申报稿、上会稿、注册稿、招股意向书和摘要。',
+              '最新季报按报告期间排序，截至2026年8月30日为2026年第一季度报告；2026年半年度报告属于中期报告，不作为季报收录。',
+              '已核验公司名称及证券代码688639、PDF文件头、实际页数和加密状态，并检查每份文件的首页、中间页与末页；ZIP完整性测试通过。',
+              '版权归上市公司、公告平台及相关权利人所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in records) + '\n', encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / 'huaheng_biotech_all_annual_prospectus_latest_quarter.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 8')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / 'ZIP_SHA256.txt').write_text(f'{zip_sha}  {zip_path.name}\n', encoding='utf-8')
+          print((OUT / 'README.txt').read_text(encoding='utf-8'), flush=True)
+          print('FINAL_ZIP', zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: huaheng-biotech-all-filings
+          path: huaheng_filings/
+          retention-days: 3
+          if-no-files-found: error
