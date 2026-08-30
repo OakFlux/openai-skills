@@ -1,0 +1,357 @@
+name: Temporary Fetch Xindong Micro System Filings
+
+on:
+  push:
+    branches:
+      - tmp/fetch-xindong-20260830
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure PDF validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pdfinfo >/dev/null 2>&1 || ! command -v pdftotext >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq poppler-utils
+          fi
+
+      - name: Download, verify, and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+
+          STOCK_ID = '688582'
+          COMPANY_SHORT = '芯动联科'
+          COMPANY_FULL = '安徽芯动联科微系统股份有限公司'
+          ROOT = Path('xindong_package')
+          PDF_DIR = ROOT / '01_招股说明书及定期报告'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://vip.stock.finance.sina.com.cn/',
+          })
+
+          def decode_response(response):
+              raw = response.content
+              for encoding in ('utf-8', 'gb18030', 'gbk'):
+                  try:
+                      return raw.decode(encoding)
+                  except UnicodeDecodeError:
+                      continue
+              return raw.decode('utf-8', errors='ignore')
+
+          def normalize_text(text):
+              return re.sub(r'\s+', '', text or '')
+
+          def visible_text(fragment):
+              text = re.sub(r'<script\b[^>]*>.*?</script>', ' ', fragment, flags=re.I | re.S)
+              text = re.sub(r'<style\b[^>]*>.*?</style>', ' ', text, flags=re.I | re.S)
+              text = re.sub(r'<[^>]+>', ' ', text)
+              return re.sub(r'\s+', ' ', html.unescape(text)).strip()
+
+          def extract_bulletin_id(href):
+              decoded = html.unescape(unquote(href))
+              patterns = [
+                  r'(?:[?&]|%3F|%26)id(?:=|%3D)(\d+)',
+                  r'/id/(\d+)',
+                  r'(?:AllBulletinDetail|RaiseExplanationDetail)\.php[^\"\'<>]*?(\d{6,12})',
+              ]
+              for pattern in patterns:
+                  match = re.search(pattern, decoded, flags=re.I)
+                  if match:
+                      return match.group(1)
+              return None
+
+          def collect_listing_entries(url):
+              response = session.get(url, timeout=60)
+              response.raise_for_status()
+              page = html.unescape(decode_response(response)).replace('\\/', '/')
+              entries = []
+              for match in re.finditer(r'<a\b[^>]*href=[\"\']([^\"\']+)[\"\'][^>]*>(.*?)</a>', page, flags=re.I | re.S):
+                  href = match.group(1)
+                  title = visible_text(match.group(2))
+                  bulletin_id = extract_bulletin_id(href)
+                  if bulletin_id and bulletin_id != STOCK_ID:
+                      entries.append({'title': title, 'href': href, 'id': bulletin_id})
+              return entries
+
+          annual_url = f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_ID}/page_type/ndbg.phtml'
+          all_url = f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{STOCK_ID}.phtml'
+          issue_url = f'https://vip.stock.finance.sina.com.cn/corp/go.php/vISSUE_RaiseExplanation/stockid/{STOCK_ID}.phtml'
+          annual_entries = collect_listing_entries(annual_url)
+          all_entries = collect_listing_entries(all_url)
+          issue_entries = collect_listing_entries(issue_url)
+
+          def choose_report(year, kind):
+              target = f'{year}年年度报告' if kind == 'annual' else f'{year}年半年度报告'
+              candidates = []
+              for entry in annual_entries + all_entries:
+                  compact = normalize_text(entry['title'])
+                  if target not in compact:
+                      continue
+                  if any(word in compact for word in ['摘要', '业绩说明会', '问询函', '回复', '审计报告', '董事会', '提示性公告']):
+                      continue
+                  score = 100
+                  if any(word in compact for word in ['修订版', '更正版', '更新后']):
+                      score += 20
+                  if compact.endswith(target) or compact.endswith('：' + target) or compact.endswith(':' + target):
+                      score += 10
+                  candidates.append((score, int(entry['id']), entry))
+              if not candidates:
+                  raise RuntimeError(f'No report found for {target}. Relevant titles: {[e["title"] for e in annual_entries + all_entries if str(year) in e["title"]]}')
+              candidates.sort(reverse=True)
+              chosen = dict(candidates[0][2])
+              chosen['document_type'] = 'annual_report' if kind == 'annual' else 'half_year_report'
+              chosen['report_year'] = year
+              return chosen
+
+          def choose_prospectus():
+              candidates = []
+              for entry in issue_entries:
+                  compact = normalize_text(entry['title'])
+                  if '招股说明书' not in compact:
+                      continue
+                  if any(word in compact for word in ['招股意向书', '申报稿', '摘要']):
+                      continue
+                  score = 100
+                  if '首次公开发行股票并在科创板上市招股说明书' in compact:
+                      score += 30
+                  candidates.append((score, int(entry['id']), entry))
+              if not candidates:
+                  raise RuntimeError(f'No final prospectus found. Issue titles: {[e["title"] for e in issue_entries]}')
+              candidates.sort(reverse=True)
+              chosen = dict(candidates[0][2])
+              chosen['document_type'] = 'prospectus'
+              chosen['report_year'] = 'IPO'
+              return chosen
+
+          selected = [choose_prospectus()]
+          selected.extend(choose_report(str(year), 'annual') for year in range(2023, 2026))
+          selected.append(choose_report('2026', 'half_year'))
+          print('SELECTED DOCUMENTS:', json.dumps(selected, ensure_ascii=False, indent=2))
+
+          def detail_urls(item):
+              bulletin_id = item['id']
+              if item['document_type'] == 'prospectus':
+                  return [
+                      f'https://vip.stock.finance.sina.com.cn/corp/view/vISSUE_RaiseExplanationDetail.php?id={bulletin_id}&stockid={STOCK_ID}',
+                      f'https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id={bulletin_id}&stockid={STOCK_ID}',
+                  ]
+              return [f'https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id={bulletin_id}&stockid={STOCK_ID}']
+
+          def extract_pdf_urls(detail_html, base_url):
+              text = html.unescape(detail_html).replace('\\/', '/')
+              urls = []
+              patterns = [
+                  r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+?\.PDF',
+                  r'https?://[^\"\'<>\s]+?\.PDF',
+                  r'(?:href|src)=[\"\']([^\"\']+?\.PDF)[\"\']',
+              ]
+              for pattern in patterns:
+                  for value in re.findall(pattern, text, flags=re.I):
+                      if isinstance(value, tuple):
+                          value = value[0]
+                      url = unquote(urljoin(base_url, value))
+                      if url not in urls:
+                          urls.append(url)
+              return urls
+
+          def download_pdf(item, destination):
+              errors = []
+              for detail in detail_urls(item):
+                  try:
+                      response = session.get(detail, timeout=60)
+                      response.raise_for_status()
+                      detail_html = decode_response(response)
+                      pdf_candidates = extract_pdf_urls(detail_html, detail)
+                  except Exception as exc:
+                      errors.append(f'{detail}: detail error {exc}')
+                      continue
+                  for pdf_url in pdf_candidates:
+                      for attempt in range(1, 4):
+                          try:
+                              print(f'GET {item["title"]} attempt={attempt}: {pdf_url}')
+                              with session.get(pdf_url, timeout=180, allow_redirects=True, stream=True) as pdf_response:
+                                  pdf_response.raise_for_status()
+                                  data = bytearray()
+                                  for chunk in pdf_response.iter_content(chunk_size=1024 * 256):
+                                      if chunk:
+                                          data.extend(chunk)
+                                  raw = bytes(data)
+                                  content_type = pdf_response.headers.get('content-type')
+                              if len(raw) < 100_000 or not raw.lstrip().startswith(b'%PDF'):
+                                  raise RuntimeError(f'not a substantial PDF: type={content_type}, bytes={len(raw)}, head={raw[:20]!r}')
+                              destination.write_bytes(raw)
+                              item['detail_url'] = detail
+                              item['source_url'] = pdf_url
+                              return
+                          except Exception as exc:
+                              errors.append(f'{pdf_url} attempt {attempt}: {exc}')
+                              time.sleep(attempt * 2)
+              raise RuntimeError(f'Unable to download {item["title"]}:\n' + '\n'.join(errors))
+
+          def pdf_page_count(path):
+              completed = subprocess.run(['pdfinfo', str(path)], capture_output=True, text=True, check=True)
+              match = re.search(r'^Pages:\s+(\d+)\s*$', completed.stdout, flags=re.M)
+              if not match:
+                  raise RuntimeError(f'Unable to parse page count for {path}')
+              return int(match.group(1))
+
+          def extract_text(path, first_page, last_page):
+              with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temporary:
+                  output = Path(temporary.name)
+              try:
+                  completed = subprocess.run(
+                      ['pdftotext', '-f', str(first_page), '-l', str(last_page), '-enc', 'UTF-8', str(path), str(output)],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if completed.returncode != 0 or not output.exists():
+                      return ''
+                  return output.read_text(encoding='utf-8', errors='ignore')
+              finally:
+                  output.unlink(missing_ok=True)
+
+          manifest = []
+          sha_lines = []
+          for index, item in enumerate(selected, start=1):
+              if item['document_type'] == 'prospectus':
+                  filename = f'{index:02d}_芯动联科_首次公开发行股票并在科创板上市招股说明书.pdf'
+                  title_target = '招股说明书'
+                  minimum_pages = 250
+              elif item['document_type'] == 'annual_report':
+                  filename = f'{index:02d}_芯动联科_{item["report_year"]}年年度报告.pdf'
+                  title_target = f'{item["report_year"]}年年度报告'
+                  minimum_pages = 100
+              else:
+                  filename = f'{index:02d}_芯动联科_{item["report_year"]}年半年度报告.pdf'
+                  title_target = f'{item["report_year"]}年半年度报告'
+                  minimum_pages = 60
+
+              path = PDF_DIR / filename
+              download_pdf(item, path)
+              raw = path.read_bytes()
+              pages = pdf_page_count(path)
+              if pages < minimum_pages:
+                  raise RuntimeError(f'Unexpectedly short document: {item["title"]}, pages={pages}')
+
+              first_text = extract_text(path, 1, min(35, pages))
+              middle_page = max(1, pages // 2)
+              sampled_text = first_text + '\n' + extract_text(path, middle_page, middle_page) + '\n' + extract_text(path, pages, pages)
+              compact = normalize_text(sampled_text)
+              identity_ok = any(term in compact for term in [COMPANY_SHORT, COMPANY_FULL, STOCK_ID])
+              year_ok = True if item['document_type'] == 'prospectus' else item['report_year'] in compact
+              title_ok = title_target in compact
+              draft_markers_absent = True
+              if item['document_type'] == 'prospectus':
+                  head_compact = normalize_text(first_text[:20000])
+                  draft_markers_absent = not any(marker in head_compact for marker in ['招股意向书', '申报稿'])
+
+              if not identity_ok or not year_ok or not title_ok or not draft_markers_absent:
+                  raise RuntimeError(
+                      f'Identity/year/title/version check failed for {item["title"]}: '
+                      f'identity={identity_ok}, year={year_ok}, title={title_ok}, final={draft_markers_absent}'
+                  )
+
+              sha = hashlib.sha256(raw).hexdigest()
+              relative = str(path.relative_to(ROOT))
+              record = {
+                  'document_type': item['document_type'],
+                  'report_year': item['report_year'],
+                  'source_page_title': item['title'],
+                  'bulletin_id': item['id'],
+                  'file': relative,
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': sha,
+                  'detail_url': item['detail_url'],
+                  'source_url': item['source_url'],
+                  'pdf_header_valid': True,
+                  'identity_text_matched': identity_ok,
+                  'year_text_matched': year_ok,
+                  'title_text_matched': title_ok,
+                  'draft_markers_absent': draft_markers_absent,
+              }
+              manifest.append(record)
+              sha_lines.append(f'{sha}  {relative}')
+              print(f'VERIFIED {item["title"]}: pages={pages}, bytes={len(raw)}')
+
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(sha_lines) + '\n', encoding='utf-8')
+
+          readme = [
+              '安徽芯动联科微系统股份有限公司（芯动联科，688582）公开披露文件包',
+              '',
+              '内容范围：',
+              '1. 正式版首次公开发行股票并在科创板上市招股说明书；',
+              '2. 上市以来全部独立年度报告：2023年、2024年、2025年年度报告；',
+              '3. 截至2026年8月30日最新披露的2026年半年度报告全文。',
+              '',
+              '说明：公司于2023年6月30日在科创板上市，因此不存在单独披露的上市公司2022年年度报告。',
+              '上市前2019—2022年度经审计历史财务资料已包含在正式招股说明书中。',
+              '不包含招股意向书、申报稿、年度报告摘要、半年度报告摘要。',
+              '',
+              '校验项目：PDF文件头、pdfinfo可解析页数、公司名称/证券代码、报告年份和标题、正式招股说明书版本、SHA-256、ZIP CRC。',
+              '',
+              '文件清单：',
+          ]
+          for record in manifest:
+              readme.extend([
+                  f'- {record["source_page_title"]}',
+                  f'  文件：{record["file"]}',
+                  f'  页数：{record["pages"]}',
+                  f'  大小：{record["bytes"]} bytes',
+                  f'  SHA256：{record["sha256"]}',
+                  f'  公告详情：{record["detail_url"]}',
+                  f'  PDF来源：{record["source_url"]}',
+              ])
+          (ROOT / 'README_来源与校验.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          zip_name = '芯动联科_688582_全部年报_招股说明书_2026年最新半年报_完整PDF.zip'
+          with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_name, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed at {bad}')
+          print(f'CREATED {zip_name} bytes={Path(zip_name).stat().st_size}')
+          PY
+
+      - name: Upload packaged reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: xindong-micro-system-filings-final
+          path: 芯动联科_688582_全部年报_招股说明书_2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
