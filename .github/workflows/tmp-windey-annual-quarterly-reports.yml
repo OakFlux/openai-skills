@@ -1,0 +1,430 @@
+name: Temporary Windey annual and quarterly report collection
+
+on:
+  push:
+    branches:
+      - tmp/windey-annual-quarterly-reports-20260830
+    paths:
+      - .github/workflows/tmp-windey-annual-quarterly-reports.yml
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF Pillow
+      - name: Discover, download, validate, and package official reports
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          CODE = '300772'
+          COMPANY = '运达股份'
+          COMPANY_NAMES = [
+              '运达能源科技集团股份有限公司',
+              '浙江运达风电股份有限公司',
+              '浙江运达风电股份',
+              '运达能源科技集团股份',
+          ]
+          YEARS = list(range(2020, 2026))
+          TODAY = '2026-08-30'
+
+          OUT = Path('windey_financial_reports')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'X-Requested-With': 'XMLHttpRequest',
+          })
+
+          logs: list[str] = []
+
+          def note(*parts):
+              line = ' '.join(str(part) for part in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def clean_filename(value: object, limit: int = 110) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(value or '')).strip(' ._')
+              return (text or 'report')[:limit]
+
+          def clean_title(value: object) -> str:
+              text = html.unescape(str(value or ''))
+              text = re.sub(r'<[^>]+>', '', text)
+              text = re.sub(r'\s+', '', text)
+              return text
+
+          def identity_match(text: str) -> bool:
+              compact = re.sub(r'\s+', '', text or '')
+              return CODE in compact or COMPANY in compact or any(name in compact for name in COMPANY_NAMES)
+
+          def timestamp_to_date(value: object) -> str:
+              try:
+                  number = float(value)
+                  if number > 10_000_000_000:
+                      number /= 1000
+                  return datetime.fromtimestamp(number, tz=timezone.utc).strftime('%Y-%m-%d')
+              except Exception:
+                  text = str(value or '')
+                  match = re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}', text)
+                  return match.group(0).replace('/', '-') if match else ''
+
+          def find_org_id() -> str:
+              urls = [
+                  'https://www.cninfo.com.cn/new/information/topSearch/query',
+                  'https://www.cninfo.com.cn/new/information/topSearch/query?keyWord=300772&maxSecNum=10',
+              ]
+              for url in urls:
+                  try:
+                      if '?' in url:
+                          response = session.get(url, timeout=40)
+                      else:
+                          response = session.get(url, params={'keyWord': CODE, 'maxSecNum': 20}, timeout=40)
+                      note('TOP_SEARCH', response.status_code, len(response.content), response.url)
+                      payload = response.json()
+                  except Exception as exc:
+                      note('TOP_SEARCH_ERROR', repr(exc))
+                      continue
+
+                  stack = [payload]
+                  while stack:
+                      node = stack.pop()
+                      if isinstance(node, dict):
+                          code = str(node.get('code') or node.get('secCode') or node.get('stockCode') or '')
+                          name = str(node.get('zwjc') or node.get('secName') or node.get('name') or '')
+                          org = str(node.get('orgId') or node.get('orgid') or node.get('orgID') or '')
+                          if (code == CODE or COMPANY in name) and org:
+                              note('ORG_ID', org, code, name)
+                              return org
+                          stack.extend(node.values())
+                      elif isinstance(node, list):
+                          stack.extend(node)
+              note('ORG_ID_NOT_FOUND')
+              return ''
+
+          ORG_ID = find_org_id()
+
+          def query_announcements(search_key: str, start_date: str, end_date: str, category: str = '') -> list[dict]:
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              stock_variants = []
+              if ORG_ID:
+                  stock_variants.append(f'{CODE},{ORG_ID}')
+              stock_variants.extend([CODE, ''])
+              all_rows: list[dict] = []
+              seen = set()
+
+              for stock_value in stock_variants:
+                  for page_num in range(1, 8):
+                      form = {
+                          'pageNum': str(page_num),
+                          'pageSize': '30',
+                          'column': 'szse',
+                          'tabName': 'fulltext',
+                          'plate': 'sz',
+                          'stock': stock_value,
+                          'searchkey': search_key,
+                          'secid': '',
+                          'category': category,
+                          'trade': '',
+                          'seDate': f'{start_date}~{end_date}',
+                          'sortName': '',
+                          'sortType': '',
+                          'isHLtitle': 'true',
+                      }
+                      try:
+                          response = session.post(
+                              endpoint,
+                              data=form,
+                              timeout=50,
+                              headers={'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                          )
+                          payload = response.json()
+                          rows = payload.get('announcements') or []
+                          total = int(payload.get('totalAnnouncement') or 0)
+                          note('CNINFO_QUERY', search_key, stock_value or 'NO_STOCK', page_num, response.status_code, len(rows), total)
+                      except Exception as exc:
+                          note('CNINFO_QUERY_ERROR', search_key, stock_value or 'NO_STOCK', page_num, repr(exc))
+                          break
+
+                      for row in rows:
+                          title = clean_title(row.get('announcementTitle'))
+                          sec_code = str(row.get('secCode') or '')
+                          sec_name = str(row.get('secName') or '')
+                          if stock_value == '' and not (sec_code == CODE or COMPANY in sec_name or identity_match(title)):
+                              continue
+                          key = str(row.get('announcementId') or row.get('adjunctUrl') or '')
+                          if not key or key in seen:
+                              continue
+                          seen.add(key)
+                          row = dict(row)
+                          row['_clean_title'] = title
+                          row['_announce_date'] = timestamp_to_date(row.get('announcementTime'))
+                          all_rows.append(row)
+
+                      if not rows or page_num * 30 >= total:
+                          break
+                      time.sleep(0.25)
+
+                  if all_rows:
+                      # A stock-scoped result is preferable; do not broaden further once useful rows exist.
+                      break
+
+              note('QUERY_RESULT_COUNT', search_key, len(all_rows))
+              return all_rows
+
+          def annual_rank(row: dict, year: int) -> tuple:
+              title = row['_clean_title']
+              exact = title in {f'{year}年年度报告', f'{year}年年度报告（修订版）', f'{year}年年度报告(修订版)'}
+              revised = any(word in title for word in ['修订', '更正后', '更新后'])
+              return (1 if revised else 0, 1 if exact else 0, row.get('announcementTime') or 0)
+
+          annual_candidates: dict[int, list[dict]] = {}
+          for year in YEARS:
+              rows = query_announcements(
+                  f'{year}年年度报告',
+                  f'{year + 1}-01-01',
+                  TODAY if year == 2025 else f'{year + 1}-12-31',
+                  'category_ndbg_szsh;',
+              )
+              valid = []
+              for row in rows:
+                  title = row['_clean_title']
+                  if f'{year}年年度报告' not in title:
+                      continue
+                  if any(word in title for word in ['摘要', '英文版', '审计报告', '问询函', '回复', '取消审核', '内部控制']):
+                      continue
+                  valid.append(row)
+              valid.sort(key=lambda item: annual_rank(item, year), reverse=True)
+              annual_candidates[year] = valid
+              note('ANNUAL_CANDIDATES', year, json.dumps([
+                  {'title': x['_clean_title'], 'date': x['_announce_date'], 'url': x.get('adjunctUrl')}
+                  for x in valid[:8]
+              ], ensure_ascii=False))
+
+          quarterly_rows = query_announcements('季度报告', '2024-01-01', TODAY, '')
+          quarterly_candidates: list[dict] = []
+          for row in quarterly_rows:
+              title = row['_clean_title']
+              match = re.search(r'(20\d{2})年(第一|第三)季度报告', title)
+              if not match:
+                  continue
+              if any(word in title for word in ['摘要', '英文版', '问询函', '回复']):
+                  continue
+              row['_period_year'] = int(match.group(1))
+              row['_period_quarter'] = 1 if match.group(2) == '第一' else 3
+              quarterly_candidates.append(row)
+          quarterly_candidates.sort(
+              key=lambda item: (item['_period_year'], item['_period_quarter'], item.get('announcementTime') or 0),
+              reverse=True,
+          )
+          note('QUARTERLY_CANDIDATES', json.dumps([
+              {'title': x['_clean_title'], 'date': x['_announce_date'], 'url': x.get('adjunctUrl')}
+              for x in quarterly_candidates[:12]
+          ], ensure_ascii=False))
+
+          records: list[dict] = []
+          render_entries: list[tuple[str, Path]] = []
+          used_hashes = set()
+
+          def download_and_validate(row: dict, report_type: str, expected_year: int | None = None) -> dict | None:
+              adjunct = str(row.get('adjunctUrl') or '').lstrip('/')
+              if not adjunct:
+                  return None
+              urls = [
+                  f'https://static.cninfo.com.cn/{adjunct}',
+                  f'https://www.cninfo.com.cn/{adjunct}',
+              ]
+              data = None
+              source_url = None
+              for url in urls:
+                  try:
+                      response = session.get(url, timeout=120, allow_redirects=True, headers={'Accept': 'application/pdf,*/*;q=0.8'})
+                      note('PDF_GET', response.status_code, len(response.content), response.headers.get('content-type'), response.url)
+                      if response.status_code == 200 and len(response.content) > 50_000 and response.content.lstrip().startswith(b'%PDF'):
+                          data = response.content
+                          source_url = response.url
+                          break
+                  except Exception as exc:
+                      note('PDF_GET_ERROR', url, repr(exc))
+              if data is None:
+                  return None
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in used_hashes:
+                  note('DUPLICATE_PDF', row['_clean_title'])
+                  return None
+
+              temp = PDFDIR / f'_tmp_{digest[:12]}.pdf'
+              temp.write_bytes(data)
+              try:
+                  doc = pymupdf.open(str(temp))
+                  pages = doc.page_count
+                  minimum_pages = 60 if report_type == 'annual' else 8
+                  if pages < minimum_pages:
+                      raise ValueError(f'only {pages} pages')
+                  sample_indices = sorted(set([0, 1, min(5, pages - 1), pages // 2, pages - 1]))
+                  text = '\n'.join(doc.load_page(index).get_text('text') for index in sample_indices)
+                  if not identity_match(text):
+                      raise ValueError('company identity not found')
+                  if expected_year is not None and f'{expected_year}' not in re.sub(r'\s+', '', text[:10000]):
+                      note('YEAR_TEXT_WARNING', expected_year, row['_clean_title'])
+                  stem = clean_filename(row['_clean_title'], 55)
+                  for label, index in [('first', 0), ('middle', pages // 2), ('last', pages - 1)]:
+                      pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.65, 0.65), alpha=False)
+                      render_path = RENDERDIR / f'{stem}_{label}.png'
+                      pix.save(str(render_path))
+                      render_entries.append((f'{stem}-{label}', render_path))
+                  encrypted = bool(doc.is_encrypted)
+                  doc.close()
+              except Exception as exc:
+                  note('PDF_VALIDATION_ERROR', row['_clean_title'], repr(exc))
+                  temp.unlink(missing_ok=True)
+                  return None
+
+              used_hashes.add(digest)
+              announce_date = row.get('_announce_date') or '日期未知'
+              filename = f"{row['_clean_title']}_{pages}页_巨潮资讯网官方PDF.pdf"
+              final = PDFDIR / filename
+              final.unlink(missing_ok=True)
+              temp.rename(final)
+              record = {
+                  'title': row['_clean_title'],
+                  'type': report_type,
+                  'report_year': expected_year,
+                  'announcement_date': announce_date,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'encrypted': encrypted,
+                  'file': filename,
+                  'source_url': source_url,
+                  'announcement_id': row.get('announcementId'),
+                  'adjunct_url': row.get('adjunctUrl'),
+              }
+              note('VALIDATED', json.dumps(record, ensure_ascii=False))
+              return record
+
+          # Download annual reports, trying later corrected/revised disclosures first.
+          for year in YEARS:
+              candidates = annual_candidates.get(year) or []
+              record = None
+              for row in candidates:
+                  record = download_and_validate(row, 'annual', year)
+                  if record:
+                      break
+              if record is None:
+                  raise RuntimeError(f'Could not obtain a valid {year} annual report')
+              records.append(record)
+
+          quarterly_record = None
+          for row in quarterly_candidates:
+              quarterly_record = download_and_validate(row, 'quarterly', row.get('_period_year'))
+              if quarterly_record:
+                  quarterly_record['period_quarter'] = row.get('_period_quarter')
+                  break
+          if quarterly_record is None:
+              raise RuntimeError('Could not obtain a valid latest quarterly report')
+          records.append(quarterly_record)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 reports, got {len(records)}')
+
+          # Build visual contact sheet for QA.
+          thumbnails = []
+          for label, image_path in render_entries:
+              if not image_path.exists():
+                  continue
+              with Image.open(image_path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((260, 340))
+                  canvas = Image.new('RGB', (280, 380), 'white')
+                  canvas.paste(image, ((280 - image.width) // 2, 8))
+                  ImageDraw.Draw(canvas).text((8, 356), label[:44], fill='black')
+                  thumbnails.append(canvas)
+          if thumbnails:
+              columns = 3
+              rows_count = (len(thumbnails) + columns - 1) // columns
+              sheet = Image.new('RGB', (columns * 280, rows_count * 380), 'white')
+              for index, thumbnail in enumerate(thumbnails):
+                  sheet.paste(thumbnail, ((index % columns) * 280, (index // columns) * 380))
+              sheet.save(OUT / 'contact_sheet.jpg', quality=88)
+
+          total_pages = sum(item['pages'] for item in records)
+          (OUT / 'selected_reports.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '运达股份（300772.SZ）2020—2025年年度报告及最新季报下载包',
+              '',
+              f'完整PDF数量：{len(records)}份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for index, item in enumerate(records, 1):
+              readme.append(
+                  f"{index}. {item['title']}｜公告日期：{item['announcement_date']}｜{item['pages']}页｜巨潮资讯网官方PDF"
+              )
+          readme += [
+              '',
+              '年度报告均为完整正文，未混入年度报告摘要；同一年度存在修订或更正版本时，优先采用后续披露且通过校验的版本。',
+              '最新季报按报告期间排序，在第一季度报告与第三季度报告中选取截至2026-08-30最新一期。',
+              '已核验公司名称及证券代码300772、PDF文件头、实际页数和加密状态，并检查每份文件的首页、中间页与末页；ZIP完整性测试通过。',
+              '版权归上市公司及公告平台所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{item['sha256']}  {item['file']}" for item in records) + '\n',
+              encoding='utf-8',
+          )
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / 'windey_2020_2025_annual_and_latest_quarterly_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdf_names)} PDFs instead of 7')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / 'ZIP_SHA256.txt').write_text(zip_sha + '  ' + zip_path.name + '\n', encoding='utf-8')
+          print((OUT / 'README.txt').read_text(encoding='utf-8'))
+          print('FINAL_ZIP', zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windey-annual-quarterly-reports
+          path: windey_financial_reports/
+          retention-days: 3
+          if-no-files-found: error
