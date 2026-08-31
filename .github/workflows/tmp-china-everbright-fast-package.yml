@@ -1,0 +1,158 @@
+name: Temporary China Everbright Limited fast report package
+
+on:
+  push:
+    branches:
+      - tmp/china-everbright-broker-reports-fast-20260831
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests Pillow PyMuPDF img2pdf
+      - name: Probe, download, compile, validate, and package
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import concurrent.futures
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          reports = [
+              {'id':'5370196','date':'2026-04-17','org':'国金证券','title':'跨境资管标的，业绩弹性可期','min':18,'max':35},
+              {'id':'5040903','date':'2025-09-03','org':'国泰海通证券','title':'资负共振，锚定科创，拐点已现','min':20,'max':35},
+              {'id':'4956136','date':'2025-07-17','org':'太平洋证券','title':'2024年年报点评：持续深耕硬科技，减亏初显成效','min':8,'max':25},
+          ]
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+          OUT=Path('china_everbright_fast'); PDFDIR=OUT/'pdfs'; IMGROOT=OUT/'images'; RENDER=OUT/'renders'
+          for p in [OUT,PDFDIR,IMGROOT,RENDER]: p.mkdir(parents=True,exist_ok=True)
+
+          def clean(s,limit=100): return re.sub(r'[\\/:*?"<>|\r\n]+','_',s).strip(' ._')[:limit]
+          def base_url(meta,n):
+              y,m,d=meta['date'].split('-')
+              return f"https://public.fxbaogao.com/report-image/{y}/{m}/{d}/{meta['id']}-{n}.png"
+          def new_session():
+              s=requests.Session(); s.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.fxbaogao.com/'}); return s
+
+          def probe(meta,n):
+              url=base_url(meta,n)
+              s=new_session()
+              try:
+                  r=s.head(url,timeout=(5,10),allow_redirects=True,headers={'Referer':f"https://www.fxbaogao.com/detail/{meta['id']}"})
+                  ct=(r.headers.get('content-type') or '').lower(); size=int(r.headers.get('content-length') or 0)
+                  print('HEAD',meta['id'],n,r.status_code,size,ct,r.url,flush=True)
+                  if r.status_code==200 and ct.startswith('image/') and size>8000: return True
+              except Exception as e: print('HEAD_ERR',meta['id'],n,repr(e),flush=True)
+              try:
+                  r=s.get(url,timeout=(5,15),allow_redirects=True,headers={'Range':'bytes=0-65535','Referer':f"https://www.fxbaogao.com/detail/{meta['id']}"})
+                  ct=(r.headers.get('content-type') or '').lower()
+                  print('RANGE',meta['id'],n,r.status_code,len(r.content),ct,r.url,flush=True)
+                  return r.status_code in (200,206) and ct.startswith('image/') and len(r.content)>8000
+              except Exception as e: print('RANGE_ERR',meta['id'],n,repr(e),flush=True); return False
+
+          def download(meta,n):
+              url=base_url(meta,n)
+              for attempt in range(3):
+                  s=new_session()
+                  try:
+                      r=s.get(url,timeout=(7,40),allow_redirects=True,headers={'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8','Referer':f"https://www.fxbaogao.com/detail/{meta['id']}"})
+                      ct=(r.headers.get('content-type') or '').lower()
+                      print('GET',meta['id'],n,attempt,r.status_code,len(r.content),ct,r.url,flush=True)
+                      if r.status_code==200 and ct.startswith('image/') and len(r.content)>8000:
+                          with Image.open(io.BytesIO(r.content)) as im:
+                              im.load()
+                              if im.width<700 or im.height<900: raise ValueError(f'small image {im.size}')
+                              rgb=im.convert('RGB')
+                              return n,rgb.copy(),r.url,hashlib.sha256(r.content).hexdigest()
+                  except Exception as e: print('GET_ERR',meta['id'],n,attempt,repr(e),flush=True)
+                  time.sleep(1.0*(attempt+1))
+              raise RuntimeError(f"failed page {meta['id']}-{n}")
+
+          records=[]; qa=[]
+          for meta in reports:
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                  future_map={ex.submit(probe,meta,n):n for n in range(1,meta['max']+1)}
+                  exists={future_map[f]:f.result() for f in concurrent.futures.as_completed(future_map)}
+              present=sorted(n for n,v in exists.items() if v)
+              if not present: raise RuntimeError(f"no pages {meta['id']}")
+              page_count=max(present)
+              expected=list(range(1,page_count+1))
+              if present!=expected: raise RuntimeError(f"non-contiguous pages {meta['id']}: {present}")
+              if page_count<meta['min']: raise RuntimeError(f"only {page_count} pages {meta['id']}")
+              print('PROBED',meta['id'],page_count,flush=True)
+
+              imgdir=IMGROOT/meta['id']; imgdir.mkdir(parents=True,exist_ok=True)
+              results={}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                  fs={ex.submit(download,meta,n):n for n in expected}
+                  for f in concurrent.futures.as_completed(fs):
+                      n,img,url,digest=f.result(); results[n]=(img,url,digest)
+              hashes=set(); paths=[]
+              for n in expected:
+                  img,url,digest=results[n]
+                  if digest in hashes: raise RuntimeError(f"duplicate page {meta['id']}-{n}")
+                  hashes.add(digest)
+                  p=imgdir/f'{n:03d}.png'; img.save(p,'PNG',optimize=True); paths.append(p)
+
+              pdf_name=f"{meta['date']}_{meta['org']}_中国光大控股（0165.HK）_{clean(meta['title'],68)}_{page_count}页_完整公开页图PDF.pdf"
+              pdf_path=PDFDIR/pdf_name
+              layout=img2pdf.get_layout_fun((img2pdf.mm_to_pt(210),img2pdf.mm_to_pt(297)))
+              pdf_path.write_bytes(img2pdf.convert([str(p) for p in paths],layout_fun=layout))
+              doc=pymupdf.open(str(pdf_path))
+              if doc.page_count!=page_count or doc.is_encrypted: raise RuntimeError(f"bad pdf {pdf_name}")
+              for label,idx in [('first',0),('middle',page_count//2),('last',page_count-1)]:
+                  pix=doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(0.65,0.65),alpha=False)
+                  rp=RENDER/f"{meta['id']}_{label}.png"; pix.save(str(rp)); qa.append((f"{meta['org']}-{label}",rp))
+              doc.close()
+              data=pdf_path.read_bytes()
+              rec={**meta,'pages':page_count,'file':pdf_name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'source_detail':f"https://www.fxbaogao.com/detail/{meta['id']}",'version':'发现报告公开原始页图顺序合成PDF'}
+              records.append(rec); print('REPORT',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          thumbs=[]
+          for label,p in qa:
+              with Image.open(p) as im:
+                  im=im.convert('RGB'); im.thumbnail((300,390)); c=Image.new('RGB',(320,435),'white'); c.paste(im,((320-im.width)//2,8)); ImageDraw.Draw(c).text((10,410),label,fill='black'); thumbs.append(c)
+          cols=3; rows=(len(thumbs)+2)//3; sheet=Image.new('RGB',(cols*320,rows*435),'white')
+          for i,t in enumerate(thumbs): sheet.paste(t,((i%3)*320,(i//3)*435))
+          sheet.save(OUT/'contact_sheet.jpg',quality=90)
+
+          readme=['中国光大控股（0165.HK）券商深度研究报告下载包','',f'报告数量：{len(records)}份',f"合计页数：{sum(x['pages'] for x in records)}页",'']
+          for i,x in enumerate(records,1): readme.append(f"{i}. {x['date']}｜{x['org']}｜{x['title']}｜{x['pages']}页")
+          readme += ['', '三份报告均以中国光大控股为主要研究主体。', 'PDF由公开展示的原始报告页图逐页下载后按顺序合成，保留原报告页面版式；并非券商服务器原生PDF文件。', '已检查页面连续性、重复页、图像可解码性、PDF页数、加密状态及首页/中间页/末页渲染。', '版权归原发布机构及相关权利人所有，仅供研究参考。']
+          (OUT/'README.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'selected_reports.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in records)+'\n',encoding='utf-8')
+          zpath=OUT/'china_everbright_limited_broker_reports_3.zip'
+          with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(PDFDIR.glob('*.pdf')): z.write(p,p.name)
+              for name in ['README.txt','selected_reports.json','SHA256SUMS.txt']: z.write(OUT/name,name)
+          with zipfile.ZipFile(zpath) as z:
+              if z.testzip(): raise RuntimeError('zip failure')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=3: raise RuntimeError('wrong pdf count')
+          zhash=hashlib.sha256(zpath.read_bytes()).hexdigest(); (OUT/'ZIP_SHA256.txt').write_text(f'{zhash}  {zpath.name}\n',encoding='utf-8')
+          print((OUT/'README.txt').read_text(encoding='utf-8'),flush=True); print('FINAL_ZIP',zpath.stat().st_size,zhash,flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-limited-broker-reports-fast
+          path: china_everbright_fast/
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 6
