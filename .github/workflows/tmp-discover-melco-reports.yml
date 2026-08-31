@@ -1,0 +1,286 @@
+name: Temporary Discover Melco International Broker Reports
+
+on:
+  push:
+    branches:
+      - tmp/melco-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-discover-melco-reports.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Discover report metadata and validate public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf beautifulsoup4
+          python - <<'PY'
+          import html
+          import io
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('out')
+          PDF_DIR = OUT / 'pdfs'
+          OUT.mkdir(exist_ok=True)
+          PDF_DIR.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          company_needles = ['新濠国际发展', '新濠國際發展', 'Melco International', '00200.HK', '00200']
+          known_dates = [
+              ('2024-08-14', '2024-08-18'),
+              ('2025-04-25', '2025-05-18'),
+              ('2025-07-29', '2025-08-04'),
+              ('2025-11-05', '2025-11-12'),
+              ('2026-04-17', '2026-04-22'),
+          ]
+
+          raw_responses = []
+          rows_by_key = {}
+
+          def save_response(label, response):
+              raw_responses.append({
+                  'label': label,
+                  'url': response.url,
+                  'status': response.status_code,
+                  'content_type': response.headers.get('content-type'),
+                  'bytes': len(response.content),
+                  'head': response.text[:12000] if 'text' in response.headers.get('content-type','').lower() or 'json' in response.headers.get('content-type','').lower() else response.content[:100].hex(),
+              })
+
+          def flatten_rows(payload):
+              candidates = []
+              if isinstance(payload, list):
+                  candidates.extend(payload)
+              if isinstance(payload, dict):
+                  for key in ('data', 'rows', 'list', 'dataList', 'result'):
+                      value = payload.get(key)
+                      if isinstance(value, list):
+                          candidates.extend(value)
+                      elif isinstance(value, dict):
+                          for key2 in ('data', 'rows', 'list', 'dataList'):
+                              v2 = value.get(key2)
+                              if isinstance(v2, list):
+                                  candidates.extend(v2)
+              return [x for x in candidates if isinstance(x, dict)]
+
+          def add_rows(source, payload):
+              for row in flatten_rows(payload):
+                  blob = json.dumps(row, ensure_ascii=False)
+                  info = str(row.get('infoCode') or row.get('INFO_CODE') or row.get('infocode') or row.get('id') or row.get('reportId') or '')
+                  title = str(row.get('title') or row.get('TITLE') or row.get('reportTitle') or row.get('REPORT_TITLE') or '')
+                  stock_name = str(row.get('stockName') or row.get('stockNameText') or row.get('SECURITY_NAME_ABBR') or '')
+                  stock_code = str(row.get('stockCode') or row.get('code') or row.get('SECURITY_CODE') or '')
+                  if not any(n.lower() in blob.lower() for n in company_needles):
+                      continue
+                  key = info or (title + stock_code + str(row.get('publishDate') or row.get('NOTICE_DATE') or ''))
+                  existing = rows_by_key.setdefault(key, {'sources': [], 'row': row})
+                  if source not in existing['sources']:
+                      existing['sources'].append(source)
+
+          # Eastmoney report/list GET variants.
+          list_url = 'https://reportapi.eastmoney.com/report/list'
+          code_variants = ['00200', '0200', 'HK00200', '00200.HK', '200']
+          for code in code_variants:
+              for qtype in ['0','1','2','3','4']:
+                  params = {
+                      'industryCode': '*', 'pageSize': '500', 'industry': '*', 'rating': '*',
+                      'ratingChange': '*', 'beginTime': '2018-01-01', 'endTime': '2026-08-31',
+                      'pageNo': '1', 'fields': '', 'qType': qtype, 'orgCode': '', 'author': '',
+                      'code': code, 'rcode': '', '_': str(int(time.time()*1000)),
+                  }
+                  try:
+                      r = session.get(list_url, params=params, timeout=50)
+                      save_response(f'list_get_code={code}_q={qtype}', r)
+                      if r.ok:
+                          try: add_rows(f'list_get_code={code}_q={qtype}', r.json())
+                          except Exception: pass
+                  except Exception as exc:
+                      raw_responses.append({'label': f'list_get_code={code}_q={qtype}', 'error': repr(exc)})
+
+          # Global narrow-date GET searches, including all stocks, then local company filtering.
+          for begin, end in known_dates:
+              for qtype in ['0','1','2','3']:
+                  params = {
+                      'industryCode': '*', 'pageSize': '500', 'industry': '*', 'rating': '*',
+                      'ratingChange': '*', 'beginTime': begin, 'endTime': end,
+                      'pageNo': '1', 'fields': '', 'qType': qtype, 'orgCode': '', 'author': '',
+                      'code': '', 'rcode': '', '_': str(int(time.time()*1000)),
+                  }
+                  try:
+                      r = session.get(list_url, params=params, timeout=50)
+                      save_response(f'list_global_{begin}_{end}_q={qtype}', r)
+                      if r.ok:
+                          try: add_rows(f'list_global_{begin}_{end}_q={qtype}', r.json())
+                          except Exception: pass
+                  except Exception as exc:
+                      raw_responses.append({'label': f'list_global_{begin}_{end}_q={qtype}', 'error': repr(exc)})
+
+          # report/list2 POST variants.
+          list2_url = 'https://reportapi.eastmoney.com/report/list2'
+          post_payloads = []
+          for code in code_variants:
+              for qtype in [0,1,2,3,4]:
+                  post_payloads.append({
+                      'industryCode': '*', 'pageSize': 500, 'industry': '*', 'rating': '*',
+                      'ratingChange': '*', 'beginTime': '2018-01-01', 'endTime': '2026-08-31',
+                      'pageNo': 1, 'fields': '', 'qType': qtype, 'orgCode': '', 'author': '',
+                      'code': code, 'rcode': '',
+                  })
+          for idx, payload in enumerate(post_payloads):
+              for mode in ('json','form'):
+                  try:
+                      kwargs = {'json': payload} if mode == 'json' else {'data': payload}
+                      r = session.post(list2_url, timeout=50, **kwargs)
+                      save_response(f'list2_{mode}_{idx}_{payload["code"]}_q={payload["qType"]}', r)
+                      if r.ok:
+                          try: add_rows(f'list2_{mode}_{idx}_{payload["code"]}_q={payload["qType"]}', r.json())
+                          except Exception: pass
+                  except Exception as exc:
+                      raw_responses.append({'label': f'list2_{mode}_{idx}', 'error': repr(exc)})
+
+          # Inspect Eastmoney report/F10 pages and scripts for report APIs or embedded IDs.
+          inspect_pages = [
+              'https://data.eastmoney.com/report/00200.html',
+              'https://data.eastmoney.com/report/hk/00200.html',
+              'https://data.eastmoney.com/report/stock.jshtml?code=00200',
+              'https://emweb.securities.eastmoney.com/PC_HKF10/ResearchReport/index?type=web&code=HK00200',
+              'https://emweb.securities.eastmoney.com/PC_HKF10/ResearchReport/index?type=web&code=00200',
+              'https://f10.eastmoney.com/ResearchReport/Index?type=web&code=HK00200',
+          ]
+          page_findings = []
+          scripts = []
+          for page_url in inspect_pages:
+              try:
+                  r = session.get(page_url, timeout=50, allow_redirects=True)
+                  text = html.unescape(r.text).replace('\\/','/')
+                  soup = BeautifulSoup(text, 'html.parser')
+                  scripts.extend(urljoin(r.url, s.get('src')) for s in soup.find_all('script') if s.get('src'))
+                  snippets = []
+                  for needle in ['report/list', 'list2', 'infoCode', 'encodeUrl', 'pdf.dfcfw', '00200', '新濠国际']:
+                      for m in list(re.finditer(re.escape(needle), text, re.I))[:20]:
+                          snippets.append({'needle': needle, 'text': re.sub(r'\s+',' ', text[max(0,m.start()-500):m.start()+2000])})
+                  page_findings.append({'url': page_url, 'final': r.url, 'status': r.status_code, 'bytes': len(r.content), 'title': soup.title.get_text(' ',strip=True) if soup.title else '', 'scripts': scripts[-30:], 'snippets': snippets[:100]})
+              except Exception as exc:
+                  page_findings.append({'url': page_url, 'error': repr(exc)})
+
+          script_findings = []
+          for script_url in list(dict.fromkeys(scripts))[:100]:
+              try:
+                  r = session.get(script_url, timeout=45)
+                  body = html.unescape(r.text).replace('\\/','/')
+                  hits = []
+                  for needle in ['report/list', 'report/list2', 'infoCode', 'encodeUrl', 'pdf.dfcfw', 'ResearchReport', 'HKF10']:
+                      for m in list(re.finditer(re.escape(needle), body, re.I))[:30]:
+                          hits.append({'needle': needle, 'text': re.sub(r'\s+',' ', body[max(0,m.start()-700):m.start()+2500])})
+                  if hits:
+                      script_findings.append({'url': script_url, 'status': r.status_code, 'bytes': len(r.content), 'hits': hits[:200]})
+              except Exception as exc:
+                  script_findings.append({'url': script_url, 'error': repr(exc)})
+
+          # Inspect public index pages for likely original/public PDF clues. Do not bypass paywalls.
+          third_party_pages = [
+              'https://www.360why.com/bg/0b1188000059015.html',
+              'https://www.360why.com/bg/c2ab29000082458.html',
+          ]
+          third_party_findings = []
+          for page_url in third_party_pages:
+              try:
+                  r = session.get(page_url, timeout=50)
+                  text = html.unescape(r.text).replace('\\/','/')
+                  urls = sorted(set(re.findall(r'https?://[^"\'<>\s]+', text)))
+                  snippets=[]
+                  for needle in ['pdf', 'download', 'fileUrl', 'oss', '00200', '新濠国际']:
+                      for m in list(re.finditer(re.escape(needle), text, re.I))[:30]:
+                          snippets.append({'needle':needle,'text':re.sub(r'\s+',' ',text[max(0,m.start()-500):m.start()+1800])})
+                  third_party_findings.append({'url':page_url,'status':r.status_code,'bytes':len(r.content),'urls':[u for u in urls if any(k in u.lower() for k in ['pdf','download','oss','file'])][:200],'snippets':snippets[:120]})
+              except Exception as exc:
+                  third_party_findings.append({'url':page_url,'error':repr(exc)})
+
+          # Validate PDFs for discovered info codes and any direct URL fields.
+          validated = []
+          for key, entry in rows_by_key.items():
+              row = entry['row']
+              info = str(row.get('infoCode') or row.get('INFO_CODE') or row.get('infocode') or '')
+              title = str(row.get('title') or row.get('TITLE') or row.get('reportTitle') or row.get('REPORT_TITLE') or '')
+              broker = str(row.get('orgSName') or row.get('orgName') or row.get('ORG_SNAME') or '')
+              date = str(row.get('publishDate') or row.get('NOTICE_DATE') or row.get('date') or '')[:10]
+              direct_urls = []
+              for field in ('attachUrl','pdfUrl','downloadUrl','fileUrl','url','encodeUrl'):
+                  value = row.get(field)
+                  if isinstance(value, str) and value:
+                      if value.startswith('//'): value = 'https:' + value
+                      elif value.startswith('/'): value = urljoin('https://data.eastmoney.com/', value)
+                      if '.pdf' in value.lower(): direct_urls.append(value.replace('http://','https://',1))
+              if info:
+                  direct_urls += [
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?{int(time.time()*1000)}.pdf',
+                  ]
+              item = {'key':key,'infoCode':info,'title':title,'broker':broker,'date':date,'sources':entry['sources'],'row':row,'pdf_attempts':[],'ok':False}
+              for url in dict.fromkeys(direct_urls):
+                  try:
+                      r = session.get(url, timeout=70, allow_redirects=True, headers={'Referer':'https://data.eastmoney.com/'})
+                      attempt = {'url':url,'final':r.url,'status':r.status_code,'bytes':len(r.content),'content_type':r.headers.get('content-type'),'head':r.content[:8].hex()}
+                      if r.status_code == 200 and r.content.lstrip().startswith(b'%PDF') and len(r.content)>20000:
+                          reader = PdfReader(io.BytesIO(r.content), strict=False)
+                          attempt['pages'] = len(reader.pages)
+                          attempt['encrypted'] = bool(reader.is_encrypted)
+                          first=''
+                          try:first=' '.join((reader.pages[0].extract_text() or '').split())[:1500]
+                          except Exception:pass
+                          attempt['first_text']=first
+                          filename = re.sub(r'[^0-9A-Za-z\u4e00-\u9fff._-]+','_',f'{date}_{broker}_{title}_{info}.pdf')[:180]
+                          path = PDF_DIR / filename
+                          path.write_bytes(r.content)
+                          attempt['saved']=str(path)
+                          item.update({'ok':True,'pdf_url':r.url,'pages':len(reader.pages),'bytes':len(r.content),'saved':str(path),'first_text':first})
+                          item['pdf_attempts'].append(attempt)
+                          break
+                      item['pdf_attempts'].append(attempt)
+                  except Exception as exc:
+                      item['pdf_attempts'].append({'url':url,'error':repr(exc)})
+              validated.append(item)
+
+          result = {
+              'matching_rows': list(rows_by_key.values()),
+              'validated': validated,
+              'raw_responses': raw_responses,
+              'page_findings': page_findings,
+              'script_findings': script_findings,
+              'third_party_findings': third_party_findings,
+          }
+          (OUT/'melco_discovery.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY=' + json.dumps({
+              'matching_rows':len(rows_by_key),
+              'validated_pdfs':sum(1 for x in validated if x.get('ok')),
+              'validated':[{'infoCode':x.get('infoCode'),'date':x.get('date'),'broker':x.get('broker'),'title':x.get('title'),'pages':x.get('pages'),'url':x.get('pdf_url')} for x in validated if x.get('ok')],
+          },ensure_ascii=False),flush=True)
+          PY
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: melco-report-discovery
+          path: out
+          retention-days: 3
+          if-no-files-found: error
