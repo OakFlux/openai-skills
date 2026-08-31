@@ -1,0 +1,446 @@
+name: Temporary China Everbright Limited broker report collection
+
+on:
+  push:
+    branches:
+      - tmp/china-everbright-ltd-broker-reports-20260831
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests PyMuPDF Pillow
+      - name: Discover, download, validate, and package reports
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          COMPANY = '中国光大控股'
+          CODE = '00165'
+          OUT = Path('china_everbright_limited_reports')
+          PDFDIR = OUT / 'pdfs'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+          })
+          sd = requests.Session()
+          sd.headers.update({
+              'User-Agent': session.headers['User-Agent'],
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+
+          candidates: list[dict] = []
+          seen_candidate_keys: set[tuple] = set()
+          logs: list[str] = []
+
+          def note(*parts):
+              line = ' '.join(str(part) for part in parts)
+              print(line, flush=True)
+              logs.append(line)
+
+          def clean(value: object, limit: int = 105) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(value or '')).strip(' ._')
+              return (text or 'report')[:limit]
+
+          def norm(value: object) -> str:
+              return re.sub(r'[\W_]+', '', str(value or ''), flags=re.UNICODE).lower()
+
+          def company_match(value: object) -> bool:
+              text = re.sub(r'\s+', '', str(value or '')).lower()
+              keys = [
+                  '中国光大控股', '光大控股', '00165', '0165.hk', '165.hk',
+                  'chinaeverbrightlimited', 'china everbright limited'
+              ]
+              return any(key.replace(' ', '') in text.replace(' ', '') for key in keys)
+
+          preferred_titles = [
+              '跨境资管标的业绩弹性可期',
+              '资负共振锚定科创拐点已现',
+          ]
+
+          def score(item: dict) -> float:
+              title = str(item.get('title') or '')
+              title_norm = norm(title)
+              pages = int(item.get('pages_meta') or 0)
+              value = pages * 5.0
+              for index, key in enumerate(preferred_titles):
+                  if key in title_norm:
+                      value += 6000 - index * 250
+              if any(word in title for word in ['深度报告', '公司深度', '深度研究']):
+                  value += 1300
+              if any(word in title for word in ['首次覆盖', '首次评级', '首次推荐']):
+                  value += 1200
+              if '公司研究' in title:
+                  value += 500
+              if any(word in title for word in ['点评', '季报', '年报', '中报', '业绩快报', '事件点评', '跟踪报告']):
+                  value -= 1200
+              try:
+                  year = int(str(item.get('date') or '')[:4])
+                  value += max(0, year - 2018) * 20
+              except Exception:
+                  pass
+              return value
+
+          def add_candidate(item: dict):
+              title = str(item.get('title') or '').strip()
+              identity_blob = ' '.join([
+                  title,
+                  str(item.get('stockCode') or ''),
+                  str(item.get('stockName') or ''),
+                  json.dumps(item.get('stock') or {}, ensure_ascii=False),
+              ])
+              if not company_match(identity_blob):
+                  return
+              if any(word in title for word in [
+                  '年度报告', '半年度报告', '季度报告', '招股说明书', '行业周报',
+                  '行业研究', '策略报告', '调研纪要', '会议纪要', '公告'
+              ]):
+                  return
+              code = str(item.get('code') or '')
+              if not code.startswith('AP'):
+                  return
+              pages = int(item.get('pages_meta') or 0)
+              if pages and pages < 12:
+                  return
+              key = (code, norm(title))
+              if key in seen_candidate_keys:
+                  return
+              seen_candidate_keys.add(key)
+              item['_score'] = score(item)
+              candidates.append(item)
+              note('CANDIDATE', json.dumps(item, ensure_ascii=False))
+
+          # Eastmoney's public stock-report catalogue.
+          endpoint = 'https://reportapi.eastmoney.com/report/list2'
+          windows = [
+              ('2010-01-01', '2022-12-31'),
+              ('2023-01-01', '2024-12-31'),
+              ('2025-01-01', '2026-08-31'),
+          ]
+          for code_variant in ['00165', '0165', '165']:
+              for begin, end in windows:
+                  for page in range(1, 6):
+                      body = {
+                          'beginTime': begin,
+                          'endTime': end,
+                          'industryCode': '*',
+                          'ratingChange': '*',
+                          'rating': '*',
+                          'orgCode': '*',
+                          'code': code_variant,
+                          'rcode': '',
+                          'pageSize': 100,
+                          'pageNo': page,
+                          'p': page,
+                          'pageNum': page,
+                          'pageNumber': page,
+                          'qType': 0,
+                      }
+                      try:
+                          response = session.post(
+                              endpoint,
+                              json=body,
+                              timeout=50,
+                              headers={
+                                  'Content-Type': 'application/json',
+                                  'Origin': 'https://data.eastmoney.com',
+                                  'Referer': 'https://data.eastmoney.com/report/stock.jshtml',
+                              },
+                          )
+                          result = response.json()
+                          rows = result.get('data') or []
+                          total_pages = int(result.get('TotalPage') or result.get('totalPage') or 1)
+                          note('EM_SEARCH', code_variant, begin, end, page, response.status_code, len(rows), total_pages)
+                      except Exception as exc:
+                          note('EM_SEARCH_ERROR', code_variant, begin, end, page, repr(exc))
+                          break
+                      for row in rows:
+                          add_candidate({
+                              'source': 'eastmoney',
+                              'title': row.get('title') or '',
+                              'org': row.get('orgSName') or row.get('orgName') or '',
+                              'date': str(row.get('publishDate') or '')[:10],
+                              'pages_meta': row.get('attachPages'),
+                              'code': row.get('infoCode'),
+                              'stockCode': row.get('stockCode') or row.get('code'),
+                              'stockName': row.get('stockName') or row.get('name'),
+                          })
+                      if page >= total_pages or not rows:
+                          break
+                      time.sleep(0.15)
+
+          # Secondary catalogue, particularly useful for Hong Kong-listed issuers.
+          queries = [
+              COMPANY,
+              CODE,
+              '中国光大控股 深度报告',
+              '中国光大控股 首次覆盖',
+              '中国光大控股 跨境资管标的 业绩弹性可期',
+              '中国光大控股 资负共振 锚定科创 拐点已现',
+              '光大控股 资负共振',
+          ]
+          raw_rows: dict[object, dict] = {}
+          for query in queries:
+              for page in range(1, 4):
+                  try:
+                      response = sd.post(
+                          'https://api.sdyanbao.com/api/file/search',
+                          json={'page': page, 'pageSize': 100, 'keyword': query},
+                          timeout=50,
+                      )
+                      rows = (response.json().get('data') or {}).get('files') or []
+                      note('SD_SEARCH', query, page, response.status_code, len(rows))
+                  except Exception as exc:
+                      note('SD_SEARCH_ERROR', query, page, repr(exc))
+                      break
+                  for row in rows:
+                      rid = row.get('id')
+                      if rid is not None:
+                          raw_rows[rid] = row
+                  if len(rows) < 100:
+                      break
+
+          for row in raw_rows.values():
+              initial_name = str(row.get('name') or '')
+              initial_stock = row.get('stock') or {}
+              initial_code = str(initial_stock.get('code') or '') if isinstance(initial_stock, dict) else ''
+              if initial_code not in ['00165', '0165', '165'] and not company_match(initial_name + json.dumps(row, ensure_ascii=False)):
+                  continue
+              detail = {}
+              try:
+                  payload = sd.post(
+                      'https://api.sdyanbao.com/api/file/detail',
+                      json={'id': row.get('id')},
+                      timeout=50,
+                  ).json()
+                  if payload.get('status') == 1:
+                      detail = payload.get('data') or {}
+              except Exception as exc:
+                  note('SD_DETAIL_ERROR', row.get('id'), repr(exc))
+              stock = detail.get('stock') or row.get('stock') or {}
+              add_candidate({
+                  'source': 'sdyanbao',
+                  'title': detail.get('name') or row.get('name') or '',
+                  'org': ((detail.get('organization') or {}).get('name')
+                          or (row.get('organization') or {}).get('name')
+                          or ''),
+                  'date': str(detail.get('time_text') or row.get('time_text') or '')[:10],
+                  'pages_meta': detail.get('page_count') or row.get('page_count'),
+                  'code': detail.get('data_source_uuid') or row.get('data_source_uuid'),
+                  'stock': stock,
+                  'stockCode': (stock.get('code') if isinstance(stock, dict) else ''),
+                  'stockName': (stock.get('name') if isinstance(stock, dict) else ''),
+              })
+
+          candidates.sort(
+              key=lambda item: (item['_score'], str(item.get('date') or ''), int(item.get('pages_meta') or 0)),
+              reverse=True,
+          )
+          (OUT / 'candidates.json').write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+          note('CANDIDATE_COUNT', len(candidates))
+
+          validated: list[dict] = []
+          hashes: set[str] = set()
+          render_entries: list[tuple[str, Path]] = []
+
+          for meta in candidates:
+              if len(validated) >= 10:
+                  break
+              code = str(meta.get('code') or '')
+              data = None
+              source_url = None
+              for url in [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time() * 1000)}.pdf=',
+              ]:
+                  try:
+                      response = session.get(
+                          url,
+                          timeout=120,
+                          allow_redirects=True,
+                          headers={'Referer': 'https://data.eastmoney.com/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                      )
+                      note('PDF_GET', response.status_code, len(response.content), response.headers.get('content-type'), response.url)
+                      if response.status_code == 200 and len(response.content) > 50_000 and response.content.lstrip().startswith(b'%PDF'):
+                          data = response.content
+                          source_url = response.url
+                          break
+                  except Exception as exc:
+                      note('PDF_GET_ERROR', url, repr(exc))
+              if data is None:
+                  continue
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  continue
+              temp = PDFDIR / f'_tmp_{digest[:12]}.pdf'
+              temp.write_bytes(data)
+              try:
+                  doc = pymupdf.open(str(temp))
+                  pages = doc.page_count
+                  if pages < 12:
+                      raise ValueError(f'only {pages} pages')
+                  sample = sorted(set([0, 1, min(5, pages - 1), min(10, pages - 1), pages // 2, pages - 1]))
+                  text = '\n'.join(doc.load_page(index).get_text('text') for index in sample)
+                  if not company_match(text):
+                      raise ValueError('company identity not found')
+                  encrypted = bool(doc.is_encrypted)
+                  stem = clean(meta['title'], 55)
+                  for label, index in [('first', 0), ('middle', pages // 2), ('last', pages - 1)]:
+                      pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.75, 0.75), alpha=False)
+                      render_path = RENDERDIR / f'{stem}_{label}.png'
+                      pix.save(str(render_path))
+                      render_entries.append((f'{stem}-{label}', render_path))
+                  doc.close()
+              except Exception as exc:
+                  note('VALIDATION_ERROR', meta.get('title'), repr(exc))
+                  temp.unlink(missing_ok=True)
+                  continue
+
+              hashes.add(digest)
+              filename = f"{meta.get('date') or '日期未知'}_{clean(meta.get('org'), 30)}_{clean(meta.get('title'), 90)}_{pages}页_原始PDF.pdf"
+              final = PDFDIR / filename
+              final.unlink(missing_ok=True)
+              temp.rename(final)
+              record = {
+                  'file': filename,
+                  'title': meta.get('title'),
+                  'org': meta.get('org'),
+                  'date': meta.get('date'),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'encrypted': encrypted,
+                  'source_url': source_url,
+                  'score': meta.get('_score'),
+                  'code': code,
+              }
+              validated.append(record)
+              note('VALIDATED', json.dumps(record, ensure_ascii=False))
+
+          # Select preferred deep/first-coverage reports, with different institutions where possible.
+          validated.sort(key=lambda item: (item['score'], item['date'] or '', item['pages']), reverse=True)
+          selected: list[dict] = []
+          used_orgs: set[str] = set()
+          for item in validated:
+              if len(selected) >= 3:
+                  break
+              title = str(item.get('title') or '')
+              if any(word in title for word in ['点评', '季报', '年报', '中报', '事件点评', '跟踪报告']):
+                  continue
+              org = str(item.get('org') or '')
+              if org and org in used_orgs:
+                  continue
+              selected.append(item)
+              if org:
+                  used_orgs.add(org)
+          if len(selected) < 2:
+              for item in validated:
+                  if item not in selected:
+                      selected.append(item)
+                  if len(selected) >= 2:
+                      break
+          selected = selected[:3]
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} complete reports obtained')
+
+          keep = {item['file'] for item in selected}
+          for path in PDFDIR.glob('*.pdf'):
+              if path.name not in keep:
+                  path.unlink()
+
+          # Visual QA contact sheet, limited to selected reports.
+          selected_stems = {clean(item['title'], 55) for item in selected}
+          thumbnails = []
+          for label, image_path in render_entries:
+              if not any(label.startswith(stem) for stem in selected_stems):
+                  continue
+              if not image_path.exists():
+                  continue
+              with Image.open(image_path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((280, 365))
+                  canvas = Image.new('RGB', (300, 405), 'white')
+                  canvas.paste(image, ((300 - image.width) // 2, 10))
+                  ImageDraw.Draw(canvas).text((8, 382), label[:48], fill='black')
+                  thumbnails.append(canvas)
+          if thumbnails:
+              columns = 3
+              rows = (len(thumbnails) + columns - 1) // columns
+              sheet = Image.new('RGB', (columns * 300, rows * 405), 'white')
+              for index, thumbnail in enumerate(thumbnails):
+                  sheet.paste(thumbnail, ((index % columns) * 300, (index // columns) * 405))
+              sheet.save(OUT / 'contact_sheet.jpg', quality=88)
+
+          total_pages = sum(item['pages'] for item in selected)
+          (OUT / 'selected_reports.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '中国光大控股（00165.HK）券商深度报告下载包',
+              '',
+              f'完整原始PDF数量：{len(selected)}份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for index, item in enumerate(selected, 1):
+              readme.append(f"{index}. {item['date']}｜{item['org']}｜{item['title']}｜{item['pages']}页")
+          readme += [
+              '',
+              '优先收录以中国光大控股为主要研究主体的公司深度或首次覆盖报告；未使用行业周报、网页摘要或缺页预览。',
+              '已核验PDF文件头、公司名称/证券代码、实际页数和加密状态，并检查首页、中间页与末页；ZIP完整性测试通过。',
+              '版权归原发布机构及作者所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{item['sha256']}  {item['file']}" for item in selected) + '\n', encoding='utf-8')
+          (OUT / 'download_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+
+          zip_path = OUT / 'china_everbright_limited_broker_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(selected):
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs, expected {len(selected)}')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / 'ZIP_SHA256.txt').write_text(f'{zip_sha}  {zip_path.name}\n', encoding='utf-8')
+          print((OUT / 'README.txt').read_text(encoding='utf-8'), flush=True)
+          print('FINAL_ZIP', zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-limited-broker-reports
+          path: china_everbright_limited_reports/
+          retention-days: 3
+          if-no-files-found: error
