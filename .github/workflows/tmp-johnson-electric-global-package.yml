@@ -1,0 +1,382 @@
+name: Temporary Johnson Electric global report package
+
+on:
+  push:
+    branches:
+      - tmp-johnson-electric-reports-20260831
+    paths:
+      - .github/workflows/tmp-johnson-electric-global-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Prepare PDF tools
+        run: |
+          python -m pip install --disable-pip-version-check --quiet requests pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Discover original attachments, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import math
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          OUT = Path('德昌电机控股_券商深度报告')
+          VERIFY = Path('verification')
+          OUT.mkdir(exist_ok=True)
+          VERIFY.mkdir(exist_ok=True)
+
+          target_phrases = [
+              '德昌电机控股',
+              '车用电机龙头，AIDC液冷+机器人开启成长新曲线',
+              '有内生优势的人形机器人供应链公司',
+              '汽车微电机单车价值提升，机器人与AIDC液冷泵开辟新成长曲线',
+              '液冷水泵、人形机器人零部件弹性可期',
+              '全球化电机企业探索人形机器人应用',
+              '全球微型电机领军企业，进军人形机器人赛道',
+          ]
+          known = {
+              'AP202603041820269876': {
+                  'title': '车用电机龙头，AIDC液冷+机器人开启成长新曲线',
+                  'broker': '国盛证券', 'date': '2026-03-04', 'expected_pages': 28,
+              },
+          }
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/report/',
+          })
+
+          rows_by_info: dict[str, dict] = {}
+          date_windows = [
+              ('2025-03-16', '2025-03-20'),
+              ('2025-09-26', '2025-10-01'),
+              ('2025-10-14', '2025-10-18'),
+              ('2025-11-04', '2025-11-14'),
+              ('2026-02-03', '2026-02-08'),
+              ('2026-03-02', '2026-03-06'),
+          ]
+
+          def is_target(row: dict) -> bool:
+              blob = ' '.join(str(row.get(k) or '') for k in [
+                  'title', 'stockName', 'stockCode', 'orgSName', 'orgName', 'researcher'
+              ])
+              compact = re.sub(r'\s+', '', blob)
+              return any(re.sub(r'\s+', '', p) in compact for p in target_phrases)
+
+          # Scan all reports around exact publication dates. HK reports may not be searchable by stock code.
+          for begin, end in date_windows:
+              for endpoint_type in ('list2', 'list'):
+                  page = 1
+                  while page <= 60:
+                      try:
+                          if endpoint_type == 'list2':
+                              body = {
+                                  'pageSize': 100, 'pageNo': page, 'p': page,
+                                  'pageNum': page, 'pageNumber': page,
+                                  'beginTime': begin, 'endTime': end, 'code': '',
+                                  'industryCode': '*', 'rating': None,
+                                  'ratingChange': None, 'orgCode': None, 'rcode': ''
+                              }
+                              r = session.post(
+                                  'https://reportapi.eastmoney.com/report/list2',
+                                  json=body,
+                                  headers={'User-Agent': UA, 'Referer': 'https://data.eastmoney.com/',
+                                           'Content-Type': 'application/json', 'Accept': 'application/json,text/plain,*/*'},
+                                  timeout=90,
+                              )
+                          else:
+                              params = {
+                                  'pageNo': str(page), 'pageSize': '100', 'code': '',
+                                  'industryCode': '*', 'industry': '*', 'rating': '*',
+                                  'ratingChange': '*', 'beginTime': begin, 'endTime': end,
+                                  'fields': '', 'qType': '0', 'orgCode': '', 'rcode': '',
+                                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page)
+                              }
+                              r = session.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=90)
+                          print('API', endpoint_type, begin, end, page, r.status_code, len(r.content), r.url)
+                          if r.status_code != 200:
+                              break
+                          obj = r.json()
+                          rows = obj.get('data') or []
+                          print('API_ROWS', len(rows), 'HITS', obj.get('hits'), 'TOTAL_PAGE', obj.get('TotalPage'))
+                          for row in rows:
+                              if not is_target(row):
+                                  continue
+                              info = str(row.get('infoCode') or '')
+                              print('TARGET_ROW', json.dumps(row, ensure_ascii=False))
+                              if info:
+                                  rows_by_info[info] = row
+                          total_page = int(obj.get('TotalPage') or 0)
+                          if not rows or (total_page and page >= total_page):
+                              break
+                          page += 1
+                      except Exception as exc:
+                          print('API_ERROR', endpoint_type, begin, end, page, repr(exc))
+                          break
+
+          # Search metadata mirror with broad title fragments; retain AP ids when present.
+          sd = requests.Session()
+          sd.headers.update({
+              'User-Agent': UA, 'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Accept': 'application/json,text/plain,*/*'
+          })
+          sd_queries = [
+              '德昌电机控股', '车用电机龙头', '内生优势 人形机器人供应链',
+              '汽车微电机 单车价值 提升 AIDC', '液冷水泵 人形机器人零部件',
+              '全球化电机企业 人形机器人', '全球微型电机 进军人形机器人',
+          ]
+          sdy_matches = []
+          for query in sd_queries:
+              for page in range(1, 12):
+                  payload = {
+                      'device': 1, 'hideTrader': 0, 'onlyTitle': 0, 'order': 0,
+                      'page': page, 'pageSize': 100, 'keyword': query, 'pageCount': 0,
+                      'dateRange': 0, 'startTime': '', 'endTime': '',
+                      'typeIds': [], 'industryIds': []
+                  }
+                  try:
+                      r = sd.post('https://api.sdyanbao.com/api/file/search', json=payload, timeout=90)
+                      print('SD_API', query, page, r.status_code, len(r.content))
+                      if r.status_code != 200:
+                          break
+                      data = (r.json().get('data') or {})
+                      files = data.get('files') or []
+                      for f in files:
+                          blob = ' '.join([
+                              str(f.get('name') or ''), str(f.get('content') or '')[:3000],
+                              str((f.get('stock') or {}).get('name') or ''),
+                              str((f.get('stock') or {}).get('code') or ''),
+                          ])
+                          if '德昌电机控股' not in blob and '00179' not in blob and '0179.HK' not in blob:
+                              continue
+                          print('SD_TARGET', json.dumps(f, ensure_ascii=False))
+                          sdy_matches.append(f)
+                          uuid = str(f.get('data_source_uuid') or '')
+                          for info in re.findall(r'AP\d+', uuid):
+                              if info not in rows_by_info:
+                                  rows_by_info[info] = {
+                                      'infoCode': info,
+                                      'title': f.get('name'),
+                                      'orgSName': (f.get('organization') or {}).get('name'),
+                                      'publishDate': f.get('time_text'),
+                                      'attachPages': f.get('page_count'),
+                                      'researcher': '',
+                                  }
+                      if not files or page * 100 >= int(data.get('total') or 0):
+                          break
+                  except Exception as exc:
+                      print('SD_ERROR', query, page, repr(exc))
+                      break
+
+          for info, meta in known.items():
+              if info not in rows_by_info:
+                  rows_by_info[info] = {
+                      'infoCode': info, 'title': meta['title'], 'orgSName': meta['broker'],
+                      'publishDate': meta['date'], 'attachPages': meta['expected_pages'],
+                  }
+
+          print('INFO_CODES', json.dumps(rows_by_info, ensure_ascii=False, indent=2))
+
+          downloaded: list[dict] = []
+          seen_hashes: set[str] = set()
+          for info, row in rows_by_info.items():
+              title = str(row.get('title') or '').strip()
+              broker = str(row.get('orgSName') or row.get('orgName') or '').strip() or '未知券商'
+              date = str(row.get('publishDate') or '')[:10]
+              if not date:
+                  date = 'unknown-date'
+              content = None
+              used_url = None
+              attempts = []
+              for prefix in ('H3', 'H2', 'H1'):
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  try:
+                      resp = requests.get(
+                          url,
+                          headers={'User-Agent': UA, 'Referer': 'https://data.eastmoney.com/',
+                                   'Accept': 'application/pdf,*/*'},
+                          timeout=(30, 240), allow_redirects=True,
+                      )
+                      attempts.append((url, resp.status_code, len(resp.content), resp.headers.get('content-type'), resp.content[:40]))
+                      print('PDF_TRY', info, prefix, resp.status_code, len(resp.content), resp.headers.get('content-type'), repr(resp.content[:40]), resp.url)
+                      if resp.status_code == 200 and resp.content.startswith(b'%PDF-') and len(resp.content) > 100_000:
+                          content = resp.content
+                          used_url = resp.url
+                          break
+                  except Exception as exc:
+                      attempts.append((url, 'ERROR', repr(exc)))
+                      print('PDF_ERROR', info, prefix, repr(exc))
+              if content is None:
+                  print('NO_PDF', info, title, attempts)
+                  continue
+
+              sha = hashlib.sha256(content).hexdigest()
+              if sha in seen_hashes:
+                  print('DUPLICATE_HASH', info, sha)
+                  continue
+              seen_hashes.add(sha)
+
+              temp_path = VERIFY / f'{info}.pdf'
+              temp_path.write_bytes(content)
+              try:
+                  reader = PdfReader(str(temp_path), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 8:
+                      raise RuntimeError(f'too few pages: {pages}')
+                  text = ''
+                  for pg in reader.pages[:min(10, pages)]:
+                      try:
+                          text += pg.extract_text() or ''
+                      except Exception:
+                          pass
+                  compact = re.sub(r'\s+', '', text)
+                  if not any(x in compact for x in ['德昌电机控股', 'JohnsonElectric', '00179', '0179.HK', '0179']):
+                      raise RuntimeError('company identity not found in first pages')
+              except Exception as exc:
+                  print('VALIDATE_FAIL', info, repr(exc))
+                  temp_path.unlink(missing_ok=True)
+                  continue
+
+              score = pages * 10
+              if any(k in title for k in ['深度', '首次覆盖', '首次覆盖报告']):
+                  score += 1000
+              if date.startswith('2026'):
+                  score += 200
+              elif date.startswith('2025'):
+                  score += 100
+              downloaded.append({
+                  'info_code': info, 'title': title, 'broker': broker, 'date': date,
+                  'pages': pages, 'bytes': len(content), 'sha256': sha,
+                  'source_url': used_url, 'score': score, 'temp_path': str(temp_path),
+                  'rating': row.get('emRatingName') or row.get('sRatingName') or '',
+                  'researcher': row.get('researcher') or '',
+              })
+
+          downloaded.sort(key=lambda x: (x['score'], x['date']), reverse=True)
+          print('VALID_DOWNLOADS', json.dumps(downloaded, ensure_ascii=False, indent=2))
+
+          selected = []
+          used_titles = set()
+          used_brokers = set()
+          for item in downloaded:
+              if item['title'] in used_titles:
+                  continue
+              if item['broker'] in used_brokers and len(downloaded) >= 4:
+                  continue
+              selected.append(item)
+              used_titles.add(item['title'])
+              used_brokers.add(item['broker'])
+              if len(selected) >= 3:
+                  break
+          if len(selected) < 2:
+              for item in downloaded:
+                  if item not in selected:
+                      selected.append(item)
+                  if len(selected) >= 2:
+                      break
+          if not selected:
+              raise RuntimeError('No complete original PDF was publicly downloadable')
+
+          manifest = []
+          for idx, item in enumerate(selected, 1):
+              safe_title = re.sub(r'[\\/:*?"<>|]+', '_', item['title']).strip()[:85]
+              final_name = f"{idx:02d}_{item['date']}_{item['broker']}_{safe_title}_{item['pages']}页.pdf"
+              final_path = OUT / final_name
+              final_path.write_bytes(Path(item['temp_path']).read_bytes())
+              entry = {k: v for k, v in item.items() if k not in {'temp_path', 'score'}}
+              entry['filename'] = final_name
+              manifest.append(entry)
+
+              # Render first, middle and last pages for verification evidence.
+              for label, pageno in [('first', 1), ('middle', max(1, item['pages'] // 2)), ('last', item['pages'])]:
+                  subprocess.run([
+                      'pdftoppm', '-f', str(pageno), '-singlefile', '-png', '-r', '90',
+                      str(final_path), str(VERIFY / f'{idx:02d}_{label}')
+                  ], check=True)
+
+          readme = [
+              '德昌电机控股（0179.HK / 00179.HK）券商深度报告下载包', '',
+              f'收录完整原始PDF数量：{len(manifest)}份', '',
+              '筛选原则：优先公司深度和首次覆盖；排除3-6页业绩点评、网页摘要和预览图片。',
+              '核验项目：PDF文件头、实际页数、公司名称/代码、文本可解析性、首中末页渲染和ZIP完整性。', '',
+          ]
+          for idx, item in enumerate(manifest, 1):
+              readme += [
+                  f"{idx}. {item['broker']}｜{item['date']}｜{item['pages']}页",
+                  f"   标题：{item['title']}",
+                  f"   文件：{item['filename']}",
+                  f"   评级：{item.get('rating') or '未标注'}",
+                  f"   分析师：{item.get('researcher') or '未标注'}",
+                  f"   来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}", '',
+              ]
+          if len(manifest) < 2:
+              readme += [
+                  '说明：其他已确认存在的长篇报告，其原始附件入口需要登录、订阅或未开放匿名下载；本包未以摘要、预览图或短篇点评凑数。', ''
+              ]
+          readme += ['资料仅供研究参考，不构成投资建议。']
+
+          (OUT / 'README_报告清单与核验信息.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (OUT / 'SHA256SUMS.txt').open('w', encoding='utf-8') as handle:
+              for item in manifest:
+                  handle.write(f"{item['sha256']}  {item['filename']}\n")
+
+          zip_cn = Path(f'德昌电机控股_券商深度报告_{len(manifest)}份.zip')
+          zip_en = Path(f'johnson_electric_broker_deep_reports_{len(manifest)}.zip')
+          for zip_path in (zip_cn, zip_en):
+              with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for path in sorted(OUT.iterdir()):
+                      zf.write(path, arcname=f'{OUT.name}/{path.name}')
+              with zipfile.ZipFile(zip_path) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP integrity failure: {bad}')
+              print('ZIP_OK', zip_path, zip_path.stat().st_size)
+
+          Path('selected_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SELECTION', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload report package and verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: Johnson_Electric_Broker_Deep_Reports
+          path: |
+            johnson_electric_broker_deep_reports_*.zip
+            德昌电机控股_券商深度报告_*.zip
+            德昌电机控股_券商深度报告/*.pdf
+            德昌电机控股_券商深度报告/*.txt
+            德昌电机控股_券商深度报告/manifest.json
+            selected_manifest.json
+            verification/*.png
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
