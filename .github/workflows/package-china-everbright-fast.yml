@@ -1,0 +1,153 @@
+name: Build verified China Everbright report package fast
+
+on:
+  push:
+    branches:
+      - tmp/china-everbright-package-fast-20260831
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pillow img2pdf pypdf pymupdf
+      - name: Fetch, assemble, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf out && mkdir -p out/pdfs out/pages out/renders
+          python - <<'PY'
+          from __future__ import annotations
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import hashlib, io, json, re, zipfile
+          from pathlib import Path
+          import requests, img2pdf, pymupdf
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT=Path('out'); PDFDIR=OUT/'pdfs'; PAGEDIR=OUT/'pages'; RENDER=OUT/'renders'
+          REPORTS=[
+              dict(id='5370196', date_path='2026/04/17', date='2026-04-17', org='国金证券',
+                   title='中国光大控股深度报告：跨境资管标的，业绩弹性可期', min_pages=18, max_pages=26,
+                   short='中国光大控股深度报告_跨境资管标的_业绩弹性可期'),
+              dict(id='5040903', date_path='2025/09/03', date='2025-09-03', org='国泰海通证券',
+                   title='中国光大控股首次覆盖报告：资负共振，锚定科创，拐点已现', min_pages=22, max_pages=28,
+                   short='中国光大控股首次覆盖报告_资负共振_锚定科创_拐点已现'),
+          ]
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+          logs=[]
+          def log(*xs):
+              s=' '.join(str(x) for x in xs); logs.append(s); print(s, flush=True)
+          def fetch(rep,n):
+              urls=[
+                  f"https://public.fxbaogao.com/report-image/{rep['date_path']}/{rep['id']}-{n}.png?x-oss-process=image%2Fformat%2Cwebp",
+                  f"https://public.fxbaogao.com/report-image/{rep['date_path']}/{rep['id']}-{n}.png",
+              ]
+              for u in urls:
+                  try:
+                      r=requests.get(u,timeout=(8,18),headers={
+                          'User-Agent':UA,
+                          'Referer':f"https://www.fxbaogao.com/detail/{rep['id']}",
+                          'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                      })
+                      if r.status_code != 200 or len(r.content) < 10000:
+                          continue
+                      im=Image.open(io.BytesIO(r.content)); im.load()
+                      if im.width < 650 or im.height < 850:
+                          continue
+                      rgb=im.convert('RGB'); b=io.BytesIO(); rgb.save(b,'JPEG',quality=95,optimize=True)
+                      data=b.getvalue()
+                      return n, data, im.width, im.height, u
+                  except Exception:
+                      continue
+              return n, None, 0, 0, ''
+
+          records=[]
+          for rep in REPORTS:
+              results={}
+              with ThreadPoolExecutor(max_workers=12) as ex:
+                  futs=[ex.submit(fetch,rep,n) for n in range(1,36)]
+                  for fut in as_completed(futs):
+                      n,data,w,h,u=fut.result(); results[n]=(data,w,h,u)
+                      log('PAGE',rep['id'],n,'OK' if data else 'MISS',len(data) if data else 0,w,h)
+              ordered=[]; seen_hash=set()
+              for n in range(1,36):
+                  data,w,h,u=results.get(n,(None,0,0,''))
+                  if data is None:
+                      break
+                  dg=hashlib.sha256(data).hexdigest()
+                  if dg in seen_hash:
+                      log('DUPLICATE_STOP',rep['id'],n,dg)
+                      break
+                  seen_hash.add(dg); ordered.append((n,data,w,h,u))
+              count=len(ordered)
+              log('CONTIGUOUS_COUNT',rep['id'],count)
+              if not (rep['min_pages'] <= count <= rep['max_pages']):
+                  raise RuntimeError(f"{rep['id']}: invalid contiguous page count {count}")
+              pdir=PAGEDIR/rep['id']; pdir.mkdir(parents=True,exist_ok=True)
+              image_paths=[]
+              for n,data,w,h,u in ordered:
+                  p=pdir/f'{n:03d}.jpg'; p.write_bytes(data); image_paths.append(p)
+              pdf_bytes=img2pdf.convert([str(p) for p in image_paths])
+              filename=f"{rep['date']}_{rep['org']}_{rep['short']}_{count}页_公开完整页面合成PDF.pdf"
+              pdf=PDFDIR/filename; pdf.write_bytes(pdf_bytes)
+              actual=len(PdfReader(str(pdf)).pages)
+              if actual != count: raise RuntimeError(f"{rep['id']}: PDF {actual} pages, expected {count}")
+              doc=pymupdf.open(str(pdf))
+              for label,idx in [('first',0),('middle',actual//2),('last',actual-1)]:
+                  pix=doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(.75,.75),alpha=False)
+                  pix.save(str(RENDER/f"{rep['id']}_{label}.png"))
+              doc.close()
+              records.append({
+                  'date':rep['date'],'org':rep['org'],'title':rep['title'],'pages':actual,
+                  'file':filename,'bytes':pdf.stat().st_size,
+                  'sha256':hashlib.sha256(pdf.read_bytes()).hexdigest(),
+                  'source_page':f"https://www.fxbaogao.com/detail/{rep['id']}",
+                  'file_type':'公开完整逐页图像合成PDF',
+              })
+
+          readme=['中国光大控股（0165.HK）券商深度报告','',f"完整PDF数量：{len(records)}份",f"合计页数：{sum(x['pages'] for x in records)}页",'']
+          for i,r in enumerate(records,1):
+              readme.append(f"{i}. {r['date']}｜{r['org']}｜{r['title']}｜{r['pages']}页")
+          readme += ['',
+              '说明：两份报告均为公司深度/首次覆盖报告，不是年报、行业周报或短篇财报点评。',
+              '公开网页提供了报告全部逐页图像，本包按原页序合成为完整PDF；因此文件名明确标注“公开完整页面合成PDF”。',
+              '校验：连续页码检查、PDF可解析检查、实际页数核对、首页/中间页/末页渲染检查、ZIP CRC检查。',
+              '版权归报告发布机构及相关权利人所有，仅供研究参考。']
+          (OUT/'README.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'报告清单.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['file']}" for r in records)+'\n',encoding='utf-8')
+          (OUT/'download_log.txt').write_text('\n'.join(logs),encoding='utf-8')
+          zpath=OUT/'中国光大控股_券商深度报告_2份_新链接.zip'
+          with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED,allowZip64=True) as z:
+              for p in sorted(PDFDIR.glob('*.pdf')): z.write(p,p.name)
+              for name in ['README.txt','报告清单.json','SHA256SUMS.txt']: z.write(OUT/name,name)
+          with zipfile.ZipFile(zpath) as z:
+              if z.testzip() is not None: raise RuntimeError('ZIP CRC validation failed')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')]) != 2: raise RuntimeError('ZIP PDF count is not 2')
+          summary={'zip':zpath.name,'bytes':zpath.stat().st_size,'sha256':hashlib.sha256(zpath.read_bytes()).hexdigest(),'records':records}
+          (OUT/'package_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PACKAGE_SUMMARY',json.dumps(summary,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-reports-fast-verified
+          path: |
+            out/中国光大控股_券商深度报告_2份_新链接.zip
+            out/package_summary.json
+            out/README.txt
+            out/报告清单.json
+            out/SHA256SUMS.txt
+            out/download_log.txt
+            out/renders/*.png
+          if-no-files-found: error
+          retention-days: 7
