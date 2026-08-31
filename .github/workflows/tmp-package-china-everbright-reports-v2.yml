@@ -1,0 +1,307 @@
+name: Rebuild China Everbright broker report package v2
+
+on:
+  push:
+    branches:
+      - tmp/china-everbright-hibor-js-probe-20260831
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PDF dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pillow img2pdf pypdf pymupdf
+      - name: Search, download, verify and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/work/pdfs out/work/images out/work/renders
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, shutil, time, zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+          import pymupdf
+
+          OUT=Path('out')
+          WORK=OUT/'work'
+          PDFDIR=WORK/'pdfs'
+          IMGROOT=WORK/'images'
+          RENDERDIR=WORK/'renders'
+          for p in (OUT,WORK,PDFDIR,IMGROOT,RENDERDIR): p.mkdir(parents=True,exist_ok=True)
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+          sess=requests.Session()
+          sess.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/'})
+          logs=[]
+          def note(*x):
+              line=' '.join(str(v) for v in x); logs.append(line); print(line,flush=True)
+          def compact(v): return re.sub(r'\s+','',str(v or ''))
+          def clean(v,limit=90):
+              t=re.sub(r'[\\/:*?"<>|\r\n]+','_',str(v or '')).strip(' ._')
+              return (t or 'report')[:limit]
+          def date_of(v):
+              s=str(v or '')
+              m=re.search(r'(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})',s)
+              if m:return f'{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
+              m=re.search(r'(20\d{2})(\d{2})(\d{2})',s)
+              return f'{m.group(1)}-{m.group(2)}-{m.group(3)}' if m else ''
+          def rec_strings(obj:Any):
+              if isinstance(obj,dict):
+                  for v in obj.values(): yield from rec_strings(v)
+              elif isinstance(obj,list):
+                  for v in obj: yield from rec_strings(v)
+              elif isinstance(obj,str): yield obj
+          def organization(src):
+              for obj in [src.get('detail') or {},src.get('row') or {}]:
+                  v=obj.get('organization') or obj.get('org') or obj.get('org_name')
+                  if isinstance(v,dict):
+                      n=v.get('name') or v.get('short_name')
+                      if n:return str(n)
+                  elif v:return str(v)
+              return ''
+          def stock(src):
+              for obj in [src.get('detail') or {},src.get('row') or {}]:
+                  v=obj.get('stock')
+                  if isinstance(v,dict): return str(v.get('name') or ''),str(v.get('code') or '')
+                  for nk,ck in [('stockName','stockCode'),('stock_name','stock_code')]:
+                      if obj.get(nk) or obj.get(ck):return str(obj.get(nk) or ''),str(obj.get(ck) or '')
+              return '',''
+          def normalize(src):
+              row=src.get('row') or {}; d=src.get('detail') or {}
+              title=str(d.get('name') or row.get('name') or d.get('title') or row.get('title') or '')
+              pages=int(d.get('page_count') or row.get('page_count') or d.get('pages') or row.get('pages') or 0)
+              sid=str(d.get('data_source_uuid') or row.get('data_source_uuid') or d.get('source_id') or row.get('source_id') or '')
+              purl=str(d.get('page_url') or row.get('page_url') or '')
+              ourl=str(d.get('online_url') or row.get('online_url') or d.get('file_url') or row.get('file_url') or '')
+              sn,sc=stock(src)
+              return {'id':row.get('id') or d.get('id'),'title':title,'date':date_of(d.get('time_text') or row.get('time_text') or d.get('date') or row.get('date')),'pages_meta':pages,'source_id':sid,'page_url':purl,'online_url':ourl,'org':organization(src),'stock_name':sn,'stock_code':sc,'raw':src}
+          def score(c):
+              t=c['title']; n=compact(t).lower(); p=c['pages_meta']; v=p*3
+              if any(x in t for x in ['深度报告','深度研究','公司深度','首次覆盖','首次评级','首次推荐']):v+=1800
+              if any(x in n for x in ['initiation','initiatingcoverage','companyreport']):v+=1600
+              if any(x in t for x in ['跨境资管','资产管理','投资管理','科创','价值重估','业绩弹性']):v+=220
+              if any(x in t for x in ['点评','业绩点评','年报点评','中报点评','季报点评','盈利预告','事件点评']):v-=900
+              if any(x in t for x in ['行业周报','行业研究','策略报告','周报','晨会','日报','宏观']):v-=1600
+              try:v+=(int(c['date'][:4])-2010)*25
+              except:pass
+              return v
+
+          search_terms=['中国光大控股','0165.HK','00165.HK','中国光大控股 首次覆盖','中国光大控股 深度报告','跨境资管标的 业绩弹性可期','资负共振 锚定科创 拐点已现','China Everbright Limited']
+          items=[]; seen_ids=set()
+          for q in search_terms:
+              for page in range(1,6):
+                  try:
+                      r=sess.post('https://api.sdyanbao.com/api/file/search',json={'page':page,'pageSize':100,'keyword':q},timeout=60)
+                      payload=r.json(); rows=(payload.get('data') or {}).get('files') or []
+                      note('SEARCH',q,page,r.status_code,len(rows))
+                  except Exception as e:
+                      note('SEARCH_ERROR',q,page,repr(e)); break
+                  for row in rows:
+                      rid=row.get('id')
+                      if rid in seen_ids:continue
+                      blob=json.dumps(row,ensure_ascii=False)
+                      if not any(k in compact(blob) for k in ['中国光大控股','0165','00165','ChinaEverbrightLimited']):continue
+                      seen_ids.add(rid)
+                      detail={}
+                      try:
+                          x=sess.post('https://api.sdyanbao.com/api/file/detail',json={'id':rid},timeout=60).json()
+                          if x.get('status')==1:detail=x.get('data') or {}
+                      except Exception as e:note('DETAIL_ERROR',rid,repr(e))
+                      extra={}
+                      for body in ({'id':rid},{'file_id':rid},{'data_source_uuid':detail.get('data_source_uuid') or row.get('data_source_uuid')}):
+                          try:
+                              x=sess.post('https://api.sdyanbao.com/api/file/page_json_url',json=body,timeout=40).json()
+                              if x.get('status')==1 and x.get('data'):
+                                  extra=x.get('data'); break
+                          except Exception:pass
+                      items.append({'row':row,'detail':detail,'page_json':extra})
+                  if len(rows)<100:break
+                  time.sleep(.1)
+
+          (WORK/'all_results.json').write_text(json.dumps({'items':items},ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+          candidates=[]; seen=set()
+          for src in items:
+              c=normalize(src); blob=compact(c['title']+c['stock_name']+c['stock_code'])
+              if not any(k in blob for k in ['中国光大控股','0165','00165','ChinaEverbrightLimited']):continue
+              if c['pages_meta'] and c['pages_meta']<14:continue
+              if any(x in c['title'] for x in ['年度报告','半年度报告','季度报告','招股说明书','公告','会议纪要','调研纪要','摘要']):continue
+              key=compact(c['title']).lower()
+              if not key or key in seen:continue
+              seen.add(key); c['score']=score(c); candidates.append(c)
+          candidates.sort(key=lambda x:(x['score'],x['date'],x['pages_meta']),reverse=True)
+          note('CANDIDATES',len(candidates))
+          for c in candidates[:40]:note('CAND',json.dumps({k:c[k] for k in ['id','date','org','title','pages_meta','source_id','page_url','online_url','score']},ensure_ascii=False))
+          (WORK/'candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+
+          def urls_in(obj):
+              out=[]
+              for s in rec_strings(obj):
+                  for u in re.findall(r'https?://[^"\\\s<>]+',s):
+                      u=u.replace('\\/','/').rstrip('.,;)')
+                      if u not in out:out.append(u)
+              return out
+          def get_direct_pdf(c):
+              urls=[]
+              for u in [c.get('online_url','')]+urls_in(c['raw']):
+                  if isinstance(u,str) and u.startswith('http') and ('.pdf' in u.lower() or 'download' in u.lower()):urls.append(u)
+              sid=c['source_id']
+              if sid.startswith('AP'):urls += [f'https://pdf.dfcfw.com/pdf/H3_{sid}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{sid}.pdf']
+              ded=[]
+              for u in urls:
+                  if u not in ded:ded.append(u)
+              for u in ded:
+                  try:
+                      r=sess.get(u,timeout=90,allow_redirects=True,headers={'Referer':'https://www.sdyanbao.com/','Accept':'application/pdf,*/*;q=0.8'})
+                      note('PDF_TRY',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+                      if r.status_code==200 and len(r.content)>50000 and r.content.lstrip().startswith(b'%PDF'):return r.content,r.url
+                  except Exception as e:note('PDF_ERROR',u,repr(e))
+              return None,None
+
+          def image_list_from_json(c):
+              urls=[]
+              raw=c['raw']
+              for u in urls_in(raw.get('page_json')):
+                  if re.search(r'\.(?:png|jpe?g|webp)(?:\?|$)',u,re.I):urls.append(u)
+                  elif '.json' in u.lower():
+                      try:
+                          x=sess.get(u,timeout=60).json()
+                          for v in urls_in(x):
+                              if re.search(r'\.(?:png|jpe?g|webp)(?:\?|$)',v,re.I):urls.append(v)
+                      except Exception:pass
+              return list(dict.fromkeys(urls))
+
+          def fetch_image_url(u,out):
+              try:
+                  r=sess.get(u,timeout=70,headers={'Referer':'https://www.sdyanbao.com/','Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'})
+                  if r.status_code!=200 or len(r.content)<4000:return None
+                  with Image.open(io.BytesIO(r.content)) as im:
+                      im.load()
+                      if im.width<450 or im.height<450:return None
+                      im.convert('RGB').save(out,'JPEG',quality=92,optimize=True)
+                  return out
+              except Exception:return None
+
+          def reconstruct(c):
+              outdir=IMGROOT/clean(c['source_id'] or c['title'],55)
+              shutil.rmtree(outdir,ignore_errors=True);outdir.mkdir(parents=True)
+              explicit=image_list_from_json(c)
+              if len(explicit)>=14:
+                  files=[]
+                  for i,u in enumerate(explicit,1):
+                      p=fetch_image_url(u,outdir/f'{i:04d}.jpg')
+                      if p:files.append(p)
+                  if len(files)>=14:
+                      return img2pdf.convert([str(p) for p in files]),'page_json image list'
+              bases=[]
+              for u in [c.get('page_url','')]+urls_in(c['raw']):
+                  if not isinstance(u,str) or not u.startswith('http'):continue
+                  low=u.lower()
+                  if any(x in low for x in ['page','preview','image','img','static','oss','cos']) and not re.search(r'\.(?:pdf|png|jpe?g|webp)(?:\?|$)',low):bases.append(u)
+              bases=list(dict.fromkeys(bases))
+              count=c['pages_meta'] or 80
+              for base in bases:
+                  for offset in [0,1]:
+                      files=[]
+                      for j in range(count):
+                          idx=j+offset; got=None
+                          patterns=[]
+                          if '{page}' in base:patterns.append(base.replace('{page}',str(idx)))
+                          if '{}' in base:patterns.append(base.replace('{}',str(idx)))
+                          for ext in ['png','jpg','jpeg','webp']:
+                              patterns += [f"{base.rstrip('/')}/{idx}.{ext}",f"{base.rstrip('/')}/{idx:04d}.{ext}"]
+                          for u in patterns:
+                              p=fetch_image_url(u,outdir/f'{j+1:04d}.jpg')
+                              if p:got=p;break
+                          if not got:break
+                          files.append(got)
+                      if len(files)>=14 and (not c['pages_meta'] or len(files)==c['pages_meta']):
+                          return img2pdf.convert([str(p) for p in files]),base
+                      for p in outdir.glob('*.jpg'):p.unlink()
+              return None,None
+
+          def validate_and_save(c,data,source,mode):
+              h=hashlib.sha256(data).hexdigest(); tmp=PDFDIR/f'_tmp_{h[:12]}.pdf';tmp.write_bytes(data)
+              try:
+                  reader=PdfReader(str(tmp));pages=len(reader.pages)
+                  if pages<14:raise ValueError(f'only {pages} pages')
+                  if c['pages_meta'] and abs(pages-c['pages_meta'])>1:raise ValueError(f'page mismatch {pages}/{c["pages_meta"]}')
+                  doc=pymupdf.open(str(tmp))
+                  for label,idx in [('first',0),('middle',pages//2),('last',pages-1)]:
+                      pix=doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(.65,.65),alpha=False)
+                      pix.save(str(RENDERDIR/f'{h[:12]}_{label}.png'))
+                  doc.close()
+              except Exception as e:
+                  note('VALIDATE_ERROR',c['title'],repr(e));tmp.unlink(missing_ok=True);return None
+              version='公开原始PDF' if mode=='original' else '公开完整页面合成PDF'
+              fn=f"{c['date'] or '未知日期'}_{clean(c['org'],24)}_{clean(c['title'],80)}_{pages}页_{version}.pdf"
+              final=PDFDIR/fn;tmp.rename(final)
+              return {'date':c['date'],'org':c['org'],'title':c['title'],'pages':pages,'pages_meta':c['pages_meta'],'file':fn,'sha256':h,'bytes':len(data),'version':version,'source':source,'source_id':c['source_id'],'score':c['score']}
+
+          records=[]; hashes=set()
+          for distinct_org in [True,False]:
+              for c in candidates:
+                  if len(records)>=3:break
+                  if any(compact(c['title'])==compact(r['title']) for r in records):continue
+                  if distinct_org and c['org'] and any(c['org']==r['org'] for r in records):continue
+                  data,src=get_direct_pdf(c);mode='original'
+                  if data is None:data,src=reconstruct(c);mode='reconstructed'
+                  if data is None:
+                      note('NO_COMPLETE_FILE',c['title']);continue
+                  dg=hashlib.sha256(data).hexdigest()
+                  if dg in hashes:continue
+                  rec=validate_and_save(c,data,src or '',mode)
+                  if rec:records.append(rec);hashes.add(dg);note('SAVED',json.dumps(rec,ensure_ascii=False))
+              if len(records)>=3:break
+          if len(records)<2:
+              (WORK/'download_log.txt').write_text('\n'.join(logs),encoding='utf-8')
+              raise RuntimeError(f'Only {len(records)} complete reports obtained')
+          records=records[:3]
+          keep={r['file'] for r in records}
+          for p in PDFDIR.glob('*.pdf'):
+              if p.name not in keep:p.unlink()
+          readme=['中国光大控股（0165.HK）券商深度报告','',f'完整PDF数量：{len(records)}份',f'合计页数：{sum(r["pages"] for r in records)}页','']
+          for i,r in enumerate(records,1):readme.append(f"{i}. {r['date']}｜{r['org']}｜{r['title']}｜{r['pages']}页｜{r['version']}")
+          readme += ['','筛选：公司深度、首次覆盖或系统性公司研究；排除行业周报、定期报告、短篇财报点评及摘要页。','公开原始PDF优先；仅提供公开逐页图像时，合成为完整页面PDF并在文件名中明确标注。','已校验PDF可打开、实际页数，并渲染检查首页、中间页和末页。','版权归原发布机构及相关权利人所有，仅供研究参考。']
+          (WORK/'README.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (WORK/'selected_reports.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (WORK/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['file']}" for r in records)+'\n',encoding='utf-8')
+          (WORK/'download_log.txt').write_text('\n'.join(logs),encoding='utf-8')
+          zip_path=OUT/'中国光大控股_券商深度报告_重新打包.zip'
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(PDFDIR.glob('*.pdf')):z.write(p,p.name)
+              for n in ['README.txt','selected_reports.json','SHA256SUMS.txt']:z.write(WORK/n,n)
+          with zipfile.ZipFile(zip_path) as z:
+              assert z.testzip() is None
+              assert len([n for n in z.namelist() if n.lower().endswith('.pdf')])==len(records)
+          (OUT/'package_summary.json').write_text(json.dumps({'records':records,'zip':zip_path.name,'sha256':hashlib.sha256(zip_path.read_bytes()).hexdigest(),'bytes':zip_path.stat().st_size},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('\n'.join(readme));print('FINAL_ZIP',zip_path,zip_path.stat().st_size,hashlib.sha256(zip_path.read_bytes()).hexdigest())
+          PY
+      - name: Upload rebuilt package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-broker-reports-rebuilt
+          path: |
+            out/中国光大控股_券商深度报告_重新打包.zip
+            out/package_summary.json
+            out/work/README.txt
+            out/work/selected_reports.json
+            out/work/SHA256SUMS.txt
+            out/work/download_log.txt
+            out/work/candidates.json
+            out/work/renders/*.png
+          if-no-files-found: error
+          retention-days: 7
