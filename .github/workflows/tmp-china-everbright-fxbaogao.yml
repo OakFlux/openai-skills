@@ -1,0 +1,227 @@
+name: Temporary China Everbright Limited exact deep report package
+
+on:
+  push:
+    branches:
+      - tmp/china-everbright-fxbaogao-20260831
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests Pillow img2pdf PyMuPDF
+      - name: Download public report pages and build PDFs
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          reports = [
+              {
+                  'id': '5370196',
+                  'path_date': '2026/04/17',
+                  'date': '2026-04-17',
+                  'org': '国金证券',
+                  'title': '跨境资管标的，业绩弹性可期',
+                  'type': '首次覆盖/公司深度',
+                  'minimum_pages': 18,
+              },
+              {
+                  'id': '5040903',
+                  'path_date': '2025/09/03',
+                  'date': '2025-09-03',
+                  'org': '国泰海通证券',
+                  'title': '资负共振，锚定科创，拐点已现',
+                  'type': '首次覆盖报告',
+                  'minimum_pages': 22,
+              },
+          ]
+
+          OUT = Path('china_everbright_exact')
+          PDFDIR = OUT / 'pdfs'
+          IMGROOT = OUT / 'page_images'
+          RENDERDIR = OUT / 'renders'
+          for path in (OUT, PDFDIR, IMGROOT, RENDERDIR):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://www.fxbaogao.com/',
+          })
+
+          def clean(value: object, limit: int = 100) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(value or '')).strip(' ._')
+              return (text or 'report')[:limit]
+
+          records = []
+          render_entries = []
+
+          for meta in reports:
+              image_dir = IMGROOT / meta['id']
+              image_dir.mkdir(parents=True, exist_ok=True)
+              images: list[Path] = []
+              consecutive_misses = 0
+
+              for page_no in range(1, 81):
+                  base = f"https://public.fxbaogao.com/report-image/{meta['path_date']}/{meta['id']}-{page_no}.png"
+                  attempts = [
+                      base,
+                      base + '?x-oss-process=image/format,webp',
+                  ]
+                  image_bytes = None
+                  final_url = None
+                  for url in attempts:
+                      for retry in range(3):
+                          try:
+                              response = session.get(url, timeout=60, allow_redirects=True)
+                              print('PAGE_GET', meta['id'], page_no, retry + 1, response.status_code, len(response.content), response.headers.get('content-type'), response.url, flush=True)
+                              if response.status_code == 200 and len(response.content) > 8_000:
+                                  with Image.open(io.BytesIO(response.content)) as test_image:
+                                      test_image.load()
+                                      if test_image.width >= 700 and test_image.height >= 900:
+                                          image_bytes = response.content
+                                          final_url = response.url
+                                          break
+                          except Exception as exc:
+                              print('PAGE_ERROR', meta['id'], page_no, repr(exc), flush=True)
+                          time.sleep(0.3)
+                      if image_bytes is not None:
+                          break
+
+                  if image_bytes is None:
+                      consecutive_misses += 1
+                      if images and consecutive_misses >= 2:
+                          break
+                      continue
+
+                  consecutive_misses = 0
+                  with Image.open(io.BytesIO(image_bytes)) as image:
+                      rgb = image.convert('RGB')
+                      output = image_dir / f'{page_no:03d}.jpg'
+                      rgb.save(output, 'JPEG', quality=96, subsampling=0, optimize=True)
+                  images.append(output)
+                  print('PAGE_SAVED', meta['id'], page_no, output.stat().st_size, final_url, flush=True)
+
+              if len(images) < meta['minimum_pages']:
+                  raise RuntimeError(f"{meta['title']} only yielded {len(images)} pages")
+
+              # Ensure page numbering is contiguous from 1.
+              expected_names = [f'{i:03d}.jpg' for i in range(1, len(images) + 1)]
+              actual_names = [path.name for path in images]
+              if actual_names != expected_names:
+                  raise RuntimeError(f"Non-contiguous page sequence for {meta['title']}: {actual_names}")
+
+              filename = f"{meta['date']}_{meta['org']}_{clean(meta['title'], 80)}_{len(images)}页_公开完整页面合成版.pdf"
+              pdf_path = PDFDIR / filename
+              pdf_path.write_bytes(img2pdf.convert([str(path) for path in images]))
+
+              doc = pymupdf.open(str(pdf_path))
+              if doc.page_count != len(images):
+                  raise RuntimeError(f"PDF page count mismatch for {meta['title']}")
+              for label, index in [('first', 0), ('middle', doc.page_count // 2), ('last', doc.page_count - 1)]:
+                  pix = doc.load_page(index).get_pixmap(matrix=pymupdf.Matrix(0.75, 0.75), alpha=False)
+                  render_path = RENDERDIR / f"{clean(meta['title'], 50)}_{label}.png"
+                  pix.save(str(render_path))
+                  render_entries.append((f"{meta['title']}-{label}", render_path))
+              encrypted = bool(doc.is_encrypted)
+              doc.close()
+
+              data = pdf_path.read_bytes()
+              record = {
+                  **meta,
+                  'file': filename,
+                  'pages': len(images),
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'encrypted': encrypted,
+                  'page_source_pattern': f"https://public.fxbaogao.com/report-image/{meta['path_date']}/{meta['id']}-<page>.png",
+                  'detail_page': f"https://www.fxbaogao.com/detail/{meta['id']}",
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          # Visual contact sheet for first/middle/last-page inspection.
+          thumbnails = []
+          for label, image_path in render_entries:
+              with Image.open(image_path) as image:
+                  image = image.convert('RGB')
+                  image.thumbnail((280, 365))
+                  canvas = Image.new('RGB', (300, 405), 'white')
+                  canvas.paste(image, ((300 - image.width) // 2, 10))
+                  ImageDraw.Draw(canvas).text((8, 382), label[:48], fill='black')
+                  thumbnails.append(canvas)
+          columns = 3
+          rows = (len(thumbnails) + columns - 1) // columns
+          sheet = Image.new('RGB', (columns * 300, rows * 405), 'white')
+          for index, thumbnail in enumerate(thumbnails):
+              sheet.paste(thumbnail, ((index % columns) * 300, (index // columns) * 405))
+          sheet.save(OUT / 'contact_sheet.jpg', quality=90)
+
+          total_pages = sum(item['pages'] for item in records)
+          (OUT / 'selected_reports.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '中国光大控股（00165.HK）券商深度报告下载包',
+              '',
+              f'完整PDF数量：{len(records)}份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for index, item in enumerate(records, 1):
+              readme.append(f"{index}. {item['date']}｜{item['org']}｜{item['title']}｜{item['pages']}页｜{item['type']}")
+          readme += [
+              '',
+              '两份均以中国光大控股为主要研究主体，属于公司深度或首次覆盖报告。',
+              '公开渠道未直接暴露原始PDF下载地址，本包依据报告详情页公开提供的逐页高清页面，按原页序无缺页合成为PDF。',
+              '合成文件保留原始页面画面，但不具备原始PDF文字层；未使用网页摘要、低清截图或不连续预览页。',
+              '已核验页面序号连续性、实际页数、PDF文件头和加密状态，并检查每份文件的首页、中间页和末页；ZIP完整性测试通过。',
+              '版权归原发布机构、作者及相关权利人所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{item['sha256']}  {item['file']}" for item in records) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'china_everbright_limited_deep_reports_2.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  archive.write(path, path.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  archive.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              if len([name for name in archive.namelist() if name.lower().endswith('.pdf')]) != 2:
+                  raise RuntimeError('ZIP PDF count failed')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / 'ZIP_SHA256.txt').write_text(f'{zip_sha}  {zip_path.name}\n', encoding='utf-8')
+          print((OUT / 'README.txt').read_text(encoding='utf-8'), flush=True)
+          print('FINAL_ZIP', zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-limited-deep-reports-2
+          path: china_everbright_exact/
+          retention-days: 3
+          if-no-files-found: error
