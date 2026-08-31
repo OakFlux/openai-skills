@@ -1,0 +1,252 @@
+name: Temporary China Everbright Limited final broker report package
+
+on:
+  push:
+    branches:
+      - tmp/china-everbright-broker-reports-final-20260831
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests Pillow PyMuPDF img2pdf
+      - name: Download complete public report pages, compile PDFs, validate and package
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+
+          reports = [
+              {
+                  'id': '5370196',
+                  'date': '2026-04-17',
+                  'org': '国金证券',
+                  'title': '跨境资管标的，业绩弹性可期',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5370196',
+                  'minimum_pages': 18,
+              },
+              {
+                  'id': '5040903',
+                  'date': '2025-09-03',
+                  'org': '国泰海通证券',
+                  'title': '资负共振，锚定科创，拐点已现',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5040903',
+                  'minimum_pages': 20,
+              },
+              {
+                  'id': '4956136',
+                  'date': '2025-07-17',
+                  'org': '太平洋证券',
+                  'title': '2024年年报点评：持续深耕硬科技，减亏初显成效',
+                  'detail_url': 'https://www.fxbaogao.com/detail/4956136',
+                  'minimum_pages': 8,
+              },
+          ]
+
+          OUT = Path('china_everbright_reports')
+          PDFDIR = OUT / 'pdfs'
+          IMGROOT = OUT / 'page_images'
+          RENDERDIR = OUT / 'renders'
+          for p in [OUT, PDFDIR, IMGROOT, RENDERDIR]:
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://www.fxbaogao.com/',
+          })
+
+          def clean(value: str, limit: int = 105) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value).strip(' ._')
+              return text[:limit]
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          records = []
+          render_items = []
+
+          for meta in reports:
+              year, month, day = meta['date'].split('-')
+              image_dir = IMGROOT / meta['id']
+              image_dir.mkdir(parents=True, exist_ok=True)
+              normalized_paths = []
+              page_hashes = set()
+              misses = 0
+
+              for page_no in range(1, 101):
+                  base = f"https://public.fxbaogao.com/report-image/{year}/{month}/{day}/{meta['id']}-{page_no}.png"
+                  candidates = [
+                      base,
+                      base + '?x-oss-process=image/format,png',
+                      base + '?x-oss-process=image/format,webp',
+                  ]
+                  data = None
+                  source_url = None
+                  for attempt in range(3):
+                      for url in candidates:
+                          try:
+                              r = session.get(url, timeout=60, allow_redirects=True, headers={'Referer': meta['detail_url'], 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'})
+                              print('PAGE_GET', meta['id'], page_no, attempt, r.status_code, len(r.content), r.headers.get('content-type'), r.url, flush=True)
+                              if r.status_code == 200 and len(r.content) > 8_000 and (r.headers.get('content-type') or '').lower().startswith('image/'):
+                                  try:
+                                      with Image.open(io.BytesIO(r.content)) as probe:
+                                          probe.load()
+                                          if probe.width >= 700 and probe.height >= 900:
+                                              data = r.content
+                                              source_url = r.url
+                                              break
+                                  except Exception as exc:
+                                      print('IMAGE_DECODE_FAIL', meta['id'], page_no, repr(exc), flush=True)
+                          except Exception as exc:
+                              print('PAGE_ERROR', meta['id'], page_no, repr(exc), flush=True)
+                      if data is not None:
+                          break
+                      time.sleep(0.8 * (attempt + 1))
+
+                  if data is None:
+                      misses += 1
+                      if misses >= 2:
+                          break
+                      continue
+                  misses = 0
+
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in page_hashes:
+                      raise RuntimeError(f"Duplicate page image in report {meta['id']} page {page_no}")
+                  page_hashes.add(digest)
+
+                  # Normalize every source image to high-quality RGB PNG so img2pdf can embed it reliably.
+                  with Image.open(io.BytesIO(data)) as image:
+                      image.load()
+                      rgb = image.convert('RGB')
+                      out_path = image_dir / f'{page_no:03d}.png'
+                      rgb.save(out_path, 'PNG', optimize=True)
+                      normalized_paths.append(out_path)
+                      print('PAGE_OK', meta['id'], page_no, rgb.size, digest, source_url, flush=True)
+
+              page_count = len(normalized_paths)
+              if page_count < meta['minimum_pages']:
+                  raise RuntimeError(f"Only {page_count} pages downloaded for {meta['org']} {meta['title']}")
+
+              # Ensure page sequence is gap-free.
+              expected_names = [f'{i:03d}.png' for i in range(1, page_count + 1)]
+              actual_names = [p.name for p in normalized_paths]
+              if actual_names != expected_names:
+                  raise RuntimeError(f"Page sequence gap for report {meta['id']}: {actual_names}")
+
+              pdf_name = f"{meta['date']}_{meta['org']}_中国光大控股（0165.HK）_{clean(meta['title'], 70)}_{page_count}页_完整公开页图合成PDF.pdf"
+              pdf_path = PDFDIR / pdf_name
+              layout = img2pdf.get_layout_fun((img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297)))
+              pdf_path.write_bytes(img2pdf.convert([str(p) for p in normalized_paths], layout_fun=layout))
+
+              doc = pymupdf.open(str(pdf_path))
+              if doc.page_count != page_count:
+                  raise RuntimeError(f"PDF page count mismatch for {pdf_name}: {doc.page_count} vs {page_count}")
+              if doc.is_encrypted:
+                  raise RuntimeError(f"Unexpected encrypted PDF: {pdf_name}")
+              sample_indices = [0, page_count // 2, page_count - 1]
+              for label, idx in zip(['first', 'middle', 'last'], sample_indices):
+                  pix = doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(0.55, 0.55), alpha=False)
+                  rp = RENDERDIR / f"{meta['id']}_{label}.png"
+                  pix.save(str(rp))
+                  render_items.append((f"{meta['org']}-{label}", rp))
+              doc.close()
+
+              record = {
+                  **meta,
+                  'pages': page_count,
+                  'file': pdf_name,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha256(pdf_path),
+                  'version': '发现报告公开原始页图按顺序合成PDF',
+                  'image_pattern': f"https://public.fxbaogao.com/report-image/{year}/{month}/{day}/{meta['id']}-<页码>.png",
+              }
+              records.append(record)
+              print('REPORT_OK', json.dumps(record, ensure_ascii=False), flush=True)
+
+          # Create QA contact sheet from first/middle/last pages of all reports.
+          thumbs = []
+          for label, path in render_items:
+              with Image.open(path) as im:
+                  im = im.convert('RGB')
+                  im.thumbnail((300, 390))
+                  canvas = Image.new('RGB', (320, 435), 'white')
+                  canvas.paste(im, ((320 - im.width)//2, 8))
+                  ImageDraw.Draw(canvas).text((10, 410), label, fill='black')
+                  thumbs.append(canvas)
+          cols = 3
+          rows = (len(thumbs) + cols - 1) // cols
+          sheet = Image.new('RGB', (cols * 320, rows * 435), 'white')
+          for i, thumb in enumerate(thumbs):
+              sheet.paste(thumb, ((i % cols) * 320, (i // cols) * 435))
+          sheet.save(OUT / 'contact_sheet.jpg', quality=90)
+
+          total_pages = sum(r['pages'] for r in records)
+          readme = [
+              '中国光大控股（0165.HK）券商深度研究报告下载包',
+              '',
+              f'报告数量：{len(records)}份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for idx, r in enumerate(records, 1):
+              readme.append(f"{idx}. {r['date']}｜{r['org']}｜{r['title']}｜{r['pages']}页")
+          readme += [
+              '',
+              '三份报告均以中国光大控股（0165.HK）为主要研究主体，包含两份首次覆盖/深度报告及一份系统性年报点评。',
+              '文件由发现报告公开展示的原始报告页图逐页下载后按顺序无损合成为PDF；内容与原报告版式保持一致，但不是券商服务器上的原生PDF文件。',
+              '已逐页检查图片可解码性、尺寸、页码连续性及重复页，并核验合成PDF页数、加密状态及首页/中间页/末页渲染。',
+              '版权归报告发布机构、作者及相关权利人所有，仅供研究参考。',
+          ]
+          (OUT / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'selected_reports.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['file']}" for r in records) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'china_everbright_limited_broker_reports_3.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(PDFDIR.glob('*.pdf')):
+                  z.write(p, p.name)
+              for name in ['README.txt', 'selected_reports.json', 'SHA256SUMS.txt']:
+                  z.write(OUT / name, name)
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdf_names = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdf_names)} PDFs instead of 3')
+
+          zip_digest = sha256(zip_path)
+          (OUT / 'ZIP_SHA256.txt').write_text(f'{zip_digest}  {zip_path.name}\n', encoding='utf-8')
+          print((OUT / 'README.txt').read_text(encoding='utf-8'), flush=True)
+          print('FINAL_ZIP', zip_path.stat().st_size, zip_digest, flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-limited-broker-reports
+          path: china_everbright_reports/
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 6
