@@ -1,0 +1,246 @@
+name: Temporary Capture Reportify Melco Page Assets
+
+on:
+  push:
+    branches:
+      - tmp/melco-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-capture-reportify-melco-pages.yml
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install browser and Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium-browser chromium-chromedriver || true
+          python -m pip install --quiet selenium requests pillow pypdf
+          (google-chrome --version || chromium --version || chromium-browser --version || true)
+          (chromedriver --version || true)
+
+      - name: Capture network requests and public page images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import time
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import requests
+          from PIL import Image
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+
+          OUT = Path('out')
+          OUT.mkdir(exist_ok=True)
+          ASSET_DIR = OUT / 'assets'
+          ASSET_DIR.mkdir(exist_ok=True)
+
+          targets = [
+              {
+                  'report_id': '1118968060607336448',
+                  'url': 'https://reportify.cn/reports/1118968060607336448',
+                  'expected_title': '澳门总GGR恢复超行业，市场份额和EM增长',
+                  'expected_pages': 15,
+              },
+              {
+                  'report_id': '1052271542572027904',
+                  'url': 'https://reportify.cn/reports/1052271542572027904',
+                  'expected_title': '2024年三季报业绩点评',
+                  'expected_pages': 4,
+              },
+              {
+                  'report_id': '962339654089314304',
+                  'url': 'https://reportify.cn/reports/962339654089314304',
+                  'expected_title': '2023年四季报点评',
+                  'expected_pages': 4,
+              },
+          ]
+
+          options = Options()
+          options.add_argument('--headless=new')
+          options.add_argument('--no-sandbox')
+          options.add_argument('--disable-dev-shm-usage')
+          options.add_argument('--disable-gpu')
+          options.add_argument('--window-size=1600,1200')
+          options.add_argument('--lang=zh-CN')
+          options.set_capability('goog:loggingPrefs', {'performance': 'ALL', 'browser': 'ALL'})
+
+          # Choose available Chromium binary explicitly if needed.
+          for candidate in ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser']:
+              if Path(candidate).exists():
+                  options.binary_location = candidate
+                  break
+
+          driver = webdriver.Chrome(options=options)
+          session = requests.Session()
+          session.headers.update({'User-Agent': 'Mozilla/5.0 Chrome/151.0 Safari/537.36', 'Referer': 'https://reportify.cn/'})
+
+          all_results = []
+          try:
+              for target in targets:
+                  rid = target['report_id']
+                  report_dir = ASSET_DIR / rid
+                  report_dir.mkdir(parents=True, exist_ok=True)
+                  driver.get(target['url'])
+                  time.sleep(8)
+
+                  # Scroll repeatedly to trigger lazy loading.
+                  for step in range(30):
+                      driver.execute_script('window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));')
+                      time.sleep(0.7)
+                      driver.execute_script('window.scrollBy(0, -250);')
+                      time.sleep(0.2)
+
+                  page_source = driver.page_source
+                  (report_dir / 'page_source.html').write_text(page_source, encoding='utf-8')
+                  driver.save_screenshot(str(report_dir / 'full_view.png'))
+
+                  dom = driver.execute_script('''
+                    const attrs = [];
+                    document.querySelectorAll('img,source,iframe,object,embed,a').forEach(el => {
+                      ['src','href','data-src','data-url','data-file','data-download'].forEach(k => {
+                        const v = el.getAttribute && el.getAttribute(k);
+                        if (v) attrs.push(v);
+                      });
+                    });
+                    return {title: document.title, urls: attrs, text: document.body ? document.body.innerText.slice(0,20000) : ''};
+                  ''')
+
+                  logs = []
+                  try:
+                      logs = driver.get_log('performance')
+                  except Exception:
+                      logs = []
+
+                  requests_seen = []
+                  response_meta = {}
+                  for entry in logs:
+                      try:
+                          msg = json.loads(entry['message'])['message']
+                      except Exception:
+                          continue
+                      method = msg.get('method')
+                      params = msg.get('params', {})
+                      if method == 'Network.requestWillBeSent':
+                          req = params.get('request', {})
+                          url = req.get('url')
+                          if url:
+                              requests_seen.append({'url': url, 'method': req.get('method'), 'type': params.get('type')})
+                      elif method == 'Network.responseReceived':
+                          resp = params.get('response', {})
+                          url = resp.get('url')
+                          if url:
+                              response_meta[url] = {
+                                  'status': resp.get('status'),
+                                  'mimeType': resp.get('mimeType'),
+                                  'fromDiskCache': resp.get('fromDiskCache'),
+                                  'encodedDataLength': resp.get('encodedDataLength'),
+                              }
+
+                  candidates = []
+                  for u in dom.get('urls', []):
+                      if isinstance(u, str):
+                          candidates.append(u)
+                  for item in requests_seen:
+                      candidates.append(item['url'])
+                  candidates += re.findall(r'https?://[^"\'<>\s]+', page_source)
+                  candidates = list(dict.fromkeys(candidates))
+
+                  interesting = []
+                  for url in candidates:
+                      low = url.lower()
+                      if any(k in low for k in ['reportify', 'document', 'preview', 'report/', '.pdf', '.png', '.jpg', '.jpeg', '.webp', 'image', 'page']) or rid in url:
+                          interesting.append(url)
+
+                  downloads = []
+                  for idx, url in enumerate(interesting):
+                      if not url.startswith('http'):
+                          continue
+                      try:
+                          r = session.get(url, timeout=45, allow_redirects=True)
+                          body = r.content
+                          ctype = (r.headers.get('content-type') or '').lower()
+                          rec = {
+                              'url': url,
+                              'final_url': r.url,
+                              'status': r.status_code,
+                              'content_type': ctype,
+                              'bytes': len(body),
+                              'sha256': hashlib.sha256(body).hexdigest() if body else '',
+                          }
+                          if r.status_code == 200 and body:
+                              ext = None
+                              if body.lstrip().startswith(b'%PDF'):
+                                  ext = '.pdf'
+                              elif ctype.startswith('image/'):
+                                  ext = '.' + ctype.split('/')[1].split(';')[0].replace('jpeg','jpg')
+                              else:
+                                  try:
+                                      im = Image.open(io.BytesIO(body))
+                                      fmt = (im.format or 'png').lower().replace('jpeg','jpg')
+                                      ext = '.' + fmt
+                                      rec['image_size'] = list(im.size)
+                                  except Exception:
+                                      pass
+                              if ext:
+                                  filename = f'{idx:04d}{ext}'
+                                  path = report_dir / filename
+                                  path.write_bytes(body)
+                                  rec['saved_as'] = str(path)
+                                  if ext != '.pdf':
+                                      try:
+                                          im = Image.open(io.BytesIO(body))
+                                          rec['image_size'] = list(im.size)
+                                      except Exception:
+                                          pass
+                          downloads.append(rec)
+                      except Exception as exc:
+                          downloads.append({'url': url, 'error': repr(exc)})
+
+                  result = {
+                      **target,
+                      'document_title': dom.get('title'),
+                      'body_text_head': dom.get('text'),
+                      'dom_url_count': len(dom.get('urls', [])),
+                      'network_request_count': len(requests_seen),
+                      'interesting_urls': interesting,
+                      'responses': response_meta,
+                      'downloads': downloads,
+                  }
+                  all_results.append(result)
+                  print('REPORT_RESULT=' + json.dumps({
+                      'report_id': rid,
+                      'title': result['document_title'],
+                      'interesting_urls': len(interesting),
+                      'downloaded_assets': [x for x in downloads if x.get('saved_as')],
+                  }, ensure_ascii=False), flush=True)
+          finally:
+              driver.quit()
+
+          (OUT / 'reportify_capture.json').write_text(json.dumps(all_results, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Upload capture results
+        uses: actions/upload-artifact@v4
+        with:
+          name: reportify-melco-page-capture
+          path: out
+          retention-days: 3
+          if-no-files-found: error
