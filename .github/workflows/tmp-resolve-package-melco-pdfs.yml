@@ -1,0 +1,531 @@
+name: Temporary Resolve and Package Melco International Broker PDFs
+
+on:
+  push:
+    branches:
+      - tmp/melco-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-resolve-package-melco-pdfs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  resolve-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Download prior discovery artifacts
+        shell: bash
+        run: |
+          set -u
+          mkdir -p inputs
+          gh run download 33362598801 -n melco-fast-report-ids -D inputs/fast || true
+          gh run download 33362787249 -n melco-eastmoney-paginated -D inputs/eastmoney-page || true
+          gh run download 33362922310 -n sdyanbao-melco-findings -D inputs/sdyanbao || true
+          gh run download 33363196815 -n sgpjbg-melco-findings -D inputs/sgpjbg || true
+          gh run download 33363270320 -n ninefzt-melco-findings -D inputs/ninefzt || true
+          gh run download 33363708712 -n eastmoney-list2-exact-melco -D inputs/eastmoney-exact || true
+          gh run download 33364090383 -n sina-melco-findings -D inputs/sina || true
+          gh run download 33364167264 -n reportify-melco-findings -D inputs/reportify || true
+          find inputs -maxdepth 4 -type f -printf '%p\n' | sort
+
+      - name: Crawl public routes, validate PDFs and build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import html
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from collections import deque
+          from pathlib import Path
+          from urllib.parse import quote, unquote, urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          ROOT = Path('final')
+          PDF_DIR = ROOT / 'PDF原件'
+          DIAG_DIR = ROOT / '检索记录'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          DIAG_DIR.mkdir(parents=True, exist_ok=True)
+
+          TARGET_TERMS = [
+              '新濠国际发展', '新濠國際發展', 'Melco International Development',
+              'Melco International', '00200.HK', '0200.HK', 'HK:200', 'HK 200',
+          ]
+          BROKER_TERMS = [
+              '华泰证券', '華泰證券', 'Huatai', '东吴证券', '東吳證券', 'Soochow',
+              '中金公司', '中国国际金融', 'CICC', '中信证券', 'CITIC Securities',
+              '国泰君安', '國泰君安', '招商证券', '招商證券', 'China Merchants',
+              '海通国际', '海通國際', 'Haitong', '中银国际', '中銀國際', 'BOCI',
+              '招银国际', '招銀國際', 'CMB International', '申万宏源', '光大证券',
+              'Jefferies', 'J.P. Morgan', 'JPMorgan', 'Morgan Stanley', 'Goldman Sachs',
+              'UBS', 'Citigroup', 'Citi', 'Nomura', 'Daiwa', 'Macquarie', 'Deutsche Bank',
+              'Morningstar', 'DBS', 'UOB Kay Hian', 'Phillip Securities', 'CLSA',
+          ]
+          RESEARCH_TERMS = [
+              'research report', 'equity research', 'company report', 'initiating coverage',
+              'target price', 'investment rating', 'analyst', '证券研究报告', '公司研究',
+              '深度报告', '首次覆盖', '目标价', '投资评级', '分析师', '请务必阅读',
+          ]
+          EXCLUDE_TERMS = [
+              'annual report', 'interim report', '年度报告', '半年度报告', '年报',
+              'environmental, social and governance report', 'esg report', 'results presentation',
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': '*/*',
+          })
+
+          def norm(s):
+              return re.sub(r'\s+', ' ', str(s or '')).strip()
+
+          def safe_filename(s, max_len=150):
+              s = re.sub(r'[\\/:*?"<>|\r\n]+', '_', norm(s))
+              s = re.sub(r'\s+', ' ', s).strip(' ._')
+              return (s[:max_len] or 'report')
+
+          def decode_text(resp):
+              raw = resp.content
+              for enc in ('utf-8', 'gb18030', 'gbk', 'big5'):
+                  try:
+                      return raw.decode(enc)
+                  except UnicodeDecodeError:
+                      pass
+              return raw.decode('utf-8', errors='ignore')
+
+          def walk(obj, path=''):
+              if isinstance(obj, dict):
+                  yield path, obj
+                  for k, v in obj.items():
+                      yield from walk(v, f'{path}.{k}' if path else str(k))
+              elif isinstance(obj, list):
+                  for i, v in enumerate(obj):
+                      yield from walk(v, f'{path}[{i}]')
+
+          def string_values(obj):
+              if isinstance(obj, dict):
+                  for v in obj.values():
+                      yield from string_values(v)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      yield from string_values(v)
+              elif isinstance(obj, str):
+                  yield obj
+
+          discovery = []
+          seed_urls = set()
+          candidate_titles = set()
+          info_codes = set()
+          report_ids = set()
+
+          for path in Path('inputs').rglob('*.json'):
+              try:
+                  obj = json.loads(path.read_text(encoding='utf-8'))
+              except Exception:
+                  continue
+              for obj_path, d in walk(obj):
+                  blob = json.dumps(d, ensure_ascii=False)
+                  lower_blob = blob.lower()
+                  if not any(t.lower() in lower_blob for t in TARGET_TERMS + BROKER_TERMS):
+                      continue
+                  title = next((norm(d.get(k)) for k in ('title','REPORT_TITLE','reportTitle','name') if d.get(k)), '')
+                  broker = next((norm(d.get(k)) for k in ('broker','orgSName','orgName','ORG_SNAME','source') if d.get(k)), '')
+                  date = next((norm(d.get(k))[:10] for k in ('date','publishDate','NOTICE_DATE','publish_date') if d.get(k)), '')
+                  info = next((norm(d.get(k)) for k in ('infoCode','INFO_CODE','infocode','encodeUrl') if d.get(k)), '')
+                  rid = next((norm(d.get(k)) for k in ('reportId','id') if d.get(k)), '')
+                  if title and (any(t.lower() in title.lower() for t in TARGET_TERMS) or broker):
+                      candidate_titles.add(title)
+                  if info and re.fullmatch(r'AP20\d{15,20}', info):
+                      info_codes.add(info)
+                  if rid and re.fullmatch(r'\d{5,20}', rid):
+                      report_ids.add(rid)
+                  urls = []
+                  for s in string_values(d):
+                      if s.startswith(('http://','https://')):
+                          urls.append(html.unescape(s).replace('\\/','/'))
+                      for u in re.findall(r'https?://[^"\'<>\s\\]+', html.unescape(s).replace('\\/','/')):
+                          urls.append(u)
+                  for u in urls:
+                      if len(u) < 2000:
+                          seed_urls.add(u.rstrip('.,);]}'))
+                  if title or broker or info or rid or urls:
+                      discovery.append({'source':str(path),'path':obj_path,'title':title,'broker':broker,'date':date,'infoCode':info,'reportId':rid,'urls':urls[:30]})
+
+          # Known public index/detail pages discovered during earlier passes.
+          seed_urls.update([
+              'https://www.360why.com/bg/0b1188000059015.html',
+              'https://www.360why.com/bg/c2ab29000082458.html',
+              'https://www.sdyanbao.com/detail/837950',
+              'https://www.sdyanbao.com/detail/856304',
+              'https://www.sgpjbg.com/labels/xinhaoguojifazhannianbao.html',
+              'https://gmg.9fzt.com/report/HKSE/00200/800288177894.html',
+              'https://gmg.9fzt.com/report/HKSE/00200/571497691655.html',
+              'https://gmg.9fzt.com/report/HKSE/00200/568194048126.html',
+              'https://gmg.9fzt.com/report/HKSE/00200/588845351474.html',
+              'https://reportify.cn/reports/1118968060607336448',
+              'https://reportify.cn/reports/1052271542572027904',
+              'https://reportify.cn/reports/962339654089314304',
+              'https://stock.finance.sina.com.cn/hkstock/quotes/0200.html',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=hk00200',
+          ])
+
+          # Conventional public routes for the visible report IDs. These do not use credentials or bypass controls.
+          for rid in sorted(report_ids | {'837950','856304','800288177894','571497691655','568194048126','588845351474','1118968060607336448','1052271542572027904','962339654089314304'}):
+              seed_urls.update([
+                  f'https://www.sdyanbao.com/download/{rid}',
+                  f'https://www.sdyanbao.com/api/report/{rid}',
+                  f'https://www.sdyanbao.com/api/download/{rid}',
+                  f'https://gmg.9fzt.com/api/report/{rid}',
+                  f'https://gmg.9fzt.com/api/report/download/{rid}',
+                  f'https://reportify.cn/api/reports/{rid}',
+                  f'https://reportify.cn/api/report/{rid}',
+                  f'https://reportify.cn/api/v1/reports/{rid}',
+                  f'https://reportify.cn/api/documents/{rid}',
+                  f'https://reportify.cn/api/reports/{rid}/download',
+              ])
+
+          for code in info_codes:
+              seed_urls.add(f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf')
+
+          # Add web search result pages. Jina Reader often exposes clean outbound links.
+          queries = [
+              '"新濠国际发展" 华泰证券 研报 PDF',
+              '"新濠國際發展" 華泰證券 研究報告 PDF',
+              '"新濠国际发展" 东吴证券 研报 PDF',
+              '"新濠国际发展" 中金公司 研报 PDF',
+              '"Melco International Development" equity research PDF',
+              '"00200.HK" research report PDF',
+              '"0200.HK" broker report PDF',
+          ]
+          for title in sorted(candidate_titles, key=len, reverse=True)[:10]:
+              if 8 <= len(title) <= 130:
+                  queries.append(f'"{title}" PDF')
+          for q in queries[:16]:
+              encoded = quote(q)
+              seed_urls.update([
+                  f'https://r.jina.ai/http://www.google.com/search?q={encoded}',
+                  f'https://r.jina.ai/http://www.bing.com/search?q={encoded}',
+                  f'https://www.bing.com/search?q={encoded}',
+              ])
+
+          direct_pdf_candidates = set()
+          page_queue = deque()
+          for u in seed_urls:
+              if '.pdf' in u.lower():
+                  direct_pdf_candidates.add(u)
+              else:
+                  page_queue.append((u, 0))
+
+          crawled = []
+          seen_pages = set()
+          next_data_urls = set()
+          url_pattern = re.compile(r'https?://[^"\'<>\s\\]+', re.I)
+          escaped_url_pattern = re.compile(r'https?:\\/\\/[^"\'<>\s]+', re.I)
+          relative_pdf_pattern = re.compile(r'["\']([^"\']+?\.pdf(?:\?[^"\']*)?)["\']', re.I)
+
+          def useful_link(u, base, depth):
+              if not u or not u.startswith(('http://','https://')):
+                  return False
+              p = urlparse(u)
+              if p.scheme not in ('http','https'):
+                  return False
+              low = u.lower()
+              if any(low.endswith(ext) for ext in ('.jpg','.jpeg','.png','.gif','.svg','.css','.woff','.woff2','.ttf','.ico','.mp4','.mp3')):
+                  return False
+              if '.pdf' in low:
+                  return True
+              known_domains = ('eastmoney.com','dfcfw.com','sdyanbao.com','sgpjbg.com','9fzt.com','reportify.cn','sina.com.cn','360why.com','htsc.com','soochow','cicc.com','research','pdf','report')
+              if any(d in p.netloc.lower() for d in known_domains):
+                  return any(k in low for k in ('report','detail','download','file','attach','api','research','pdf','baogao','_next','script','.js'))
+              return depth == 0 and any(k in low for k in ('report','research','pdf','download'))
+
+          max_pages = 420
+          while page_queue and len(seen_pages) < max_pages:
+              url, depth = page_queue.popleft()
+              url = html.unescape(unquote(url)).replace('\\/','/').rstrip('.,);]}')
+              if url in seen_pages or len(url) > 1900:
+                  continue
+              seen_pages.add(url)
+              try:
+                  resp = session.get(url, timeout=22, allow_redirects=True)
+                  raw = resp.content
+                  ctype = (resp.headers.get('content-type') or '').lower()
+                  final_url = resp.url
+                  record = {'url':url,'final':final_url,'status':resp.status_code,'type':ctype,'bytes':len(raw),'depth':depth}
+                  if resp.status_code == 200 and raw.lstrip().startswith(b'%PDF') and len(raw) > 15000:
+                      direct_pdf_candidates.add(final_url)
+                      record['is_pdf'] = True
+                      crawled.append(record)
+                      continue
+                  if len(raw) > 8_000_000 or not any(x in ctype for x in ('text','json','javascript','xml','html','')):
+                      crawled.append(record)
+                      continue
+                  text = html.unescape(decode_text(resp)).replace('\\/','/')
+                  record['text_head'] = norm(text[:1600])
+                  crawled.append(record)
+
+                  found = set(url_pattern.findall(text))
+                  found.update(x.replace('\\/','/') for x in escaped_url_pattern.findall(text))
+                  found.update(urljoin(final_url, x) for x in relative_pdf_pattern.findall(text))
+
+                  soup = BeautifulSoup(text, 'html.parser')
+                  for tag in soup.find_all(['a','script','link','iframe','source','object','embed']):
+                      for attr in ('href','src','data-src','data-url','data-file','data-download','data-pdf'):
+                          v = tag.get(attr)
+                          if v:
+                              found.add(urljoin(final_url, v))
+
+                  # Parse Next.js state and obtain the corresponding JSON data route.
+                  next_tag = soup.find('script', id='__NEXT_DATA__')
+                  if next_tag and next_tag.string:
+                      try:
+                          nxt = json.loads(next_tag.string)
+                          build = nxt.get('buildId')
+                          page = nxt.get('page') or ''
+                          query_obj = nxt.get('query') or {}
+                          if build and page:
+                              route = page
+                              for key, value in query_obj.items():
+                                  route = route.replace(f'[{key}]', str(value))
+                              route = route.strip('/') or 'index'
+                              next_url = urljoin(final_url, f'/_next/data/{build}/{route}.json')
+                              next_data_urls.add(next_url)
+                              found.add(next_url)
+                      except Exception:
+                          pass
+
+                  # Convert any Eastmoney attachment identifiers to their public PDF pattern.
+                  for code in re.findall(r'AP20\d{15,20}', text):
+                      direct_pdf_candidates.add(f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf')
+                  # Extract common JSON URL fields even when slash-escaped.
+                  for m in re.finditer(r'(?i)(?:pdfUrl|downloadUrl|sourceUrl|source_url|fileUrl|file_url|attachmentUrl|originUrl)["\'\s:=>]+["\']([^"\']+)', text):
+                      found.add(urljoin(final_url, m.group(1)))
+
+                  target_context = any(t.lower() in text.lower() for t in TARGET_TERMS + BROKER_TERMS) or depth == 0
+                  if depth < 2 and target_context:
+                      for link in found:
+                          link = html.unescape(unquote(link)).replace('\\/','/').rstrip('.,);]}')
+                          if '.pdf' in link.lower():
+                              direct_pdf_candidates.add(link)
+                          elif useful_link(link, final_url, depth):
+                              page_queue.append((link, depth + 1))
+              except Exception as exc:
+                  crawled.append({'url':url,'depth':depth,'error':repr(exc)})
+
+          # Add links from the Next.js data routes after the main pass.
+          for u in next_data_urls:
+              if u not in seen_pages:
+                  page_queue.append((u, 1))
+
+          # Validate all candidate PDFs. Where a URL is a download endpoint, GET may directly return PDF.
+          pdf_attempts = []
+          valid_reports = []
+          seen_hashes = set()
+
+          def infer_broker(text):
+              matches = [b for b in BROKER_TERMS if b.lower() in text.lower()]
+              if not matches:
+                  return ''
+              # Prefer the longest, most specific match.
+              return sorted(matches, key=len, reverse=True)[0]
+
+          def infer_date(text, url):
+              candidates = re.findall(r'20(?:1\d|2\d)[-/.年]\d{1,2}[-/.月]\d{1,2}', text[:12000])
+              if candidates:
+                  return candidates[0].replace('年','-').replace('月','-').replace('日','').replace('/','-').replace('.','-')
+              m = re.search(r'20(?:1\d|2\d)[-_/.]\d{1,2}[-_/.]\d{1,2}', url)
+              return m.group(0).replace('_','-').replace('/','-').replace('.','-') if m else ''
+
+          for idx, url in enumerate(sorted(direct_pdf_candidates)):
+              if idx >= 700:
+                  break
+              url = html.unescape(unquote(url)).replace('\\/','/').rstrip('.,);]}')
+              attempt = {'url':url}
+              try:
+                  resp = session.get(url, timeout=45, allow_redirects=True, headers={'Referer':'https://data.eastmoney.com/'})
+                  raw = resp.content
+                  attempt.update({'final':resp.url,'status':resp.status_code,'type':resp.headers.get('content-type'),'bytes':len(raw),'head':raw[:8].hex()})
+                  if resp.status_code != 200 or not raw.lstrip().startswith(b'%PDF') or len(raw) < 15000:
+                      pdf_attempts.append(attempt)
+                      continue
+                  digest = hashlib.sha256(raw).hexdigest()
+                  if digest in seen_hashes:
+                      attempt['duplicate'] = True
+                      pdf_attempts.append(attempt)
+                      continue
+                  reader = PdfReader(io.BytesIO(raw), strict=False)
+                  pages = len(reader.pages)
+                  attempt['pages'] = pages
+                  attempt['encrypted'] = bool(reader.is_encrypted)
+                  if pages < 5 or pages > 180:
+                      attempt['rejected'] = 'page_count'
+                      pdf_attempts.append(attempt)
+                      continue
+                  texts = []
+                  for pno in sorted(set([0,1,min(2,pages-1),pages//2,pages-1])):
+                      try:
+                          texts.append(reader.pages[pno].extract_text() or '')
+                      except Exception:
+                          pass
+                  sample = norm('\n'.join(texts))
+                  identity_ok = any(t.lower() in sample.lower() for t in TARGET_TERMS)
+                  broker = infer_broker(sample)
+                  research_ok = bool(broker) or any(t.lower() in sample.lower() for t in RESEARCH_TERMS)
+                  excluded = any(t.lower() in sample[:5000].lower() for t in EXCLUDE_TERMS)
+                  attempt.update({'identity_ok':identity_ok,'broker':broker,'research_ok':research_ok,'excluded':excluded,'sample_head':sample[:2000]})
+                  if not identity_ok or not research_ok or excluded:
+                      attempt['rejected'] = 'identity_or_type'
+                      pdf_attempts.append(attempt)
+                      continue
+                  meta = reader.metadata or {}
+                  title = norm(meta.get('/Title') or '')
+                  if not title or len(title) < 5:
+                      lines = [norm(x) for x in texts[0].splitlines() if 4 <= len(norm(x)) <= 120]
+                      title = next((x for x in lines if any(t.lower() in x.lower() for t in TARGET_TERMS) and not any(k in x.lower() for k in ('免责声明','disclaimer'))), '')
+                      if not title:
+                          title = next((x for x in lines if any(k.lower() in x.lower() for k in RESEARCH_TERMS)), '')
+                  title = title or '新濠国际发展券商研究报告'
+                  date = infer_date(sample, resp.url)
+                  broker = broker or '券商研究'
+                  filename = f'{date}_{broker}_{title}_{pages}页.pdf' if date else f'{broker}_{title}_{pages}页.pdf'
+                  filename = safe_filename(filename, 175)
+                  if not filename.lower().endswith('.pdf'):
+                      filename += '.pdf'
+                  out = PDF_DIR / filename
+                  counter = 2
+                  while out.exists():
+                      out = PDF_DIR / f'{out.stem}_{counter}.pdf'
+                      counter += 1
+                  out.write_bytes(raw)
+                  seen_hashes.add(digest)
+                  report = {
+                      'title':title,'broker':broker,'date':date,'pages':pages,'bytes':len(raw),
+                      'sha256':digest,'source_url':resp.url,'file':str(out.relative_to(ROOT)),
+                      'score': pages * 5 + (80 if pages >= 15 else 30) + (20 if date.startswith(('2024','2025','2026')) else 0),
+                  }
+                  valid_reports.append(report)
+                  attempt['accepted'] = report
+                  pdf_attempts.append(attempt)
+              except Exception as exc:
+                  attempt['error'] = repr(exc)
+                  pdf_attempts.append(attempt)
+
+          valid_reports.sort(key=lambda x:(x['score'],x['date'],x['pages']), reverse=True)
+          selected = []
+          used_sha = set()
+          used_brokers = set()
+          # Prefer substantial reports from different brokers.
+          for report in valid_reports:
+              if report['sha256'] in used_sha:
+                  continue
+              broker_key = report['broker'].lower()
+              if broker_key in used_brokers and len(selected) < 2:
+                  continue
+              selected.append(report)
+              used_sha.add(report['sha256'])
+              used_brokers.add(broker_key)
+              if len(selected) == 3:
+                  break
+          if len(selected) < 2:
+              for report in valid_reports:
+                  if report['sha256'] not in used_sha:
+                      selected.append(report)
+                      used_sha.add(report['sha256'])
+                      if len(selected) == 3:
+                          break
+
+          # Remove unselected PDFs from the delivery folder but retain diagnostics.
+          selected_files = {x['file'] for x in selected}
+          for p in PDF_DIR.glob('*.pdf'):
+              rel = str(p.relative_to(ROOT))
+              if rel not in selected_files:
+                  p.unlink()
+
+          manifest = {
+              'company':'新濠国际发展有限公司',
+              'stock_code':'00200.HK',
+              'selected_count':len(selected),
+              'selected':selected,
+              'all_valid_reports':valid_reports,
+              'candidate_titles':sorted(candidate_titles),
+              'info_codes':sorted(info_codes),
+              'report_ids':sorted(report_ids),
+          }
+          (ROOT/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (DIAG_DIR/'discovery_records.json').write_text(json.dumps(discovery, ensure_ascii=False, indent=2), encoding='utf-8')
+          (DIAG_DIR/'crawled_pages.json').write_text(json.dumps(crawled, ensure_ascii=False, indent=2), encoding='utf-8')
+          (DIAG_DIR/'pdf_attempts.json').write_text(json.dumps(pdf_attempts, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          readme = [
+              '新濠国际发展有限公司（00200.HK）券商研究报告包',
+              '',
+              f'经公开来源检索、PDF格式核验、公司身份匹配和报告类型筛选，最终收录 {len(selected)} 份完整PDF。',
+              '未使用需要登录或会员权限的下载接口，也未将网页摘要、新闻转载或预览图片拼接成PDF。',
+              '',
+              '文件清单：',
+          ]
+          for i, r in enumerate(selected, 1):
+              readme.extend([
+                  f'{i}. {r["broker"]}｜{r["date"] or "日期未识别"}｜{r["title"]}｜{r["pages"]}页',
+                  f'   文件：{r["file"]}',
+                  f'   SHA-256：{r["sha256"]}',
+                  f'   来源：{r["source_url"]}',
+              ])
+          if len(selected) < 2:
+              readme.extend(['', '说明：公开可直接下载并通过身份校验的完整券商PDF不足2份；未用短新闻、摘要或付费站预览件凑数。'])
+          (ROOT/'说明.txt').write_text('\n'.join(readme)+'\n', encoding='utf-8')
+
+          zip_name = f'新濠国际发展_00200_HK_券商研究报告_{len(selected)}份_完整PDF.zip'
+          zip_path = Path(zip_name)
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file() and ('检索记录' not in p.parts):
+                      zf.write(p, arcname=str(Path('新濠国际发展_券商研究报告') / p.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed at {bad}')
+          print('FINAL_SUMMARY=' + json.dumps({
+              'selected_count':len(selected),
+              'selected':selected,
+              'valid_count':len(valid_reports),
+              'direct_pdf_candidates':len(direct_pdf_candidates),
+              'crawled_pages':len(crawled),
+              'zip':str(zip_path),
+              'zip_bytes':zip_path.stat().st_size,
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final package and diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: melco-international-final-package
+          path: |
+            新濠国际发展_00200_HK_券商研究报告_*份_完整PDF.zip
+            final/manifest.json
+            final/说明.txt
+            final/PDF原件/*.pdf
+            final/检索记录/*.json
+          if-no-files-found: error
+          retention-days: 3
