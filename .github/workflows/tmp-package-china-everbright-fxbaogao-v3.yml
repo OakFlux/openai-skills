@@ -1,0 +1,154 @@
+name: Package China Everbright deep reports from public pages v3
+
+on:
+  push:
+    branches:
+      - tmp/china-everbright-hibor-js-probe-20260831
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pillow img2pdf pypdf pymupdf
+      - name: Download public report pages, build and verify PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf out && mkdir -p out/pdfs out/pages out/renders
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, zipfile
+          from pathlib import Path
+          import requests, img2pdf, pymupdf
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT=Path('out'); PDFDIR=OUT/'pdfs'; PAGEDIR=OUT/'pages'; RENDER=OUT/'renders'
+          reports=[
+              {
+                  'id':'5370196','date_path':'2026/04/17','date':'2026-04-17','org':'国金证券',
+                  'title':'中国光大控股深度报告：跨境资管标的，业绩弹性可期',
+                  'expected_min':18,'expected_max':24,
+              },
+              {
+                  'id':'5040903','date_path':'2025/09/03','date':'2025-09-03','org':'国泰海通证券',
+                  'title':'中国光大控股首次覆盖报告：资负共振，锚定科创，拐点已现',
+                  'expected_min':22,'expected_max':26,
+              },
+          ]
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+          sess=requests.Session(); sess.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+          logs=[]
+          def log(*xs):
+              s=' '.join(str(x) for x in xs); logs.append(s); print(s,flush=True)
+          def safe(s): return re.sub(r'[\\/:*?"<>|\r\n]+','_',s).strip(' ._')
+          records=[]
+
+          for rep in reports:
+              rid=rep['id']; page_dir=PAGEDIR/rid; page_dir.mkdir(parents=True,exist_ok=True)
+              jpgs=[]; hashes=[]; failures=0
+              referer=f'https://www.fxbaogao.com/view?id={rid}'
+              for n in range(1,41):
+                  variants=[
+                      f"https://public.fxbaogao.com/report-image/{rep['date_path']}/{rid}-{n}.png",
+                      f"https://public.fxbaogao.com/report-image/{rep['date_path']}/{rid}-{n}.png?x-oss-process=image%2Fformat%2Cwebp",
+                  ]
+                  valid=None
+                  for url in variants:
+                      try:
+                          r=sess.get(url,timeout=60,headers={'Referer':referer,'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'})
+                          log('GET',rid,n,r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+                          if r.status_code!=200 or len(r.content)<12000: continue
+                          im=Image.open(io.BytesIO(r.content)); im.load()
+                          log('IMAGE',rid,n,im.format,im.width,im.height)
+                          if im.width<700 or im.height<900: continue
+                          valid=im.convert('RGB')
+                          break
+                      except Exception as e:
+                          log('ERROR',rid,n,repr(e))
+                  if valid is None:
+                      failures+=1
+                      if jpgs and failures>=1: break
+                      if not jpgs and failures>=2: break
+                      continue
+                  failures=0
+                  buf=io.BytesIO(); valid.save(buf,'JPEG',quality=95,optimize=True,progressive=False)
+                  data=buf.getvalue(); h=hashlib.sha256(data).hexdigest()
+                  # Stop if the host returns a repeated terminal/placeholder page.
+                  if h in hashes:
+                      log('REPEATED_PAGE_STOP',rid,n,h); break
+                  hashes.append(h)
+                  p=page_dir/f'{n:03d}.jpg'; p.write_bytes(data); jpgs.append(p)
+              count=len(jpgs)
+              log('PAGE_COUNT',rid,count)
+              if not (rep['expected_min'] <= count <= rep['expected_max']):
+                  raise RuntimeError(f'{rid}: unexpected complete page count {count}')
+              pdf_bytes=img2pdf.convert([str(p) for p in jpgs])
+              filename=f"{rep['date']}_{rep['org']}_{safe(rep['title'])}_{count}页_公开完整页面合成PDF.pdf"
+              pdf_path=PDFDIR/filename; pdf_path.write_bytes(pdf_bytes)
+              reader=PdfReader(str(pdf_path)); actual=len(reader.pages)
+              if actual!=count: raise RuntimeError(f'{rid}: PDF pages {actual} != images {count}')
+              doc=pymupdf.open(str(pdf_path))
+              for label,idx in [('first',0),('middle',actual//2),('last',actual-1)]:
+                  page=doc.load_page(idx)
+                  pix=page.get_pixmap(matrix=pymupdf.Matrix(0.8,0.8),alpha=False)
+                  pix.save(str(RENDER/f'{rid}_{label}.png'))
+              doc.close()
+              digest=hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+              records.append({**rep,'pages':actual,'file':filename,'sha256':digest,'bytes':pdf_path.stat().st_size,'source_page':f'https://www.fxbaogao.com/detail/{rid}'})
+
+          readme=[
+              '中国光大控股（0165.HK）券商深度报告', '',
+              f'完整PDF数量：{len(records)}份',
+              f'合计页数：{sum(r["pages"] for r in records)}页', '',
+          ]
+          for i,r in enumerate(records,1):
+              readme.append(f"{i}. {r['date']}｜{r['org']}｜{r['title']}｜{r['pages']}页")
+          readme += [
+              '',
+              '文件说明：来源页面公开展示了报告全部逐页图像；本压缩包按原页顺序合成为完整PDF。',
+              '由于并非券商服务器直接提供的原始PDF文件，文件名已明确标注“公开完整页面合成PDF”。',
+              '已校验：PDF可解析、页数与下载页面数一致，并渲染检查首页、中间页和末页。',
+              '版权归报告发布机构及相关权利人所有，仅供研究参考。',
+          ]
+          (OUT/'README.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'报告清单.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['file']}" for r in records)+'\n',encoding='utf-8')
+          (OUT/'download_log.txt').write_text('\n'.join(logs),encoding='utf-8')
+
+          zip_path=OUT/'中国光大控股_券商深度报告_2份_重新打包.zip'
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,allowZip64=True) as z:
+              for p in sorted(PDFDIR.glob('*.pdf')): z.write(p,p.name)
+              for n in ['README.txt','报告清单.json','SHA256SUMS.txt']: z.write(OUT/n,n)
+          with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip()
+              if bad is not None: raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_names=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names)!=2: raise RuntimeError(f'ZIP has {len(pdf_names)} PDFs')
+          summary={'zip':zip_path.name,'sha256':hashlib.sha256(zip_path.read_bytes()).hexdigest(),'bytes':zip_path.stat().st_size,'records':records}
+          (OUT/'package_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('\n'.join(readme)); print('FINAL',json.dumps(summary,ensure_ascii=False))
+          PY
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-deep-reports-verified-v3
+          path: |
+            out/中国光大控股_券商深度报告_2份_重新打包.zip
+            out/package_summary.json
+            out/README.txt
+            out/报告清单.json
+            out/SHA256SUMS.txt
+            out/download_log.txt
+            out/renders/*.png
+          if-no-files-found: error
+          retention-days: 7
