@@ -1,0 +1,229 @@
+name: Build verified CEL annual report package
+
+on:
+  push:
+    branches:
+      - tmp/cel-report-scrape-fast-20260831
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PDF dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+      - name: Download, verify, render and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf out && mkdir -p out/reports out/renders
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, json, re, shutil, warnings, zipfile
+          from pathlib import Path
+          from urllib.parse import unquote
+          import requests
+          import pymupdf
+          from pypdf import PdfReader
+          from urllib3.exceptions import InsecureRequestWarning
+
+          warnings.simplefilter('ignore', InsecureRequestWarning)
+          OUT=Path('out'); REPORTS=OUT/'reports'; RENDERS=OUT/'renders'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+          session=requests.Session()
+          session.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          annuals={
+            2020:[
+              'https://www.everbright.com/sites/default/files/results-announcements/C_Annual%20Report_0.pdf',
+              'https://www.everbright.com/sites/default/files/results-announcements/C_Annual%20Report.pdf',
+            ],
+            2021:[
+              'https://www.everbright.com/sites/default/files/results-announcements/C%20Annual%20Report.pdf',
+            ],
+            2022:[
+              'https://www.everbright.com/sites/default/files/results-announcements/cw0165_Annual%20Report.pdf',
+            ],
+            2023:[
+              'https://www.everbright.com/sites/default/files/results-announcements/CW001651-AR23.pdf',
+            ],
+            2024:[
+              'https://www.everbright.com/sites/default/files/results-announcements/CW00165-AR24.pdf',
+            ],
+            2025:[
+              'https://www.everbright.com/sites/default/files/results-announcements/C%20Annual%20Report_0.pdf',
+            ],
+          }
+          interim={
+            'period':'2026H1',
+            'url':'https://www.hkexnews.hk/listedco/listconews/sehk/2026/0827/2026082701530_c.pdf',
+            'filename':'中国光大控股_2026年中期业绩公告.pdf',
+          }
+
+          def fetch_pdf(url:str) -> bytes:
+            last=''
+            for verify in (True, False):
+              try:
+                r=session.get(url,timeout=(15,180),allow_redirects=True,verify=verify,headers={'Referer':'https://www.everbright.com/' if 'everbright.com' in url else 'https://www.hkexnews.hk/'})
+                last=f'{r.status_code} {r.headers.get("content-type")} {len(r.content)} {r.url}'
+                if r.status_code==200 and len(r.content)>50000 and r.content.lstrip().startswith(b'%PDF'):
+                  return r.content
+              except Exception as e:
+                last=repr(e)
+            raise RuntimeError(f'Cannot download PDF: {url} :: {last}')
+
+          def text_sample(path:Path) -> str:
+            doc=pymupdf.open(str(path))
+            idxs=list(range(min(8,len(doc))))
+            if len(doc)>8: idxs += [len(doc)//2, max(0,len(doc)-2), len(doc)-1]
+            parts=[]
+            for i in sorted(set(idxs)):
+              try: parts.append(doc.load_page(i).get_text('text'))
+              except Exception: pass
+            doc.close()
+            return '\n'.join(parts)
+
+          def compact(s:str)->str:
+            return re.sub(r'\s+','',s).lower()
+
+          def verify_annual(path:Path,year:int) -> tuple[int,str]:
+            reader=PdfReader(str(path))
+            pages=len(reader.pages)
+            if pages<80: raise RuntimeError(f'{year} annual report suspiciously short: {pages} pages')
+            sample=text_sample(path)
+            c=compact(sample)
+            company_ok=any(x in c for x in ['中國光大控股','中国光大控股','chinaeverbrightlimited'])
+            stock_ok=any(x in c for x in ['00165','stockcode:165','stockcode：165','股份代號：165','股份代号：165'])
+            annual_ok=any(x in c for x in ['年度報告','年度报告','annualreport'])
+            year_ok=str(year) in c
+            if not (company_ok and annual_ok and year_ok):
+              raise RuntimeError(f'{year} annual report identity check failed company={company_ok} annual={annual_ok} year={year_ok} stock={stock_ok}')
+            return pages, sample[:2000]
+
+          def verify_interim(path:Path) -> tuple[int,str]:
+            reader=PdfReader(str(path)); pages=len(reader.pages)
+            if pages<20: raise RuntimeError(f'2026 interim results suspiciously short: {pages} pages')
+            sample=text_sample(path); c=compact(sample)
+            checks={
+              'company':any(x in c for x in ['中國光大控股','中国光大控股','chinaeverbrightlimited']),
+              'period':'2026' in c and ('6月30日' in c or '30june2026' in c),
+              'interim':any(x in c for x in ['中期業績','中期业绩','interimresults']),
+            }
+            if not all(checks.values()): raise RuntimeError(f'2026 interim identity check failed: {checks}')
+            return pages,sample[:2000]
+
+          def render_checks(path:Path,stem:str,pages:int):
+            doc=pymupdf.open(str(path))
+            for label,idx in [('first',0),('middle',pages//2),('last',pages-1)]:
+              pix=doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(0.75,0.75),alpha=False)
+              pix.save(str(RENDERS/f'{stem}_{label}.png'))
+            doc.close()
+
+          records=[]
+          selected_urls=[]
+          for year,candidates in annuals.items():
+            errors=[]; chosen=None
+            for url in candidates:
+              try:
+                data=fetch_pdf(url)
+                tmp=REPORTS/f'_candidate_{year}_{len(errors)}.pdf'; tmp.write_bytes(data)
+                pages,_=verify_annual(tmp,year)
+                chosen=(url,tmp,pages,data); break
+              except Exception as e:
+                errors.append(f'{url} => {e}')
+                try: tmp.unlink(missing_ok=True)
+                except Exception: pass
+            if chosen is None: raise RuntimeError(f'No valid {year} annual report: {errors}')
+            url,tmp,pages,data=chosen
+            final=REPORTS/f'中国光大控股_{year}年年度报告.pdf'
+            tmp.rename(final)
+            sha=hashlib.sha256(data).hexdigest()
+            render_checks(final,f'{year}_annual',pages)
+            records.append({'type':'年度报告','period':str(year),'filename':final.name,'pages':pages,'bytes':len(data),'sha256':sha,'source_url':url,'source':'中国光大控股投资者关系官网'})
+            selected_urls.append(url)
+            print('VERIFIED',year,pages,len(data),sha,url,flush=True)
+
+          data=fetch_pdf(interim['url'])
+          final=REPORTS/interim['filename']; final.write_bytes(data)
+          pages,_=verify_interim(final)
+          sha=hashlib.sha256(data).hexdigest()
+          render_checks(final,'2026H1_interim_results',pages)
+          records.append({'type':'中期业绩公告（最新季报口径）','period':'截至2026-06-30止六个月','filename':final.name,'pages':pages,'bytes':len(data),'sha256':sha,'source_url':interim['url'],'source':'香港交易所披露易'})
+          selected_urls.append(interim['url'])
+          print('VERIFIED','2026H1',pages,len(data),sha,interim['url'],flush=True)
+
+          total_pages=sum(r['pages'] for r in records)
+          readme=[
+            '中国光大控股有限公司（00165.HK）2020-2025年报及最新定期财务披露',
+            '',
+            f'文件数量：{len(records)}份完整PDF',
+            f'合计页数：{total_pages}页',
+            '',
+            '口径说明：香港上市公司通常不披露A股式第一季度/第三季度报告。',
+            '截至2026年8月31日，中国光大控股最新正式财务披露为2026年8月27日在香港交易所发布的',
+            '《截至2026年6月30日止六个月之中期业绩公告》，本压缩包将其作为“最新季报口径”纳入。',
+            '',
+            '文件清单：',
+          ]
+          for i,r in enumerate(records,1):
+            readme.append(f"{i}. {r['filename']}｜{r['pages']}页｜{r['source']}")
+          readme += [
+            '',
+            '校验：已验证PDF文件头、可解析页数、公司名称、报告期间，并渲染检查每份文件的首页、中间页和末页。',
+            '压缩包已完成CRC完整性测试；逐文件SHA-256见 SHA256SUMS.txt。',
+            '版权归中国光大控股、香港交易所及相关权利人所有，仅供研究参考。',
+          ]
+          (OUT/'README.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'报告清单.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          with (OUT/'来源及校验清单.csv').open('w',encoding='utf-8-sig',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=['type','period','filename','pages','bytes','sha256','source','source_url'])
+            w.writeheader(); w.writerows(records)
+          (OUT/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['filename']}" for r in records)+'\n',encoding='utf-8')
+
+          zh_zip=OUT/'中国光大控股_2020-2025年报及2026年中期业绩公告.zip'
+          en_zip=OUT/'china_everbright_reports_2020_2025_2026_interim.zip'
+          for zpath in [zh_zip,en_zip]:
+            with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED,allowZip64=True) as z:
+              for p in sorted(REPORTS.glob('*.pdf')): z.write(p,p.name)
+              for name in ['README.txt','报告清单.json','来源及校验清单.csv','SHA256SUMS.txt']:
+                z.write(OUT/name,name)
+            with zipfile.ZipFile(zpath) as z:
+              bad=z.testzip()
+              if bad is not None: raise RuntimeError(f'ZIP CRC failure {zpath}: {bad}')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')]) != 7:
+                raise RuntimeError(f'ZIP PDF count mismatch: {zpath}')
+          summary={
+            'records':records,
+            'total_pages':total_pages,
+            'zip_chinese':zh_zip.name,
+            'zip_chinese_bytes':zh_zip.stat().st_size,
+            'zip_chinese_sha256':hashlib.sha256(zh_zip.read_bytes()).hexdigest(),
+            'zip_english':en_zip.name,
+            'zip_english_bytes':en_zip.stat().st_size,
+            'zip_english_sha256':hashlib.sha256(en_zip.read_bytes()).hexdigest(),
+          }
+          (OUT/'package_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PACKAGE_SUMMARY',json.dumps(summary,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cel-2020-2025-annual-and-2026-interim-verified
+          path: |
+            out/中国光大控股_2020-2025年报及2026年中期业绩公告.zip
+            out/china_everbright_reports_2020_2025_2026_interim.zip
+            out/package_summary.json
+            out/README.txt
+            out/报告清单.json
+            out/来源及校验清单.csv
+            out/SHA256SUMS.txt
+            out/renders/*.png
+          if-no-files-found: error
+          retention-days: 7
