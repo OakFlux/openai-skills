@@ -1,0 +1,394 @@
+name: Temporary Zhongchuang Zhilin broker report package v2
+
+on:
+  push:
+    branches:
+      - tmp/zhongchuang-broker-reports-20260902-v2
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests Pillow PyMuPDF img2pdf
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          REPORT_API = 'https://reportapi.eastmoney.com/report/list'
+          PDF_TPL = 'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+
+          targets = [
+              {
+                  'fx_id': '5123806',
+                  'date': '2025-10-29',
+                  'org': '东方财富证券',
+                  'title': '煤机业务稳健增长，汽零转型打开新空间',
+                  'keywords': ['煤机业务稳健增长', '汽零转型打开新空间'],
+                  'expected_pages': 39,
+                  'minimum_pages': 30,
+                  'detail_url': 'https://www.fxbaogao.com/detail/5123806',
+              },
+              {
+                  'fx_id': '4501093',
+                  'date': '2024-09-12',
+                  'org': '中原证券',
+                  'title': '公司深度分析：中报快速增长，煤机、汽车零部件双轮驱动',
+                  'keywords': ['中报快速增长', '煤机', '汽车零部件', '双轮驱动'],
+                  'expected_pages': 22,
+                  'minimum_pages': 18,
+                  'detail_url': 'https://www.fxbaogao.com/detail/4501093',
+              },
+          ]
+
+          out = Path('zhongchuang_reports')
+          pdf_dir = out / 'PDF'
+          image_root = out / 'page_images'
+          render_dir = out / 'renders'
+          for p in [out, pdf_dir, image_root, render_dir]:
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          retry = Retry(
+              total=4,
+              connect=4,
+              read=4,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'],
+              raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+          })
+
+          def clean_name(value: str, limit: int = 100) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value).strip(' ._')
+              return value[:limit]
+
+          def norm(value: str) -> str:
+              value = value or ''
+              value = value.replace('：', ':').replace('，', ',').replace('、', ',')
+              return re.sub(r'[\s\-—_:：,，()（）【】\[\]]+', '', value).lower()
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def fetch_eastmoney_records() -> list[dict]:
+              all_rows = []
+              for page in range(1, 11):
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2020-01-01', 'endTime': '2026-12-31',
+                      'pageNo': str(page), 'fields': '', 'qType': '0',
+                      'orgCode': '', 'code': '601717', 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  }
+                  r = session.get(
+                      REPORT_API,
+                      params=params,
+                      headers={'Referer': 'https://data.eastmoney.com/'},
+                      timeout=40,
+                  )
+                  print('API', page, r.status_code, len(r.content), r.url, flush=True)
+                  if r.status_code != 200:
+                      break
+                  try:
+                      payload = r.json()
+                  except Exception as exc:
+                      print('API_JSON_ERROR', repr(exc), r.text[:300], flush=True)
+                      break
+                  rows = payload.get('data') or []
+                  if not rows:
+                      break
+                  all_rows.extend(rows)
+                  total_page = payload.get('TotalPage') or payload.get('totalPage') or 1
+                  try:
+                      total_page = int(total_page)
+                  except Exception:
+                      total_page = 1
+                  if page >= total_page:
+                      break
+                  time.sleep(1.2)
+              return all_rows
+
+          def date_distance_days(a: str, b: str) -> int:
+              try:
+                  return abs((datetime.fromisoformat(a[:10]) - datetime.fromisoformat(b[:10])).days)
+              except Exception:
+                  return 9999
+
+          def match_record(meta: dict, records: list[dict]) -> dict | None:
+              scored = []
+              for r in records:
+                  title_n = norm(r.get('title', ''))
+                  org_n = norm(r.get('orgSName', ''))
+                  score = sum(4 for k in meta['keywords'] if norm(k) in title_n)
+                  if norm(meta['org'].replace('证券', '')) in org_n:
+                      score += 4
+                  dd = date_distance_days(meta['date'], r.get('publishDate', ''))
+                  if dd == 0:
+                      score += 5
+                  elif dd <= 3:
+                      score += 2
+                  if score:
+                      scored.append((score, -dd, r))
+              scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+              if not scored:
+                  return None
+              best = scored[0]
+              print('MATCH_CANDIDATE', meta['fx_id'], best[0], -best[1], json.dumps(best[2], ensure_ascii=False), flush=True)
+              return best[2] if best[0] >= 10 else None
+
+          def validate_pdf(path: Path, minimum_pages: int) -> int:
+              raw_head = path.read_bytes()[:5]
+              if raw_head != b'%PDF-':
+                  raise RuntimeError(f'Not a PDF: {path} head={raw_head!r}')
+              if path.stat().st_size < 100_000:
+                  raise RuntimeError(f'PDF too small: {path} {path.stat().st_size}')
+              doc = pymupdf.open(str(path))
+              try:
+                  if doc.is_encrypted:
+                      raise RuntimeError(f'Encrypted PDF: {path}')
+                  if doc.page_count < minimum_pages:
+                      raise RuntimeError(f'PDF page count too small: {path} {doc.page_count}')
+                  for idx in sorted(set([0, doc.page_count // 2, doc.page_count - 1])):
+                      page = doc.load_page(idx)
+                      pix = page.get_pixmap(matrix=pymupdf.Matrix(0.35, 0.35), alpha=False)
+                      if pix.width < 150 or pix.height < 200:
+                          raise RuntimeError(f'Render too small: {path} page {idx + 1}')
+                  return doc.page_count
+              finally:
+                  doc.close()
+
+          def try_native_pdf(meta: dict, record: dict | None, target: Path) -> tuple[bool, str | None, int | None]:
+              if not record or not record.get('infoCode'):
+                  return False, None, None
+              url = PDF_TPL.format(info_code=record['infoCode'])
+              variants = [url, url + f'?{int(time.time() * 1000)}.pdf']
+              for candidate in variants:
+                  try:
+                      r = session.get(
+                          candidate,
+                          headers={
+                              'Referer': 'https://data.eastmoney.com/',
+                              'Accept': 'application/pdf,*/*;q=0.8',
+                          },
+                          timeout=90,
+                          allow_redirects=True,
+                      )
+                      print('NATIVE_GET', meta['fx_id'], r.status_code, len(r.content), r.headers.get('content-type'), r.url, flush=True)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 100_000:
+                          target.write_bytes(r.content)
+                          pages = validate_pdf(target, meta['minimum_pages'])
+                          return True, r.url, pages
+                  except Exception as exc:
+                      print('NATIVE_ERROR', meta['fx_id'], repr(exc), flush=True)
+                  if target.exists():
+                      target.unlink()
+              return False, None, None
+
+          def build_from_public_images(meta: dict, target: Path) -> tuple[str, int]:
+              year, month, day = meta['date'].split('-')
+              image_dir = image_root / meta['fx_id']
+              image_dir.mkdir(parents=True, exist_ok=True)
+              image_paths = []
+              image_hashes = set()
+
+              for page_no in range(1, meta['expected_pages'] + 1):
+                  base = f"https://public.fxbaogao.com/report-image/{year}/{month}/{day}/{meta['fx_id']}-{page_no}.png"
+                  candidates = [
+                      base,
+                      base + '?x-oss-process=image/format,png',
+                      base + '?x-oss-process=image/format,webp',
+                  ]
+                  data = None
+                  final_url = None
+                  for attempt in range(4):
+                      for candidate in candidates:
+                          try:
+                              r = session.get(
+                                  candidate,
+                                  timeout=70,
+                                  allow_redirects=True,
+                                  headers={
+                                      'Referer': meta['detail_url'],
+                                      'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                                  },
+                              )
+                              ctype = (r.headers.get('content-type') or '').lower()
+                              print('PAGE_GET', meta['fx_id'], page_no, attempt, r.status_code, len(r.content), ctype, r.url, flush=True)
+                              if r.status_code == 200 and len(r.content) > 8_000 and ctype.startswith('image/'):
+                                  with Image.open(io.BytesIO(r.content)) as probe:
+                                      probe.load()
+                                      if probe.width >= 700 and probe.height >= 900:
+                                          data = r.content
+                                          final_url = r.url
+                                          break
+                          except Exception as exc:
+                              print('PAGE_ERROR', meta['fx_id'], page_no, attempt, repr(exc), flush=True)
+                      if data is not None:
+                          break
+                      time.sleep(1.0 + attempt)
+                  if data is None:
+                      raise RuntimeError(f"Failed to download public page {page_no}/{meta['expected_pages']} for report {meta['fx_id']}")
+
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in image_hashes:
+                      raise RuntimeError(f"Duplicate public page image in report {meta['fx_id']} at page {page_no}")
+                  image_hashes.add(digest)
+
+                  with Image.open(io.BytesIO(data)) as image:
+                      image.load()
+                      rgb = image.convert('RGB')
+                      page_path = image_dir / f'{page_no:03d}.png'
+                      rgb.save(page_path, 'PNG', optimize=True)
+                      image_paths.append(page_path)
+                      print('PAGE_OK', meta['fx_id'], page_no, rgb.size, final_url, flush=True)
+
+              layout = img2pdf.get_layout_fun((img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297)))
+              target.write_bytes(img2pdf.convert([str(p) for p in image_paths], layout_fun=layout))
+              pages = validate_pdf(target, meta['minimum_pages'])
+              if pages != meta['expected_pages']:
+                  raise RuntimeError(f"Public-image PDF page mismatch for {meta['fx_id']}: {pages} vs {meta['expected_pages']}")
+              return f"https://public.fxbaogao.com/report-image/{year}/{month}/{day}/{meta['fx_id']}-<页码>.png", pages
+
+          records = fetch_eastmoney_records()
+          (out / 'eastmoney_records.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('RECORD_COUNT', len(records), flush=True)
+
+          selected = []
+          render_items = []
+          for index, meta in enumerate(targets, 1):
+              filename = f"{index:02d}_{meta['date']}_{meta['org']}_中创智领（原郑煤机）_{clean_name(meta['title'], 72)}.pdf"
+              pdf_path = pdf_dir / filename
+              record = match_record(meta, records)
+              native_ok, source_url, page_count = try_native_pdf(meta, record, pdf_path)
+              version = '券商研报原始PDF（东方财富研报数据库公开链接）'
+              if not native_ok:
+                  source_url, page_count = build_from_public_images(meta, pdf_path)
+                  version = '发现报告公开原始页图逐页合成PDF'
+
+              page_count = validate_pdf(pdf_path, meta['minimum_pages'])
+              doc = pymupdf.open(str(pdf_path))
+              try:
+                  for label, idx in [('first', 0), ('middle', page_count // 2), ('last', page_count - 1)]:
+                      pix = doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(0.55, 0.55), alpha=False)
+                      render_path = render_dir / f"{meta['fx_id']}_{label}.png"
+                      pix.save(str(render_path))
+                      render_items.append((f"{index}-{label}", render_path))
+              finally:
+                  doc.close()
+
+              item = {
+                  'index': index,
+                  'date': meta['date'],
+                  'org': meta['org'],
+                  'title': meta['title'],
+                  'pages': page_count,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha256(pdf_path),
+                  'file': filename,
+                  'version': version,
+                  'source_url': source_url,
+                  'fxbaogao_detail': meta['detail_url'],
+                  'eastmoney_info_code': (record or {}).get('infoCode'),
+              }
+              selected.append(item)
+              print('REPORT_OK', json.dumps(item, ensure_ascii=False), flush=True)
+
+          thumbs = []
+          for label, path in render_items:
+              with Image.open(path) as im:
+                  im = im.convert('RGB')
+                  im.thumbnail((300, 390))
+                  canvas = Image.new('RGB', (320, 435), 'white')
+                  canvas.paste(im, ((320 - im.width) // 2, 8))
+                  ImageDraw.Draw(canvas).text((10, 410), label, fill='black')
+                  thumbs.append(canvas)
+          cols = 3
+          rows = (len(thumbs) + cols - 1) // cols
+          sheet = Image.new('RGB', (cols * 320, rows * 435), 'white')
+          for i, thumb in enumerate(thumbs):
+              sheet.paste(thumb, ((i % cols) * 320, (i // cols) * 435))
+          sheet.save(out / 'PDF抽样渲染校验.jpg', quality=90)
+
+          total_pages = sum(x['pages'] for x in selected)
+          readme_lines = [
+              '中创智领（601717，原郑煤机）券商深度报告资料包',
+              '',
+              f'报告数量：{len(selected)}份',
+              f'合计页数：{total_pages}页',
+              '',
+          ]
+          for x in selected:
+              readme_lines.append(f"{x['index']}. {x['date']}｜{x['org']}｜{x['title']}｜{x['pages']}页｜{x['version']}")
+          readme_lines += [
+              '',
+              '完整性校验：每份PDF均已检查文件头、文件大小、加密状态、页数，并抽样渲染首页、中间页和末页。',
+              '若未能从券商研报数据库取得原生PDF，则使用公开展示的原始报告页图逐页下载、按页码顺序合成为PDF；版式内容与公开页图保持一致。',
+              '报告版权归发布机构、作者及相关权利人所有，仅供个人研究参考，不构成投资建议。',
+          ]
+          (out / '报告清单与说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (out / '报告元数据.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'PDF_SHA256.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in selected) + '\n', encoding='utf-8')
+
+          zip_path = out / '中创智领_券商深度报告_2份_重新打包.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+              for pdf in sorted(pdf_dir.glob('*.pdf')):
+                  zf.write(pdf, pdf.name)
+              for name in ['报告清单与说明.txt', '报告元数据.json', 'PDF_SHA256.txt']:
+                  zf.write(out / name, name)
+
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdf_members = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_members) != 2:
+                  raise RuntimeError(f'Expected 2 PDFs in ZIP, got {len(pdf_members)}')
+
+          zip_hash = sha256(zip_path)
+          (out / 'ZIP_SHA256.txt').write_text(f'{zip_hash}  {zip_path.name}\n', encoding='utf-8')
+          print((out / '报告清单与说明.txt').read_text(encoding='utf-8'), flush=True)
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, zip_hash, flush=True)
+          PY
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongchuang-zhilin-broker-reports-v2
+          path: zhongchuang_reports/
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 6
