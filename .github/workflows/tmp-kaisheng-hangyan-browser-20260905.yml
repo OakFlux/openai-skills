@@ -1,0 +1,214 @@
+name: Temporary Kaisheng Hangyan browser retrieval
+
+on:
+  push:
+    branches:
+      - tmp-kaisheng-hangyan-browser-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Install browser dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet playwright requests beautifulsoup4 cryptography pypdf
+          python -m playwright install --with-deps chromium
+      - name: Load public viewer and retrieve PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import io
+          import json
+          import time
+          from pathlib import Path
+
+          import requests
+          from cryptography.hazmat.primitives import padding
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from pypdf import PdfReader
+
+          out = Path('output')
+          out.mkdir(exist_ok=True)
+          page_url = 'https://www.hangyan.co/reports/2874009292044765086'
+          expected_pages = 30
+          observed_urls = []
+          metadata = {}
+          downloaded = None
+
+          def validate_pdf(data: bytes, label: str):
+              if b'%PDF-' not in data[:1024] or len(data) < 100000:
+                  raise RuntimeError(f'{label}: unusable PDF bytes={len(data)} head={data[:40]!r}')
+              pages = len(PdfReader(io.BytesIO(data), strict=False).pages)
+              print('VALIDATE', label, 'bytes', len(data), 'pages', pages, flush=True)
+              if pages != expected_pages:
+                  raise RuntimeError(f'{label}: expected {expected_pages} pages, got {pages}')
+              return pages
+
+          def decrypt_cache_key(cache_key: str):
+              encoded = cache_key.replace('-', '+').replace('_', '/')
+              encoded += '=' * ((4 - len(encoded) % 4) % 4)
+              raw = base64.b64decode(encoded)
+              if len(raw) <= 16:
+                  raise RuntimeError('encrypted cache key is too short')
+              iv, ciphertext = raw[:16], raw[16:]
+              current_bucket = int(time.time()) // 120
+              candidates = []
+              for delta in range(-4320, 4321):
+                  bucket = current_bucket + delta
+                  key_text = (f'cv_{bucket}zIDfwokaoIUFlw')[:32].ljust(32, '0')
+                  try:
+                      decryptor = Cipher(algorithms.AES(key_text.encode()), modes.CBC(iv)).decryptor()
+                      padded = decryptor.update(ciphertext) + decryptor.finalize()
+                      unpadder = padding.PKCS7(128).unpadder()
+                      plain = unpadder.update(padded) + unpadder.finalize()
+                      text = plain.decode('utf-8')
+                      if text.startswith('https://') and '.pdf' in text.lower():
+                          candidates.append({'url': text, 'delta': delta, 'key': key_text})
+                          return candidates[0]
+                  except Exception:
+                      pass
+              raise RuntimeError('unable to decrypt public viewer cache key')
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True,
+                  args=[
+                      '--disable-blink-features=AutomationControlled',
+                      '--no-sandbox',
+                      '--disable-dev-shm-usage',
+                  ],
+              )
+              context = browser.new_context(
+                  viewport={'width': 1440, 'height': 1100},
+                  locale='zh-CN',
+                  timezone_id='Asia/Shanghai',
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                  extra_http_headers={
+                      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                      'DNT': '1',
+                  },
+              )
+              context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+              page = context.new_page()
+              page.on('response', lambda response: observed_urls.append(response.url))
+
+              response = page.goto(page_url, wait_until='domcontentloaded', timeout=120000)
+              print('GOTO_STATUS', response.status if response else None, flush=True)
+              try:
+                  page.wait_for_load_state('networkidle', timeout=45000)
+              except PlaywrightTimeoutError:
+                  print('NETWORKIDLE_TIMEOUT', flush=True)
+              page.wait_for_timeout(12000)
+              title = page.title()
+              html = page.content()
+              print('TITLE', title, 'HTML_LEN', len(html), 'URL', page.url, flush=True)
+              (out / 'viewer.html').write_text(html, encoding='utf-8')
+              page.screenshot(path=str(out / 'viewer.png'), full_page=True)
+
+              locator = page.locator('[data-controller~="native-pdf"]')
+              metadata['native_pdf_count'] = locator.count()
+              metadata['title'] = title
+              metadata['page_url'] = page.url
+              if locator.count():
+                  node = locator.first
+                  attrs = page.evaluate("""el => Object.fromEntries(Array.from(el.attributes).map(a => [a.name, a.value]))""", node.element_handle())
+                  metadata['attributes'] = attrs
+                  print('NATIVE_PDF_ATTRIBUTES', json.dumps(attrs, ensure_ascii=False), flush=True)
+
+              # First try the site's ordinary public download button.
+              button = page.locator('button[data-action*="native-pdf#download"]')
+              metadata['download_button_count'] = button.count()
+              if button.count():
+                  try:
+                      with page.expect_download(timeout=60000) as pending:
+                          button.first.click(timeout=30000)
+                      download = pending.value
+                      target = out / 'browser_download.pdf'
+                      download.save_as(str(target))
+                      payload = target.read_bytes()
+                      validate_pdf(payload, 'browser_download')
+                      downloaded = payload
+                      metadata['browser_download_filename'] = download.suggested_filename
+                      print('BROWSER_DOWNLOAD_OK', download.suggested_filename, len(payload), flush=True)
+                  except Exception as exc:
+                      metadata['browser_download_error'] = repr(exc)
+                      print('BROWSER_DOWNLOAD_ERROR', repr(exc), flush=True)
+
+              # Then resolve the public viewer's encrypted cache key when present.
+              if downloaded is None and locator.count():
+                  attrs = metadata.get('attributes', {})
+                  cache_key = attrs.get('data-native-pdf-cache-key-value')
+                  if cache_key:
+                      resolved = decrypt_cache_key(cache_key)
+                      metadata['decrypted'] = resolved
+                      print('DECRYPTED_URL', resolved['url'], 'DELTA', resolved['delta'], flush=True)
+                      cookies = {item['name']: item['value'] for item in context.cookies()}
+                      session = requests.Session()
+                      session.headers.update({
+                          'User-Agent': context._options.get('user_agent') or 'Mozilla/5.0',
+                          'Referer': page_url,
+                          'Accept': 'application/pdf,*/*',
+                          'Accept-Language': 'zh-CN,zh;q=0.9',
+                      })
+                      session.cookies.update(cookies)
+                      r = session.get(resolved['url'], timeout=(30, 240), allow_redirects=True)
+                      metadata['decrypted_fetch'] = {
+                          'status': r.status_code,
+                          'bytes': len(r.content),
+                          'content_type': r.headers.get('content-type'),
+                          'final_url': r.url,
+                      }
+                      print('DECRYPTED_FETCH', json.dumps(metadata['decrypted_fetch'], ensure_ascii=False), flush=True)
+                      r.raise_for_status()
+                      validate_pdf(r.content, 'decrypted_fetch')
+                      downloaded = r.content
+
+              # Finally inspect PDF-like network URLs that the viewer itself requested.
+              pdf_urls = []
+              for url in observed_urls:
+                  low = url.lower()
+                  if ('.pdf' in low or '/documents/' in low) and url not in pdf_urls:
+                      pdf_urls.append(url)
+              metadata['observed_pdf_urls'] = pdf_urls
+              print('OBSERVED_PDF_URLS', json.dumps(pdf_urls, ensure_ascii=False), flush=True)
+              if downloaded is None:
+                  cookies = {item['name']: item['value'] for item in context.cookies()}
+                  session = requests.Session()
+                  session.headers.update({'User-Agent': 'Mozilla/5.0', 'Referer': page_url, 'Accept': 'application/pdf,*/*'})
+                  session.cookies.update(cookies)
+                  for candidate in pdf_urls:
+                      try:
+                          r = session.get(candidate, timeout=(30, 240), allow_redirects=True)
+                          print('OBSERVED_FETCH', r.status_code, len(r.content), candidate, flush=True)
+                          validate_pdf(r.content, candidate)
+                          downloaded = r.content
+                          metadata['selected_observed_url'] = candidate
+                          break
+                      except Exception as exc:
+                          print('OBSERVED_FETCH_ERROR', candidate, repr(exc), flush=True)
+
+              browser.close()
+
+          (out / 'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          if downloaded is None:
+              raise RuntimeError('public browser session did not expose a valid 30-page PDF')
+          final_path = out / '国海证券_洛阳玻璃（凯盛新能）_转型新能源材料平台成长中的光伏玻璃龙头_20220701_30页.pdf'
+          final_path.write_bytes(downloaded)
+          print('FINAL_PDF', final_path, len(downloaded), flush=True)
+          PY
+      - name: Upload retrieval results
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaisheng-hangyan-browser-result
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
