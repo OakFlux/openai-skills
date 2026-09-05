@@ -1,0 +1,196 @@
+name: Build Ming Yuan Cloud broker report package
+
+on:
+  push:
+    branches:
+      - tmp-mingyuan-cloud-broker-reports-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Download, verify and package public reports
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 cryptography pypdf
+          mkdir -p deliverable/package
+          cat > /tmp/build_mingyuan.py <<'PY'
+          import base64
+          import hashlib
+          import json
+          import math
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+          from cryptography.hazmat.primitives.padding import PKCS7
+          from pypdf import PdfReader
+
+          OUT = Path('deliverable')
+          WORK = OUT / 'package'
+          WORK.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def fetch(url, referer=None, attempts=6, timeout=(20, 100)):
+              headers = {'Referer': referer} if referer else None
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      if response.status_code == 200:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}: {url}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(2 ** attempt, 12))
+              raise RuntimeError(f'Failed to fetch {url}: {last}')
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def decrypt_public_pdf_url(token):
+              encoded = token.replace('-', '+').replace('_', '/')
+              encoded += '=' * ((4 - len(encoded) % 4) % 4)
+              payload = base64.b64decode(encoded)
+              if len(payload) <= 16:
+                  raise RuntimeError('Invalid encrypted PDF token')
+              iv, ciphertext = payload[:16], payload[16:]
+              now = int(time.time())
+              for offset in range(-10, 11):
+                  bucket = math.floor((now + offset * 120) / 120)
+                  key_text = ('cv_' + str(bucket) + 'zIDfwokaoIUFlw')[:32].ljust(32, '0')
+                  try:
+                      decryptor = Cipher(algorithms.AES(key_text.encode()), modes.CBC(iv)).decryptor()
+                      padded = decryptor.update(ciphertext) + decryptor.finalize()
+                      unpadder = PKCS7(128).unpadder()
+                      plaintext = unpadder.update(padded) + unpadder.finalize()
+                      url = plaintext.decode('utf-8')
+                      if url.startswith('https://') or url.startswith('http://'):
+                          return url
+                  except Exception:
+                      continue
+              raise RuntimeError('Could not decrypt temporary public PDF URL')
+
+          reports = [
+              {
+                  'page': 'https://www.hangyan.co/reports/2530133482001138703',
+                  'broker': '开源证券',
+                  'date': '2020-10-21',
+                  'title': '地产SaaS龙头C位出道',
+                  'file': '2020-10-21_开源证券_地产SaaS龙头C位出道_完整原始PDF.pdf',
+                  'type': '港股公司首次覆盖报告',
+              },
+              {
+                  'page': 'https://www.hangyan.co/reports/3156671809168868472',
+                  'broker': '东兴证券',
+                  'date': '2023-07-28',
+                  'title': '不动产生态链SaaS龙头，天际PaaS平台构建长期竞争优势',
+                  'file': '2023-07-28_东兴证券_不动产生态链SaaS龙头，天际PaaS平台构建长期竞争优势_完整原始PDF.pdf',
+                  'type': '公司覆盖深度报告',
+              },
+          ]
+
+          manifest = []
+          for report in reports:
+              page_response = fetch(report['page'])
+              soup = BeautifulSoup(page_response.text, 'html.parser')
+              element = soup.select_one('[data-controller~="native-pdf"]')
+              if element is None:
+                  raise RuntimeError(f"native-pdf element not found: {report['page']}")
+              token = element.get('data-native-pdf-cache-key-value')
+              original_filename = element.get('data-native-pdf-filename-value') or ''
+              if not token:
+                  raise RuntimeError(f"public PDF token not found: {report['page']}")
+
+              pdf_url = decrypt_public_pdf_url(token)
+              pdf_response = fetch(pdf_url, referer=report['page'], attempts=5)
+              data = pdf_response.content
+              if not data.lstrip().startswith(b'%PDF') or len(data) < 50000:
+                  raise RuntimeError(f"Invalid PDF response for {report['broker']}: {len(data)} bytes")
+
+              path = WORK / report['file']
+              path.write_bytes(data)
+              reader = PdfReader(str(path), strict=False)
+              page_count = len(reader.pages)
+              if page_count < 5:
+                  raise RuntimeError(f"Unexpected page count {page_count}: {report['file']}")
+              first_text = ''.join((page.extract_text() or '') for page in reader.pages[:8])
+              compact = re.sub(r'\s+', '', first_text).lower()
+              if not any(term in compact for term in ('明源云', '00909', '0909.hk', 'mingyuanyun')):
+                  raise RuntimeError(f"Issuer name/code not found: {report['file']}")
+
+              digest = sha256(data)
+              manifest.append({
+                  'company': '明源云集团控股有限公司',
+                  'stock_code': '00909.HK',
+                  'broker': report['broker'],
+                  'report_date': report['date'],
+                  'report_type': report['type'],
+                  'title': report['title'],
+                  'file': report['file'],
+                  'original_filename': original_filename,
+                  'pages': page_count,
+                  'size_bytes': len(data),
+                  'sha256': digest,
+                  'source_page': report['page'],
+                  'access_type': '公开报告页面下载按钮返回的完整原始PDF',
+              })
+              print('REPORT_OK', report['broker'], page_count, len(data), digest)
+
+          manifest_path = WORK / 'manifest.json'
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          readme_lines = [
+              '明源云（00909.HK）券商深度研究报告资料包',
+              '',
+              '本资料包共收录2份券商深度/首次覆盖报告，均为公开报告页面下载按钮返回的完整原始PDF。',
+              '',
+          ]
+          for idx, item in enumerate(manifest, 1):
+              readme_lines.append(f"{idx}. {item['broker']}｜{item['report_date']}｜{item['title']}｜{item['pages']}页")
+          readme_lines.extend([
+              '',
+              '详细来源、原始文件名、文件大小和SHA-256见 manifest.json 与 SHA256SUMS.txt。',
+              '报告版权归原券商及作者所有，仅供个人研究使用。',
+          ])
+          (WORK / 'README_来源说明.txt').write_text('\n'.join(readme_lines) + '\n', encoding='utf-8')
+
+          checksum_lines = [f"{item['sha256']}  {item['file']}" for item in manifest]
+          checksum_lines.append(f"{sha256(manifest_path.read_bytes())}  manifest.json")
+          (WORK / 'SHA256SUMS.txt').write_text('\n'.join(checksum_lines) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'mingyuan_cloud_broker_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(WORK.iterdir(), key=lambda p: p.name):
+                  archive.write(path, path.name)
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdf_count = sum(1 for name in archive.namelist() if name.lower().endswith('.pdf'))
+              if pdf_count != 2:
+                  raise RuntimeError(f'Expected 2 PDFs, found {pdf_count}')
+
+          print('PACKAGE_OK', zip_path.stat().st_size, sha256(zip_path.read_bytes()))
+          PY
+          python /tmp/build_mingyuan.py
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: mingyuan-cloud-broker-reports
+          path: deliverable/mingyuan_cloud_broker_reports.zip
+          retention-days: 1
+          compression-level: 0
