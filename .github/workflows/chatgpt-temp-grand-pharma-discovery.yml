@@ -1,0 +1,245 @@
+name: chatgpt-temp-grand-pharma-report-discovery
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-grand-pharma-reports-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Discover and download public report PDFs
+        shell: bash
+        run: |
+          python -m pip install --quiet pypdf
+          python <<'PY'
+          import os, re, json, time, hashlib, zipfile
+          from urllib.parse import urljoin, unquote
+          import requests
+          from pypdf import PdfReader
+
+          OUT = 'grand_pharma_discovery'
+          PDFDIR = os.path.join(OUT, 'pdfs')
+          os.makedirs(PDFDIR, exist_ok=True)
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': '*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+          log = []
+          records = []
+
+          def addlog(x):
+              x = str(x)
+              print(x)
+              log.append(x)
+
+          def safe_name(x):
+              x = re.sub(r'[\\/:*?"<>|]+', '_', x)
+              x = re.sub(r'\s+', '_', x).strip('._')
+              return x[:150] or 'report'
+
+          def parse_jsonp(text):
+              text = text.strip()
+              if text.startswith('{'):
+                  return json.loads(text)
+              a, b = text.find('{'), text.rfind('}')
+              if a >= 0 and b > a:
+                  return json.loads(text[a:b+1])
+              raise ValueError('not JSON/JSONP')
+
+          # Eastmoney research-report API variants.
+          api = 'https://reportapi.eastmoney.com/report/list'
+          codes = ['00512', '0512', '512', '00512.HK', 'HK00512']
+          for idx, code in enumerate(codes):
+              params = {
+                  'cb': f'datatable{int(time.time()*1000)}',
+                  'pageSize': 100,
+                  'pageNo': 1,
+                  'qType': 0,
+                  'stockCode': code,
+                  'beginTime': '2020-01-01',
+                  'endTime': '2026-09-05',
+                  'fields': '',
+                  'orgCode': '',
+                  'author': '',
+                  'industryCode': '*',
+                  'industry': '*',
+                  'rating': '',
+                  'ratingChange': '',
+              }
+              try:
+                  r = s.get(api, params=params, timeout=30, headers={'Referer':'https://data.eastmoney.com/'})
+                  addlog(f'Eastmoney {code}: {r.status_code} {len(r.content)} {r.url}')
+                  open(os.path.join(OUT, f'eastmoney_{idx}_{safe_name(code)}.txt'), 'wb').write(r.content)
+                  if r.ok:
+                      obj = parse_jsonp(r.text)
+                      data = obj.get('data') or obj.get('result', {}).get('data') or []
+                      if isinstance(data, dict):
+                          data = data.get('data') or data.get('list') or []
+                      if isinstance(data, list):
+                          for item in data:
+                              if isinstance(item, dict):
+                                  txt = json.dumps(item, ensure_ascii=False)
+                                  if '远大医药' in txt or 'Grand Pharma' in txt or code in txt:
+                                      item['_query_code'] = code
+                                      records.append(item)
+              except Exception as e:
+                  addlog(f'Eastmoney {code} ERROR: {e!r}')
+
+          # Deduplicate API records.
+          seen = set(); unique = []
+          for item in records:
+              key = item.get('infoCode') or item.get('title') or json.dumps(item, sort_keys=True, ensure_ascii=False)
+              if key not in seen:
+                  seen.add(key); unique.append(item)
+          records = unique
+          open(os.path.join(OUT, 'eastmoney_records.json'), 'w', encoding='utf-8').write(json.dumps(records, ensure_ascii=False, indent=2))
+          addlog(f'Eastmoney matching records: {len(records)}')
+
+          # Public report landing pages and search pages; collect links for diagnostics.
+          pages = [
+              'https://www.51pdf.cn/report/view_5606319.html',
+              'https://www.fxbaogao.com/detail/4918101',
+              'https://www.sdyanbao.com/detail/920292',
+              'https://www.sgpjbg.com/bgdown/915930.html',
+              'https://consult.pharnexcloud.com/report/detail/91826.html',
+              'https://www.nxny.com/report/view_5911762.html',
+          ]
+          all_links = []
+          for idx, url in enumerate(pages):
+              try:
+                  r = s.get(url, timeout=30, allow_redirects=True)
+                  addlog(f'PAGE {url}: {r.status_code} {len(r.content)} -> {r.url}')
+                  open(os.path.join(OUT, f'page_{idx}.html'), 'wb').write(r.content)
+                  text = r.text
+                  raw = re.findall(r'''(?:href|src)\s*=\s*["']([^"']+)["']''', text, flags=re.I)
+                  raw += re.findall(r'''https?://[^\s"'<>\\]+''', text)
+                  for x in raw:
+                      x = x.replace('\\/','/')
+                      absu = urljoin(r.url, x)
+                      if any(k in absu.lower() for k in ['.pdf', 'download', 'down/', '/file', 'report']):
+                          all_links.append({'source': url, 'url': absu})
+              except Exception as e:
+                  addlog(f'PAGE {url} ERROR: {e!r}')
+          # Deduplicate links.
+          dedup = []; seen_urls = set()
+          for item in all_links:
+              if item['url'] not in seen_urls:
+                  seen_urls.add(item['url']); dedup.append(item)
+          open(os.path.join(OUT, 'page_links.json'), 'w', encoding='utf-8').write(json.dumps(dedup, ensure_ascii=False, indent=2))
+          addlog(f'Candidate landing-page links: {len(dedup)}')
+
+          # Search Bing HTML for exact report titles, for diagnostics and direct PDF discovery.
+          queries = [
+              '"传统业务远航稳舵 核药布局大业新程" PDF',
+              '"核药增速快 脓毒症 STC3141 有望成为全球大药" PDF',
+              '"点亮核药蓝海市场 创新药械促新成长" PDF',
+              '"核药等创新管线不断兑现 多项业务稳健增长" PDF',
+              '"多业务齐头并进 核药引领发展" PDF',
+          ]
+          from urllib.parse import quote_plus
+          bing_links = []
+          for idx, q in enumerate(queries):
+              try:
+                  url = 'https://www.bing.com/search?q=' + quote_plus(q)
+                  r = s.get(url, timeout=30)
+                  addlog(f'BING {q}: {r.status_code} {len(r.content)}')
+                  open(os.path.join(OUT, f'bing_{idx}.html'), 'wb').write(r.content)
+                  for x in re.findall(r'''href=["'](https?://[^"']+)["']''', r.text, flags=re.I):
+                      if any(k in x.lower() for k in ['.pdf', 'report', 'yanbao', 'dfcfw', 'eastmoney', '51pdf', 'fxbaogao']):
+                          bing_links.append({'query': q, 'url': x})
+              except Exception as e:
+                  addlog(f'BING ERROR {q}: {e!r}')
+          open(os.path.join(OUT, 'bing_links.json'), 'w', encoding='utf-8').write(json.dumps(bing_links, ensure_ascii=False, indent=2))
+
+          downloaded = []
+          attempted = set()
+
+          def try_pdf(url, title='report', org='', date=''):
+              if url in attempted: return None
+              attempted.add(url)
+              try:
+                  r = s.get(url, timeout=60, allow_redirects=True, headers={'Referer':'https://data.eastmoney.com/'})
+                  ctype = r.headers.get('content-type','')
+                  addlog(f'PDFTRY {r.status_code} {len(r.content)} {ctype} {url} -> {r.url}')
+                  if r.status_code == 200 and len(r.content) > 30000 and r.content[:5] == b'%PDF-':
+                      base = safe_name('_'.join(x for x in [date[:10], org, title] if x)) + '.pdf'
+                      path = os.path.join(PDFDIR, base)
+                      n=2
+                      while os.path.exists(path):
+                          path = os.path.join(PDFDIR, safe_name(base[:-4] + f'_{n}') + '.pdf'); n+=1
+                      open(path,'wb').write(r.content)
+                      try: pages = len(PdfReader(path).pages)
+                      except Exception as e: pages = -1
+                      sha = hashlib.sha256(r.content).hexdigest()
+                      info = {'path':path,'url':r.url,'title':title,'org':org,'date':date,'size':len(r.content),'pages':pages,'sha256':sha}
+                      downloaded.append(info)
+                      return info
+              except Exception as e:
+                  addlog(f'PDFTRY ERROR {url}: {e!r}')
+              return None
+
+          # Attempt PDF URLs from Eastmoney records.
+          for item in records:
+              info = item.get('infoCode') or item.get('info_code') or item.get('INFO_CODE')
+              title = item.get('title') or item.get('TITLE') or '远大医药研究报告'
+              org = item.get('orgSName') or item.get('orgName') or item.get('ORG_SNAME') or ''
+              date = str(item.get('publishDate') or item.get('PUBLIC_DATE') or item.get('noticeDate') or '')
+              if info:
+                  for u in [
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',
+                      f'https://pdf.dfcfw.com/pdf/{info}_1.pdf',
+                  ]:
+                      got = try_pdf(u, title, org, date)
+                      if got: break
+
+          # Attempt direct .pdf links found on pages or Bing.
+          for obj in dedup + bing_links:
+              u = obj['url']
+              if '.pdf' in u.lower():
+                  try_pdf(u, '远大医药研究报告')
+
+          open(os.path.join(OUT, 'downloaded.json'), 'w', encoding='utf-8').write(json.dumps(downloaded, ensure_ascii=False, indent=2))
+          open(os.path.join(OUT, 'discovery.log'), 'w', encoding='utf-8').write('\n'.join(log))
+          addlog(f'Valid PDFs downloaded: {len(downloaded)}')
+
+          # Score likely deep/initiating reports and package up to 3.
+          def score(x):
+              t = x['title']
+              sc = 0
+              if '首次' in t: sc += 50
+              if '深度' in t: sc += 45
+              if any(k in t for k in ['传统业务远航', '核药增速快', '点亮核药蓝海', '核药等创新管线', '多业务齐头并进']): sc += 80
+              if any(k in t for k in ['点评','快报','中报','年报','季报','跟踪','更新']): sc -= 50
+              sc += min(max(x.get('pages',0),0), 50)
+              sc += int(re.sub(r'\D','',x.get('date','')[:4]) or 0) - 2020
+              return sc
+          selected = sorted(downloaded, key=score, reverse=True)[:3]
+          if len(selected) >= 2:
+              manifest = ['远大医药（00512.HK）券商深度报告', '']
+              for i,x in enumerate(selected,1):
+                  manifest += [f'{i}. {x["org"]}｜{x["date"][:10]}｜{x["title"]}', f'   页数：{x["pages"]}；大小：{x["size"]} bytes；SHA-256：{x["sha256"]}', f'   来源：{x["url"]}', '']
+              open(os.path.join(OUT,'文件清单.txt'),'w',encoding='utf-8').write('\n'.join(manifest))
+              zpath = os.path.join(OUT,'远大医药_00512_券商深度报告_3份.zip')
+              with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as z:
+                  for x in selected: z.write(x['path'], arcname=os.path.basename(x['path']))
+                  z.write(os.path.join(OUT,'文件清单.txt'), arcname='文件清单.txt')
+              addlog(f'PACKAGE {zpath} {os.path.getsize(zpath)} bytes')
+          PY
+
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: Grand-Pharma-Report-Discovery
+          path: grand_pharma_discovery
+          if-no-files-found: error
+          retention-days: 1
