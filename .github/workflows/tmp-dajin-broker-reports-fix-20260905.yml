@@ -1,0 +1,177 @@
+name: Build corrected Dajin broker report package
+
+on:
+  push:
+    branches:
+      - tmp-dajin-broker-reports-fix-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Download reports and build ZIP
+        run: |
+          python -m pip install --quiet requests pypdf pillow
+          mkdir -p deliverable/package
+          cat > /tmp/build.py <<'PY'
+          import hashlib, io, json, re, time, zipfile
+          from pathlib import Path
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('deliverable')
+          WORK = OUT / 'package'
+          WORK.mkdir(parents=True, exist_ok=True)
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def get(url, referer=None, attempts=6):
+              last = None
+              for i in range(attempts):
+                  try:
+                      headers = {'Referer': referer} if referer else None
+                      r = s.get(url, headers=headers, timeout=(20, 100), allow_redirects=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as e:
+                      last = e
+                  time.sleep(min(2 ** i, 10))
+              raise RuntimeError(f'cannot fetch {url}: {last}')
+
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def validate_text_pdf(path, terms, min_pages):
+              data = path.read_bytes()
+              if not data.lstrip().startswith(b'%PDF') or len(data) < 30000:
+                  raise RuntimeError(f'invalid PDF {path.name}')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'page count {pages} below {min_pages}: {path.name}')
+              text = ''.join((p.extract_text() or '') for p in reader.pages[:6])
+              compact = re.sub(r'\s+', '', text).lower()
+              if not any(t.lower().replace(' ', '') in compact for t in terms):
+                  raise RuntimeError(f'issuer not found: {path.name}')
+              return pages, len(data), digest(data)
+
+          manifest = []
+          direct = [
+              {
+                  'pdf':'https://pdf.dfcfw.com/pdf/H3_AP202605281822933159_1.pdf',
+                  'source':'https://data.eastmoney.com/report/info/AP202605281822933159.html',
+                  'file':'2026-05-27_国金证券_一体化布局有序落地，全产业链服务出海加速_完整原始PDF.pdf',
+                  'broker':'国金证券','date':'2026-05-27',
+                  'title':'一体化布局有序落地，全产业链服务出海加速',
+                  'terms':['大金重工','002487','一体化布局有序落地'],'min_pages':10,
+              },
+              {
+                  'pdf':'https://pdf.dfcfw.com/pdf/H3_AP202509181745845865_1.pdf',
+                  'source':'https://data.eastmoney.com/report/info/AP202509181745845865.html',
+                  'file':'2025-09-18_中航证券_两海战略先行者，海外潜能快速释放_完整原始PDF.pdf',
+                  'broker':'中航证券','date':'2025-09-18',
+                  'title':'“两海”战略先行者，海外潜能快速释放',
+                  'terms':['大金重工','002487','两海战略先行者'],'min_pages':5,
+              },
+          ]
+          for x in direct:
+              r = get(x['pdf'], x['source'])
+              p = WORK / x['file']
+              p.write_bytes(r.content)
+              pages, size, sha = validate_text_pdf(p, x['terms'], x['min_pages'])
+              manifest.append({
+                  'company':'大金重工股份有限公司','stock_code':'002487.SZ',
+                  'broker':x['broker'],'report_date':x['date'],'title':x['title'],
+                  'file':x['file'],'pages':pages,'size_bytes':size,'sha256':sha,
+                  'source_page':x['source'],'source_pdf':x['pdf'],
+                  'access_type':'公开研报页面“查看PDF原文”对应的完整原始PDF',
+              })
+              print('FULL_OK', x['broker'], pages, size, sha)
+
+          # 国盛证券首次覆盖深度报告：来源页面明确公开前10页预览。
+          detail = 'https://www.sdyanbao.com/detail/869917'
+          html = get(detail).text
+          if '大金重工' not in html or '002487' not in html or '国盛证券' not in html:
+              raise RuntimeError('unexpected preview detail page')
+          m = re.search(r'page_url:"([^"]+)"', html)
+          if not m:
+              raise RuntimeError('page_url not found')
+          base = m.group(1).replace('\\u002F','/').replace('\\/','/')
+          cm = re.search(r'page_count:(\d+)', html)
+          full_pages = int(cm.group(1)) if cm else None
+          preview_count = min(10, full_pages or 10)
+          images = []
+          for i in range(preview_count):
+              url = f'{base}/{i}.png'
+              rr = get(url, detail)
+              if len(rr.content) < 1000:
+                  raise RuntimeError(f'image response too small: page {i+1}')
+              im = Image.open(io.BytesIO(rr.content)); im.load()
+              if im.width < 500 or im.height < 700:
+                  raise RuntimeError(f'unexpected image dimensions {im.size}')
+              rgba = im.convert('RGBA')
+              bg = Image.new('RGB', rgba.size, 'white')
+              bg.paste(rgba, mask=rgba.getchannel('A'))
+              im.close(); rgba.close(); images.append(bg)
+          preview_name = '2025-04-11_国盛证券_海风塔桩出海龙头，迎来量利齐升时刻_公开预览10页.pdf'
+          preview_path = WORK / preview_name
+          images[0].save(preview_path, 'PDF', save_all=True, append_images=images[1:], resolution=150.0, quality=95, subsampling=0)
+          for im in images: im.close()
+          preview_data = preview_path.read_bytes()
+          preview_pages = len(PdfReader(str(preview_path), strict=False).pages)
+          if preview_pages != preview_count or not preview_data.lstrip().startswith(b'%PDF'):
+              raise RuntimeError('preview PDF validation failed')
+          manifest.append({
+              'company':'大金重工股份有限公司','stock_code':'002487.SZ',
+              'broker':'国盛证券','report_date':'2025-04-11',
+              'title':'海风塔&桩出海龙头，迎来量利齐升时刻',
+              'file':preview_name,'reported_full_length_pages':full_pages,
+              'pages_included':preview_pages,'size_bytes':len(preview_data),
+              'sha256':digest(preview_data),'source_page':detail,
+              'public_preview_base':base,
+              'access_type':'来源页面无需登录公开展示的前10页预览；其余页面未绕过下载或权限限制',
+          })
+          print('PREVIEW_OK', preview_pages, full_pages, digest(preview_data))
+
+          (WORK/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme = [
+              '大金重工（002487.SZ）券商深度研究报告资料包','',
+              '共收录3份报告：2份完整原始PDF，1份来源页面公开展示的10页预览。',
+              '完整报告与预览版本已在文件名和 manifest.json 中明确区分。','',
+          ]
+          for i,x in enumerate(manifest,1):
+              pages=x.get('pages',x.get('pages_included'))
+              readme.append(f"{i}. {x['broker']}｜{x['report_date']}｜{x['title']}｜收录{pages}页｜{x['access_type']}")
+          readme += ['', '详细来源、文件大小和SHA-256见 manifest.json 与 SHA256SUMS.txt。']
+          (WORK/'README_来源说明.txt').write_text('\n'.join(readme)+'\n', encoding='utf-8')
+          sums=[f"{x['sha256']}  {x['file']}" for x in manifest]
+          sums.append(f"{digest((WORK/'manifest.json').read_bytes())}  manifest.json")
+          (WORK/'SHA256SUMS.txt').write_text('\n'.join(sums)+'\n', encoding='utf-8')
+
+          zpath=OUT/'dajin_broker_reports.zip'
+          with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(WORK.iterdir(),key=lambda p:p.name): z.write(p,p.name)
+          with zipfile.ZipFile(zpath) as z:
+              if z.testzip() is not None: raise RuntimeError('ZIP integrity failure')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')]) != 3:
+                  raise RuntimeError('PDF count failure')
+          print('PACKAGE_OK',zpath.stat().st_size,digest(zpath.read_bytes()))
+          PY
+          python /tmp/build.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dajin-broker-reports-fixed
+          path: deliverable/dajin_broker_reports.zip
+          retention-days: 1
+          compression-level: 0
