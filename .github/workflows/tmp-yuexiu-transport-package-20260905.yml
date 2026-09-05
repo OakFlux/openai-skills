@@ -1,0 +1,307 @@
+name: Temporary Yuexiu Transport broker report package
+
+on:
+  push:
+    branches:
+      - tmp-yuexiu-transport-broker-reports-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Fetch public report pages and build PDFs
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pillow pypdf
+          cat > /tmp/build_yuexiu_reports.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          from urllib.parse import urlsplit, urlunsplit
+
+          import requests
+          from PIL import Image, ImageOps
+          from pypdf import PdfReader
+
+          OUT = Path("deliverable")
+          WORK = Path("work")
+          OUT.mkdir(exist_ok=True)
+          WORK.mkdir(exist_ok=True)
+
+          candidates = [
+              {
+                  "id": "4757676",
+                  "date": "2025-03-31",
+                  "broker": "兴证国际证券",
+                  "title": "平临高速收购落地，保持稳健派息",
+                  "preferred": True,
+              },
+              {
+                  "id": "4734664",
+                  "date": "2025-03-17",
+                  "broker": "东兴证券",
+                  "title": "越秀交通基建：平临高速将增厚25年业绩，收费权摊销略高于预期",
+                  "preferred": True,
+              },
+              {
+                  "id": "3834744",
+                  "date": "2023-08-09",
+                  "broker": "国联证券",
+                  "title": "中期分红率53.8%，基本面长期向好",
+                  "preferred": True,
+              },
+              {
+                  "id": "4586038",
+                  "date": "2024-11-11",
+                  "broker": "东兴证券",
+                  "title": "越秀交通基建：收购平临高速，优质资产将增厚公司业绩",
+                  "preferred": False,
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update(
+              {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+                  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+              }
+          )
+
+          def clean_url(url: str) -> str:
+              parts = urlsplit(url)
+              return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+          def find_first_page_url(report: dict) -> str:
+              detail_url = f"https://www.fxbaogao.com/detail/{report['id']}"
+              r = session.get(detail_url, timeout=60, allow_redirects=True)
+              r.raise_for_status()
+              text = html.unescape(r.text).replace("\\/", "/").replace("\\u0026", "&")
+              (WORK / f"detail_{report['id']}.html").write_text(text, encoding="utf-8")
+
+              patterns = [
+                  rf"https://public\.fxbaogao\.com/report-image/[0-9]{{4}}/[0-9]{{2}}/[0-9]{{2}}/{report['id']}-1\.png(?:\?[^\"'<>\\\s]*)?",
+                  rf"https://public\.fxbaogao\.com/report-image/[^\"'<>\\\s]+/{report['id']}-1\.png(?:\?[^\"'<>\\\s]*)?",
+              ]
+              for pattern in patterns:
+                  m = re.search(pattern, text, flags=re.I)
+                  if m:
+                      return clean_url(m.group(0))
+
+              # Public report pages normally publish the image under the report date.
+              # Probe only openly accessible image URLs around the published date.
+              pubdate = datetime.strptime(report["date"], "%Y-%m-%d")
+              for delta in range(-5, 8):
+                  d = pubdate + timedelta(days=delta)
+                  url = f"https://public.fxbaogao.com/report-image/{d:%Y/%m/%d}/{report['id']}-1.png"
+                  rr = session.get(url, timeout=45, headers={"Referer": detail_url})
+                  if rr.status_code == 200 and rr.content[:16] and (rr.headers.get("content-type", "").lower().startswith("image/") or len(rr.content) > 5000):
+                      try:
+                          im = Image.open(io.BytesIO(rr.content))
+                          im.verify()
+                          return url
+                      except Exception:
+                          pass
+              raise RuntimeError(f"Could not locate public first-page image for report {report['id']}")
+
+          def get_page_image(url: str, detail_url: str) -> bytes | None:
+              attempts = [url, url + "?x-oss-process=image/format,webp"]
+              for attempt in attempts:
+                  for retry in range(3):
+                      try:
+                          r = session.get(attempt, timeout=60, headers={"Referer": detail_url})
+                          if r.status_code != 200 or len(r.content) < 3000:
+                              break
+                          ctype = (r.headers.get("content-type") or "").lower()
+                          if not ctype.startswith("image/") and not r.content.startswith((b"\x89PNG", b"\xff\xd8\xff", b"RIFF")):
+                              break
+                          im = Image.open(io.BytesIO(r.content))
+                          im.load()
+                          if im.width < 500 or im.height < 500:
+                              break
+                          return r.content
+                      except requests.RequestException:
+                          time.sleep(1.0 + retry)
+                      except Exception:
+                          break
+              return None
+
+          def build_pdf(report: dict) -> dict:
+              detail_url = f"https://www.fxbaogao.com/detail/{report['id']}"
+              first = find_first_page_url(report)
+              m = re.search(rf"^(.*?/{report['id']})-1\.png$", first)
+              if not m:
+                  raise RuntimeError(f"Unexpected first-page URL for {report['id']}: {first}")
+              prefix = m.group(1)
+
+              image_bytes: list[bytes] = []
+              digests: set[str] = set()
+              for page_no in range(1, 101):
+                  page_url = f"{prefix}-{page_no}.png"
+                  data = get_page_image(page_url, detail_url)
+                  if data is None:
+                      if page_no == 1:
+                          raise RuntimeError(f"First public page failed for report {report['id']}")
+                      break
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in digests:
+                      # Protect against a repeated placeholder image after the final page.
+                      break
+                  digests.add(digest)
+                  image_bytes.append(data)
+                  print("PAGE", report["id"], page_no, len(data), page_url)
+
+              if len(image_bytes) < 2:
+                  raise RuntimeError(f"Only {len(image_bytes)} public page(s) found for report {report['id']}")
+
+              safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", report["title"])
+              filename = f"{report['date']}_{report['broker']}_{safe_title}.pdf"
+              pdf_path = WORK / filename
+
+              pages: list[Image.Image] = []
+              for data in image_bytes:
+                  im = Image.open(io.BytesIO(data))
+                  im = ImageOps.exif_transpose(im)
+                  if im.mode != "RGB":
+                      background = Image.new("RGB", im.size, "white")
+                      if "A" in im.getbands():
+                          background.paste(im, mask=im.getchannel("A"))
+                      else:
+                          background.paste(im.convert("RGB"))
+                      im = background
+                  pages.append(im.copy())
+                  im.close()
+
+              pages[0].save(
+                  pdf_path,
+                  "PDF",
+                  resolution=150.0,
+                  save_all=True,
+                  append_images=pages[1:],
+                  quality=95,
+                  subsampling=0,
+                  title=f"{report['broker']} - {report['title']}",
+                  author=report["broker"],
+                  subject="越秀交通基建（01052.HK）公司研究",
+              )
+              for im in pages:
+                  im.close()
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != len(image_bytes):
+                  raise RuntimeError(f"PDF page mismatch for {report['id']}: {actual_pages} vs {len(image_bytes)}")
+
+              pdf_data = pdf_path.read_bytes()
+              item = {
+                  **report,
+                  "file": filename,
+                  "source_page": detail_url,
+                  "public_page_image_prefix": prefix,
+                  "pages": actual_pages,
+                  "size_bytes": len(pdf_data),
+                  "sha256": hashlib.sha256(pdf_data).hexdigest(),
+                  "format_note": "由公开网页逐页展示图像无删减合成为PDF；不等同于券商原始可检索PDF文件结构。",
+              }
+              print("BUILT", json.dumps(item, ensure_ascii=False))
+              return item
+
+          successes: dict[str, dict] = {}
+          errors: dict[str, str] = {}
+          for report in candidates:
+              try:
+                  successes[report["id"]] = build_pdf(report)
+              except Exception as exc:
+                  errors[report["id"]] = repr(exc)
+                  print("ERROR", report["id"], repr(exc))
+
+          preferred_ids = ["4757676", "4734664", "3834744"]
+          selected: list[dict] = [successes[rid] for rid in preferred_ids if rid in successes]
+          if len(selected) < 3:
+              for rid in ["4586038"]:
+                  if rid in successes and successes[rid] not in selected:
+                      selected.append(successes[rid])
+                  if len(selected) == 3:
+                      break
+
+          if len(selected) < 3:
+              raise RuntimeError(f"Need 3 reports, built {len(selected)}; errors={errors}")
+
+          readme_lines = [
+              "越秀交通基建（01052.HK）券商研究报告资料包",
+              "",
+              "本资料包共收录3份单公司券商研究报告。",
+              "",
+              "重要说明：",
+              "1. 文件内容来自无需登录即可公开浏览的报告页面。",
+              "2. 由于公开页面未直接提供券商原始PDF二进制下载，本资料包将公开展示的各页图像按原顺序合成为PDF。页面内容未作改写或删减，但PDF文字层、书签、链接、压缩方式及清晰度可能与券商原始文件不同。",
+              "3. 本资料包仅供个人研究与学习，不构成投资建议；版权归报告发布机构及作者所有。",
+              "4. 每份文件的来源、页数、大小及SHA-256见manifest.json和SHA256SUMS.txt。",
+              "",
+              "文件清单：",
+          ]
+          for idx, item in enumerate(selected, 1):
+              readme_lines.extend(
+                  [
+                      f"{idx}. {item['broker']}｜{item['date']}｜{item['title']}",
+                      f"   页数：{item['pages']}；来源页面：{item['source_page']}",
+                  ]
+              )
+          readme_lines.extend(["", "生成日期：2026-09-05"])
+
+          readme_path = WORK / "README_来源与说明.txt"
+          readme_path.write_text("\n".join(readme_lines), encoding="utf-8")
+
+          manifest = {
+              "company": "越秀交通基建有限公司",
+              "stock_code": "01052.HK",
+              "created_at": "2026-09-05",
+              "report_count": len(selected),
+              "reports": selected,
+              "failed_candidates": errors,
+          }
+          manifest_path = WORK / "manifest.json"
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          sums_lines = [f"{item['sha256']}  {item['file']}" for item in selected]
+          sums_path = WORK / "SHA256SUMS.txt"
+          sums_path.write_text("\n".join(sums_lines) + "\n", encoding="utf-8")
+
+          zip_path = OUT / "yuexiu_transport_broker_reports_3.zip"
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for item in selected:
+                  zf.write(WORK / item["file"], arcname=item["file"])
+              zf.write(readme_path, arcname=readme_path.name)
+              zf.write(manifest_path, arcname=manifest_path.name)
+              zf.write(sums_path, arcname=sums_path.name)
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"Corrupt member in final ZIP: {bad}")
+              pdf_members = [n for n in zf.namelist() if n.lower().endswith(".pdf")]
+              if len(pdf_members) != 3:
+                  raise RuntimeError(f"Expected 3 PDFs, got {len(pdf_members)}")
+
+          print("FINAL_ZIP", zip_path, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest())
+          PY
+          python /tmp/build_yuexiu_reports.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuexiu-transport-broker-reports-package
+          path: deliverable/yuexiu_transport_broker_reports_3.zip
+          retention-days: 1
+          compression-level: 0
