@@ -1,0 +1,271 @@
+name: Temporary Kaisheng New Energy broker report archive
+
+on:
+  push:
+    branches:
+      - tmp-kaisheng-reports-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 cryptography pypdf pymupdf pillow
+          python - <<'PY'
+          import base64
+          import csv
+          import hashlib
+          import html
+          import io
+          import random
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from cryptography.hazmat.primitives import padding
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+
+          root = Path.cwd()
+          reports_dir = root / 'reports'
+          output_dir = root / 'output'
+          qa_dir = root / 'qa'
+          for folder in (reports_dir, output_dir, qa_dir):
+              folder.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'report_id': '2874009292044765086',
+                  'broker': '国海证券',
+                  'date': '2022-07-01',
+                  'title': '公司深度研究：转型新能源材料平台，成长中的光伏玻璃龙头',
+                  'expected_pages': 30,
+                  'filename': '01_国海证券_洛阳玻璃（凯盛新能）_转型新能源材料平台成长中的光伏玻璃龙头_20220701.pdf',
+              },
+              {
+                  'report_id': '2799266787668002789',
+                  'broker': '民生证券',
+                  'date': '2022-03-21',
+                  'title': '深度报告：光伏玻璃新力量，驶入成长快车道',
+                  'expected_pages': 18,
+                  'filename': '02_民生证券_洛阳玻璃（凯盛新能）_光伏玻璃新力量驶入成长快车道_20220321.pdf',
+              },
+          ]
+
+          user_agents = [
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': user_agents[0],
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/pdf,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Cache-Control': 'no-cache',
+              'Pragma': 'no-cache',
+              'Connection': 'keep-alive',
+          })
+
+          def fetch_report_page(report_id):
+              errors = []
+              for attempt in range(1, 10):
+                  session.headers['User-Agent'] = random.choice(user_agents)
+                  host = 'www.hangyan.co' if attempt % 2 else 'hangyan.co'
+                  url = f'https://{host}/reports/{report_id}?_={int(time.time()*1000)}{attempt}'
+                  try:
+                      if attempt == 1:
+                          try:
+                              session.get('https://www.hangyan.co/reports', timeout=(15, 30))
+                          except Exception:
+                              pass
+                      response = session.get(
+                          url,
+                          headers={'Referer': 'https://www.hangyan.co/reports'},
+                          timeout=(20, 80),
+                          allow_redirects=True,
+                      )
+                      text = response.text
+                      if response.status_code != 200:
+                          raise RuntimeError(f'HTTP {response.status_code}')
+                      if len(text) < 5000:
+                          raise RuntimeError(f'HTML too short: {len(text)}')
+                      soup = BeautifulSoup(text, 'html.parser')
+                      container = soup.select_one('[data-controller~="native-pdf"]')
+                      if container is None:
+                          raise RuntimeError('native-pdf metadata missing')
+                      cache_key = container.get('data-native-pdf-cache-key-value')
+                      source_filename = html.unescape(container.get('data-native-pdf-filename-value') or '')
+                      if not cache_key:
+                          raise RuntimeError('cache key missing')
+                      return response.url, cache_key, source_filename
+                  except Exception as exc:
+                      errors.append(f'attempt {attempt}: {exc}')
+                      time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'Unable to fetch report page {report_id}: {errors}')
+
+          def decrypt_cache_key(cache_key):
+              encoded = cache_key.replace('-', '+').replace('_', '/')
+              encoded += '=' * ((4 - len(encoded) % 4) % 4)
+              raw = base64.b64decode(encoded)
+              if len(raw) <= 16:
+                  raise RuntimeError('encrypted cache key too short')
+              iv, ciphertext = raw[:16], raw[16:]
+              current_bucket = int(time.time()) // 120
+              # Search two days around the current bucket to tolerate cached HTML.
+              for delta in range(-1440, 1441):
+                  bucket = current_bucket + delta
+                  key_text = (f'cv_{bucket}zIDfwokaoIUFlw')[:32].ljust(32, '0')
+                  try:
+                      decryptor = Cipher(algorithms.AES(key_text.encode()), modes.CBC(iv)).decryptor()
+                      padded = decryptor.update(ciphertext) + decryptor.finalize()
+                      unpadder = padding.PKCS7(128).unpadder()
+                      plain = unpadder.update(padded) + unpadder.finalize()
+                      url = plain.decode('utf-8')
+                      if url.startswith('https://') and '.pdf' in url.lower():
+                          return url, delta
+                  except Exception:
+                      continue
+              raise RuntimeError('Unable to decrypt PDF URL')
+
+          def download_pdf(pdf_url, page_url):
+              errors = []
+              for attempt in range(1, 7):
+                  try:
+                      response = session.get(
+                          pdf_url,
+                          headers={
+                              'Referer': page_url,
+                              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                          },
+                          timeout=(30, 240),
+                          allow_redirects=True,
+                      )
+                      data = response.content
+                      if response.status_code != 200:
+                          raise RuntimeError(f'HTTP {response.status_code}')
+                      if len(data) < 100000:
+                          raise RuntimeError(f'file too small: {len(data)} bytes')
+                      if b'%PDF-' not in data[:1024]:
+                          raise RuntimeError(f'not a PDF: {response.headers.get("content-type")}; head={data[:40]!r}')
+                      return data, response.url
+                  except Exception as exc:
+                      errors.append(f'attempt {attempt}: {exc}')
+                      time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'Unable to download PDF: {errors}')
+
+          manifest = []
+          covers = []
+          for item in reports:
+              page_url, cache_key, source_filename = fetch_report_page(item['report_id'])
+              pdf_url, bucket_offset = decrypt_cache_key(cache_key)
+              raw, final_pdf_url = download_pdf(pdf_url, page_url)
+
+              reader = PdfReader(io.BytesIO(raw), strict=False)
+              page_count = len(reader.pages)
+              if page_count != item['expected_pages']:
+                  raise RuntimeError(f"{item['broker']} page count {page_count}, expected {item['expected_pages']}")
+
+              document = fitz.open(stream=raw, filetype='pdf')
+              first_text = ''.join(document.load_page(i).get_text('text') for i in range(min(3, len(document))))
+              compact = re.sub(r'\s+', '', first_text).lower()
+              company_ok = any(term in compact for term in ['洛阳玻璃', '洛陽玻璃', '600876', '1108hk', '1108.hk'])
+              broker_ok = item['broker'].replace('证券', '') in first_text or item['broker'] in first_text
+              if not company_ok:
+                  raise RuntimeError(f"{item['broker']} PDF identity check failed: company not found")
+              if not broker_ok:
+                  raise RuntimeError(f"{item['broker']} PDF identity check failed: broker not found")
+
+              output_path = reports_dir / item['filename']
+              output_path.write_bytes(raw)
+              sha256 = hashlib.sha256(raw).hexdigest()
+
+              pixmap = document.load_page(0).get_pixmap(matrix=fitz.Matrix(1.15, 1.15), alpha=False)
+              cover_path = qa_dir / f"{item['broker']}_{item['date']}.png"
+              pixmap.save(str(cover_path))
+              document.close()
+              covers.append((f"{item['broker']} {item['date']} ({page_count}页)", cover_path))
+
+              manifest.append({
+                  '文件名': item['filename'],
+                  '券商': item['broker'],
+                  '发布日期': item['date'],
+                  '报告标题': item['title'],
+                  '页数': page_count,
+                  '文件大小（字节）': len(raw),
+                  'SHA256': sha256,
+                  '研报信息页': page_url.split('?')[0],
+                  'PDF最终来源': final_pdf_url,
+                  '来源文件名': source_filename,
+                  '缓存密钥时间偏移': bucket_offset,
+              })
+              print(f"VALID {item['broker']}: pages={page_count}, bytes={len(raw)}, sha256={sha256}", flush=True)
+
+          manifest_path = reports_dir / '文件清单与校验值.csv'
+          with manifest_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          readme_path = reports_dir / 'README.txt'
+          readme_path.write_text(
+              '凯盛新能源股份有限公司（600876.SH / 01108.HK，原名洛阳玻璃）券商深度报告资料包\n\n'
+              '包含2份完整公司深度研究报告：\n'
+              '1. 国海证券，2022-07-01，30页：《公司深度研究：转型新能源材料平台，成长中的光伏玻璃龙头》；\n'
+              '2. 民生证券，2022-03-21，18页：《深度报告：光伏玻璃新力量，驶入成长快车道》。\n\n'
+              '说明：两份报告发布时公司名称仍为“洛阳玻璃”，后更名为“凯盛新能”，证券代码保持600876.SH / 01108.HK。\n'
+              '校验：已检查PDF文件头、可解析性、实际页数、首页/前三页公司名称与券商名称，并记录SHA-256；ZIP已执行CRC完整性测试。\n'
+              '提示：研报中的盈利预测、目标价和投资评级均对应报告发布时点，不代表当前观点。\n',
+              encoding='utf-8',
+          )
+
+          width, height = 470, 650
+          contact_sheet = Image.new('RGB', (width * len(covers), height), 'white')
+          for index, (label, cover_path) in enumerate(covers):
+              image = Image.open(cover_path).convert('RGB')
+              image.thumbnail((width - 30, height - 90), Image.Resampling.LANCZOS)
+              tile = Image.new('RGB', (width, height), 'white')
+              tile.paste(image, ((width - image.width) // 2, 10))
+              ImageDraw.Draw(tile).text((15, height - 65), label, fill='black')
+              contact_sheet.paste(tile, (index * width, 0))
+          contact_sheet.save(output_dir / '凯盛新能_券商深度报告_首页核验图.jpg', quality=92)
+
+          archive_path = output_dir / '凯盛新能_600876_01108_券商深度报告_2份.zip'
+          with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(reports_dir.iterdir(), key=lambda p: p.name):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(archive_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in archive.namelist())
+              if pdf_count != 2:
+                  raise RuntimeError(f'Expected 2 PDFs, got {pdf_count}')
+
+          (output_dir / '文件清单与校验值.csv').write_bytes(manifest_path.read_bytes())
+          (output_dir / 'README.txt').write_bytes(readme_path.read_bytes())
+          print(f'ARCHIVE_READY={archive_path}', flush=True)
+          print(f'ARCHIVE_SIZE={archive_path.stat().st_size}', flush=True)
+          PY
+      - name: Upload archive and QA files
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaisheng-new-energy-broker-reports
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
