@@ -1,0 +1,263 @@
+name: Build Huayan Robotics 1021 reports package
+
+on:
+  push:
+    branches:
+      - tmp-huayan-1021-reports-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download official HKEX documents and build ZIP
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          mkdir -p deliverable/package
+          cat > /tmp/build_huayan_reports.py <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('deliverable')
+          WORK = OUT / 'package'
+          WORK.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          TITLE_URLS = [
+              ('ZH', 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=ZH&market=SEHK&stockId=1000297158'),
+              ('EN', 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=1000297158'),
+          ]
+
+          def fetch(url, referer=None, attempts=7, timeout=(20, 120)):
+              headers = {'Referer': referer} if referer else None
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      if response.status_code == 200:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}: {url}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(2 ** attempt, 12))
+              raise RuntimeError(f'Failed to fetch {url}: {last}')
+
+          def normalize(text):
+              return re.sub(r'\s+', ' ', text or '').strip()
+
+          all_links = []
+          page_titles = []
+          for lang, title_url in TITLE_URLS:
+              response = fetch(title_url)
+              print('TITLE_PAGE', lang, response.status_code, len(response.content), response.url)
+              soup = BeautifulSoup(response.text, 'html.parser')
+              for anchor in soup.find_all('a', href=True):
+                  href = urljoin(response.url, anchor.get('href'))
+                  text = normalize(' '.join(anchor.stripped_strings))
+                  if text:
+                      page_titles.append({'lang': lang, 'text': text, 'href': href})
+                  if '.pdf' in href.lower():
+                      all_links.append({'lang': lang, 'text': text, 'url': href, 'title_page': title_url})
+
+          # Deduplicate while preserving language preference (ZH first).
+          deduped = []
+          seen = set()
+          for item in all_links:
+              key = item['url']
+              if key not in seen:
+                  seen.add(key)
+                  deduped.append(item)
+          all_links = deduped
+          print('PDF_LINKS_FOUND', len(all_links))
+          for item in all_links:
+              if any(word in item['text'].lower() for word in ['annual', 'interim', 'global offering', '年報', '中期', '全球發售', '全球发售']):
+                  print('CANDIDATE_LINK', item['lang'], item['text'][:220], item['url'])
+
+          known_fallbacks = {
+              'annual': [
+                  {'lang': 'EN', 'text': '2025 Annual Report', 'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0427/2026042703294.pdf', 'title_page': TITLE_URLS[1][1]},
+              ],
+              'prospectus': [
+                  {'lang': 'EN', 'text': 'GLOBAL OFFERING', 'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0320/2026032000035.pdf', 'title_page': TITLE_URLS[1][1]},
+              ],
+          }
+
+          def is_annual(item):
+              t = item['text'].lower().replace(' ', '')
+              return ('2025annualreport' in t or 'annualreport2025' in t or '2025年報' in t or '二零二五年年報' in t)
+
+          def is_prospectus(item):
+              t = item['text'].lower()
+              return ('global offering' in t or '全球發售' in item['text'] or '全球发售' in item['text']) and '/2026/0320/' in item['url']
+
+          def is_interim_results(item):
+              t = item['text'].lower().replace(' ', '')
+              cn = item['text'].replace(' ', '')
+              return (
+                  ('interimresults' in t and ('june30,2026' in t or 'june30,2026' in t.replace('th',''))) or
+                  (('中期業績' in cn or '中期业绩' in cn) and ('2026年6月30日' in cn or '二零二六年六月三十日' in cn))
+              )
+
+          candidates = {
+              'annual': [x for x in all_links if is_annual(x)] + known_fallbacks['annual'],
+              'prospectus': [x for x in all_links if is_prospectus(x)] + known_fallbacks['prospectus'],
+              'interim': [x for x in all_links if is_interim_results(x)],
+          }
+
+          # Remove duplicate URLs inside each candidate list.
+          for key, items in candidates.items():
+              unique = []
+              seen_urls = set()
+              for item in items:
+                  if item['url'] not in seen_urls:
+                      seen_urls.add(item['url'])
+                      unique.append(item)
+              candidates[key] = unique
+              print('CANDIDATE_COUNT', key, len(unique))
+
+          def inspect_pdf_candidate(item, label):
+              response = fetch(item['url'], referer=item.get('title_page'))
+              data = response.content
+              if not data.lstrip().startswith(b'%PDF') or len(data) < 30000:
+                  raise RuntimeError(f'{label}: invalid PDF response from {item["url"]}, {len(data)} bytes')
+              tmp = OUT / f'_candidate_{label}_{hashlib.md5(item["url"].encode()).hexdigest()}.pdf'
+              tmp.write_bytes(data)
+              reader = PdfReader(str(tmp), strict=False)
+              pages = len(reader.pages)
+              sample = ''.join((page.extract_text() or '') for page in reader.pages[:min(20, pages)])
+              compact = re.sub(r'\s+', '', sample).lower()
+              return {'item': item, 'data': data, 'pages': pages, 'compact': compact, 'tmp': tmp}
+
+          thresholds = {'annual': 100, 'prospectus': 300, 'interim': 5}
+          selected = {}
+          for label in ('annual', 'prospectus', 'interim'):
+              inspected = []
+              for item in candidates[label]:
+                  try:
+                      result = inspect_pdf_candidate(item, label)
+                      print('INSPECTED', label, item['lang'], result['pages'], len(result['data']), item['text'][:150], item['url'])
+                      inspected.append(result)
+                  except Exception as exc:
+                      print('CANDIDATE_FAILED', label, item['url'], repr(exc))
+              inspected = [r for r in inspected if r['pages'] >= thresholds[label]]
+              if not inspected:
+                  raise RuntimeError(f'No valid {label} document found')
+              # Prefer Chinese-language filing, then the largest page count / byte size.
+              inspected.sort(key=lambda r: (1 if r['item']['lang'] == 'ZH' else 0, r['pages'], len(r['data'])), reverse=True)
+              selected[label] = inspected[0]
+
+          checks = {
+              'annual': ['廣東華沿機器人股份有限公司', '广东华沿机器人股份有限公司', 'guangdonghuayanrobotics', '2025annualreport'],
+              'prospectus': ['廣東華沿機器人股份有限公司', '广东华沿机器人股份有限公司', 'guangdonghuayanrobotics', 'globaloffering'],
+              'interim': ['廣東華沿機器人股份有限公司', '广东华沿机器人股份有限公司', 'guangdonghuayanrobotics', 'interimresults'],
+          }
+          for label, result in selected.items():
+              if not any(term.lower().replace(' ', '') in result['compact'] for term in checks[label]):
+                  raise RuntimeError(f'{label}: issuer/title validation failed for {result["item"]["url"]}')
+
+          output_meta = [
+              ('annual', '华沿机器人_2025年年度报告.pdf', '2025年年度报告', '2026-04-27'),
+              ('prospectus', '华沿机器人_2026年招股说明书_全球发售.pdf', '招股说明书（全球发售）', '2026-03-20'),
+              ('interim', '华沿机器人_2026年中期业绩公告_截至2026年6月30日止六个月.pdf', '2026年中期业绩公告', '2026-08-27'),
+          ]
+
+          manifest = []
+          for label, filename, doc_type, publication_date in output_meta:
+              result = selected[label]
+              path = WORK / filename
+              path.write_bytes(result['data'])
+              sha = hashlib.sha256(result['data']).hexdigest()
+              manifest.append({
+                  'company': '广东华沿机器人股份有限公司',
+                  'stock_code': '01021.HK',
+                  'document_type': doc_type,
+                  'publication_date': publication_date,
+                  'file': filename,
+                  'language_selected': result['item']['lang'],
+                  'official_title': result['item']['text'],
+                  'pages': result['pages'],
+                  'size_bytes': len(result['data']),
+                  'sha256': sha,
+                  'source_url': result['item']['url'],
+                  'source_listing_page': result['item'].get('title_page'),
+                  'source': '香港交易所披露易（HKEXnews）',
+              })
+              print('SELECTED', label, result['item']['lang'], result['pages'], len(result['data']), sha, result['item']['url'])
+
+          titles_joined = '\n'.join(x['text'] for x in page_titles)
+          formal_interim_report_found = bool(re.search(r'(2026\s*Interim\s*Report|2026年?中期報告|二零二六年中期報告)', titles_joined, re.I))
+
+          readme_lines = [
+              '华沿机器人（01021.HK）年度报告、招股说明书及最新半年期资料包',
+              '',
+              '整理日期：2026-09-05',
+              '官方来源：香港交易所披露易（HKEXnews）',
+              '',
+              '文件清单：',
+          ]
+          for idx, item in enumerate(manifest, 1):
+              readme_lines.append(f"{idx}. {item['document_type']}｜披露日期 {item['publication_date']}｜{item['pages']}页｜{item['file']}")
+          readme_lines += [
+              '',
+              '说明：',
+              '1. 华沿机器人于2026年3月30日在香港联交所主板上市；截至整理日，正式发布的年度报告只有《2025年年度报告》，因此“所有年报”即本包所收录的这一份。',
+              '2. 招股说明书收录2026年3月20日刊发的最终版《全球发售》文件，不以较早的聆讯后资料集（PHIP）替代。',
+          ]
+          if formal_interim_report_found:
+              readme_lines.append('3. 官方披露列表已出现《2026年中期报告》，本包按最新正式中期报告收录。')
+          else:
+              readme_lines.append('3. 截至2026年9月5日，官方披露列表尚未刊发独立的《2026年中期报告》；本包收录目前最新的《截至2026年6月30日止六个月中期业绩公告》，作为最新半年期财务资料，并在文件名中如实标注。')
+          readme_lines += [
+              '4. manifest.json 记录每份文件的官方链接、页数、文件大小和 SHA-256；SHA256SUMS.txt 可用于校验。',
+              '',
+              '本资料仅供研究与查阅，文件版权归发行人及相关权利人所有。',
+          ]
+          (WORK / 'README_文件说明.txt').write_text('\n'.join(readme_lines) + '\n', encoding='utf-8')
+          manifest_path = WORK / 'manifest.json'
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          checksums = [f"{item['sha256']}  {item['file']}" for item in manifest]
+          checksums.append(f"{hashlib.sha256(manifest_path.read_bytes()).hexdigest()}  manifest.json")
+          (WORK / 'SHA256SUMS.txt').write_text('\n'.join(checksums) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'huayan_robotics_1021_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(WORK.iterdir(), key=lambda p: p.name):
+                  archive.write(path, path.name)
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 3:
+                  raise RuntimeError(f'Expected 3 PDFs, found {len(pdf_names)}')
+
+          package_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('PACKAGE_OK', zip_path.stat().st_size, package_sha, formal_interim_report_found)
+          PY
+          python /tmp/build_huayan_reports.py
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: huayan-robotics-1021-reports
+          path: deliverable/huayan_robotics_1021_reports.zip
+          retention-days: 1
+          compression-level: 0
