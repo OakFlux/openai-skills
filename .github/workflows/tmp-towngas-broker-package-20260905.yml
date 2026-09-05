@@ -1,0 +1,236 @@
+name: Temporary Towngas Smart Energy broker research archive
+
+on:
+  push:
+    branches:
+      - tmp-towngas-broker-reports-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download, validate, render, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf pymupdf pillow cryptography beautifulsoup4
+          python - <<'PY'
+          import base64
+          import csv
+          import hashlib
+          import html
+          import io
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from cryptography.hazmat.primitives import padding
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+
+          root = Path.cwd()
+          reports_dir = root / 'reports'
+          output_dir = root / 'output'
+          qa_dir = root / 'qa'
+          for folder in (reports_dir, output_dir, qa_dir):
+              folder.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'report_id': '3859916406027978716',
+                  'broker': '西南证券',
+                  'date': '2026-03-23',
+                  'title': '2025年年报点评：智慧能源聚合服务商龙头，发展前景广阔',
+                  'filename': '01_西南证券_港华智慧能源_智慧能源聚合服务商龙头发展前景广阔_20260323.pdf',
+                  'min_pages': 14,
+                  'expected_pages': 16,
+                  'label': 'Southwest Securities 2026',
+              },
+              {
+                  'report_id': '3860972724125959389',
+                  'broker': '兴证国际证券',
+                  'date': '2026-03-25',
+                  'title': '售气价差增长，派息维持稳定',
+                  'filename': '02_兴证国际证券_港华智慧能源_售气价差增长派息维持稳定_20260325.pdf',
+                  'min_pages': 3,
+                  'expected_pages': '',
+                  'label': 'Industrial Securities Intl 2026',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Connection': 'keep-alive',
+          })
+
+          def decrypt_cache_key(cache_key):
+              encoded = cache_key.replace('-', '+').replace('_', '/')
+              encoded += '=' * ((4 - len(encoded) % 4) % 4)
+              raw = base64.b64decode(encoded)
+              if len(raw) <= 16:
+                  raise RuntimeError('encrypted cache key is too short')
+              iv, ciphertext = raw[:16], raw[16:]
+              current_bucket = int(time.time()) // 120
+              # The server may cache report HTML for a while. Search a generous window.
+              for delta in range(-1440, 1441):
+                  bucket = current_bucket + delta
+                  key_text = (f'cv_{bucket}zIDfwokaoIUFlw')[:32].ljust(32, '0')
+                  try:
+                      decryptor = Cipher(algorithms.AES(key_text.encode('utf-8')), modes.CBC(iv)).decryptor()
+                      padded = decryptor.update(ciphertext) + decryptor.finalize()
+                      unpadder = padding.PKCS7(128).unpadder()
+                      plain = unpadder.update(padded) + unpadder.finalize()
+                      url = plain.decode('utf-8')
+                      if url.startswith('https://') and url.lower().endswith('.pdf'):
+                          return url, delta, key_text
+                  except Exception:
+                      continue
+              raise RuntimeError('unable to decrypt report cache key')
+
+          def get_report_pdf(item):
+              page_url = f"https://www.hangyan.co/reports/{item['report_id']}"
+              page_response = session.get(page_url, headers={'Referer': 'https://www.hangyan.co/reports'}, timeout=90, allow_redirects=True)
+              page_response.raise_for_status()
+              page_html = page_response.text
+              soup = BeautifulSoup(page_html, 'html.parser')
+              container = soup.select_one('[data-controller~="native-pdf"]')
+              if container is None:
+                  raise RuntimeError(f"native PDF metadata missing for {page_url}; response length={len(page_html)}")
+              cache_key = container.get('data-native-pdf-cache-key-value')
+              source_filename = html.unescape(container.get('data-native-pdf-filename-value') or '')
+              if not cache_key:
+                  raise RuntimeError(f'cache key missing for {page_url}')
+              pdf_url, offset, key_text = decrypt_cache_key(cache_key)
+              print(f"RESOLVED {item['broker']} page={page_url} source_filename={source_filename} offset={offset} pdf={pdf_url}", flush=True)
+              errors = []
+              for attempt in range(1, 5):
+                  try:
+                      response = session.get(pdf_url, headers={'Referer': page_url, 'Accept': 'application/pdf,*/*'}, timeout=(30, 300), allow_redirects=True)
+                      data = response.content
+                      if response.status_code >= 400:
+                          raise RuntimeError(f'HTTP {response.status_code}')
+                      if len(data) < 80000:
+                          raise RuntimeError(f'file too small: {len(data)} bytes')
+                      if b'%PDF-' not in data[:1024]:
+                          raise RuntimeError(f"not PDF: content-type={response.headers.get('content-type')}; head={data[:60]!r}")
+                      return data, page_url, response.url, source_filename
+                  except Exception as exc:
+                      errors.append(f'attempt {attempt}: {exc}')
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f"Unable to download {item['title']}: {errors}")
+
+          manifest_rows = []
+          covers = []
+          for item in reports:
+              raw, info_url, final_url, source_filename = get_report_pdf(item)
+              reader = PdfReader(io.BytesIO(raw), strict=False)
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f"{item['filename']}: only {pages} pages; expected at least {item['min_pages']}")
+              if item['expected_pages'] and pages != item['expected_pages']:
+                  raise RuntimeError(f"{item['filename']}: got {pages} pages; expected exactly {item['expected_pages']}")
+
+              pdf = pymupdf.open(stream=raw, filetype='pdf')
+              text = ''.join(pdf.load_page(i).get_text('text') for i in range(min(2, len(pdf))))
+              compact_text = re.sub(r'\s+', '', text).lower()
+              valid_company = any(term.lower() in compact_text for term in ('港华智慧能源', '港華智慧能源', 'towngas smart energy', '01083.hk', '1083.hk'))
+              if not valid_company:
+                  raise RuntimeError(f"{item['filename']}: opening pages do not identify 港华智慧能源")
+              pix = pdf.load_page(0).get_pixmap(matrix=pymupdf.Matrix(1.35, 1.35), alpha=False)
+              cover_path = qa_dir / f"{item['broker']}_{item['date']}.png"
+              pix.save(str(cover_path))
+              pdf.close()
+
+              path = reports_dir / item['filename']
+              path.write_bytes(raw)
+              sha = hashlib.sha256(raw).hexdigest()
+              manifest_rows.append({
+                  '文件名': item['filename'],
+                  '券商': item['broker'],
+                  '发布日期': item['date'],
+                  '报告标题': item['title'],
+                  'PDF页数': pages,
+                  '文件大小（字节）': len(raw),
+                  'SHA256': sha,
+                  '研报信息页': info_url,
+                  'PDF原始来源': final_url,
+                  '来源文件名': source_filename,
+              })
+              covers.append((f"{item['label']} ({pages} pages)", cover_path))
+              print(f"VALID {item['filename']}: pages={pages}, bytes={len(raw)}, sha256={sha}", flush=True)
+
+          manifest_path = reports_dir / '文件清单与校验值.csv'
+          with manifest_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=list(manifest_rows[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest_rows)
+
+          report_lines = []
+          for index, row in enumerate(manifest_rows, start=1):
+              report_lines.append(f"{index}. {row['券商']}，{row['发布日期']}，{row['PDF页数']}页：《{row['报告标题']}》；")
+          readme_path = reports_dir / 'README.txt'
+          readme_path.write_text(
+              '港华智慧能源有限公司（01083.HK，原称港华燃气）券商研究报告资料包\n\n'
+              '包含2份完整券商公司研究报告：\n' + '\n'.join(report_lines) + '\n\n'
+              '选择说明：公开可直接取得的系统性公司研究有限，本资料包优先保留篇幅较长、能够覆盖公司燃气与可再生能源业务的报告；未使用新闻摘要或网页摘录替代PDF原文。\n'
+              '来源：小牛行研所提供的券商PDF原文。\n'
+              '校验：全部PDF已检查文件头、可解析性、实际页数、首页/前两页公司名称和SHA-256；压缩包已执行CRC完整性测试。\n'
+              '提示：研报中的盈利预测、目标价和投资评级均对应报告发布时点，不代表当前观点。\n',
+              encoding='utf-8'
+          )
+
+          tile_w, tile_h = 430, 610
+          thumbs = []
+          for label, cover_path in covers:
+              image = Image.open(cover_path).convert('RGB')
+              image.thumbnail((tile_w - 30, tile_h - 80), Image.Resampling.LANCZOS)
+              canvas = Image.new('RGB', (tile_w, tile_h), 'white')
+              canvas.paste(image, ((tile_w - image.width) // 2, 10))
+              ImageDraw.Draw(canvas).text((15, tile_h - 55), label, fill='black')
+              thumbs.append(canvas)
+          sheet = Image.new('RGB', (tile_w * len(thumbs), tile_h), 'white')
+          for index, thumb in enumerate(thumbs):
+              sheet.paste(thumb, (index * tile_w, 0))
+          sheet.save(output_dir / '港华智慧能源_券商深度报告_首页核验图.jpg', quality=92)
+
+          archive_path = output_dir / '港华智慧能源_01083_券商深度报告_2份.zip'
+          with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(reports_dir.iterdir(), key=lambda p: p.name):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(archive_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              names = archive.namelist()
+              pdf_count = sum(name.lower().endswith('.pdf') for name in names)
+              if pdf_count != 2:
+                  raise RuntimeError(f'Expected 2 PDFs, got {pdf_count}: {names}')
+
+          (output_dir / '文件清单与校验值.csv').write_bytes(manifest_path.read_bytes())
+          (output_dir / 'README.txt').write_bytes(readme_path.read_bytes())
+          print(f'ARCHIVE_READY={archive_path}', flush=True)
+          print(f'ARCHIVE_SIZE={archive_path.stat().st_size}', flush=True)
+          print('PDF_COUNT=2', flush=True)
+          PY
+
+      - name: Upload archive and QA files
+        uses: actions/upload-artifact@v4
+        with:
+          name: towngas-broker-reports-archive
+          path: output/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
