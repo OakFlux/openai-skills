@@ -1,0 +1,149 @@
+name: Temporary clean Yuexiu Transport public report previews
+
+on:
+  push:
+    branches:
+      - tmp-yuexiu-transport-clean-previews-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch and compose clean public preview PDFs
+        run: |
+          python -m pip install --quiet requests pillow pypdf beautifulsoup4
+          cat > /tmp/build_clean.py <<'PY'
+          import hashlib, html, io, json, re, zipfile
+          from pathlib import Path
+          from urllib.parse import urlsplit, urlunsplit
+          import requests
+          from PIL import Image, ImageOps, ImageStat
+          from pypdf import PdfReader
+
+          reports = [
+              {"id":"4757676","date":"2025-03-31","broker":"兴证国际证券","title":"平临高速收购落地，保持稳健派息","original_total_pages":4},
+              {"id":"4734664","date":"2025-03-17","broker":"东兴证券","title":"越秀交通基建：平临高速将增厚25年业绩，收费权摊销略高于预期","original_total_pages":6},
+              {"id":"3834744","date":"2023-08-09","broker":"国联证券","title":"中期分红率53.8%，基本面长期向好","original_total_pages":None},
+          ]
+          out=Path('deliverable'); out.mkdir(exist_ok=True)
+          work=Path('work'); work.mkdir(exist_ok=True)
+          rawdir=work/'raw'; rawdir.mkdir(exist_ok=True)
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'})
+
+          def strip_query(u):
+              p=urlsplit(u); return urlunsplit((p.scheme,p.netloc,p.path,'','',''))
+
+          def locate_first(rid):
+              detail=f'https://www.fxbaogao.com/detail/{rid}'
+              r=s.get(detail,timeout=35,allow_redirects=True); r.raise_for_status()
+              raw=html.unescape(r.text).replace('\\/','/').replace('\\u0026','&')
+              (rawdir/f'{rid}.html').write_text(raw,encoding='utf-8')
+              pats=[
+                  rf'https://public\.fxbaogao\.com/report-image/[0-9]{{4}}/[0-9]{{2}}/[0-9]{{2}}/{rid}-1\.png(?:\?[^\"\'<>\\\s]*)?',
+                  rf'https://public\.fxbaogao\.com/report-image/[^\"\'<>\\\s]+/{rid}-1\.png(?:\?[^\"\'<>\\\s]*)?',
+              ]
+              for pat in pats:
+                  m=re.search(pat,raw,re.I)
+                  if m: return strip_query(m.group(0)), detail
+              raise RuntimeError(f'first page URL not found for {rid}')
+
+          def fetch_image(url, referer):
+              for candidate in [url, url+'?x-oss-process=image/format,webp']:
+                  try:
+                      r=s.get(candidate,timeout=35,headers={'Referer':referer,'User-Agent':s.headers['User-Agent']})
+                      if r.status_code==200 and len(r.content)>3000:
+                          im=Image.open(io.BytesIO(r.content)); im.load()
+                          if im.width>=500 and im.height>=500:
+                              return r.content
+                  except Exception:
+                      pass
+              return None
+
+          def white_composite(data):
+              im=Image.open(io.BytesIO(data)); im=ImageOps.exif_transpose(im)
+              # Preserve transparency correctly; direct P/RGBA -> RGB conversion turns transparent paper black.
+              if im.mode in ('RGBA','LA') or ('transparency' in im.info):
+                  rgba=im.convert('RGBA')
+                  white=Image.new('RGBA',rgba.size,(255,255,255,255))
+                  white.alpha_composite(rgba)
+                  rgb=white.convert('RGB')
+              else:
+                  rgb=im.convert('RGB')
+              im.close()
+              # Sanity: reports should have light page backgrounds. If still mostly black, invert only luminance.
+              thumb=rgb.resize((64,64))
+              mean=sum(ImageStat.Stat(thumb.convert('L')).mean)/1
+              thumb.close()
+              if mean < 55:
+                  from PIL import ImageChops
+                  rgb=ImageChops.invert(rgb)
+              return rgb
+
+          manifest=[]
+          for rep in reports:
+              first,detail=locate_first(rep['id'])
+              prefix=re.sub(r'-1\.png$','',first)
+              blobs=[]; hashes=set()
+              for n in range(1,8):
+                  data=fetch_image(f'{prefix}-{n}.png',detail)
+                  if data is None:
+                      break
+                  h=hashlib.sha256(data).hexdigest()
+                  if h in hashes: break
+                  hashes.add(h); blobs.append(data)
+                  (rawdir/f"{rep['id']}_{n}.img").write_bytes(data)
+                  print('PAGE',rep['id'],n,len(data))
+              if len(blobs)<2:
+                  raise RuntimeError(f"Expected at least 2 public pages for {rep['id']}, got {len(blobs)}")
+              images=[white_composite(b) for b in blobs]
+              safe=re.sub(r'[\\/:*?\"<>|]+','_',rep['title'])
+              name=f"{rep['date']}_{rep['broker']}_{safe}_公开预览版_前{len(images)}页.pdf"
+              pdf=work/name
+              images[0].save(pdf,'PDF',save_all=True,append_images=images[1:],resolution=160.0,quality=95,subsampling=0)
+              for im in images: im.close()
+              pages=len(PdfReader(str(pdf),strict=False).pages)
+              data=pdf.read_bytes()
+              manifest.append({**rep,'file':name,'public_preview_pages':pages,'size_bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'source_page':detail,'public_image_prefix':prefix,'status':'公开预览版，不是券商原始完整版PDF'})
+
+          readme=[
+            '越秀交通基建（01052.HK）券商研究报告公开预览资料包',
+            '',
+            '本资料包收录3份券商单公司研究报告的公开预览页PDF。',
+            '',
+            '重要说明：',
+            '1. 相关平台在无需登录状态下只公开展示每份报告的前2页；完整原始PDF需要平台授权或登录权限，因此本资料包不是完整版。',
+            '2. PDF由公开展示页按原顺序合成，已修复透明背景，未改写页面内容。',
+            '3. 文件仅供个人研究和学习，版权归原券商、分析师及相关权利人所有，不构成投资建议。',
+            '',
+            '文件清单：'
+          ]
+          for i,x in enumerate(manifest,1):
+              total=f"原报告共{x['original_total_pages']}页" if x['original_total_pages'] else '原报告总页数未在公开页确认'
+              readme.append(f"{i}. {x['broker']}｜{x['date']}｜{x['title']}｜公开前{x['public_preview_pages']}页；{total}")
+          readme += ['', '生成日期：2026-09-05']
+          (work/'README_重要说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (work/'manifest.json').write_text(json.dumps({'company':'越秀交通基建有限公司','stock_code':'01052.HK','package_type':'public_preview','reports':manifest},ensure_ascii=False,indent=2),encoding='utf-8')
+          (work/'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in manifest)+'\n',encoding='utf-8')
+
+          zpath=out/'yuexiu_transport_broker_reports_public_previews_3.zip'
+          with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for x in manifest: z.write(work/x['file'],x['file'])
+              for n in ['README_重要说明.txt','manifest.json','SHA256SUMS.txt']: z.write(work/n,n)
+          with zipfile.ZipFile(zpath) as z:
+              assert z.testzip() is None
+              assert len([n for n in z.namelist() if n.lower().endswith('.pdf')])==3
+          print('FINAL',zpath,zpath.stat().st_size,hashlib.sha256(zpath.read_bytes()).hexdigest())
+          PY
+          python /tmp/build_clean.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuexiu-transport-clean-public-previews
+          path: deliverable/yuexiu_transport_broker_reports_public_previews_3.zip
+          retention-days: 1
+          compression-level: 0
