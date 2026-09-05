@@ -1,0 +1,168 @@
+name: Temporary Kaisheng Eastmoney paginated date probe
+
+on:
+  push:
+    branches:
+      - tmp-kaisheng-eastmoney-dateprobe2-20260905
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Query all date-range pages and download matching PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf pymupdf
+          python - <<'PY'
+          import io
+          import json
+          import math
+          import re
+          import time
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          output = Path('output')
+          output.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Origin': 'https://data.eastmoney.com',
+          })
+          api = 'https://reportapi.eastmoney.com/report/list'
+          ranges = [
+              ('2024-05-29', '2024-06-04'),
+              ('2023-07-28', '2023-08-12'),
+              ('2022-06-20', '2022-07-10'),
+              ('2022-05-20', '2022-06-05'),
+              ('2022-03-15', '2022-03-28'),
+          ]
+          wanted = {}
+          all_records = []
+
+          for begin, end in ranges:
+              page = 1
+              total_pages = 1
+              while page <= total_pages and page <= 20:
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*', 'beginTime': begin,
+                      'endTime': end, 'pageNo': str(page), 'fields': '',
+                      'qType': '0', 'orgCode': '', 'code': '', 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                      'client': 'WEB', 'source': 'WEB',
+                  }
+                  response = session.get(api, params=params, timeout=90)
+                  print('API', begin, end, 'page', page, response.status_code, len(response.content), response.url, flush=True)
+                  response.raise_for_status()
+                  obj = response.json()
+                  batch = obj.get('data') or obj.get('Data') or []
+                  if isinstance(batch, dict):
+                      batch = batch.get('data') or batch.get('list') or batch.get('records') or []
+                  hits = int(obj.get('hits') or obj.get('Hits') or obj.get('total') or 0)
+                  total_pages = max(1, math.ceil(hits / 100))
+                  print('ROWS', len(batch), 'HITS', hits, 'TOTAL_PAGES', total_pages, flush=True)
+                  if not batch:
+                      break
+                  all_records.extend(batch)
+                  for record in batch:
+                      title = str(record.get('title') or record.get('TITLE') or '')
+                      stock_name = str(record.get('stockName') or record.get('SECURITY_NAME_ABBR') or '')
+                      stock_code = str(record.get('stockCode') or record.get('SECURITY_CODE') or '')
+                      joined = re.sub(r'\s+', '', stock_name + title)
+                      is_target = (
+                          stock_code == '600876'
+                          or '凯盛新能' in joined
+                          or '凯盛新能源' in joined
+                          or '洛阳玻璃' in joined
+                      )
+                      if is_target:
+                          info_code = str(record.get('infoCode') or record.get('INFO_CODE') or '')
+                          if info_code:
+                              wanted[info_code] = record
+                              print('TARGET', json.dumps({key: record.get(key) for key in [
+                                  'stockName', 'stockCode', 'title', 'orgSName', 'publishDate',
+                                  'infoCode', 'attachPages', 'attachSize', 'researcher', 'emRatingName'
+                              ]}, ensure_ascii=False), flush=True)
+                  page += 1
+                  time.sleep(0.15)
+
+          (output / 'all_target_records.json').write_text(
+              json.dumps(list(wanted.values()), ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          results = []
+          for info_code, record in wanted.items():
+              pdf_url = f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf'
+              referer = f'https://data.eastmoney.com/report/info/600876/{info_code}.html'
+              errors = []
+              data = None
+              final_url = None
+              for attempt in range(1, 5):
+                  try:
+                      pdf_response = session.get(
+                          pdf_url,
+                          headers={'Referer': referer, 'Accept': 'application/pdf,*/*'},
+                          timeout=(20, 180),
+                          allow_redirects=True,
+                      )
+                      payload = pdf_response.content
+                      if pdf_response.status_code != 200:
+                          raise RuntimeError(f'HTTP {pdf_response.status_code}')
+                      if b'%PDF-' not in payload[:1024] or len(payload) < 50000:
+                          raise RuntimeError(f'not a usable PDF: {len(payload)} bytes, type={pdf_response.headers.get("content-type")}')
+                      data = payload
+                      final_url = pdf_response.url
+                      break
+                  except Exception as exc:
+                      errors.append(f'attempt {attempt}: {exc}')
+                      time.sleep(attempt)
+              row = {
+                  'infoCode': info_code,
+                  'record': record,
+                  'pdf_url': pdf_url,
+                  'final_url': final_url,
+                  'errors': errors,
+              }
+              if data is not None:
+                  pages = len(PdfReader(io.BytesIO(data), strict=False).pages)
+                  row['pages'] = pages
+                  row['bytes'] = len(data)
+                  doc = pymupdf.open(stream=data, filetype='pdf')
+                  opening_text = ''.join(doc.load_page(index).get_text('text') for index in range(min(3, len(doc))))
+                  doc.close()
+                  row['opening_text'] = opening_text[:5000]
+                  path = output / f'{info_code}.pdf'
+                  path.write_bytes(data)
+                  row['saved'] = path.name
+                  print('PDF_OK', info_code, 'pages', pages, 'bytes', len(data), record.get('orgSName'), record.get('title'), flush=True)
+              else:
+                  print('PDF_FAIL', info_code, errors, flush=True)
+              results.append(row)
+
+          (output / 'download_results.json').write_text(
+              json.dumps(results, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          print('TARGET_COUNT', len(wanted), flush=True)
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaisheng-eastmoney-dateprobe2
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
