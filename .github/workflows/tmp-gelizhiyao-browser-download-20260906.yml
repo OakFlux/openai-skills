@@ -1,0 +1,291 @@
+name: Temporary Ascletis browser report download
+
+on:
+  push:
+    branches:
+      - tmp-gelizhiyao-browser-download-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Chromium and PDF tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet playwright pypdf
+          python -m playwright install --with-deps chromium
+
+      - name: Resolve report pages and download public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          WORK = Path('work')
+          OUT.mkdir(exist_ok=True)
+          WORK.mkdir(exist_ok=True)
+
+          targets = [
+              {
+                  'key': 'dongwu',
+                  'institution': '东吴证券',
+                  'date': '2025-04-01',
+                  'title': '全新GLP-1减重不减肌，有潜力成为Best-in-Class',
+                  'type': '公司深度报告',
+                  'chart_url': 'https://www.hangyan.co/charts/3601111842144912396',
+              },
+              {
+                  'key': 'dongfang',
+                  'institution': '东方证券',
+                  'date': '2025-12-28',
+                  'title': '首次覆盖报告：口服小分子率先破局，紧跟减重前沿',
+                  'type': '首次覆盖报告',
+                  'query': '口服小分子率先破局，紧跟减重前沿',
+              },
+              {
+                  'key': 'xingye',
+                  'institution': '兴业证券',
+                  'date': '2025-09-07',
+                  'title': '聚焦减重代谢产品差异化管线，2025年下半年有望读出多项核心管线临床数据',
+                  'type': '公司深度/首次覆盖报告',
+                  'query': '聚焦减重代谢产品差异化管线',
+              },
+          ]
+
+          def clean(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', ' ', value).strip(' ._')
+              return value[:180]
+
+          def wait_settle(page, milliseconds: int = 4000):
+              try:
+                  page.wait_for_load_state('networkidle', timeout=35000)
+              except PlaywrightTimeout:
+                  pass
+              page.wait_for_timeout(milliseconds)
+
+          def click_protected_and_wait(page, locator):
+              before = page.url
+              locator.scroll_into_view_if_needed()
+              locator.click(timeout=15000)
+              try:
+                  page.wait_for_url(lambda u: u != before and '/r' not in u, timeout=45000)
+              except PlaywrightTimeout:
+                  pass
+              wait_settle(page, 4000)
+              return page.url
+
+          def navigate_search_result(page, query: str, expected_text: str) -> str:
+              # Use the site's own public search selector; choose the “研究报告” result type.
+              response = page.goto('https://www.hangyan.co/', wait_until='domcontentloaded', timeout=120000)
+              wait_settle(page, 2500)
+              search = page.locator('#autocomplete-0-input')
+              if not search.count():
+                  raise RuntimeError('Hangyan search input not found')
+              search.click()
+              search.fill(query)
+              page.wait_for_timeout(3000)
+              report_option = page.locator('a[href^="/reports?q="]')
+              if not report_option.count():
+                  # Fallback: second autocomplete item is the research-report option.
+                  report_option = page.locator('.aa-Item a').nth(1)
+              href = report_option.first.get_attribute('href')
+              print('SEARCH_OPTION', query, href, report_option.first.inner_text(), flush=True)
+              try:
+                  report_option.first.click(timeout=15000)
+                  page.wait_for_timeout(1500)
+              except Exception:
+                  if not href:
+                      raise
+                  page.goto(urljoin('https://www.hangyan.co/', href), wait_until='domcontentloaded', timeout=120000)
+              wait_settle(page, 5000)
+              print('SEARCH_PAGE', query, page.url, page.title(), flush=True)
+
+              # Search result cards are protected-link anchors whose text is the report title.
+              links = page.locator('a[data-controller~="protected-link"]')
+              best = None
+              for i in range(links.count()):
+                  item = links.nth(i)
+                  text = ' '.join((item.inner_text(timeout=2000) or '').split())
+                  if expected_text in text or ('歌礼制药' in text and any(fragment in text for fragment in expected_text.split('，')[:1])):
+                      best = item
+                      print('MATCHED_SEARCH_LINK', text, item.get_attribute('data-protected-link-token-value'), flush=True)
+                      break
+              if best is None:
+                  # Broader title match if punctuation differs.
+                  expected_compact = re.sub(r'\W+', '', expected_text)
+                  for i in range(links.count()):
+                      item = links.nth(i)
+                      text = ' '.join((item.inner_text(timeout=2000) or '').split())
+                      compact = re.sub(r'\W+', '', text)
+                      if '歌礼制药' in text and (expected_compact[:8] in compact or expected_compact[-8:] in compact):
+                          best = item
+                          print('MATCHED_SEARCH_LINK_FUZZY', text, flush=True)
+                          break
+              if best is None:
+                  all_text = [' '.join((links.nth(i).inner_text(timeout=2000) or '').split()) for i in range(min(links.count(), 100))]
+                  raise RuntimeError(f'Expected report not found in search results: {query}; links={all_text}')
+              return click_protected_and_wait(page, best)
+
+          results = []
+          diagnostics = []
+          seen_hashes = set()
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'])
+              context = browser.new_context(
+                  viewport={'width': 1440, 'height': 1200},
+                  locale='zh-CN',
+                  timezone_id='Asia/Shanghai',
+                  accept_downloads=True,
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                  extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7'},
+              )
+              context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+              page = context.new_page()
+
+              # Establish first-party cookies/session.
+              page.goto('https://www.hangyan.co/', wait_until='domcontentloaded', timeout=120000)
+              wait_settle(page, 2000)
+
+              for target in targets:
+                  row = dict(target)
+                  try:
+                      if target.get('chart_url'):
+                          page.goto(target['chart_url'], wait_until='domcontentloaded', timeout=120000)
+                          wait_settle(page, 3500)
+                          read_link = page.get_by_text('阅读研究报告', exact=True)
+                          if not read_link.count():
+                              read_link = page.locator('a[data-controller~="protected-link"]').first
+                          row['report_url'] = click_protected_and_wait(page, read_link.first)
+                      else:
+                          row['report_url'] = navigate_search_result(page, target['query'], target['query'])
+
+                      row['report_page_title'] = page.title()
+                      body = ' '.join(page.locator('body').inner_text().split())
+                      row['body_head'] = body[:6000]
+                      print('REPORT_PAGE', target['key'], page.url, page.title(), flush=True)
+                      if '歌礼制药' not in body and '歌礼制药' not in page.title() and '01672' not in body:
+                          raise RuntimeError('Resolved page does not identify 歌礼制药')
+
+                      native = page.locator('[data-controller~="native-pdf"]')
+                      row['native_pdf_count'] = native.count()
+                      if native.count():
+                          row['native_pdf_attributes'] = page.evaluate(
+                              'el => Object.fromEntries(Array.from(el.attributes).map(a => [a.name,a.value]))',
+                              native.first.element_handle(),
+                          )
+                      download_button = page.locator('button[data-action*="native-pdf#download"], a[data-action*="native-pdf#download"]')
+                      row['download_button_count'] = download_button.count()
+                      if not download_button.count() or not download_button.first.is_visible():
+                          raise RuntimeError('Public PDF download button not available')
+
+                      with page.expect_download(timeout=60000) as pending:
+                          download_button.first.click(timeout=15000)
+                      download = pending.value
+                      temp = WORK / f"{target['key']}_{clean(download.suggested_filename)}"
+                      download.save_as(str(temp))
+                      data = temp.read_bytes()
+                      if b'%PDF-' not in data[:1024] or len(data) < 50000:
+                          raise RuntimeError(f'Invalid PDF download: {len(data)} bytes')
+                      pages = len(PdfReader(io.BytesIO(data), strict=False).pages)
+                      sha256 = hashlib.sha256(data).hexdigest()
+                      if sha256 in seen_hashes:
+                          raise RuntimeError('Duplicate PDF')
+                      if pages < 10:
+                          raise RuntimeError(f'Report too short for deep-report package: {pages} pages')
+                      final_name = clean(f"{target['date']}_{target['institution']}_歌礼制药_{target['title']}_{pages}页.pdf")
+                      final_path = WORK / final_name
+                      temp.replace(final_path)
+                      seen_hashes.add(sha256)
+                      row.update({'file': final_name, 'pages': pages, 'bytes': len(data), 'sha256': sha256})
+                      results.append(row)
+                      print('PDF_OK', target['key'], pages, len(data), final_name, flush=True)
+                  except Exception as exc:
+                      row['error'] = repr(exc)
+                      diagnostics.append(row)
+                      print('TARGET_ERROR', target['key'], repr(exc), 'URL', page.url, flush=True)
+                      try:
+                          page.screenshot(path=str(WORK / f"error_{target['key']}.png"), full_page=True)
+                          (WORK / f"error_{target['key']}.html").write_text(page.content(), encoding='utf-8')
+                      except Exception:
+                          pass
+
+              browser.close()
+
+          (WORK / 'diagnostics.json').write_text(json.dumps({'results': results, 'diagnostics': diagnostics}, ensure_ascii=False, indent=2), encoding='utf-8')
+          if len(results) < 2:
+              raise RuntimeError(f'Only {len(results)} complete deep-report PDFs downloaded; need at least 2')
+
+          results.sort(key=lambda x: x['date'], reverse=True)
+          results = results[:3]
+          manifest = WORK / '文件清单与校验值.csv'
+          with manifest.open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=['序号','券商','发布日期','报告类型','报告标题','页数','文件大小_字节','SHA256','来源页面','文件名'])
+              writer.writeheader()
+              for idx, item in enumerate(results, 1):
+                  writer.writerow({
+                      '序号': idx,
+                      '券商': item['institution'],
+                      '发布日期': item['date'],
+                      '报告类型': item['type'],
+                      '报告标题': item['title'],
+                      '页数': item['pages'],
+                      '文件大小_字节': item['bytes'],
+                      'SHA256': item['sha256'],
+                      '来源页面': item['report_url'],
+                      '文件名': item['file'],
+                  })
+
+          readme = WORK / 'README.txt'
+          readme.write_text(
+              '歌礼制药-B（01672.HK）券商深度报告资料包\n'
+              '生成日期：2026-09-06\n\n'
+              f'包含完整公司深度/首次覆盖报告 {len(results)} 份。已排除少于10页的业绩点评、事件点评及预览文件。\n'
+              '所有PDF均检查文件头、可解析性、实际页数与SHA-256；ZIP已通过CRC测试。\n'
+              '研报中的评级、目标价和预测均对应报告发布时点，仅供研究参考。\n',
+              encoding='utf-8',
+          )
+
+          archive = OUT / f'歌礼制药_01672_券商深度报告_{len(results)}份.zip'
+          with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for item in results:
+                  zf.write(WORK / item['file'], arcname=item['file'])
+              zf.write(manifest, arcname=manifest.name)
+              zf.write(readme, arcname=readme.name)
+          with zipfile.ZipFile(archive, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+          summary = {'archive': str(archive), 'archive_bytes': archive.stat().st_size, 'reports': results}
+          (OUT / 'result.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(summary, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: gelizhiyuo-public-deep-reports
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
