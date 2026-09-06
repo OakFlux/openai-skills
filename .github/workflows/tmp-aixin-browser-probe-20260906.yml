@@ -1,0 +1,140 @@
+name: Temporary Aixin public report browser probe
+
+on:
+  push:
+    branches:
+      - tmp-aixin-reportify-js-probe-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet playwright requests beautifulsoup4 pypdf
+          python -m playwright install --with-deps chromium
+      - name: Probe viewers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import io, json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+          from pypdf import PdfReader
+
+          out=Path('output'); out.mkdir(exist_ok=True)
+          targets={
+            'vzkoo_guosheng':'https://www.vzkoo.com/document/1126926038310001149384a3edee.html',
+            'reportify_guosheng':'https://reportify.cn/reports/1278761946887360512',
+            'reportify_guotai':'https://reportify.cn/reports/1262379005902983168',
+            'reportify_zhongyou':'https://reportify.cn/reports/1246890949045522432',
+            'fx_guotai':'https://www.fxbaogao.com/detail/5472548',
+            'fx_guosheng_update':'https://www.fxbaogao.com/detail/5605896',
+          }
+          summary={}
+          with sync_playwright() as p:
+            browser=p.chromium.launch(headless=True,args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'])
+            for name,url in targets.items():
+              print('START',name,url,flush=True)
+              context=browser.new_context(
+                viewport={'width':1440,'height':1100},
+                locale='zh-CN',
+                timezone_id='Asia/Shanghai',
+                accept_downloads=True,
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                extra_http_headers={'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+              )
+              context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+              page=context.new_page()
+              responses=[]
+              def on_response(resp):
+                low=resp.url.lower()
+                if any(k in low for k in ['.pdf','download','document','report','attachment','preview','page','image','api']):
+                  responses.append({'url':resp.url,'status':resp.status,'content_type':resp.headers.get('content-type','')})
+              page.on('response',on_response)
+              row={'url':url}
+              downloads=[]
+              try:
+                r=page.goto(url,wait_until='domcontentloaded',timeout=120000)
+                row['goto_status']=r.status if r else None
+                try: page.wait_for_load_state('networkidle',timeout=40000)
+                except PWTimeout: row['networkidle_timeout']=True
+                page.wait_for_timeout(8000)
+                row['final_url']=page.url
+                row['title']=page.title()
+                html=page.content()
+                row['html_len']=len(html)
+                (out/f'{name}.html').write_text(html,encoding='utf-8')
+                page.screenshot(path=str(out/f'{name}.png'),full_page=True)
+                row['body_text']=page.locator('body').inner_text()[:20000]
+                # Gather candidate URLs from DOM and network.
+                attrs=page.eval_on_selector_all('a,iframe,embed,object,img,source,script,link','els => els.flatMap(e => [e.href,e.src,e.data,e.getAttribute("data-src"),e.getAttribute("data-url"),e.getAttribute("data-pdf")]).filter(Boolean)')
+                candidates=[]
+                for u in attrs+[x['url'] for x in responses]:
+                  if not isinstance(u,str): continue
+                  u=urljoin(page.url,u)
+                  low=u.lower()
+                  if any(k in low for k in ['.pdf','download','document','attachment','report-image','preview','page/','api/']):
+                    if u not in candidates: candidates.append(u)
+                row['candidates']=candidates[:1000]
+                row['responses']=responses[-1000:]
+                # Click visible download-like controls only; no login or access-control bypass.
+                locators=[
+                  page.get_by_text(re.compile('下载|Download',re.I)),
+                  page.locator('a[href*="download"],button:has-text("下载"),a:has-text("下载")'),
+                ]
+                seen=set()
+                for loc in locators:
+                  try: count=min(loc.count(),20)
+                  except Exception: count=0
+                  for i in range(count):
+                    item=loc.nth(i)
+                    try:
+                      txt=(item.inner_text(timeout=2000) or '').strip()
+                      key=(txt,item.get_attribute('href'))
+                      if key in seen: continue
+                      seen.add(key)
+                      if not item.is_visible(): continue
+                      print('CLICK_CANDIDATE',name,i,txt,key[1],flush=True)
+                      try:
+                        with page.expect_download(timeout=12000) as pending:
+                          item.click(timeout=8000)
+                        dl=pending.value
+                        target=out/f'{name}_{len(downloads)+1}_{dl.suggested_filename}'
+                        dl.save_as(str(target))
+                        data=target.read_bytes()
+                        info={'file':target.name,'bytes':len(data),'suggested':dl.suggested_filename}
+                        if b'%PDF-' in data[:1024]:
+                          info['pages']=len(PdfReader(io.BytesIO(data),strict=False).pages)
+                        downloads.append(info)
+                        print('DOWNLOAD_OK',name,json.dumps(info,ensure_ascii=False),flush=True)
+                      except Exception as e:
+                        print('CLICK_NO_DOWNLOAD',name,txt,repr(e),flush=True)
+                    except Exception as e:
+                      print('CLICK_ERROR',name,i,repr(e),flush=True)
+                row['downloads']=downloads
+              except Exception as e:
+                row['error']=repr(e)
+                print('TARGET_ERROR',name,repr(e),flush=True)
+              summary[name]=row
+              (out/f'{name}.json').write_text(json.dumps(row,ensure_ascii=False,indent=2),encoding='utf-8')
+              context.close()
+            browser.close()
+          (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:{x:v.get(x) for x in ['title','goto_status','final_url','error','downloads']} for k,v in summary.items()},ensure_ascii=False,indent=2),flush=True)
+          PY
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: aixin-browser-probe
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
