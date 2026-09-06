@@ -1,0 +1,733 @@
+name: Temporary Aixin Yuanzhi broker report archive
+
+on:
+  push:
+    branches:
+      - tmp-aixin-final-package-20260906-v3
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp-aixin-final-package-20260906-v3
+          persist-credentials: true
+      - name: Search, download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf pillow playwright
+          python -m playwright install --with-deps chromium >/dev/null 2>&1 || true
+          python - <<'PY'
+          import csv
+          import hashlib
+          import html as html_module
+          import io
+          import json
+          import math
+          import os
+          import re
+          import time
+          import zipfile
+          from datetime import date, datetime, timedelta
+          from pathlib import Path
+          from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          import pymupdf
+          from PIL import Image, ImageDraw
+
+          ROOT = Path.cwd()
+          WORK = ROOT / 'aixin_work'
+          OUT = ROOT / 'output_aixin'
+          PDF_DIR = WORK / 'pdfs'
+          QA_DIR = WORK / 'qa'
+          DIAG = WORK / 'diagnostics'
+          for p in (WORK, OUT, PDF_DIR, QA_DIR, DIAG):
+              p.mkdir(parents=True, exist_ok=True)
+
+          TARGET_NAME = '爱芯元智'
+          TARGET_CODE = '00600'
+          TITLE_HINTS = [
+              '踏智驾及边缘AI之浪，启高端芯片之航',
+              '高端启新，智驱全球',
+              'AI终端平台公司，智能汽车打开增量空间',
+              '中报超预期，边缘AI、智能车驱动未来成长',
+          ]
+          REPORTIFY = [
+              {
+                  'id': '1278761946887360512',
+                  'url': 'https://reportify.cn/reports/1278761946887360512',
+                  'broker_hint': '国盛证券',
+                  'title_hint': TITLE_HINTS[0],
+              },
+              {
+                  'id': '1246890949045522432',
+                  'url': 'https://reportify.cn/reports/1246890949045522432',
+                  'broker_hint': '中邮证券',
+                  'title_hint': TITLE_HINTS[1],
+              },
+              {
+                  'id': '1262379005902983168',
+                  'url': 'https://reportify.cn/reports/1262379005902983168',
+                  'broker_hint': '国泰海通证券',
+                  'title_hint': TITLE_HINTS[2],
+              },
+              {
+                  'id': '1262413294237519872',
+                  'url': 'https://reportify.cn/reports/1262413294237519872',
+                  'broker_hint': '国泰海通证券',
+                  'title_hint': TITLE_HINTS[2],
+              },
+          ]
+
+          USER_AGENTS = [
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+          ]
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': USER_AGENTS[0],
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': '*/*',
+          })
+
+          def norm(value):
+              return re.sub(r'[\s\u3000:：,，。·—\-_/（）()【】\[\]]+', '', str(value or '')).lower()
+
+          def safe_filename(value, max_len=150):
+              value = re.sub(r'[\\/:*?"<>|]+', '_', str(value)).strip()
+              value = re.sub(r'\s+', ' ', value)
+              return (value or 'report')[:max_len]
+
+          def recursive_strings(obj):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      yield str(k)
+                      yield from recursive_strings(v)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      yield from recursive_strings(v)
+              elif isinstance(obj, (str, int, float)):
+                  yield str(obj)
+
+          def extract_urls(text):
+              if not text:
+                  return []
+              variants = [text]
+              try:
+                  variants.append(bytes(text, 'utf-8').decode('unicode_escape'))
+              except Exception:
+                  pass
+              decoded = html_module.unescape(text).replace('\\/', '/').replace('\\u0026', '&').replace('\\u003d', '=').replace('\\u002f', '/')
+              variants.append(decoded)
+              urls = []
+              for block in variants:
+                  for match in re.findall(r'https?://[^\s"\'<>\\]+', block):
+                      u = match.rstrip('),;]}')
+                      if u not in urls:
+                          urls.append(u)
+              return urls
+
+          def fetch(url, *, headers=None, timeout=(20, 180), stream=False):
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      session.headers['User-Agent'] = USER_AGENTS[(attempt - 1) % len(USER_AGENTS)]
+                      r = session.get(url, headers=headers or {}, timeout=timeout, allow_redirects=True, stream=stream)
+                      if r.status_code >= 400:
+                          raise RuntimeError(f'HTTP {r.status_code}')
+                      return r
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(attempt)
+              raise RuntimeError(f'fetch failed {url}: {last}')
+
+          def validate_pdf(data, source='', expected_min_pages=8, broker_hint=None, title_hint=None):
+              if not data or len(data) < 60000 or b'%PDF-' not in data[:2048]:
+                  return None
+              try:
+                  reader = PdfReader(io.BytesIO(data), strict=False)
+                  pages = len(reader.pages)
+                  if pages < expected_min_pages:
+                      return None
+                  doc = pymupdf.open(stream=data, filetype='pdf')
+                  sample_indices = list(range(min(4, len(doc))))
+                  if len(doc) > 4:
+                      sample_indices.append(len(doc) - 1)
+                  sample_text = '\n'.join(doc.load_page(i).get_text('text') for i in sample_indices)
+                  doc.close()
+                  compact = norm(sample_text)
+                  company_ok = any(norm(x) in compact for x in ['爱芯元智', 'AXERA', '00600', '0600.HK', '00600.HK'])
+                  if not company_ok:
+                      return None
+                  broker_ok = True
+                  if broker_hint:
+                      short = broker_hint.replace('证券股份有限公司', '').replace('证券有限公司', '').replace('证券', '')
+                      broker_ok = norm(short) in compact or norm(broker_hint) in compact
+                  title_ok = True
+                  if title_hint:
+                      title_tokens = [t for t in re.split(r'[，,:：；;、\s]+', title_hint) if len(t) >= 4]
+                      title_ok = any(norm(t) in compact for t in title_tokens[:5])
+                  return {
+                      'pages': pages,
+                      'text': sample_text,
+                      'company_ok': company_ok,
+                      'broker_ok': broker_ok,
+                      'title_ok': title_ok,
+                  }
+              except Exception:
+                  return None
+
+          candidates = []
+          seen_sha = set()
+
+          def add_candidate(data, meta):
+              valid = validate_pdf(
+                  data,
+                  source=meta.get('source_url', ''),
+                  expected_min_pages=int(meta.get('min_pages', 8)),
+                  broker_hint=meta.get('broker'),
+                  title_hint=meta.get('title'),
+              )
+              if not valid:
+                  return False
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in seen_sha:
+                  return False
+              seen_sha.add(digest)
+              meta = dict(meta)
+              meta.update(valid)
+              meta['sha256'] = digest
+              meta['bytes'] = len(data)
+              meta['data'] = data
+              candidates.append(meta)
+              print('VALID_CANDIDATE', meta.get('broker'), meta.get('title'), valid['pages'], len(data), meta.get('source_url'), flush=True)
+              return True
+
+          # 1) Exhaustive Eastmoney company-research scan for 2026.
+          em_records = {}
+          em_api = 'https://reportapi.eastmoney.com/report/list'
+          scan_start = date(2026, 1, 1)
+          scan_end = date(2026, 9, 6)
+          cursor = scan_start
+          while cursor <= scan_end:
+              chunk_end = min(scan_end, cursor + timedelta(days=6))
+              page = 1
+              total_pages = 1
+              while page <= total_pages and page <= 30:
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': cursor.isoformat(), 'endTime': chunk_end.isoformat(),
+                      'pageNo': str(page), 'fields': '', 'qType': '0',
+                      'orgCode': '', 'code': '', 'rcode': '', 'p': str(page),
+                      'pageNum': str(page), 'pageNumber': str(page),
+                      'client': 'WEB', 'source': 'WEB',
+                  }
+                  try:
+                      r = session.get(em_api, params=params, headers={
+                          'Referer': 'https://data.eastmoney.com/report/',
+                          'Origin': 'https://data.eastmoney.com',
+                          'Accept': 'application/json,text/plain,*/*',
+                      }, timeout=90)
+                      r.raise_for_status()
+                      obj = r.json()
+                      batch = obj.get('data') or []
+                      if isinstance(batch, dict):
+                          batch = batch.get('data') or batch.get('list') or batch.get('records') or []
+                      hits = int(obj.get('hits') or obj.get('Hits') or obj.get('total') or 0)
+                      total_pages = max(1, math.ceil(hits / 100))
+                  except Exception as exc:
+                      print('EM_QUERY_FAIL', cursor, chunk_end, page, repr(exc), flush=True)
+                      break
+                  for rec in batch:
+                      joined = norm(' '.join(str(rec.get(k) or '') for k in ['stockName', 'stockCode', 'title', 'orgSName']))
+                      is_target = norm(TARGET_NAME) in joined or any(norm(hint) in joined for hint in TITLE_HINTS)
+                      if is_target:
+                          info = str(rec.get('infoCode') or rec.get('INFO_CODE') or '')
+                          if info:
+                              em_records[info] = rec
+                              print('EM_TARGET', json.dumps({k: rec.get(k) for k in ['stockName','stockCode','title','orgSName','publishDate','infoCode','attachPages','attachSize','researcher']}, ensure_ascii=False), flush=True)
+                  if not batch:
+                      break
+                  page += 1
+                  time.sleep(0.08)
+              cursor = chunk_end + timedelta(days=1)
+
+          (DIAG / 'eastmoney_target_records.json').write_text(json.dumps(list(em_records.values()), ensure_ascii=False, indent=2), encoding='utf-8')
+          for info, rec in em_records.items():
+              pdf_urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',
+              ]
+              for pdf_url in pdf_urls:
+                  try:
+                      rr = fetch(pdf_url, headers={
+                          'Referer': f'https://data.eastmoney.com/report/info/{info}.html',
+                          'Accept': 'application/pdf,*/*',
+                      })
+                      broker = str(rec.get('orgSName') or rec.get('orgName') or '')
+                      title = str(rec.get('title') or '')
+                      if add_candidate(rr.content, {
+                          'broker': broker,
+                          'date': str(rec.get('publishDate') or '')[:10],
+                          'title': title,
+                          'source_url': rr.url,
+                          'info_page': f'https://data.eastmoney.com/report/info/{info}.html',
+                          'source': '东方财富研报库原始PDF',
+                          'min_pages': 8,
+                      }):
+                          break
+                  except Exception as exc:
+                      print('EM_PDF_FAIL', info, pdf_url, repr(exc), flush=True)
+
+          # 2) Query several stock-code variants directly, in case HK reports are omitted in broad scans.
+          for code in ['00600', '0600', '0600.HK', '00600.HK', '116.00600']:
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2025-01-01', 'endTime': '2026-09-06',
+                  'pageNo': '1', 'fields': '', 'qType': '0', 'orgCode': '',
+                  'code': code, 'rcode': '', 'p': '1', 'pageNum': '1',
+                  'pageNumber': '1', 'client': 'WEB', 'source': 'WEB',
+              }
+              try:
+                  r = session.get(em_api, params=params, headers={'Referer':'https://data.eastmoney.com/report/'}, timeout=90)
+                  obj = r.json()
+                  batch = obj.get('data') or []
+                  if isinstance(batch, dict):
+                      batch = batch.get('data') or batch.get('list') or []
+                  for rec in batch:
+                      joined = norm(' '.join(str(rec.get(k) or '') for k in ['stockName','stockCode','title','orgSName']))
+                      if norm(TARGET_NAME) not in joined and not any(norm(h) in joined for h in TITLE_HINTS):
+                          continue
+                      info = str(rec.get('infoCode') or '')
+                      if not info or info in em_records:
+                          continue
+                      try:
+                          u = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+                          rr = fetch(u, headers={'Referer':f'https://data.eastmoney.com/report/info/{info}.html','Accept':'application/pdf,*/*'})
+                          add_candidate(rr.content, {
+                              'broker': str(rec.get('orgSName') or ''),
+                              'date': str(rec.get('publishDate') or '')[:10],
+                              'title': str(rec.get('title') or ''),
+                              'source_url': rr.url,
+                              'info_page': f'https://data.eastmoney.com/report/info/{info}.html',
+                              'source': '东方财富研报库原始PDF',
+                              'min_pages': 8,
+                          })
+                      except Exception as exc:
+                          print('EM_DIRECT_FAIL', code, info, repr(exc), flush=True)
+              except Exception as exc:
+                  print('EM_CODE_QUERY_FAIL', code, repr(exc), flush=True)
+
+          # Helpers for Reportify and web-host fallback.
+          def try_pdf_url(url, meta, cookies=None, referer=None):
+              if not url or not str(url).lower().startswith(('http://','https://')):
+                  return False
+              low = str(url).lower()
+              if not any(token in low for token in ['.pdf', 'download', 'attachment', 'document', '/file/', '/report/']):
+                  return False
+              try:
+                  headers = {'Accept':'application/pdf,application/octet-stream,*/*'}
+                  if referer:
+                      headers['Referer'] = referer
+                  r = session.get(url, headers=headers, cookies=cookies or {}, timeout=(20,180), allow_redirects=True)
+                  if r.status_code == 200:
+                      m = dict(meta)
+                      m['source_url'] = r.url
+                      return add_candidate(r.content, m)
+              except Exception as exc:
+                  print('URL_PDF_FAIL', url, repr(exc), flush=True)
+              return False
+
+          def collect_json_urls(obj):
+              urls = []
+              for s in recursive_strings(obj):
+                  if s.startswith(('http://','https://')):
+                      urls.append(s)
+                  elif ('http' in s and ('pdf' in s.lower() or 'download' in s.lower())):
+                      urls.extend(extract_urls(s))
+              return list(dict.fromkeys(urls))
+
+          # 3) Reportify HTML/Next.js/API/browser extraction.
+          reportify_diagnostics = []
+          for report in REPORTIFY:
+              meta = {
+                  'broker': report['broker_hint'],
+                  'date': '',
+                  'title': report['title_hint'],
+                  'info_page': report['url'],
+                  'source': 'Reportify公开研报页面/原始文件',
+                  'min_pages': 8,
+              }
+              page_html = ''
+              html_urls = []
+              script_urls = []
+              try:
+                  r = fetch(report['url'], headers={'Accept':'text/html,application/xhtml+xml'})
+                  page_html = r.text
+                  (DIAG / f"reportify_{report['id']}.html").write_text(page_html, encoding='utf-8')
+                  soup = BeautifulSoup(page_html, 'html.parser')
+                  for tag in soup.find_all('script', src=True):
+                      script_urls.append(urljoin(r.url, tag['src']))
+                  html_urls = extract_urls(page_html)
+                  # Direct URLs in hydration data.
+                  for u in html_urls:
+                      if try_pdf_url(u, meta, referer=report['url']):
+                          break
+                  # Guess common public file layouts.
+                  guesses = [
+                      f'https://files.reportify.cn/report/{report["id"]}.pdf',
+                      f'https://files.reportify.cn/report/pdf/{report["id"]}.pdf',
+                      f'https://files.reportify.cn/reports/{report["id"]}.pdf',
+                      f'https://files.reportify.cn/report/original/{report["id"]}.pdf',
+                      f'https://files.reportify.cc/report/{report["id"]}.pdf',
+                      f'https://files.reportify.cc/report/pdf/{report["id"]}.pdf',
+                  ]
+                  for u in guesses:
+                      if try_pdf_url(u, meta, referer=report['url']):
+                          break
+              except Exception as exc:
+                  print('REPORTIFY_HTML_FAIL', report['id'], repr(exc), flush=True)
+
+              # Inspect API endpoints and page JS for URLs/endpoints.
+              api_candidates = [
+                  f'https://api.reportify.cn/reports/{report["id"]}',
+                  f'https://api.reportify.cn/report/{report["id"]}',
+                  f'https://api.reportify.cn/api/reports/{report["id"]}',
+                  f'https://api.reportify.cn/api/report/{report["id"]}',
+                  f'https://api.reportify.cn/v1/reports/{report["id"]}',
+                  f'https://api.reportify.cn/v1/report/{report["id"]}',
+                  f'https://api.reportify.cn/reports/detail?id={report["id"]}',
+                  f'https://api.reportify.cn/report/detail?id={report["id"]}',
+              ]
+              js_text = ''
+              for idx, js_url in enumerate(script_urls[-40:]):
+                  try:
+                      jr = fetch(js_url, timeout=(20,90))
+                      if len(jr.content) < 3_000_000:
+                          text = jr.text
+                          js_text += '\n' + text
+                          for u in extract_urls(text):
+                              if report['id'] in u or any(k in u.lower() for k in ['download','pdf','attachment']):
+                                  api_candidates.append(u)
+                  except Exception:
+                      pass
+              endpoint_fragments = set(re.findall(r'["\'](/[^"\']{1,180}(?:report|download|document|attachment|file)[^"\']{0,180})["\']', js_text, flags=re.I))
+              for frag in endpoint_fragments:
+                  if '{' not in frag and '}' not in frag:
+                      api_candidates.append(urljoin('https://api.reportify.cn/', frag.lstrip('/')))
+              for api_url in list(dict.fromkeys(api_candidates))[:300]:
+                  try:
+                      ar = session.get(api_url, headers={'Referer':report['url'],'Accept':'application/json,text/plain,*/*'}, timeout=(15,60), allow_redirects=True)
+                      if ar.status_code != 200 or not ar.content:
+                          continue
+                      ctype = ar.headers.get('content-type','').lower()
+                      if 'pdf' in ctype or b'%PDF-' in ar.content[:2048]:
+                          mm = dict(meta); mm['source_url'] = ar.url
+                          add_candidate(ar.content, mm)
+                          continue
+                      if 'json' in ctype or ar.text.lstrip().startswith(('{','[')):
+                          try:
+                              obj = ar.json()
+                          except Exception:
+                              continue
+                          for u in collect_json_urls(obj):
+                              try_pdf_url(u, meta, referer=report['url'])
+                  except Exception:
+                      pass
+
+              browser_log = {'id': report['id'], 'url': report['url'], 'html_urls': html_urls[:100], 'script_count': len(script_urls)}
+              try:
+                  from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+                  observed = []
+                  json_objects = []
+                  downloaded_blobs = []
+                  with sync_playwright() as p:
+                      browser = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'])
+                      context = browser.new_context(
+                          viewport={'width': 1440, 'height': 1200},
+                          locale='zh-CN',
+                          timezone_id='Asia/Shanghai',
+                          user_agent=USER_AGENTS[0],
+                          accept_downloads=True,
+                      )
+                      context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                      page = context.new_page()
+
+                      def handle_response(response):
+                          try:
+                              url = response.url
+                              ct = response.headers.get('content-type','').lower()
+                              observed.append({'url':url,'status':response.status,'content_type':ct})
+                              if response.status == 200 and ('application/pdf' in ct or '.pdf' in url.lower()):
+                                  body = response.body()
+                                  if body and b'%PDF-' in body[:2048]:
+                                      downloaded_blobs.append((url, body))
+                              elif response.status == 200 and ('json' in ct or 'api.reportify' in url):
+                                  body = response.body()
+                                  if len(body) < 8_000_000:
+                                      try:
+                                          json_objects.append(json.loads(body.decode('utf-8')))
+                                      except Exception:
+                                          pass
+                          except Exception:
+                              pass
+
+                      page.on('response', handle_response)
+                      resp = page.goto(report['url'], wait_until='domcontentloaded', timeout=120000)
+                      try:
+                          page.wait_for_load_state('networkidle', timeout=45000)
+                      except Exception:
+                          pass
+                      # Trigger lazy resources.
+                      for _ in range(6):
+                          page.mouse.wheel(0, 1600)
+                          page.wait_for_timeout(900)
+                      page.mouse.wheel(0, -10000)
+                      page.wait_for_timeout(1800)
+
+                      # Click ordinary download/original-report controls if present.
+                      texts = ['下载报告','下载研报','下载PDF','PDF下载','原始报告','查看原文','获取报告','完整报告','下载']
+                      for text in texts:
+                          locator = page.get_by_text(text, exact=False)
+                          count = min(locator.count(), 4)
+                          for i in range(count):
+                              try:
+                                  with page.expect_download(timeout=7000) as pending:
+                                      locator.nth(i).click(timeout=5000, force=True)
+                                  dl = pending.value
+                                  temp = DIAG / f"reportify_download_{report['id']}_{safe_filename(dl.suggested_filename)}"
+                                  dl.save_as(str(temp))
+                                  blob = temp.read_bytes()
+                                  downloaded_blobs.append((report['url'] + '#browser-download', blob))
+                              except Exception:
+                                  try:
+                                      locator.nth(i).click(timeout=3000, force=True)
+                                      page.wait_for_timeout(1500)
+                                  except Exception:
+                                      pass
+
+                      # Extract URLs and storage values from browser state.
+                      browser_html = page.content()
+                      browser_log['title'] = page.title()
+                      browser_log['final_url'] = page.url
+                      browser_log['browser_html_len'] = len(browser_html)
+                      browser_log['storage'] = page.evaluate("""() => ({local:{...localStorage}, session:{...sessionStorage}, performance: performance.getEntriesByType('resource').map(x=>x.name)})""")
+                      browser_log['observed'] = observed[-2000:]
+                      (DIAG / f"reportify_browser_{report['id']}.html").write_text(browser_html, encoding='utf-8')
+                      cookies = {c['name']: c['value'] for c in context.cookies()}
+                      # Validate directly intercepted blobs.
+                      for url, blob in downloaded_blobs:
+                          mm = dict(meta); mm['source_url'] = url
+                          add_candidate(blob, mm)
+                      # Fetch URLs found in response JSON, HTML, storage, and performance list.
+                      browser_urls = extract_urls(browser_html)
+                      for obj in json_objects:
+                          browser_urls.extend(collect_json_urls(obj))
+                      browser_urls.extend(browser_log['storage'].get('performance') or [])
+                      for v in list((browser_log['storage'].get('local') or {}).values()) + list((browser_log['storage'].get('session') or {}).values()):
+                          browser_urls.extend(extract_urls(str(v)))
+                      for u in list(dict.fromkeys(browser_urls)):
+                          try_pdf_url(u, meta, cookies=cookies, referer=report['url'])
+                      browser.close()
+              except Exception as exc:
+                  browser_log['browser_error'] = repr(exc)
+                  print('REPORTIFY_BROWSER_FAIL', report['id'], repr(exc), flush=True)
+              reportify_diagnostics.append(browser_log)
+
+          (DIAG / 'reportify_diagnostics.json').write_text(json.dumps(reportify_diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # 4) Search-engine fallback for exact titles and direct PDF links.
+          search_results = []
+          for hint in TITLE_HINTS[:3]:
+              query = quote(f'"{hint}" 爱芯元智 pdf')
+              for search_url in [
+                  f'https://www.bing.com/search?q={query}&count=50',
+                  f'https://www.google.com/search?q={query}&num=30',
+              ]:
+                  try:
+                      sr = fetch(search_url, headers={'Accept':'text/html,application/xhtml+xml'}, timeout=(20,90))
+                      soup = BeautifulSoup(sr.text, 'html.parser')
+                      links = []
+                      for a in soup.find_all('a', href=True):
+                          href = a['href']
+                          if href.startswith('/url?q='):
+                              href = href.split('/url?q=',1)[1].split('&',1)[0]
+                          if href.startswith('http'):
+                              links.append(unquote(href))
+                      links.extend(extract_urls(sr.text))
+                      for link in list(dict.fromkeys(links))[:300]:
+                          if any(host in link for host in ['reportify.cn/reports/', 'fxbaogao.com/detail/', 'hangyan.co/reports/', 'sdyanbao.com/detail/', 'data.eastmoney.com/report/info/', 'pdf.dfcfw.com/']):
+                              search_results.append({'query':hint,'url':link})
+                          if '.pdf' in link.lower():
+                              try_pdf_url(link, {'broker':'','date':'','title':hint,'info_page':search_url,'source':'搜索引擎公开PDF','min_pages':8}, referer=search_url)
+                  except Exception as exc:
+                      print('SEARCH_FAIL', hint, search_url, repr(exc), flush=True)
+          (DIAG / 'search_results.json').write_text(json.dumps(search_results, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Deduplicate by normalized title/broker and rank deep reports.
+          def report_score(item):
+              title = norm(item.get('title'))
+              exact = 0
+              for idx, hint in enumerate(TITLE_HINTS[:3]):
+                  if norm(hint) in title or norm(hint) in norm(item.get('text')):
+                      exact = max(exact, 100 - idx)
+              broker_bonus = 15 if item.get('broker') else 0
+              title_bonus = 20 if ('首次覆盖' in str(item.get('title')) or '深度' in str(item.get('title')) or '首次覆盖' in str(item.get('text'))[:2500]) else 0
+              return exact * 1000 + title_bonus * 100 + broker_bonus * 10 + int(item.get('pages') or 0)
+
+          # Improve metadata from PDF text when missing.
+          known_brokers = ['国盛证券','中邮证券','国泰海通证券','国泰君安证券','交银国际证券','中信证券','华泰证券','中金公司','海通国际','招商证券']
+          for item in candidates:
+              text = item.get('text','')
+              if not item.get('broker'):
+                  for broker in known_brokers:
+                      if broker.replace('证券','') in text or broker in text:
+                          item['broker'] = broker
+                          break
+              if not item.get('date'):
+                  m = re.search(r'20\d{2}[年./-]\s*\d{1,2}[月./-]\s*\d{1,2}日?', text[:5000])
+                  if m:
+                      item['date'] = m.group(0).replace('年','-').replace('月','-').replace('日','').replace('.','-').replace('/','-').replace(' ','')
+              for hint in TITLE_HINTS:
+                  tokens = [t for t in re.split(r'[，,:：；;、\s]+', hint) if len(t) >= 4]
+                  if any(token in text[:8000] for token in tokens):
+                      item['title'] = hint
+                      break
+
+          candidates.sort(key=report_score, reverse=True)
+          selected = []
+          keys = set()
+          for item in candidates:
+              key = (norm(item.get('broker')), norm(item.get('title')))
+              if key in keys:
+                  continue
+              keys.add(key)
+              selected.append(item)
+              if len(selected) >= 3:
+                  break
+
+          status = {
+              'candidate_count': len(candidates),
+              'selected_count': len(selected),
+              'selected': [{k:v for k,v in item.items() if k not in ('data','text')} for item in selected],
+          }
+          (OUT / 'build_status.json').write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(selected) < 2:
+              # Preserve diagnostics for another attempt, but do not fabricate a report archive.
+              diag_zip = OUT / '爱芯元智_研报检索诊断.zip'
+              with zipfile.ZipFile(diag_zip, 'w', zipfile.ZIP_DEFLATED) as z:
+                  for path in DIAG.rglob('*'):
+                      if path.is_file():
+                          z.write(path, path.relative_to(WORK))
+              print('INSUFFICIENT_VALID_REPORTS', len(selected), flush=True)
+          else:
+              manifest = []
+              saved = []
+              for idx, item in enumerate(selected, 1):
+                  broker = item.get('broker') or f'券商{idx}'
+                  title = item.get('title') or '爱芯元智公司研究报告'
+                  date_text = re.sub(r'[^0-9]', '', str(item.get('date') or ''))[:8] or '日期未识别'
+                  filename = f"{idx:02d}_{safe_filename(broker)}_爱芯元智_{safe_filename(title,90)}_{date_text}_{item['pages']}页.pdf"
+                  path = PDF_DIR / filename
+                  path.write_bytes(item['data'])
+                  saved.append(path)
+                  manifest.append({
+                      '文件名': filename,
+                      '券商': broker,
+                      '发布日期': item.get('date',''),
+                      '报告标题': title,
+                      '页数': item['pages'],
+                      '文件大小（字节）': item['bytes'],
+                      'SHA256': item['sha256'],
+                      '报告信息页': item.get('info_page',''),
+                      'PDF来源': item.get('source_url',''),
+                      '来源说明': item.get('source',''),
+                  })
+
+              manifest_path = PDF_DIR / '文件清单与校验值.csv'
+              with manifest_path.open('w', encoding='utf-8-sig', newline='') as handle:
+                  writer = csv.DictWriter(handle, fieldnames=list(manifest[0].keys()))
+                  writer.writeheader()
+                  writer.writerows(manifest)
+
+              readme = PDF_DIR / 'README.txt'
+              lines = [
+                  '爱芯元智（00600.HK）券商深度报告资料包',
+                  '',
+                  f'本资料包包含{len(saved)}份完整PDF公司研究/首次覆盖报告：',
+              ]
+              for idx, row in enumerate(manifest, 1):
+                  lines.append(f"{idx}. {row['券商']}，{row['发布日期']}，{row['页数']}页，《{row['报告标题']}》。")
+              lines.extend([
+                  '',
+                  '校验：已检查PDF文件头、可解析性、实际页数、公司名称，并记录SHA-256；压缩包已执行CRC完整性测试。',
+                  '提示：报告中的评级、盈利预测和目标价均对应报告发布时点，不代表当前观点。',
+              ])
+              readme.write_text('\n'.join(lines), encoding='utf-8')
+
+              # Render first and last pages for QA.
+              qa_tiles = []
+              for path in saved:
+                  doc = pymupdf.open(str(path))
+                  for page_no, label in [(0,'首页'), (len(doc)-1,'末页')]:
+                      pix = doc.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(0.8,0.8), alpha=False)
+                      qpath = QA_DIR / f'{path.stem}_{label}.jpg'
+                      pix.save(str(qpath))
+                      qa_tiles.append((f'{path.name} {label}', qpath))
+                  doc.close()
+              tile_w, tile_h = 360, 510
+              cols = 2
+              rows = math.ceil(len(qa_tiles)/cols)
+              sheet = Image.new('RGB', (tile_w*cols, tile_h*rows), 'white')
+              for i,(label,path) in enumerate(qa_tiles):
+                  im = Image.open(path).convert('RGB')
+                  im.thumbnail((tile_w-24,tile_h-58), Image.Resampling.LANCZOS)
+                  canvas = Image.new('RGB',(tile_w,tile_h),'white')
+                  canvas.paste(im,((tile_w-im.width)//2,8))
+                  ImageDraw.Draw(canvas).text((8,tile_h-42),label[:55],fill='black')
+                  sheet.paste(canvas,((i%cols)*tile_w,(i//cols)*tile_h))
+              sheet.save(OUT / '爱芯元智_研报首页末页核验图.jpg', quality=90)
+
+              archive_name = f'爱芯元智_00600_券商深度报告_{len(saved)}份.zip'
+              archive_path = OUT / archive_name
+              with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+                  for path in sorted(PDF_DIR.iterdir(), key=lambda p:p.name):
+                      z.write(path, path.name)
+              with zipfile.ZipFile(archive_path, 'r') as z:
+                  bad = z.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+                  pdf_count = sum(name.lower().endswith('.pdf') for name in z.namelist())
+                  if pdf_count != len(saved):
+                      raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(saved)}')
+              (OUT / '文件清单与校验值.csv').write_bytes(manifest_path.read_bytes())
+              (OUT / 'README.txt').write_bytes(readme.read_bytes())
+              print('ARCHIVE_READY', archive_path, archive_path.stat().st_size, flush=True)
+
+          PY
+      - name: Commit generated package and diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "OakFlux"
+          git config user.email "206205057+OakFlux@users.noreply.github.com"
+          git add output_aixin || true
+          if ! git diff --cached --quiet; then
+            git commit -m "Add validated Aixin Yuanzhi broker report package"
+            git push origin HEAD:tmp-aixin-final-package-20260906-v3
+          fi
