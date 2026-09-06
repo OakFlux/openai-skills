@@ -1,0 +1,175 @@
+name: chatgpt-temp-jinjing-build-public-reports
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-jinjing-build-public-reports.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and assemble public report previews
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml pillow pypdf playwright
+          python <<'PY'
+          import asyncio, hashlib, io, json, os, re, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+          from playwright.async_api import async_playwright
+
+          root=Path('jinjing_public_broker_reports'); pdfdir=root/'PDF'; rawdir=root/'raw'
+          pdfdir.mkdir(parents=True,exist_ok=True); rawdir.mkdir(parents=True,exist_ok=True)
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          logs=[]; manifest=[]
+          def L(x): x=str(x); print(x); logs.append(x)
+          def save_pdf_from_images(images, outpath):
+              rgbs=[]
+              for im in images:
+                  if im.mode!='RGB': im=im.convert('RGB')
+                  rgbs.append(im.copy())
+              if not rgbs: raise RuntimeError('no images')
+              rgbs[0].save(outpath,'PDF',save_all=True,append_images=rgbs[1:],resolution=160.0)
+              return len(PdfReader(str(outpath),strict=False).pages)
+          def valid_page(content):
+              try:
+                  im=Image.open(io.BytesIO(content)); im.load()
+                  if im.width<700 or im.height<900: return None
+                  t=im.convert('L').resize((32,32)); sd=ImageStat.Stat(t).stddev[0]
+                  if sd<4: return None
+                  return im
+              except Exception: return None
+
+          fx_reports=[
+            {'id':'4861107','date':'2025-05-25','broker':'国金证券','title':'港股市场点评报告：6月下一个审议考察期——潜在“入通”的港股标的梳理','detail':'https://www.fxbaogao.com/detail/4861107'},
+            {'id':'4870658','date':'2025-05-28','broker':'东吴证券','title':'港股通调整预测（2025年6月）','detail':'https://www.fxbaogao.com/detail/4870658'},
+          ]
+          for rep in fx_reports:
+              rid=rep['id']; d=s.get(rep['detail'],timeout=60); (rawdir/f'{rid}_detail.html').write_bytes(d.content)
+              api='https://api.fxbaogao.com/mofoun/report/report/getReportPreviewImages'
+              rr=s.get(api,params={'reportId':rid},headers={'Referer':rep['detail'],'Origin':'https://www.fxbaogao.com','Accept':'application/json,text/plain,*/*'},timeout=60)
+              L(f'FX API {rid} status={rr.status_code} bytes={len(rr.content)} text={rr.text[:500]}')
+              obj=rr.json(); paths=obj.get('data') or []
+              if not isinstance(paths,list): paths=[]
+              images=[]; urls=[]
+              for j,p in enumerate(paths,1):
+                  if p.startswith('http'): u=p
+                  else: u='https://public.fxbaogao.com/'+p.lstrip('/')
+                  r=s.get(u,headers={'Referer':rep['detail'],'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'},timeout=90)
+                  L(f'FX IMG {rid} {j} status={r.status_code} bytes={len(r.content)} type={r.headers.get("content-type")} url={r.url}')
+                  im=valid_page(r.content)
+                  if im:
+                      (rawdir/f'{rid}_{j:02d}.img').write_bytes(r.content); images.append(im.copy()); urls.append(r.url)
+              if images:
+                  fname=f"{rep['date']}_{rep['broker']}_{rep['title']}_公开试读{len(images)}页.pdf".replace('/','-')
+                  out=pdfdir/fname; pc=save_pdf_from_images(images,out)
+                  data=out.read_bytes()
+                  manifest.append({**rep,'file':fname,'public_preview_pages':pc,'source_urls':urls,'sha256':hashlib.sha256(data).hexdigest(),'size_bytes':len(data),'note':'由来源网站明确公开展示的试读页整理；不是完整报告。'})
+
+          # Sdyanbao: collect only images actually exposed by the public page during normal browsing.
+          sd={'id':'922060','date':'2025-09-23','broker':'申万宏源','title':'2025年9月港股通月报：港股通25年9月调整回顾及26年3月调整测算','detail':'https://www.sdyanbao.com/detail/922060'}
+          async def collect_sd():
+              urls=[]; dom=[]; shots=[]
+              async with async_playwright() as p:
+                  exe=next((x for x in ['/usr/bin/google-chrome','/usr/bin/google-chrome-stable','/usr/bin/chromium'] if os.path.exists(x)),None)
+                  b=await p.chromium.launch(headless=True,executable_path=exe,args=['--no-sandbox','--disable-dev-shm-usage'])
+                  page=await b.new_page(viewport={'width':1440,'height':1000},user_agent=ua,locale='zh-CN')
+                  def onresp(resp):
+                      try:
+                          ct=(resp.headers or {}).get('content-type','').lower(); u=resp.url
+                          if 'image' in ct or re.search(r'\.(?:png|jpe?g|webp|gif)(?:\?|$)',u,re.I):
+                              if u not in urls: urls.append(u)
+                      except: pass
+                  page.on('response',onresp)
+                  await page.goto(sd['detail'],wait_until='domcontentloaded',timeout=90000)
+                  await page.wait_for_timeout(6000)
+                  # Normal public interaction: scroll page and click any visible continue-reading control.
+                  for _ in range(4):
+                      for txt in ['继续阅读','查看更多','展开','下一页']:
+                          try:
+                              loc=page.get_by_text(txt,exact=False)
+                              n=await loc.count()
+                              for i in range(min(n,3)):
+                                  if await loc.nth(i).is_visible():
+                                      await loc.nth(i).click(timeout=1500)
+                                      await page.wait_for_timeout(1000)
+                          except: pass
+                      await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                      await page.wait_for_timeout(2500)
+                  for y in range(0,30000,800):
+                      try: await page.evaluate(f'window.scrollTo(0,{y})')
+                      except: pass
+                      await page.wait_for_timeout(120)
+                  await page.wait_for_timeout(5000)
+                  try:
+                      dom=await page.locator('img').evaluate_all("els=>els.map(e=>({src:e.currentSrc||e.src,data:e.dataset.src||e.dataset.original||'',w:e.naturalWidth,h:e.naturalHeight,alt:e.alt||'',cls:e.className||''})).filter(x=>x.src||x.data)")
+                  except: dom=[]
+                  (rawdir/'922060_dom.json').write_text(json.dumps(dom,ensure_ascii=False,indent=2),encoding='utf-8')
+                  (rawdir/'922060_network_urls.json').write_text(json.dumps(urls,ensure_ascii=False,indent=2),encoding='utf-8')
+                  await page.screenshot(path=str(rawdir/'922060_fullpage.png'),full_page=True)
+                  await b.close()
+              return urls,dom
+          try: sd_urls,sd_dom=asyncio.run(collect_sd())
+          except Exception as e:
+              L('SD BROWSER ERROR '+repr(e)); sd_urls=[];sd_dom=[]
+          for x in sd_dom:
+              u=x.get('src') or x.get('data')
+              if u and u.startswith('//'): u='https:'+u
+              if u and u.startswith('/'): u=urllib.parse.urljoin(sd['detail'],u)
+              if u and u not in sd_urls: sd_urls.append(u)
+          L('SD URL COUNT '+str(len(sd_urls)))
+          fetched=[]
+          for i,u in enumerate(sd_urls):
+              try:
+                  r=s.get(u,headers={'Referer':sd['detail'],'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'},timeout=60)
+                  im=valid_page(r.content)
+                  if im:
+                      thumb=im.convert('L').resize((32,32)); fp=hashlib.sha256(bytes(thumb.getdata())).hexdigest()
+                      fetched.append({'url':r.url,'content':r.content,'im':im.copy(),'w':im.width,'h':im.height,'fp':fp,'bytes':len(r.content)})
+                      L(f'SD VALID {i} {im.width}x{im.height} bytes={len(r.content)} url={r.url}')
+              except Exception as e: L(f'SD IMG ERR {u} {e!r}')
+          # De-duplicate and identify report-page images. Prefer URLs/tags related to report/preview/page.
+          uniq={}
+          for x in fetched:
+              if x['fp'] not in uniq or x['bytes']>uniq[x['fp']]['bytes']: uniq[x['fp']]=x
+          vals=list(uniq.values())
+          preferred=[x for x in vals if any(k in x['url'].lower() for k in ['report','preview','page','pdf','oss','yanbao','file'])]
+          if len(preferred)>=2: vals=preferred
+          # Sort by numeric suffix when present, otherwise retain network order.
+          def key(x):
+              m=re.search(r'(?:page|[-_/])(\d{1,3})(?:\D|$)',x['url'].split('?')[0],re.I)
+              return int(m.group(1)) if m else 9999
+          vals=sorted(vals,key=key)
+          # The source explicitly says 10 preview pages. Keep no more than ten plausible page images.
+          vals=vals[:10]
+          if len(vals)>=2:
+              fname=f"{sd['date']}_{sd['broker']}_{sd['title']}_公开试读{len(vals)}页_原报告17页.pdf".replace('/','-')
+              out=pdfdir/fname; pc=save_pdf_from_images([x['im'] for x in vals],out)
+              data=out.read_bytes()
+              manifest.append({**sd,'file':fname,'original_pages':17,'public_preview_pages':pc,'source_urls':[x['url'] for x in vals],'sha256':hashlib.sha256(data).hexdigest(),'size_bytes':len(data),'note':'由来源网站明确公开展示的试读页整理；不是完整报告。'})
+          else:
+              L(f'SD insufficient page images: {len(vals)}')
+
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          lines=['晋景新能（01783.HK）公开券商研究材料清单','']
+          for i,m in enumerate(manifest,1):
+              lines += [f'{i}. {m["broker"]}｜{m["title"]}',f'   日期：{m["date"]}',f'   文件：{m["file"]}',f'   公开试读页数：{m["public_preview_pages"]}',f'   说明：{m["note"]}',f'   SHA-256：{m["sha256"]}','']
+          lines += ['重要说明：公开检索未发现可合法直接下载的晋景新能单家公司完整券商深度报告。以上均为证券研究机构发布且正文明确涉及晋景新能的港股通研究材料；仅收录来源网站对公众开放的试读页，未绕过登录、会员或付费限制。']
+          (root/'文件清单.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (root/'run.log').write_text('\n'.join(logs),encoding='utf-8')
+          print('FINAL MANIFEST '+json.dumps(manifest,ensure_ascii=False))
+          if len(manifest)<2: raise RuntimeError(f'Only {len(manifest)} reports built')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Jinjing-Envision-Greenwise-Public-Broker-Reports
+          path: jinjing_public_broker_reports
+          retention-days: 1
+          compression-level: 6
