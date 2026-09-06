@@ -1,0 +1,353 @@
+name: Package CR BMT annual and latest reports
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PDF tools
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Discover, download, validate and package official HKEX PDFs
+        run: |
+          mkdir -p out/pdfs out/diagnostics
+          cat > /tmp/package_reports.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import sys
+          import time
+          import zipfile
+          from dataclasses import dataclass
+          from pathlib import Path
+          from typing import Iterable
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          BASE = "https://www1.hkexnews.hk"
+          SEARCH_URL = BASE + "/search/titlesearch.xhtml"
+          STOCK_ID = "38345"
+          STOCK_CODE = "01313"
+          OUT = Path("out")
+          PDF_DIR = OUT / "pdfs"
+          DIAG_DIR = OUT / "diagnostics"
+          UA = (
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36"
+          )
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": UA,
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          @dataclass(frozen=True)
+          class Wanted:
+              key: str
+              label: str
+              filename: str
+              date_from: str
+              date_to: str
+              year: int | None = None
+              kind: str = "annual"
+
+          wanted = [
+              Wanted("annual_2020", "2020年年报", "华润建材科技_2020年年报.pdf", "20210101", "20210630", 2020),
+              Wanted("annual_2021", "2021年年报", "华润建材科技_2021年年报.pdf", "20220101", "20220630", 2021),
+              Wanted("annual_2022", "2022年年报", "华润建材科技_2022年年报.pdf", "20230101", "20230630", 2022),
+              Wanted("annual_2023", "2023年年报", "华润建材科技_2023年年报.pdf", "20240101", "20240630", 2023),
+              Wanted("annual_2024", "2024年年报", "华润建材科技_2024年年报.pdf", "20250101", "20250630", 2024),
+              Wanted("annual_2025", "2025年年报", "华润建材科技_2025年年报.pdf", "20260101", "20260630", 2025),
+              Wanted(
+                  "q1_2026",
+                  "2026年第一季度未经审核财务资料",
+                  "华润建材科技_2026年第一季度未经审核财务资料.pdf",
+                  "20260401",
+                  "20260515",
+                  2026,
+                  "quarterly",
+              ),
+              Wanted(
+                  "interim_2026",
+                  "2026年中期报告（最新完整定期报告）",
+                  "华润建材科技_2026年中期报告_最新完整定期报告.pdf",
+                  "20260801",
+                  "20260906",
+                  2026,
+                  "interim",
+              ),
+          ]
+
+          KNOWN_FALLBACKS = {
+              "annual_2024": "https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0430/2025043000421.pdf",
+              "annual_2025": "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0430/2026043000019.pdf",
+              "q1_2026": "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0424/2026042402528.pdf",
+          }
+
+          def normalize(text: str) -> str:
+              return re.sub(r"\s+", " ", text or "").strip().lower()
+
+          def all_pdf_links(html: str, page_url: str) -> list[dict[str, str]]:
+              soup = BeautifulSoup(html, "html.parser")
+              links: list[dict[str, str]] = []
+              seen: set[str] = set()
+              for a in soup.find_all("a", href=True):
+                  href = urljoin(page_url, a["href"])
+                  text = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
+                  if "/listedco/listconews/" not in href.lower() or ".pdf" not in href.lower():
+                      continue
+                  if href in seen:
+                      continue
+                  seen.add(href)
+                  links.append({"text": text, "url": href})
+              return links
+
+          def is_match(item: Wanted, title: str) -> bool:
+              t = normalize(title)
+              year = str(item.year) if item.year else ""
+              if item.kind == "annual":
+                  return year in t and (
+                      f"annual report {year}" in t
+                      or f"{year} annual report" in t
+                      or (year in t and "annual report" in t)
+                      or (year in t and "年報" in title)
+                      or (year in t and "年度報告" in title)
+                  )
+              if item.kind == "interim":
+                  return year in t and (
+                      "interim report" in t
+                      or "中期報告" in title
+                  )
+              if item.kind == "quarterly":
+                  return (
+                      "three months ended 31 march 2026" in t
+                      and ("unaudited financial information" in t or "financial information" in t)
+                  ) or (
+                      "2026" in t
+                      and ("三個月" in title or "三个月" in title)
+                      and ("未經審核" in title or "未经审核" in title)
+                      and ("財務資料" in title or "财务资料" in title)
+                  )
+              return False
+
+          def search_candidates(item: Wanted) -> list[dict[str, str]]:
+              all_links: list[dict[str, str]] = []
+              for lang in ("ZH", "EN"):
+                  params = {
+                      "category": "0",
+                      "documentType": "-1",
+                      "from": item.date_from,
+                      "lang": lang,
+                      "market": "SEHK",
+                      "searchType": "0",
+                      "stockId": STOCK_ID,
+                      "t1code": "-2",
+                      "t2Gcode": "-2",
+                      "t2code": "-2",
+                      "to": item.date_to,
+                  }
+                  response = session.get(SEARCH_URL, params=params, timeout=90)
+                  print("SEARCH", item.key, lang, response.status_code, len(response.content), response.url)
+                  response.raise_for_status()
+                  (DIAG_DIR / f"{item.key}_{lang}.html").write_bytes(response.content)
+                  links = all_pdf_links(response.text, response.url)
+                  print("PDF_LINKS", item.key, lang, len(links))
+                  for link in links:
+                      print("  LINK", link["text"][:200], link["url"])
+                  for link in links:
+                      if is_match(item, link["text"]):
+                          link = dict(link)
+                          link["lang"] = lang
+                          all_links.append(link)
+                  time.sleep(0.5)
+              # Prefer Chinese result, then English; de-duplicate URL.
+              unique: list[dict[str, str]] = []
+              seen: set[str] = set()
+              for link in all_links:
+                  if link["url"] not in seen:
+                      seen.add(link["url"])
+                      unique.append(link)
+              unique.sort(key=lambda x: (0 if x.get("lang") == "ZH" else 1, x["url"]))
+              return unique
+
+          def download_pdf(url: str, destination: Path) -> tuple[int, str]:
+              with session.get(
+                  url,
+                  headers={"Referer": SEARCH_URL, "User-Agent": UA},
+                  stream=True,
+                  timeout=180,
+              ) as response:
+                  print("DOWNLOAD", response.status_code, response.headers.get("content-type"), url)
+                  response.raise_for_status()
+                  with destination.open("wb") as fh:
+                      for chunk in response.iter_content(chunk_size=1024 * 1024):
+                          if chunk:
+                              fh.write(chunk)
+              data = destination.read_bytes()
+              if not data.lstrip().startswith(b"%PDF"):
+                  raise RuntimeError(f"Not a PDF: {url}; magic={data[:32]!r}")
+              if len(data) < 50_000:
+                  raise RuntimeError(f"PDF unexpectedly small ({len(data)} bytes): {url}")
+              return len(data), hashlib.sha256(data).hexdigest()
+
+          def validate_pdf(item: Wanted, path: Path) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if item.kind == "annual" and pages < 80:
+                  raise RuntimeError(f"Annual report {item.year} has only {pages} pages")
+              if item.kind == "interim" and pages < 40:
+                  raise RuntimeError(f"Interim report has only {pages} pages")
+              if item.kind == "quarterly" and pages < 3:
+                  raise RuntimeError(f"Quarterly disclosure has only {pages} pages")
+              sample_parts = []
+              for page in reader.pages[: min(8, pages)]:
+                  try:
+                      sample_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = normalize(" ".join(sample_parts))
+              company_tokens = (
+                  "china resources building materials",
+                  "china resources cement",
+                  "华润建材科技",
+                  "華潤建材科技",
+                  "华润水泥",
+                  "華潤水泥",
+              )
+              if not any(token.lower() in sample for token in company_tokens):
+                  raise RuntimeError(f"Company identity not found in first pages of {path.name}")
+              if item.year and str(item.year) not in sample:
+                  # Some cover pages use Chinese numerals; keep a warning rather than rejecting.
+                  print("WARNING_YEAR_NOT_IN_EXTRACTED_SAMPLE", item.key, item.year)
+              return pages, sample[:1200]
+
+          manifest: list[dict[str, object]] = []
+          failures: list[str] = []
+
+          for item in wanted:
+              print("\n===", item.key, item.label, "===")
+              candidates = search_candidates(item)
+              if not candidates and item.key in KNOWN_FALLBACKS:
+                  candidates = [{
+                      "text": item.label + " (known HKEX fallback)",
+                      "url": KNOWN_FALLBACKS[item.key],
+                      "lang": "EN",
+                  }]
+              if not candidates:
+                  failures.append(f"{item.key}: no matching HKEX PDF link found")
+                  continue
+
+              last_error = None
+              success = False
+              for candidate in candidates:
+                  tmp = PDF_DIR / (item.key + ".download")
+                  try:
+                      size, sha = download_pdf(candidate["url"], tmp)
+                      final = PDF_DIR / item.filename
+                      tmp.replace(final)
+                      pages, sample = validate_pdf(item, final)
+                      manifest.append({
+                          "key": item.key,
+                          "label": item.label,
+                          "file": item.filename,
+                          "source_title": candidate["text"],
+                          "source_url": candidate["url"],
+                          "source_language": candidate.get("lang"),
+                          "pages": pages,
+                          "bytes": size,
+                          "sha256": sha,
+                          "validation_sample": sample,
+                      })
+                      print("VALIDATED", item.filename, pages, size, sha)
+                      success = True
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      print("CANDIDATE_FAILED", candidate, repr(exc))
+                      tmp.unlink(missing_ok=True)
+                      (PDF_DIR / item.filename).unlink(missing_ok=True)
+              if not success:
+                  failures.append(f"{item.key}: {last_error!r}")
+
+          (OUT / "manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          (OUT / "failures.txt").write_text("\n".join(failures), encoding="utf-8")
+
+          expected_keys = {x.key for x in wanted}
+          actual_keys = {str(x["key"]) for x in manifest}
+          missing = sorted(expected_keys - actual_keys)
+          if missing:
+              print("MISSING", missing)
+              print("FAILURES", failures)
+              raise SystemExit(2)
+
+          readme = [
+              "华润建材科技（01313.HK）2020-2025年报及最新定期财务报告",
+              "",
+              "文件来源：香港交易所披露易（HKEXnews）官方披露。",
+              "",
+              "本资料包包含：",
+              "- 2020、2021、2022、2023、2024、2025年年度报告；",
+              "- 2026年第一季度未经审核财务资料（严格意义上的最新季度披露）；",
+              "- 2026年中期报告（截至打包日最新、且比第一季度更新的完整定期报告）。",
+              "",
+              "说明：华润建材科技为港股发行人，定期披露形式与A股不同。为避免对“最新季报”的理解偏差，",
+              "本包同时收录最新季度披露和最新中期报告。",
+              "",
+              "文件仅供个人研究使用，请遵守发行人、港交所及原文件的版权与使用条款。",
+              "",
+              "文件清单：",
+          ]
+          for row in manifest:
+              readme.append(
+                  f"- {row['file']} | {row['pages']}页 | {row['bytes']}字节 | SHA-256 {row['sha256']}"
+              )
+          (OUT / "README_文件说明.txt").write_text("\n".join(readme) + "\n", encoding="utf-8")
+          (OUT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{row['sha256']}  {row['file']}" for row in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = OUT / "crbmt_2020_2025_annual_and_latest_reports.zip"
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for row in manifest:
+                  zf.write(PDF_DIR / str(row["file"]), arcname=str(row["file"]))
+              zf.write(OUT / "README_文件说明.txt", arcname="README_文件说明.txt")
+              zf.write(OUT / "manifest.json", arcname="manifest.json")
+              zf.write(OUT / "SHA256SUMS.txt", arcname="SHA256SUMS.txt")
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"Corrupt ZIP member: {bad}")
+              pdf_members = [n for n in zf.namelist() if n.lower().endswith(".pdf")]
+              if len(pdf_members) != len(wanted):
+                  raise RuntimeError(f"Expected {len(wanted)} PDFs, found {len(pdf_members)}")
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / "PACKAGE_INFO.txt").write_text(
+              f"file={zip_path.name}\nbytes={zip_path.stat().st_size}\nsha256={zip_sha}\npdf_count={len(wanted)}\n",
+              encoding="utf-8",
+          )
+          print("PACKAGE_READY", zip_path, zip_path.stat().st_size, zip_sha)
+          PY
+          python /tmp/package_reports.py
+
+      - name: Upload package artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crbmt-financial-reports-package
+          path: out
+          retention-days: 1
+          compression-level: 0
