@@ -1,0 +1,187 @@
+name: Temporary Aixin Shenwan exact retrieval
+on:
+  push:
+    branches:
+      - tmp-aixin-shenwan-exact-20260906
+permissions:
+  contents: read
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Search public report index and probe files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 Pillow img2pdf pypdf pymupdf
+          mkdir -p output
+          python - <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          out = Path('output')
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Origin':'https://www.sdyanbao.com',
+              'Referer':'https://www.sdyanbao.com/report',
+              'Content-Type':'application/json;charset=UTF-8',
+              'Accept':'application/json, text/plain, */*',
+              'Accept-Language':'zh-CN,zh;q=0.9',
+          })
+          endpoint = 'https://api.sdyanbao.com/api/file/search'
+          queries = [
+              'AI推理芯片平台型公司，智驾与物理AI并进',
+              'AI推理芯片平台型公司 智驾与物理AI并进',
+              '爱芯元智 申万宏源',
+              '爱芯元智 物理AI',
+          ]
+          matches = {}
+          for query in queries:
+              for page in range(1, 6):
+                  body = {
+                      'device':1,'hideTrader':0,'onlyTitle':0,'order':1,
+                      'page':page,'pageSize':100,'pageCount':0,'dateRange':0,
+                      'startTime':'','endTime':'','typeIds':'','industryIds':'',
+                      'keyword':query,
+                  }
+                  response = session.post(endpoint, json=body, timeout=90)
+                  print('SEARCH', query, page, response.status_code, len(response.content), flush=True)
+                  response.raise_for_status()
+                  obj = response.json()
+                  files = ((obj.get('data') or {}).get('files') or [])
+                  print('FILES', len(files), flush=True)
+                  if not files:
+                      break
+                  for item in files:
+                      title = str(item.get('name') or '')
+                      org = item.get('organization') or {}
+                      org_name = str(org.get('name') or '') if isinstance(org, dict) else str(org)
+                      stock = item.get('stock') or {}
+                      stock_name = str(stock.get('name') or '') if isinstance(stock, dict) else ''
+                      joined = re.sub(r'\s+', '', title + org_name + stock_name)
+                      if ('爱芯元智' in joined and ('物理AI' in joined or 'AI推理芯片平台型公司' in joined or '申万宏源' in joined)):
+                          matches[str(item.get('id'))] = item
+                          print('MATCH_FULL', json.dumps(item, ensure_ascii=False), flush=True)
+                  if len(files) < 100:
+                      break
+                  time.sleep(0.1)
+
+          # Also inspect the public 360why detail page for hidden source/download metadata.
+          try:
+              page_url = 'https://www.360why.com/bg/b5b70e000113834.html'
+              r = session.get(page_url, headers={'Referer':'https://www.360why.com/'}, timeout=90)
+              print('360WHY', r.status_code, len(r.content), r.url, flush=True)
+              (out / '360why.html').write_text(r.text, encoding='utf-8')
+              soup = BeautifulSoup(r.text, 'html.parser')
+              candidates=[]
+              for tag in soup.find_all(['a','script','iframe','embed','object','source'], src=True):
+                  candidates.append(urljoin(r.url, tag.get('src')))
+              for tag in soup.find_all(['a','link'], href=True):
+                  candidates.append(urljoin(r.url, tag.get('href')))
+              candidates += re.findall(r'https?://[^"\'<>\\\s]+', r.text)
+              filtered=[]
+              for value in candidates:
+                  low=value.lower()
+                  if any(k in low for k in ['pdf','download','file','attachment','oss','cdn','api','document']):
+                      if value not in filtered: filtered.append(value)
+              (out / '360why_candidates.txt').write_text('\n'.join(filtered), encoding='utf-8')
+              print('360_CANDIDATES', json.dumps(filtered[:200], ensure_ascii=False), flush=True)
+          except Exception as exc:
+              print('360WHY_ERROR', repr(exc), flush=True)
+
+          results=[]
+          for report_id, item in matches.items():
+              row={'report_id':report_id,'item':item,'probes':[]}
+              # Detail/download APIs.
+              for method, path, payload in [
+                  ('POST','/api/file/detail',{'id':int(report_id)}),
+                  ('POST','/api/file/download',{'id':int(report_id),'device':1}),
+                  ('POST','/api/file/download',{'id':int(report_id)}),
+              ]:
+                  try:
+                      rr=session.request(method,'https://api.sdyanbao.com'+path,json=payload,timeout=90,allow_redirects=False)
+                      record={'method':method,'path':path,'payload':payload,'status':rr.status_code,'headers':dict(rr.headers),'bytes':len(rr.content),'text':rr.text[:20000]}
+                      print('API_PROBE', report_id, path, rr.status_code, len(rr.content), rr.text[:500], flush=True)
+                  except Exception as exc:
+                      record={'method':method,'path':path,'payload':payload,'error':repr(exc)}
+                  row['probes'].append(record)
+
+              page_base=str(item.get('page_url') or '').rstrip('/')
+              expected=int(item.get('page_count') or 0)
+              if page_base and expected:
+                  page_dir=out/f'pages_{report_id}'
+                  page_dir.mkdir(exist_ok=True)
+                  downloaded=[]
+                  seen=set()
+                  for idx in range(expected):
+                      good=None
+                      candidates=[f'{page_base}/{idx}.png',f'{page_base}/{idx}.jpg',f'{page_base}/{idx}.webp']
+                      for candidate in candidates:
+                          try:
+                              image_response=session.get(candidate,headers={'Referer':'https://www.sdyanbao.com/'},timeout=(15,90),allow_redirects=True)
+                              data=image_response.content
+                              if image_response.status_code != 200:
+                                  continue
+                              image=Image.open(io.BytesIO(data)); image.load()
+                              if image.width < 500 or image.height < 650 or len(data)<10000:
+                                  continue
+                              digest=hashlib.sha256(data).hexdigest()
+                              if digest in seen:
+                                  continue
+                              seen.add(digest)
+                              path=page_dir/f'{idx+1:03d}.png'
+                              if image.format=='PNG' and image.mode in ('RGB','L'):
+                                  path.write_bytes(data)
+                              else:
+                                  image.convert('RGB').save(path,'PNG')
+                              good={'index':idx,'url':image_response.url,'path':str(path),'width':image.width,'height':image.height,'bytes':len(data),'sha256':digest}
+                              break
+                          except Exception:
+                              continue
+                      if good is None:
+                          print('PAGE_MISSING', report_id, idx, flush=True)
+                          break
+                      downloaded.append(good)
+                      print('PAGE_OK', report_id, idx+1, expected, good['width'], good['height'], good['bytes'], flush=True)
+                      time.sleep(0.05)
+                  row['downloaded_pages']=downloaded
+                  if len(downloaded)==expected:
+                      paths=[x['path'] for x in downloaded]
+                      pdf_path=out/f'申万宏源_爱芯元智_AI推理芯片平台型公司智驾与物理AI并进_20260803_{expected}页.pdf'
+                      pdf_path.write_bytes(img2pdf.convert(paths))
+                      pdf_bytes=pdf_path.read_bytes()
+                      pages=len(PdfReader(io.BytesIO(pdf_bytes),strict=False).pages)
+                      doc=pymupdf.open(stream=pdf_bytes,filetype='pdf')
+                      cover=doc.load_page(0).get_pixmap(matrix=pymupdf.Matrix(1.0,1.0),alpha=False)
+                      cover.save(str(out/'shenwan_cover.png'))
+                      last=doc.load_page(len(doc)-1).get_pixmap(matrix=pymupdf.Matrix(1.0,1.0),alpha=False)
+                      last.save(str(out/'shenwan_last.png'))
+                      doc.close()
+                      row['pdf']={'path':pdf_path.name,'pages':pages,'bytes':len(pdf_bytes),'sha256':hashlib.sha256(pdf_bytes).hexdigest()}
+                      print('PDF_OK', json.dumps(row['pdf'],ensure_ascii=False), flush=True)
+              results.append(row)
+
+          (out/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCH_COUNT',len(matches),flush=True)
+          PY
+      - name: Upload retrieval output
+        uses: actions/upload-artifact@v4
+        with:
+          name: aixin-shenwan-exact-output
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
