@@ -1,0 +1,133 @@
+name: Temporary Aixin Guoyuan report download
+on:
+  push:
+    branches:
+      - tmp-aixin-hangyan-guoyuan-20260906
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install browser and PDF tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet playwright pypdf pymupdf
+          python -m playwright install --with-deps chromium
+      - name: Download and validate report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          import hashlib
+          import io
+          import json
+          from pathlib import Path
+
+          import pymupdf
+          from playwright.sync_api import sync_playwright
+          from pypdf import PdfReader
+
+          output = Path('output')
+          page_url = 'https://www.hangyan.co/reports/3821532897978877046'
+          payload = None
+          suggested = None
+          observed = []
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'])
+              context = browser.new_context(
+                  viewport={'width': 1440, 'height': 1100},
+                  locale='zh-CN',
+                  timezone_id='Asia/Shanghai',
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36',
+              )
+              context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+              page = context.new_page()
+              page.on('response', lambda response: observed.append(response.url))
+              response = page.goto(page_url, wait_until='domcontentloaded', timeout=120000)
+              page.wait_for_timeout(12000)
+              print('GOTO', response.status if response else None, page.title(), page.url, flush=True)
+              button = page.locator('button[data-action*="native-pdf#download"]')
+              print('BUTTONS', button.count(), flush=True)
+              if button.count():
+                  with page.expect_download(timeout=60000) as pending:
+                      button.first.click(timeout=30000)
+                  download = pending.value
+                  suggested = download.suggested_filename
+                  temp = output / 'browser_download.pdf'
+                  download.save_as(str(temp))
+                  payload = temp.read_bytes()
+                  temp.unlink(missing_ok=True)
+              if payload is None:
+                  pdf_urls = []
+                  for url in observed:
+                      low = url.lower()
+                      if ('.pdf' in low or '/documents/' in low) and url not in pdf_urls:
+                          pdf_urls.append(url)
+                  print('PDF_URLS', json.dumps(pdf_urls, ensure_ascii=False), flush=True)
+                  for candidate in pdf_urls:
+                      try:
+                          result = context.request.get(candidate, headers={'Referer': page_url, 'Accept': 'application/pdf,*/*'}, timeout=120000)
+                          data = result.body()
+                          if result.status == 200 and b'%PDF-' in data[:1024] and len(data) > 50000:
+                              payload = data
+                              suggested = candidate.rsplit('/', 1)[-1]
+                              break
+                      except Exception as exc:
+                          print('FETCH_ERROR', candidate, repr(exc), flush=True)
+              page.screenshot(path=str(output / 'viewer.png'), full_page=True)
+              browser.close()
+
+          if payload is None:
+              raise RuntimeError('No valid PDF was exposed by the public report viewer')
+          if b'%PDF-' not in payload[:1024] or len(payload) < 50000:
+              raise RuntimeError(f'Invalid PDF bytes={len(payload)}')
+
+          reader = PdfReader(io.BytesIO(payload), strict=False)
+          pages = len(reader.pages)
+          doc = pymupdf.open(stream=payload, filetype='pdf')
+          opening = ''.join(doc.load_page(i).get_text('text') for i in range(min(3, len(doc))))
+          ending = doc.load_page(len(doc)-1).get_text('text') if len(doc) else ''
+          compact = ''.join(opening.split()).lower()
+          company_ok = any(term in compact for term in ['爱芯元智', '愛芯元智', '00600', '0600.hk', '600.hk'])
+          broker_ok = any(term in opening for term in ['国元国际', '國元國際', 'Guoyuan'])
+          if not company_ok:
+              raise RuntimeError('Company identity check failed')
+          if not broker_ok:
+              raise RuntimeError('Broker identity check failed')
+
+          cover = doc.load_page(0).get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+          cover.save(str(output / 'cover.png'))
+          last = doc.load_page(len(doc)-1).get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+          last.save(str(output / 'last.png'))
+          doc.close()
+
+          final = output / '国元国际_爱芯元智_新股申购指南_20260130.pdf'
+          final.write_bytes(payload)
+          metadata = {
+              'broker': '国元国际',
+              'company': '爱芯元智（00600.HK）',
+              'title': '新股申购指南',
+              'date': '2026-01-30',
+              'pages': pages,
+              'bytes': len(payload),
+              'sha256': hashlib.sha256(payload).hexdigest(),
+              'viewer_url': page_url,
+              'suggested_filename': suggested,
+              'opening_text': opening[:5000],
+              'ending_text': ending[:2000],
+          }
+          (output / 'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('VALID', json.dumps({key: metadata[key] for key in ['broker','title','date','pages','bytes','sha256']}, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: aixin-guoyuan-report
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
