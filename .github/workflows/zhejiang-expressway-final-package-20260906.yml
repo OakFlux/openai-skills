@@ -1,0 +1,196 @@
+name: Build verified Zhejiang Expressway broker report package
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhejiang-expressway-final-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pillow pypdf pymupdf beautifulsoup4
+      - name: Download public page images and build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests, pymupdf
+          from PIL import Image
+          from pypdf import PdfReader
+
+          package='浙江沪杭甬_券商深度及重点公司报告_3份'
+          out=Path(package); out.mkdir(exist_ok=True)
+          work=Path('_zhejiang_final_work'); work.mkdir(exist_ok=True)
+          renders=work/'renders'; renders.mkdir(exist_ok=True)
+
+          reports=[
+            dict(id=886575, broker='申万宏源', title='浙江沪杭甬：区域经济赋能车流量长期增长，改扩建重塑资产久期', report_date='2025-04-23', platform_date='2025-05-07', authors='闫海、严天鹏、范晨轩', rating='买入（首次覆盖）', pages=21, kind='公司研究/公司深度'),
+            dict(id=724544, broker='华泰证券', title='浙江沪杭甬：改扩建启动，资本开支加码', report_date='2024-03-27', platform_date='2024-03-27', authors='沈晓峰', rating='买入（维持）', pages=7, kind='年报点评/重点公司报告'),
+            dict(id=682827, broker='华泰证券', title='浙江沪杭甬：完成供股，迈入资本开支新周期', report_date='2023-12-15', platform_date='2023-12-15', authors='沈晓峰', rating='买入（维持）', pages=7, kind='更新报告/重点公司报告'),
+          ]
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          def get_detail(report):
+            url=f"https://www.sdyanbao.com/detail/{report['id']}"
+            errors=[]
+            for attempt in range(1,5):
+              try:
+                r=s.get(url,timeout=(20,180),allow_redirects=True)
+                print('DETAIL',report['id'],attempt,r.status_code,len(r.content),r.url,flush=True)
+                r.raise_for_status()
+                html=r.text
+                m=re.search(r'page_url:"([^"]+)"',html)
+                pm=re.search(r'page_count:(\d+)',html)
+                if not m:
+                  raise RuntimeError('page_url not found')
+                encoded=m.group(1)
+                page_url=encoded.replace('\\u002F','/').replace('\\/','/')
+                if page_url.startswith('https:////'):
+                  page_url=page_url.replace('https:////','https://',1)
+                if not page_url.startswith('https://oss.sdyanbao.com/page/'):
+                  raise RuntimeError('unexpected page_url '+page_url)
+                advertised=int(pm.group(1)) if pm else None
+                if advertised is not None and advertised != report['pages']:
+                  raise RuntimeError(f"advertised page mismatch expected={report['pages']} got={advertised}")
+                return page_url,url
+              except Exception as e:
+                errors.append(repr(e)); time.sleep(attempt*2)
+            raise RuntimeError(f"detail failed {report['id']}: {errors}")
+
+          def get_image(report,page_url,index,dest):
+            urls=[f'{page_url}/{index}.png',f'{page_url}/{index}.jpg',f'{page_url}/{index}.jpeg']
+            errors=[]
+            for url in urls:
+              for attempt in range(1,4):
+                try:
+                  r=s.get(url,headers={'Referer':f"https://www.sdyanbao.com/detail/{report['id']}",'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'},timeout=(20,180),allow_redirects=True)
+                  sig=r.content[:16]
+                  ok=sig.startswith(b'\x89PNG') or sig.startswith(b'\xff\xd8\xff') or sig.startswith(b'RIFF')
+                  print('PAGE',report['id'],index,attempt,r.status_code,len(r.content),r.url,flush=True)
+                  if r.status_code==200 and ok and len(r.content)>12000:
+                    dest.write_bytes(r.content)
+                    with Image.open(dest) as im: im.verify()
+                    with Image.open(dest) as im:
+                      w,h=im.size
+                    if w<600 or h<800:
+                      raise RuntimeError(f'small image {w}x{h}')
+                    return {'page':index+1,'url':url,'bytes':len(r.content),'width':w,'height':h,'sha256':hashlib.sha256(r.content).hexdigest()}
+                  errors.append(f'{url}:HTTP {r.status_code}/{len(r.content)}')
+                except Exception as e:
+                  errors.append(f'{url}:{e!r}')
+                time.sleep(attempt)
+            raise RuntimeError(f"image failed report={report['id']} page={index+1}: {errors[-8:]}")
+
+          records=[]; overall_hashes=set()
+          for order,report in enumerate(reports,1):
+            page_url,detail_url=get_detail(report)
+            idir=work/f"images_{report['id']}"; idir.mkdir(exist_ok=True)
+            images=[]; page_manifest=[]; seen=set()
+            for index in range(report['pages']):
+              p=idir/f'{index:03d}.img'
+              meta=get_image(report,page_url,index,p)
+              if meta['sha256'] in seen:
+                raise RuntimeError(f"duplicate image report={report['id']} page={index+1}")
+              seen.add(meta['sha256']); images.append(p); page_manifest.append(meta)
+
+            pdf=work/f"{report['id']}.pdf"
+            doc=pymupdf.open()
+            for p in images:
+              with Image.open(p) as im: w,h=im.size
+              pg=doc.new_page(width=w,height=h)
+              pg.insert_image(pg.rect,filename=str(p),keep_proportion=False)
+            doc.set_metadata({'title':report['title'],'author':report['broker'],'subject':'浙江沪杭甬（00576.HK）券商研究报告'})
+            doc.save(str(pdf),garbage=4,deflate=True,clean=True)
+            doc.close()
+            data=pdf.read_bytes()
+            if data[:5]!=b'%PDF-': raise RuntimeError('bad PDF header')
+            reader=PdfReader(str(pdf),strict=False)
+            if reader.is_encrypted: raise RuntimeError('encrypted output')
+            if len(reader.pages)!=report['pages']:
+              raise RuntimeError(f"page mismatch {report['id']} {len(reader.pages)}")
+            q=subprocess.run(['qpdf','--check',str(pdf)],capture_output=True,text=True)
+            if q.returncode not in (0,3):
+              raise RuntimeError('qpdf failed '+q.stderr[-1000:])
+            d=pymupdf.open(str(pdf)); rendered=[]
+            for pno in sorted(set([0,report['pages']//2,report['pages']-1])):
+              pix=d.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1,1),alpha=False)
+              rp=renders/f"{report['id']}_{pno+1:03d}.png"; pix.save(str(rp))
+              if rp.stat().st_size<6000 or pix.width<400 or pix.height<500:
+                raise RuntimeError('render validation failed')
+              rendered.append(pno+1)
+            d.close()
+            digest=hashlib.sha256(data).hexdigest()
+            if digest in overall_hashes: raise RuntimeError('duplicate report PDF')
+            overall_hashes.add(digest)
+            filename=f"{order:02d}_{report['broker']}_{report['report_date'].replace('-','')}_{report['id']}.pdf"
+            (out/filename).write_bytes(data)
+            rec={**report,'filename':filename,'bytes':len(data),'sha256':digest,'page_url':page_url,'detail_url':detail_url,'rendered_pages':rendered,'source_type':'公开逐页原版图像按原页序合成PDF（页面内容未裁切、未重排）'}
+            records.append(rec)
+            (work/f"page_manifest_{report['id']}.json").write_text(json.dumps(page_manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+            print('VERIFIED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          lines=[
+            '浙江沪杭甬（00576.HK）券商研究报告合集','',
+            '本包共收录3份可离线打开的完整PDF，共35页。',
+            '其中第1份为申万宏源首次覆盖公司深度报告；第2、3份为华泰证券公司重点更新报告。',
+            '公开来源以逐页原版图像展示，本包仅按原页序合成为PDF，未裁切、未重排或改写正文。',''
+          ]
+          for i,r in enumerate(records,1):
+            lines += [
+              f"{i}. {r['broker']}：《{r['title']}》",
+              f"   类型：{r['kind']}；报告日期：{r['report_date']}；作者：{r['authors']}；评级：{r['rating']}",
+              f"   完整页数：{r['pages']}页；文件大小：{r['bytes']/1048576:.2f} MB",
+              f"   来源页面：{r['detail_url']}",
+              f"   SHA-256：{r['sha256']}",'']
+          lines += [
+            '核验项目：逐页图像签名与尺寸、页序连续性、页面去重、PDF文件头、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256和ZIP CRC。',
+            '由于PDF由公开页面图像合成，可正常阅读和打印，但全文文本检索能力可能弱于券商原生矢量PDF。',
+            '报告版权归原券商和作者所有，仅供研究参考，不构成投资建议。'
+          ]
+          (out/'报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          zp=Path(package+'.zip')
+          with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+            for p in sorted(out.iterdir()):
+              z.write(p,arcname=f'{package}/{p.name}')
+          with zipfile.ZipFile(zp) as z:
+            bad=z.testzip()
+            if bad: raise RuntimeError('ZIP CRC failed '+bad)
+            pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if len(pdfs)!=3: raise RuntimeError(f'PDF count mismatch {pdfs}')
+          print('FINAL_ZIP',zp,zp.stat().st_size,'REPORTS',len(records),'PAGES',sum(r['pages'] for r in records),flush=True)
+          print('ZIP_SHA256',hashlib.sha256(zp.read_bytes()).hexdigest(),flush=True)
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhejiang-expressway-final-broker-package
+          path: 浙江沪杭甬_券商深度及重点公司报告_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhejiang-expressway-final-diagnostics
+          path: _zhejiang_final_work/
+          if-no-files-found: ignore
+          retention-days: 7
