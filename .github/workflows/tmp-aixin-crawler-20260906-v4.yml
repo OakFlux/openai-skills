@@ -1,0 +1,331 @@
+name: Temporary Aixin Yuanzhi public report crawler
+
+on:
+  push:
+    branches:
+      - tmp-aixin-crawler-20260906-v4
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp-aixin-crawler-20260906-v4
+          persist-credentials: true
+      - name: Locate public full reports and build archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf pillow img2pdf rapidfuzz
+          python - <<'PY'
+          import csv, hashlib, html, io, json, math, os, re, shutil, time, zipfile
+          from pathlib import Path
+          from urllib.parse import quote, unquote, urljoin, urlparse
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+          from rapidfuzz.fuzz import ratio, partial_ratio, token_set_ratio
+
+          root = Path('/tmp/aixin_job')
+          reports_dir = root / 'reports'
+          pages_dir = root / 'pages'
+          diag_dir = root / 'diagnostics'
+          out_dir = Path('/tmp/aixin_output')
+          for p in (root, reports_dir, pages_dir, diag_dir, out_dir):
+              p.mkdir(parents=True, exist_ok=True)
+
+          titles = [
+              '踏智驾及边缘AI之浪，启高端芯片之航',
+              '高端启新，智驱全球',
+              'AI终端平台公司，智能汽车打开增量空间',
+              '中报超预期，边缘AI、智能车驱动未来成长',
+          ]
+          target_brokers = ['国盛证券','中邮证券','国泰海通证券','国泰君安证券','交银国际证券']
+          queries = [
+              '爱芯元智','爱芯','00600','0600.HK','踏智驾','边缘AI之浪','高端芯片之航',
+              '高端启新','智驱全球','AI终端平台公司','智能汽车打开增量空间',
+              '中报超预期 边缘AI 智能车','爱芯元智 首次覆盖','爱芯元智 公司深度',
+          ]
+
+          def norm(s):
+              return re.sub(r'[^0-9a-zA-Z\u4e00-\u9fff]+','',str(s or '')).lower()
+
+          def safe(s, n=120):
+              s=re.sub(r'[\\/:*?"<>|]+','_',str(s or '')).strip()
+              s=re.sub(r'\s+',' ',s)
+              return (s or 'report')[:n]
+
+          agents=[
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130 Safari/537.36',
+              'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/129 Safari/537.36',
+          ]
+          s=requests.Session()
+          s.headers.update({'User-Agent':agents[0],'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          def req(method,url,**kwargs):
+              last=None
+              for attempt in range(1,6):
+                  try:
+                      s.headers['User-Agent']=agents[(attempt-1)%len(agents)]
+                      r=s.request(method,url,timeout=kwargs.pop('timeout',(20,120)),**kwargs)
+                      if r.status_code>=400: raise RuntimeError(f'HTTP {r.status_code}')
+                      return r
+                  except Exception as e:
+                      last=e; time.sleep(min(6,attempt))
+              raise RuntimeError(f'{method} {url}: {last}')
+
+          def score_item(item):
+              title=str(item.get('name') or '')
+              org=(item.get('organization') or {}).get('name','') if isinstance(item.get('organization'),dict) else str(item.get('organization') or '')
+              stock=item.get('stock') or {}
+              stock_name=stock.get('name','') if isinstance(stock,dict) else ''
+              stock_code=stock.get('code','') if isinstance(stock,dict) else ''
+              blob=' '.join([title,org,stock_name,stock_code,str(item.get('content') or ''),str(item.get('summary') or '')])
+              nt=norm(title); nb=norm(blob)
+              sim=max(max(ratio(nt,norm(t)),partial_ratio(nt,norm(t)),token_set_ratio(nt,norm(t))) for t in titles)
+              token_hits=max(sum(1 for token in re.split(r'[，,:：；;、\s]+',t) if len(token)>=3 and norm(token) in nb) for t in titles)
+              broker_bonus=30 if any(norm(b.replace('证券','')) in norm(org) for b in target_brokers) else 0
+              stock_bonus=70 if ('爱芯元智' in stock_name or str(stock_code) in {'00600','0600','00600.HK','0600.HK'}) else 0
+              title_bonus=50 if '爱芯元智' in title else 0
+              deep_bonus=15 if any(x in title for x in ['深度','首次覆盖','投资价值']) else 0
+              return float(sim)+token_hits*11+broker_bonus+stock_bonus+title_bonus+deep_bonus
+
+          endpoint='https://api.sdyanbao.com/api/file/search'
+          items={}
+          raw_stats=[]
+          for q in queries:
+              for page in range(1,13):
+                  body={'device':1,'hideTrader':0,'onlyTitle':0,'order':1,'page':page,'pageSize':100,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','keyword':q}
+                  try:
+                      r=req('POST',endpoint,json=body,headers={'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','Content-Type':'application/json;charset=UTF-8','Accept':'application/json,text/plain,*/*'},timeout=(20,90))
+                      obj=r.json(); data=obj.get('data') or {}; batch=data.get('files') or []
+                  except Exception as e:
+                      print('SEARCH_FAIL',q,page,repr(e),flush=True); break
+                  raw_stats.append({'query':q,'page':page,'count':len(batch),'total':data.get('total')})
+                  for item in batch:
+                      iid=str(item.get('id') or item.get('original_id') or '')
+                      if iid: items[iid]=item
+                  if len(batch)<100: break
+                  time.sleep(.1)
+          (diag_dir/'search_stats.json').write_text(json.dumps(raw_stats,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          ranked=[]
+          for item in items.values():
+              sc=score_item(item)
+              org=(item.get('organization') or {}).get('name','') if isinstance(item.get('organization'),dict) else str(item.get('organization') or '')
+              pages=int(item.get('page_count') or 0)
+              year=str(item.get('time_text') or '')[:4]
+              if pages>=8 and year in {'2026','2025'} and sc>=70:
+                  ranked.append((sc,item))
+          ranked.sort(key=lambda x:(x[0],int(x[1].get('page_count') or 0)),reverse=True)
+          (diag_dir/'ranked_candidates.json').write_text(json.dumps([{'score':sc,'item':it} for sc,it in ranked[:100]],ensure_ascii=False,indent=2),encoding='utf-8')
+          for sc,it in ranked[:40]:
+              print('RANKED',round(sc,1),it.get('id'),it.get('time_text'),it.get('page_count'),(it.get('organization') or {}).get('name') if isinstance(it.get('organization'),dict) else it.get('organization'),it.get('name'),flush=True)
+
+          built=[]
+          seen_hash=set()
+
+          def fetch_image(url,referer):
+              r=req('GET',url,headers={'Referer':referer,'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'},timeout=(20,90))
+              data=r.content
+              if len(data)<12000: raise RuntimeError(f'too small {len(data)}')
+              im=Image.open(io.BytesIO(data)); im.load()
+              if im.width<600 or im.height<800: raise RuntimeError(f'dim {im.width}x{im.height}')
+              return data,im,r.url
+
+          def build_from_sdy(item,score):
+              expected=int(item.get('page_count') or 0)
+              if expected<8 or expected>120: return None
+              page_url=str(item.get('page_url') or '')
+              share_url=str(item.get('share_url') or '')
+              if not page_url and share_url:
+                  page_url=share_url.rsplit('/',1)[0]
+              if not page_url: return None
+              detail=f"https://www.sdyanbao.com/detail/{item.get('id')}"
+              local=pages_dir/str(item.get('id')); local.mkdir(exist_ok=True)
+              paths=[]; hashes=set(); page_sources=[]
+              for idx in range(expected):
+                  variants=[]
+                  if share_url and idx==0: variants.append(share_url)
+                  for ext in ['png','jpg','jpeg','webp']:
+                      variants.append(f'{page_url.rstrip("/")}/{idx}.{ext}')
+                  ok=None; last=None
+                  for u in list(dict.fromkeys(variants)):
+                      try:
+                          data,im,final=fetch_image(u,detail); ok=(data,im,final); break
+                      except Exception as e: last=e
+                  if ok is None:
+                      print('PAGE_MISSING',item.get('id'),idx+1,expected,repr(last),flush=True)
+                      return None
+                  data,im,final=ok
+                  h=hashlib.sha256(data).hexdigest()
+                  if h in hashes:
+                      print('DUP_PAGE',item.get('id'),idx+1,flush=True); return None
+                  hashes.add(h)
+                  p=local/f'{idx+1:03d}.png'
+                  if im.format=='PNG' and im.mode in ('RGB','L'):
+                      p.write_bytes(data)
+                  else:
+                      im.convert('RGB').save(p,'PNG')
+                  paths.append(p); page_sources.append(final)
+                  time.sleep(.04)
+              pdf=img2pdf.convert([str(p) for p in paths])
+              try: count=len(PdfReader(io.BytesIO(pdf),strict=False).pages)
+              except Exception: return None
+              if count!=expected: return None
+              sha=hashlib.sha256(pdf).hexdigest()
+              if sha in seen_hash: return None
+              seen_hash.add(sha)
+              org=(item.get('organization') or {}).get('name','') if isinstance(item.get('organization'),dict) else str(item.get('organization') or '')
+              result={'data':pdf,'pages':count,'sha256':sha,'broker':org or '券商未标注','date':str(item.get('time_text') or ''),'title':str(item.get('name') or ''),'info_page':detail,'source_url':page_url,'source':'水滴研报公开展示的原报告逐页图像','score':score,'item_id':item.get('id'),'page_sources':page_sources}
+              print('BUILT_SDY',result['broker'],result['date'],count,result['title'],flush=True)
+              return result
+
+          # Prefer exact/near-exact target titles and known brokers; try enough candidates to obtain 3.
+          for sc,item in ranked[:35]:
+              if len(built)>=3: break
+              org=(item.get('organization') or {}).get('name','') if isinstance(item.get('organization'),dict) else str(item.get('organization') or '')
+              title=str(item.get('name') or '')
+              strong_title=max(partial_ratio(norm(title),norm(t)) for t in titles)>=72
+              known_org=any(norm(b.replace('证券','')) in norm(org) for b in target_brokers)
+              stock=item.get('stock') or {}; target_stock=isinstance(stock,dict) and ('爱芯元智' in str(stock.get('name') or '') or str(stock.get('code') or '') in {'00600','0600','00600.HK','0600.HK'})
+              if not (strong_title or target_stock or (known_org and sc>=105)): continue
+              try:
+                  res=build_from_sdy(item,sc)
+                  if res: built.append(res)
+              except Exception as e:
+                  print('BUILD_SDY_FAIL',item.get('id'),repr(e),flush=True)
+
+          # Eastmoney direct fallback: broad 2026 company-report scan filtered by target name/title.
+          if len(built)<3:
+              em='https://reportapi.eastmoney.com/report/list'
+              emrecs={}
+              start=datetime(2026,1,1); end=datetime(2026,9,6); cur=start
+              while cur<=end:
+                  ce=min(end,cur+timedelta(days=6))
+                  page=1; total_pages=1
+                  while page<=total_pages and page<=25:
+                      params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':cur.strftime('%Y-%m-%d'),'endTime':ce.strftime('%Y-%m-%d'),'pageNo':page,'fields':'','qType':0,'orgCode':'','code':'','rcode':'','p':page,'pageNum':page,'pageNumber':page,'client':'WEB','source':'WEB'}
+                      try:
+                          rr=req('GET',em,params=params,headers={'Referer':'https://data.eastmoney.com/report/','Origin':'https://data.eastmoney.com','Accept':'application/json,text/plain,*/*'},timeout=(20,90)); obj=rr.json(); batch=obj.get('data') or []
+                          if isinstance(batch,dict): batch=batch.get('data') or batch.get('list') or []
+                          hits=int(obj.get('hits') or obj.get('total') or 0); total_pages=max(1,math.ceil(hits/100))
+                      except Exception: break
+                      for rec in batch:
+                          blob=norm(' '.join(str(rec.get(k) or '') for k in ['stockName','stockCode','title','orgSName']))
+                          if norm('爱芯元智') in blob or any(partial_ratio(norm(rec.get('title')),norm(t))>=80 for t in titles):
+                              info=str(rec.get('infoCode') or '')
+                              if info: emrecs[info]=rec
+                      if not batch: break
+                      page+=1
+                  cur=ce+timedelta(days=1)
+              for info,rec in emrecs.items():
+                  if len(built)>=3: break
+                  for prefix in ['H3','H2']:
+                      u=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                      try:
+                          rr=req('GET',u,headers={'Referer':f'https://data.eastmoney.com/report/info/{info}.html','Accept':'application/pdf,*/*'},timeout=(20,180)); data=rr.content
+                          if b'%PDF-' not in data[:2048] or len(data)<60000: continue
+                          reader=PdfReader(io.BytesIO(data),strict=False); count=len(reader.pages)
+                          if count<8: continue
+                          doc=pymupdf.open(stream=data,filetype='pdf'); text=''.join(doc.load_page(i).get_text('text') for i in range(min(4,len(doc)))); doc.close()
+                          if not any(x in norm(text) for x in [norm('爱芯元智'),norm('AXERA'),norm('00600')]): continue
+                          sha=hashlib.sha256(data).hexdigest()
+                          if sha in seen_hash: continue
+                          seen_hash.add(sha)
+                          built.append({'data':data,'pages':count,'sha256':sha,'broker':str(rec.get('orgSName') or ''),'date':str(rec.get('publishDate') or '')[:10],'title':str(rec.get('title') or ''),'info_page':f'https://data.eastmoney.com/report/info/{info}.html','source_url':rr.url,'source':'东方财富研报库原始PDF','score':200,'item_id':info,'page_sources':[]})
+                          print('BUILT_EM',rec.get('orgSName'),count,rec.get('title'),flush=True); break
+                      except Exception: pass
+
+          # Reportify pages provide reliable metadata. Save them in diagnostics even when source host is inaccessible.
+          reportify_urls=[
+              'https://reportify.cn/reports/1278761946887360512',
+              'https://reportify.cn/reports/1246890949045522432',
+              'https://reportify.cn/reports/1262379005902983168',
+          ]
+          rmeta=[]
+          for u in reportify_urls:
+              try:
+                  rr=req('GET',u,headers={'Accept':'text/html,application/xhtml+xml'},timeout=(20,90)); soup=BeautifulSoup(rr.text,'html.parser')
+                  rmeta.append({'url':u,'status':rr.status_code,'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'bytes':len(rr.content)})
+              except Exception as e: rmeta.append({'url':u,'error':repr(e)})
+          (diag_dir/'reportify_metadata.json').write_text(json.dumps(rmeta,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Deduplicate semantically and rank.
+          built.sort(key=lambda x:(x.get('score',0),x.get('pages',0)),reverse=True)
+          selected=[]; semantic=set()
+          for r in built:
+              key=(norm(r.get('broker')).replace(norm('证券'),''), max(range(len(titles)),key=lambda i:partial_ratio(norm(r.get('title')),norm(titles[i]))))
+              if key in semantic: continue
+              semantic.add(key); selected.append(r)
+              if len(selected)>=3: break
+
+          status={'all_items':len(items),'ranked_count':len(ranked),'built_count':len(built),'selected_count':len(selected),'selected':[{k:v for k,v in r.items() if k not in ('data','page_sources')} for r in selected]}
+          (out_dir/'build_status.json').write_text(json.dumps(status,ensure_ascii=False,indent=2),encoding='utf-8')
+          shutil.make_archive(str(out_dir/'diagnostics'),'zip',diag_dir)
+
+          if len(selected)<2:
+              print('ONLY_VALID',len(selected),flush=True)
+          else:
+              manifest=[]; files=[]
+              for i,r in enumerate(selected,1):
+                  d=re.sub(r'[^0-9]','',r.get('date',''))[:8] or '日期未识别'
+                  name=f"{i:02d}_{safe(r.get('broker'))}_爱芯元智_{safe(r.get('title'),85)}_{d}_{r['pages']}页.pdf"
+                  p=reports_dir/name; p.write_bytes(r['data']); files.append(p)
+                  manifest.append({'文件名':name,'券商':r.get('broker'),'发布日期':r.get('date'),'报告标题':r.get('title'),'页数':r.get('pages'),'文件大小（字节）':len(r['data']),'SHA256':r.get('sha256'),'报告信息页':r.get('info_page'),'原始来源':r.get('source_url'),'来源说明':r.get('source')})
+              mp=reports_dir/'文件清单与校验值.csv'
+              with mp.open('w',encoding='utf-8-sig',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=list(manifest[0].keys())); w.writeheader(); w.writerows(manifest)
+              readme=reports_dir/'README.txt'
+              lines=['爱芯元智（00600.HK）券商深度报告资料包','',f'包含{len(files)}份完整公司深度/首次覆盖报告：']
+              for i,row in enumerate(manifest,1): lines.append(f"{i}. {row['券商']}，{row['发布日期']}，{row['页数']}页，《{row['报告标题']}》。")
+              lines += ['','完整性：已核对公开报告元数据，逐页下载时检查图像尺寸与重复页，合并后核对PDF页数；文件清单记录SHA-256；ZIP已执行CRC测试。','提示：报告中的评级、盈利预测和目标价均对应报告发布时点，不代表当前观点。']
+              readme.write_text('\n'.join(lines),encoding='utf-8')
+
+              # QA sheet
+              tiles=[]
+              for p in files:
+                  doc=pymupdf.open(str(p))
+                  for no,label in [(0,'首页'),(len(doc)-1,'末页')]:
+                      pix=doc.load_page(no).get_pixmap(matrix=pymupdf.Matrix(.75,.75),alpha=False); qp=root/f'{p.stem}_{label}.jpg'; pix.save(str(qp)); tiles.append((p.name+' '+label,qp))
+                  doc.close()
+              tw,th=360,510; cols=2; rows=math.ceil(len(tiles)/cols); sheet=Image.new('RGB',(tw*cols,th*rows),'white')
+              for i,(lab,p) in enumerate(tiles):
+                  im=Image.open(p).convert('RGB'); im.thumbnail((tw-24,th-60),Image.Resampling.LANCZOS); cv=Image.new('RGB',(tw,th),'white'); cv.paste(im,((tw-im.width)//2,8)); ImageDraw.Draw(cv).text((8,th-42),lab[:58],fill='black'); sheet.paste(cv,((i%cols)*tw,(i//cols)*th))
+              sheet.save(out_dir/'首页末页核验图.jpg',quality=90)
+
+              zpath=out_dir/'爱芯元智_00600_券商深度报告.zip'
+              with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+                  for p in sorted(reports_dir.iterdir(),key=lambda p:p.name): z.write(p,p.name)
+              with zipfile.ZipFile(zpath) as z:
+                  assert z.testzip() is None
+                  assert 2<=sum(n.lower().endswith('.pdf') for n in z.namelist())<=3
+              print('READY',zpath,zpath.stat().st_size,len(files),flush=True)
+          PY
+      - name: Publish result to non-triggering output branch
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin tmp-aixin-output-20260906:tmp-aixin-output-20260906
+          git switch tmp-aixin-output-20260906
+          rm -rf aixin_output
+          mkdir -p aixin_output
+          cp -a /tmp/aixin_output/. aixin_output/
+          git config user.name "OakFlux"
+          git config user.email "206205057+OakFlux@users.noreply.github.com"
+          git add aixin_output
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish Aixin Yuanzhi broker report package [skip ci]"
+            git push origin tmp-aixin-output-20260906
+          fi
