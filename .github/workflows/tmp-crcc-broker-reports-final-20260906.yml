@@ -1,0 +1,209 @@
+name: Build final CRCC broker deep report package
+
+on:
+  push:
+    branches:
+      - tmp-crcc-broker-reports-final-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verify render and package three reports
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pypdf pymupdf
+          mkdir -p deliverable/package deliverable/renders
+          cat > /tmp/build_crcc_reports.py <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('deliverable')
+          WORK = OUT / 'package'
+          RENDERS = OUT / 'renders'
+          WORK.mkdir(parents=True, exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'date': '2024-03-08',
+                  'broker': '民生证券',
+                  'title': '首次覆盖报告：新签合同额稳步增长，估值有望迎来修复',
+                  'source_page': 'https://data.eastmoney.com/report/info/AP202403081626037083.html',
+                  'pdf_url': 'https://pdf.dfcfw.com/pdf/H3_AP202403081626037083_1.pdf',
+                  'file': '2024-03-08_Minsheng_CRCC_Initiation_Coverage.pdf',
+                  'expected_pages': 18,
+              },
+              {
+                  'date': '2023-05-26',
+                  'broker': '东吴证券',
+                  'title': '“投建营”一体化发展，新兴产业加快拓展',
+                  'source_page': 'https://data.eastmoney.com/report/info/AP202305261587291374.html',
+                  'pdf_url': 'https://pdf.dfcfw.com/pdf/H3_AP202305261587291374_1.pdf',
+                  'file': '2023-05-26_Soochow_CRCC_Investment_Construction_Operation.pdf',
+                  'expected_pages': 32,
+              },
+              {
+                  'date': '2023-03-09',
+                  'broker': '国信证券',
+                  'title': '基建综合“国家队”，价值重估可期',
+                  'source_page': 'https://data.eastmoney.com/report/info/AP202303091584146858.html',
+                  'pdf_url': 'https://pdf.dfcfw.com/pdf/H3_AP202303091584146858_1.pdf',
+                  'file': '2023-03-09_Guosen_CRCC_National_Team_Value_Revaluation.pdf',
+                  'expected_pages': 34,
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/pdf,text/html,*/*;q=0.8',
+          })
+
+          def fetch(url, referer, attempts=7):
+              last = None
+              for i in range(attempts):
+                  try:
+                      response = session.get(
+                          url,
+                          headers={'Referer': referer},
+                          timeout=(20, 120),
+                          allow_redirects=True,
+                      )
+                      if response.status_code == 200:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(2 ** i, 12))
+              raise RuntimeError(f'failed to fetch {url}: {last}')
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          manifest = []
+          seen_hashes = set()
+
+          for report in reports:
+              response = fetch(report['pdf_url'], report['source_page'])
+              data = response.content
+              if not data.lstrip().startswith(b'%PDF') or len(data) < 100_000:
+                  raise RuntimeError(
+                      f'invalid PDF {report["pdf_url"]}: '
+                      f'{response.headers.get("content-type")} {len(data)} bytes'
+                  )
+
+              digest = sha256(data)
+              if digest in seen_hashes:
+                  raise RuntimeError(f'duplicate PDF content: {report["file"]}')
+              seen_hashes.add(digest)
+
+              path = WORK / report['file']
+              path.write_bytes(data)
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(
+                      f'unexpected page count for {path.name}: {pages}, '
+                      f'expected {report["expected_pages"]}'
+                  )
+              if pages < 15:
+                  raise RuntimeError(f'report is not deep enough: {path.name}, {pages} pages')
+
+              sample_text = ''.join((page.extract_text() or '') for page in reader.pages[:min(12, pages)])
+              compact = re.sub(r'\s+', '', sample_text)
+              if '中国铁建' not in compact and '601186' not in compact and 'ChinaRailwayConstruction' not in compact:
+                  raise RuntimeError(f'issuer validation failed: {path.name}')
+
+              doc = pymupdf.open(str(path))
+              render_dir = RENDERS / path.stem
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for page_no, label in [(0, 'first'), (pages - 1, 'last')]:
+                  page = doc.load_page(page_no)
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False)
+                  png_path = render_dir / f'{label}.png'
+                  pix.save(str(png_path))
+                  if png_path.stat().st_size < 10_000 or pix.width < 500 or pix.height < 500:
+                      raise RuntimeError(f'render validation failed: {path.name}, page {page_no + 1}')
+              doc.close()
+
+              manifest.append({
+                  'company': '中国铁建股份有限公司',
+                  'stock_code': '601186.SH / 01186.HK',
+                  'broker': report['broker'],
+                  'report_date': report['date'],
+                  'title': report['title'],
+                  'file': report['file'],
+                  'pages': pages,
+                  'size_bytes': len(data),
+                  'sha256': digest,
+                  'source_page': report['source_page'],
+                  'original_pdf_url': report['pdf_url'],
+                  'access_type': '公开可访问的原始券商PDF',
+              })
+              print('REPORT_OK', report['date'], report['broker'], pages, len(data), digest)
+
+          if len(manifest) != 3 or len(seen_hashes) != 3:
+              raise RuntimeError('report count validation failed')
+
+          manifest_path = WORK / 'manifest.json'
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          readme = [
+              '中国铁建（601186.SH / 01186.HK）券商深度研究报告资料包',
+              '',
+              '整理日期：2026-09-06',
+              '本资料包收录3份公开可访问的原始券商PDF，均为公司深度或首次覆盖报告，不含年报点评和短篇快评。',
+              '',
+              '文件清单：',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme.append(f"{i}. {item['report_date']}｜{item['broker']}｜{item['title']}｜{item['pages']}页")
+          readme += [
+              '',
+              'manifest.json记录每份报告的公开来源、页数、文件大小和SHA-256。',
+              'SHA256SUMS.txt可用于验证文件完整性。',
+              '报告版权归原券商及作者所有，仅供个人研究与查阅。',
+          ]
+          (WORK / 'README_来源说明.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          sums = [f"{item['sha256']}  {item['file']}" for item in manifest]
+          sums.append(f"{sha256(manifest_path.read_bytes())}  manifest.json")
+          (WORK / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'crcc_broker_deep_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(WORK.iterdir(), key=lambda p: p.name):
+                  archive.write(path, path.name)
+
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'expected 3 PDFs, found {len(pdfs)}')
+
+          print('PACKAGE_OK', zip_path.stat().st_size, sha256(zip_path.read_bytes()))
+          PY
+          python /tmp/build_crcc_reports.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: crcc-broker-deep-reports-final
+          path: deliverable/crcc_broker_deep_reports.zip
+          retention-days: 1
+          compression-level: 0
