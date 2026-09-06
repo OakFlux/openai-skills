@@ -1,4 +1,4 @@
-name: Temporary Ascletis Hangyan probe
+name: Temporary Ascletis broker report package
 
 on:
   push:
@@ -9,131 +9,408 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Install Chromium
+      - name: Install browser dependencies
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --quiet playwright
+          python -m pip install --quiet playwright pypdf
           python -m playwright install --with-deps chromium
 
-      - name: Probe public pages
+      - name: Locate, download and package reports
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           from __future__ import annotations
 
+          import csv
+          import hashlib
+          import io
           import json
           import re
+          import zipfile
+          from datetime import date
           from pathlib import Path
+
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+          from pypdf import PdfReader
 
           out = Path('output')
+          work = Path('work')
           out.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+
           targets = [
-              ('listing_95', 'https://www.hangyan.co/reports?page=95'),
-              ('chart_dongwu', 'https://www.hangyan.co/charts/3601111842144912396'),
-              ('chart_xingye', 'https://www.hangyan.co/charts/3718347316894106647'),
+              {
+                  'phrase': '口服小分子率先破局，紧跟减重前沿',
+                  'institution': '东方证券',
+                  'date': '2025-12-28',
+                  'kind': '首次覆盖报告',
+                  'method': 'listing',
+              },
+              {
+                  'phrase': '聚焦减重代谢产品差异化管线',
+                  'institution': '兴业证券',
+                  'date': '2025-09-07',
+                  'kind': '公司深度报告',
+                  'method': 'listing',
+              },
+              {
+                  'phrase': '全新GLP-1减重不减肌，有潜力成为Best-in-Class',
+                  'institution': '东吴证券',
+                  'date': '2025-04-01',
+                  'kind': '公司深度报告',
+                  'method': 'chart',
+                  'chart_url': 'https://www.hangyan.co/charts/3601111842144912396',
+              },
           ]
-          wanted = [
-              '口服小分子率先破局',
-              '全新GLP-1减重不减肌',
-              '聚焦减重代谢产品差异化管线',
-              '歌礼制药',
-          ]
-          results = {}
-          network = []
+
+          def norm(value: str) -> str:
+              return re.sub(r'[\s：:，,。·\-—_（）()]+', '', value or '').lower()
+
+          def safe(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              return re.sub(r'\s+', ' ', value).strip(' ._')[:180]
+
+          status = {'targets': targets, 'page_cache': {}, 'resolved': [], 'attempts': [], 'downloads': []}
+          resolved = []
+          downloaded = []
+          seen_hashes = set()
 
           with sync_playwright() as p:
-              browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'])
+              browser = p.chromium.launch(
+                  headless=True,
+                  args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+              )
               context = browser.new_context(
                   viewport={'width': 1440, 'height': 1200},
                   locale='zh-CN',
                   timezone_id='Asia/Shanghai',
+                  accept_downloads=True,
                   user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
                   extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7'},
               )
               context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
               page = context.new_page()
 
-              def on_response(resp):
-                  low = resp.url.lower()
-                  if any(key in low for key in ['report', 'search', 'chart', 'api', 'documents']):
-                      network.append({'url': resp.url, 'status': resp.status, 'content_type': resp.headers.get('content-type','')})
-              page.on('response', on_response)
-
               for warm in ['https://www.hangyan.co/', 'https://www.hangyan.co/reports']:
                   try:
                       response = page.goto(warm, wait_until='domcontentloaded', timeout=120000)
-                      page.wait_for_timeout(3000)
-                      print('WARM', warm, response.status if response else None, page.url, page.title(), flush=True)
+                      page.wait_for_timeout(1800)
+                      print('WARM', warm, response.status if response else None, page.url, flush=True)
                   except Exception as exc:
                       print('WARM_ERROR', warm, repr(exc), flush=True)
 
-              for name, url in targets:
-                  row = {'requested_url': url}
+              page_cache = {}
+
+              def inspect_listing(page_number: int) -> dict:
+                  if page_number in page_cache:
+                      return page_cache[page_number]
+                  url = f'https://www.hangyan.co/reports?page={page_number}'
+                  row = {'page': page_number, 'url': url}
                   try:
                       response = page.goto(url, wait_until='domcontentloaded', timeout=120000)
-                      row['status'] = response.status if response else None
-                      try:
-                          page.wait_for_load_state('networkidle', timeout=35000)
-                      except PlaywrightTimeout:
-                          row['networkidle_timeout'] = True
-                      page.wait_for_timeout(7000)
-                      row['final_url'] = page.url
-                      row['title'] = page.title()
-                      body = page.locator('body').inner_text()
-                      row['body'] = body[:100000]
-                      anchors = page.eval_on_selector_all(
-                          'a',
-                          '''els => els.map(e => ({
-                              href: e.href || e.getAttribute('href'),
-                              text: (e.innerText || e.textContent || '').trim(),
-                              title: e.getAttribute('title'),
-                              parent: (e.closest('article,li,section,div')?.innerText || e.parentElement?.innerText || '').trim()
-                          }))'''
-                      )
-                      row['anchor_count'] = len(anchors)
-                      report_anchors = []
-                      wanted_anchors = []
-                      for item in anchors:
-                          href = item.get('href') or ''
-                          combined = ' '.join(((item.get('text') or '') + ' ' + (item.get('title') or '') + ' ' + (item.get('parent') or '')).split())
-                          if '/reports/' in href or '/reports?' in href:
-                              report_anchors.append({**item, 'combined': combined[:10000]})
-                          if any(term in combined for term in wanted):
-                              wanted_anchors.append({**item, 'combined': combined[:10000]})
-                      row['report_anchors'] = report_anchors[:1000]
-                      row['wanted_anchors'] = wanted_anchors[:1000]
-                      row['html'] = page.content()[:1000000]
-                      page.screenshot(path=str(out / f'{name}.png'), full_page=True)
-                      (out / f'{name}.html').write_text(page.content(), encoding='utf-8')
-                      print('PAGE', name, row['status'], row['final_url'], row['title'], 'anchors', len(anchors), 'report_anchors', len(report_anchors), 'wanted', len(wanted_anchors), flush=True)
-                      for item in wanted_anchors[:100]:
-                          print('WANTED', name, json.dumps(item, ensure_ascii=False), flush=True)
-                      for item in report_anchors[:100]:
-                          combined = item.get('combined') or ''
-                          if any(term in combined for term in wanted):
-                              print('REPORT_MATCH', name, json.dumps(item, ensure_ascii=False), flush=True)
+                      page.wait_for_timeout(900)
+                      html = page.content()
+                      dates = sorted(set(re.findall(r'20\d{2}-\d{2}-\d{2}', html)))
+                      anchors = page.locator('a[data-controller~="protected-link"]')
+                      items = []
+                      for index in range(anchors.count()):
+                          anchor = anchors.nth(index)
+                          text = ' '.join((anchor.inner_text(timeout=3000) or '').split())
+                          attrs = page.evaluate(
+                              'el => Object.fromEntries(Array.from(el.attributes).map(a => [a.name,a.value]))',
+                              anchor.element_handle(),
+                          )
+                          items.append({'index': index, 'text': text, 'attrs': attrs})
+                      row.update({
+                          'status': response.status if response else None,
+                          'final_url': page.url,
+                          'dates': dates,
+                          'newest': max(dates) if dates else None,
+                          'oldest': min(dates) if dates else None,
+                          'items': items,
+                      })
+                      print('LIST_PAGE', page_number, row['oldest'], row['newest'], 'items', len(items), flush=True)
                   except Exception as exc:
                       row['error'] = repr(exc)
-                      print('PAGE_ERROR', name, repr(exc), flush=True)
-                  results[name] = row
+                      print('LIST_ERROR', page_number, repr(exc), flush=True)
+                  page_cache[page_number] = row
+                  status['page_cache'][str(page_number)] = row
+                  return row
+
+              def locate_page(target_date_text: str) -> int | None:
+                  target_day = date.fromisoformat(target_date_text)
+                  low = 1
+                  high = 100
+                  while high <= 4000:
+                      row = inspect_listing(high)
+                      if row.get('oldest'):
+                          oldest = date.fromisoformat(row['oldest'])
+                          if oldest <= target_day:
+                              break
+                      high *= 2
+                  if high > 4000:
+                      return None
+                  candidate = None
+                  while low <= high:
+                      mid = (low + high) // 2
+                      row = inspect_listing(mid)
+                      if not row.get('oldest') or not row.get('newest'):
+                          high = mid - 1
+                          continue
+                      oldest = date.fromisoformat(row['oldest'])
+                      newest = date.fromisoformat(row['newest'])
+                      if target_day > newest:
+                          high = mid - 1
+                      elif target_day < oldest:
+                          low = mid + 1
+                      else:
+                          candidate = mid
+                          break
+                  if candidate is None:
+                      candidate = low
+                  return candidate
+
+              def click_matching_anchor(target: dict, page_number: int) -> str | None:
+                  phrase_n = norm(target['phrase'])
+                  for candidate_page in range(max(1, page_number - 4), page_number + 5):
+                      row = inspect_listing(candidate_page)
+                      for item in row.get('items', []):
+                          text = item.get('text') or ''
+                          text_n = norm(text)
+                          short_n = norm(target['phrase'][:12])
+                          if phrase_n in text_n or (short_n and short_n in text_n and '歌礼制药' in text):
+                              page.goto(row['url'], wait_until='domcontentloaded', timeout=120000)
+                              page.wait_for_timeout(700)
+                              anchors = page.locator('a[data-controller~="protected-link"]')
+                              chosen = None
+                              for index in range(anchors.count()):
+                                  anchor = anchors.nth(index)
+                                  anchor_text = ' '.join((anchor.inner_text(timeout=3000) or '').split())
+                                  if phrase_n in norm(anchor_text) or (short_n in norm(anchor_text) and '歌礼制药' in anchor_text):
+                                      chosen = anchor
+                                      break
+                              if chosen is None:
+                                  continue
+                              before = page.url
+                              try:
+                                  chosen.click(timeout=12000)
+                                  page.wait_for_timeout(3500)
+                                  try:
+                                      page.wait_for_url(re.compile(r'https://www\.hangyan\.co/reports/\d+'), timeout=15000)
+                                  except PlaywrightTimeout:
+                                      pass
+                              except Exception as exc:
+                                  status['attempts'].append({'target': target, 'page': candidate_page, 'click_error': repr(exc)})
+                                  continue
+                              after = page.url
+                              match = re.search(r'/reports/(\d+)', after)
+                              status['attempts'].append({'target': target, 'page': candidate_page, 'text': text, 'before': before, 'after': after})
+                              print('CLICK_LISTING', target['institution'], candidate_page, text, after, flush=True)
+                              if match:
+                                  return after
+                  return None
+
+              # Resolve listing-based reports using date-aware binary search.
+              for target in targets:
+                  report_url = None
+                  if target['method'] == 'listing':
+                      page_number = locate_page(target['date'])
+                      print('LOCATED_DATE_PAGE', target['date'], page_number, flush=True)
+                      if page_number is not None:
+                          report_url = click_matching_anchor(target, page_number)
+                  else:
+                      page.goto(target['chart_url'], wait_until='domcontentloaded', timeout=120000)
+                      page.wait_for_timeout(1800)
+                      phrase_n = norm(target['phrase'])
+                      anchors = page.locator('a[data-controller~="protected-link"]')
+                      chosen = None
+                      for index in range(anchors.count()):
+                          anchor = anchors.nth(index)
+                          text = ' '.join((anchor.inner_text(timeout=3000) or '').split())
+                          if phrase_n in norm(text):
+                              chosen = anchor
+                              break
+                      if chosen is None:
+                          for label in ['阅读研究报告']:
+                              locator = page.get_by_text(label, exact=True)
+                              if locator.count():
+                                  chosen = locator.first
+                                  break
+                      if chosen is not None:
+                          before = page.url
+                          try:
+                              chosen.click(timeout=12000)
+                              page.wait_for_timeout(3500)
+                              try:
+                                  page.wait_for_url(re.compile(r'https://www\.hangyan\.co/reports/\d+'), timeout=15000)
+                              except PlaywrightTimeout:
+                                  pass
+                              after = page.url
+                              print('CLICK_CHART', target['institution'], before, after, flush=True)
+                              if re.search(r'/reports/\d+', after):
+                                  report_url = after
+                          except Exception as exc:
+                              status['attempts'].append({'target': target, 'chart_url': target['chart_url'], 'click_error': repr(exc)})
+                  if report_url:
+                      record = {**target, 'report_url': report_url}
+                      resolved.append(record)
+                      status['resolved'].append(record)
+                      print('RESOLVED', json.dumps(record, ensure_ascii=False), flush=True)
+                  else:
+                      print('UNRESOLVED', json.dumps(target, ensure_ascii=False), flush=True)
+
+              # Fallback direct report identified in the public index; accepted only if substantial.
+              resolved.append({
+                  'phrase': '创新药研发推进顺利，BD合作空间广阔',
+                  'institution': '国元国际控股',
+                  'date': '2024-09-02',
+                  'kind': '港股公司研究',
+                  'report_url': 'https://www.hangyan.co/reports/3448696034581022433',
+                  'fallback': True,
+              })
+
+              for target in resolved:
+                  if len(downloaded) >= 3:
+                      break
+                  row = {**target}
+                  try:
+                      response = page.goto(target['report_url'], wait_until='domcontentloaded', timeout=120000)
+                      try:
+                          page.wait_for_load_state('networkidle', timeout=30000)
+                      except PlaywrightTimeout:
+                          row['networkidle_timeout'] = True
+                      page.wait_for_timeout(2500)
+                      row['status'] = response.status if response else None
+                      row['final_url'] = page.url
+                      row['page_title'] = page.title()
+                      body = ' '.join(page.locator('body').inner_text().split())
+                      row['body_head'] = body[:5000]
+                      if '歌礼制药' not in body and '歌礼制药' not in row['page_title'] and '01672' not in body:
+                          row['skip_reason'] = 'not Ascletis Pharma'
+                          status['attempts'].append(row)
+                          continue
+                      native = page.locator('[data-controller~="native-pdf"]')
+                      row['native_pdf_count'] = native.count()
+                      if native.count():
+                          row['native_pdf_attributes'] = page.evaluate(
+                              'el => Object.fromEntries(Array.from(el.attributes).map(a => [a.name,a.value]))',
+                              native.first.element_handle(),
+                          )
+                      button = page.locator('button[data-action*="native-pdf#download"], a[data-action*="native-pdf#download"]')
+                      row['download_button_count'] = button.count()
+                      if not button.count() or not button.first.is_visible():
+                          row['skip_reason'] = 'public download control unavailable'
+                          status['attempts'].append(row)
+                          print('NO_DOWNLOAD_CONTROL', target['report_url'], flush=True)
+                          continue
+                      with page.expect_download(timeout=45000) as pending:
+                          button.first.click(timeout=12000)
+                      download = pending.value
+                      temp_path = work / ('temp_' + safe(download.suggested_filename))
+                      download.save_as(str(temp_path))
+                      data = temp_path.read_bytes()
+                      if b'%PDF-' not in data[:1024] or len(data) < 50000:
+                          row['skip_reason'] = f'invalid PDF, {len(data)} bytes'
+                          temp_path.unlink(missing_ok=True)
+                          status['attempts'].append(row)
+                          continue
+                      reader = PdfReader(io.BytesIO(data), strict=False)
+                      pages = len(reader.pages)
+                      sha256 = hashlib.sha256(data).hexdigest()
+                      row.update({'pages': pages, 'bytes': len(data), 'sha256': sha256})
+                      if pages < 10:
+                          row['skip_reason'] = f'short report ({pages} pages)'
+                          temp_path.unlink(missing_ok=True)
+                          status['attempts'].append(row)
+                          print('SKIP_SHORT', target['institution'], pages, target['phrase'], flush=True)
+                          continue
+                      if sha256 in seen_hashes:
+                          row['skip_reason'] = 'duplicate PDF'
+                          temp_path.unlink(missing_ok=True)
+                          status['attempts'].append(row)
+                          continue
+                      final_name = safe(f"{target['date']}_{target['institution']}_歌礼制药_{target['phrase']}_{pages}页.pdf")
+                      final_path = work / final_name
+                      temp_path.replace(final_path)
+                      row['file'] = final_name
+                      seen_hashes.add(sha256)
+                      downloaded.append(row)
+                      status['downloads'].append(row)
+                      print('PDF_OK', final_name, pages, len(data), flush=True)
+                  except Exception as exc:
+                      row['error'] = repr(exc)
+                      status['attempts'].append(row)
+                      print('DOWNLOAD_ERROR', target.get('report_url'), repr(exc), flush=True)
 
               browser.close()
 
-          results['_network'] = network[-5000:]
-          (out / 'results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          # Always save diagnostics, including when fewer than two reports were obtained.
+          (out / 'status.json').write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(downloaded) >= 2:
+              downloaded.sort(key=lambda item: item['date'], reverse=True)
+              downloaded = downloaded[:3]
+              csv_path = work / '文件清单与校验值.csv'
+              with csv_path.open('w', encoding='utf-8-sig', newline='') as handle:
+                  writer = csv.DictWriter(handle, fieldnames=['序号','券商','发布日期','报告类型','报告标题','PDF页数','文件大小_字节','SHA256','来源页面','文件名'])
+                  writer.writeheader()
+                  for index, item in enumerate(downloaded, 1):
+                      writer.writerow({
+                          '序号': index,
+                          '券商': item['institution'],
+                          '发布日期': item['date'],
+                          '报告类型': item['kind'],
+                          '报告标题': item['phrase'],
+                          'PDF页数': item['pages'],
+                          '文件大小_字节': item['bytes'],
+                          'SHA256': item['sha256'],
+                          '来源页面': item['report_url'],
+                          '文件名': item['file'],
+                      })
+              readme = work / 'README.txt'
+              readme.write_text(
+                  '歌礼制药-B（01672.HK）券商深度报告资料包\n'
+                  '生成日期：2026-09-06\n\n'
+                  f'本资料包包含 {len(downloaded)} 份完整券商PDF，均达到10页或以上；已排除短篇业绩点评与事件点评。\n'
+                  'PDF已校验文件头、可解析性、实际页数和SHA-256；ZIP已执行CRC完整性检查。\n'
+                  '报告观点、评级与预测均对应各自发布日期，仅供研究参考。\n',
+                  encoding='utf-8',
+              )
+              archive_path = out / f'歌礼制药_01672_券商深度报告_{len(downloaded)}份.zip'
+              with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+                  for item in downloaded:
+                      archive.write(work / item['file'], arcname=item['file'])
+                  archive.write(csv_path, arcname=csv_path.name)
+                  archive.write(readme, arcname=readme.name)
+              with zipfile.ZipFile(archive_path, 'r') as archive:
+                  bad = archive.testzip()
+                  if bad is not None:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+              result = {
+                  'ok': True,
+                  'archive': archive_path.name,
+                  'archive_bytes': archive_path.stat().st_size,
+                  'pdf_count': len(downloaded),
+                  'reports': downloaded,
+              }
+              (out / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          else:
+              result = {'ok': False, 'pdf_count': len(downloaded), 'message': 'fewer than two substantial public PDFs downloaded'}
+              (out / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('PACKAGE_NOT_READY', json.dumps(result, ensure_ascii=False), flush=True)
           PY
 
-      - name: Upload probe
+      - name: Upload package and diagnostics
         uses: actions/upload-artifact@v4
         with:
-          name: gelizhiyuo-hangyan-probe
+          name: gelizhiyiao-broker-report-package
           path: output/*
           retention-days: 1
           if-no-files-found: error
