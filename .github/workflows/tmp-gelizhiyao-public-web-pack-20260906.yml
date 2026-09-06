@@ -1,0 +1,275 @@
+name: Temporary Ascletis public-web report package
+
+on:
+  push:
+    branches:
+      - tmp-gelizhiyao-public-web-pack-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Install PDF and browser dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet playwright pypdf
+          python -m playwright install --with-deps chromium
+
+      - name: Export public pages, label them, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import io
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+          from pypdf import PdfReader, PdfWriter
+
+          output = Path('output')
+          work = Path('work')
+          output.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+
+          sources = [
+              {
+                  'date': '2025-04-01',
+                  'institution': '东吴证券',
+                  'title': '全新GLP-1减重不减肌，有潜力成为Best-in-Class',
+                  'url': 'https://www.sohu.com/a/878388465_121118717',
+                  'edition': '公开长篇转载网页导出版',
+                  'note': '来源为公开发布的长篇转载页面；不是券商原始排版PDF。网页公开内容可能与原始19页研报存在版式或内容差异。',
+              },
+              {
+                  'date': '2025-12-29',
+                  'institution': '东方证券',
+                  'title': '首次覆盖报告：口服小分子率先破局，紧跟减重前沿',
+                  'url': 'https://www.fxbaogao.com/detail/5205547',
+                  'edition': '公开研报摘要页导出版',
+                  'note': '来源为公开研报摘要与预览页面；不是券商原始PDF附件，内容限于网页公开范围。',
+              },
+              {
+                  'date': '2025-09-07',
+                  'institution': '兴证国际',
+                  'title': '聚焦减重代谢产品差异化管线，2025年下半年有望读出多项核心管线临床数据',
+                  'url': 'https://www.fxbaogao.com/detail/5048656',
+                  'edition': '公开研报摘要页导出版',
+                  'note': '来源为公开研报摘要与预览页面；不是券商原始PDF附件，内容限于网页公开范围。',
+              },
+          ]
+
+          def safe_filename(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', ' ', value).strip(' ._')
+              return value[:180]
+
+          records = []
+          css = r'''
+          @page { size: A4; margin: 12mm 12mm 14mm 12mm; }
+          html, body { background: white !important; }
+          header, nav, footer,
+          .header, .site-header, .top-header, .nav, .navbar, .footer, .site-footer,
+          .sidebar, .right-sidebar, .left-sidebar, .side-bar,
+          [class*="advert"], [id*="advert"], [class*="ad-wrap"], [class*="ad_box"],
+          [class*="download-app"], [class*="qrcode"], [class*="float"],
+          .fixed, .modal, .dialog, .mask, .toast, .toolbar, .share-bar,
+          iframe { display: none !important; }
+          body { overflow: visible !important; }
+          img { max-width: 100% !important; height: auto !important; page-break-inside: avoid; }
+          pre, table { max-width: 100% !important; overflow-wrap: anywhere !important; }
+          a { color: inherit !important; text-decoration: none !important; }
+          '''
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True,
+                  args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+              )
+              context = browser.new_context(
+                  viewport={'width': 1440, 'height': 1200},
+                  locale='zh-CN',
+                  timezone_id='Asia/Shanghai',
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                  extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7'},
+              )
+              context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+
+              for index, source in enumerate(sources, 1):
+                  page = context.new_page()
+                  row = dict(source)
+                  try:
+                      response = page.goto(source['url'], wait_until='domcontentloaded', timeout=120000)
+                      row['http_status'] = response.status if response else None
+                      try:
+                          page.wait_for_load_state('networkidle', timeout=30000)
+                      except PlaywrightTimeout:
+                          row['networkidle_timeout'] = True
+                      page.wait_for_timeout(3500)
+
+                      # Use only controls that reveal content already available to an unauthenticated visitor.
+                      for label in ['展开全文', '阅读全文', '查看全文']:
+                          locator = page.get_by_text(label, exact=True)
+                          if locator.count() and locator.first.is_visible():
+                              try:
+                                  locator.first.click(timeout=4000)
+                                  page.wait_for_timeout(1500)
+                              except Exception:
+                                  pass
+
+                      # Trigger lazy-loaded public images/content without interacting with login or paid controls.
+                      height = page.evaluate('document.body.scrollHeight')
+                      steps = max(8, min(40, int(height / 900) + 2))
+                      for step in range(steps):
+                          page.evaluate('(y) => window.scrollTo(0, y)', int((step + 1) * height / steps))
+                          page.wait_for_timeout(180)
+                      page.evaluate('window.scrollTo(0, 0)')
+                      page.wait_for_timeout(1200)
+
+                      page.add_style_tag(content=css)
+                      raw_pdf = work / f'raw_{index}.pdf'
+                      page.pdf(
+                          path=str(raw_pdf),
+                          format='A4',
+                          print_background=True,
+                          margin={'top': '12mm', 'right': '12mm', 'bottom': '14mm', 'left': '12mm'},
+                          prefer_css_page_size=True,
+                      )
+                      row['source_page_title'] = page.title()
+                      row['source_final_url'] = page.url
+                      row['source_body_chars'] = len(page.locator('body').inner_text())
+                      page.close()
+
+                      cover = context.new_page()
+                      cover_html = f'''<!doctype html>
+                      <html lang="zh-CN"><head><meta charset="utf-8"><style>
+                      @page {{ size: A4; margin: 22mm; }}
+                      body {{ font-family: "Noto Sans CJK SC", "WenQuanYi Zen Hei", sans-serif; color:#111; line-height:1.7; }}
+                      .kicker {{ font-size:14px; letter-spacing:1px; color:#555; margin-top:28mm; }}
+                      h1 {{ font-size:27px; line-height:1.35; margin:12mm 0 7mm; }}
+                      .meta {{ font-size:16px; margin:3mm 0; }}
+                      .notice {{ margin-top:14mm; padding:8mm; border:1.5px solid #333; background:#f4f4f4; font-size:15px; }}
+                      .url {{ margin-top:12mm; font-size:11px; overflow-wrap:anywhere; color:#444; }}
+                      </style></head><body>
+                      <div class="kicker">歌礼制药-B（01672.HK）券商研究资料</div>
+                      <h1>{html.escape(source['title'])}</h1>
+                      <div class="meta"><strong>机构：</strong>{html.escape(source['institution'])}</div>
+                      <div class="meta"><strong>日期：</strong>{html.escape(source['date'])}</div>
+                      <div class="meta"><strong>文件性质：</strong>{html.escape(source['edition'])}</div>
+                      <div class="notice"><strong>重要说明</strong><br>{html.escape(source['note'])}<br><br>本文件仅将无需登录即可访问的公开网页内容导出为PDF，没有绕过登录、付费或权限控制。</div>
+                      <div class="url"><strong>公开来源页面：</strong><br>{html.escape(source['url'])}</div>
+                      </body></html>'''
+                      cover.set_content(cover_html, wait_until='load')
+                      cover_pdf = work / f'cover_{index}.pdf'
+                      cover.pdf(path=str(cover_pdf), format='A4', print_background=True, prefer_css_page_size=True)
+                      cover.close()
+
+                      merged_name = safe_filename(f"{index:02d}_{source['date']}_{source['institution']}_{source['title']}_{source['edition']}.pdf")
+                      merged_path = work / merged_name
+                      writer = PdfWriter()
+                      writer.append(str(cover_pdf))
+                      writer.append(str(raw_pdf))
+                      with merged_path.open('wb') as handle:
+                          writer.write(handle)
+                      data = merged_path.read_bytes()
+                      if b'%PDF-' not in data[:1024] or len(data) < 30000:
+                          raise RuntimeError(f'invalid generated PDF: {len(data)} bytes')
+                      pages = len(PdfReader(io.BytesIO(data), strict=False).pages)
+                      row.update({
+                          'file': merged_name,
+                          'pages': pages,
+                          'bytes': len(data),
+                          'sha256': hashlib.sha256(data).hexdigest(),
+                      })
+                      records.append(row)
+                      print('PDF_OK', merged_name, pages, len(data), row['source_body_chars'], flush=True)
+                  except Exception as exc:
+                      row['error'] = repr(exc)
+                      print('PDF_ERROR', source['url'], repr(exc), flush=True)
+                      try:
+                          page.close()
+                      except Exception:
+                          pass
+
+              browser.close()
+
+          if len(records) < 2:
+              raise RuntimeError(f'Only {len(records)} public page PDFs were generated')
+
+          csv_path = work / '文件清单与校验值.csv'
+          with csv_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=[
+                  '序号','机构','发布日期','报告标题','文件性质','PDF页数','文件大小_字节','SHA256','公开来源页面','文件名','说明'
+              ])
+              writer.writeheader()
+              for index, item in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': index,
+                      '机构': item['institution'],
+                      '发布日期': item['date'],
+                      '报告标题': item['title'],
+                      '文件性质': item['edition'],
+                      'PDF页数': item['pages'],
+                      '文件大小_字节': item['bytes'],
+                      'SHA256': item['sha256'],
+                      '公开来源页面': item['url'],
+                      '文件名': item['file'],
+                      '说明': item['note'],
+                  })
+
+          readme = work / 'README.txt'
+          readme.write_text(
+              '歌礼制药-B（01672.HK）券商研究公开网页版资料包\n'
+              '生成日期：2026-09-06\n\n'
+              '本资料包未包含需要登录、付费或机构权限才能下载的券商原始附件。\n'
+              '文件1为东吴证券深度报告的公开长篇转载网页导出版；文件2和文件3为东方证券、兴证国际报告的公开摘要页导出版。\n'
+              '每份PDF首页均标明文件性质和来源，避免将网页版本或摘要页误认作券商原始排版PDF。\n'
+              '所有PDF均已检查文件头、可解析性、实际页数和SHA-256；ZIP已执行CRC完整性检查。\n',
+              encoding='utf-8',
+          )
+
+          archive_name = f'歌礼制药_01672_券商研究_公开网页版_{len(records)}份.zip'
+          archive_path = output / archive_name
+          with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for item in records:
+                  archive.write(work / item['file'], arcname=item['file'])
+              archive.write(csv_path, arcname=csv_path.name)
+              archive.write(readme, arcname=readme.name)
+
+          with zipfile.ZipFile(archive_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              members = archive.namelist()
+
+          result = {
+              'archive': archive_name,
+              'archive_bytes': archive_path.stat().st_size,
+              'pdf_count': len(records),
+              'records': records,
+              'members': members,
+          }
+          (output / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: gelizhiyiao-public-web-package
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
