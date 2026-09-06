@@ -1,0 +1,208 @@
+name: Download public CR BMT deep reports
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          python -m pip install --quiet playwright requests beautifulsoup4 pypdf
+          python -m playwright install --with-deps chromium
+      - name: Locate and download public reports
+        run: |
+          mkdir -p out/pdfs
+          cat > /tmp/download_reports.py <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from pypdf import PdfReader
+
+          ROOT = 'https://www.hangyan.co/reports'
+          OUT = Path('out')
+          PDF_DIR = OUT / 'pdfs'
+          SEARCH_PAGES = list(range(1183, 1202)) + list(range(1211, 1233))
+          TARGET_PHRASES = ('华南水泥翘楚', '水泥骨料双轮驱动')
+          UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+
+          def sanitize(name: str) -> str:
+              name = re.sub(r'[\\/:*?"<>|]+', '_', name).strip()
+              name = re.sub(r'\s+', ' ', name)
+              return name[:180]
+
+          # Locate only the two named public report cards using the normal public list.
+          session = requests.Session()
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9'})
+          candidates = []
+          for page_no in SEARCH_PAGES:
+              response = session.get(ROOT, params={'page': page_no}, timeout=60)
+              print('LIST', page_no, response.status_code, len(response.content))
+              if response.status_code != 200:
+                  time.sleep(2.5)
+                  continue
+              soup = BeautifulSoup(response.text, 'html.parser')
+              for anchor in soup.select('a[data-controller="protected-link"]'):
+                  title = anchor.get_text(' ', strip=True)
+                  box = anchor.find_parent('div', class_=lambda c: c and 'box' in c.split())
+                  meta = box.get_text(' ', strip=True) if box else title
+                  if '华润建材科技' in title and any(phrase in title for phrase in TARGET_PHRASES):
+                      item = {'page': page_no, 'title': title, 'meta': meta}
+                      if item not in candidates:
+                          candidates.append(item)
+                          print('CANDIDATE', json.dumps(item, ensure_ascii=False))
+              if len(candidates) >= 2:
+                  break
+              time.sleep(1.2)
+
+          (OUT / 'candidates.json').write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+          if len(candidates) < 2:
+              raise SystemExit(f'Only found {len(candidates)} target report cards: {candidates}')
+
+          saved = []
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(
+                  accept_downloads=True,
+                  locale='zh-CN',
+                  user_agent=UA,
+              )
+
+              for candidate in candidates[:2]:
+                  page = context.new_page()
+                  list_url = f"{ROOT}?page={candidate['page']}"
+                  print('OPEN_LIST', list_url, candidate['title'])
+                  page.goto(list_url, wait_until='domcontentloaded', timeout=120000)
+                  page.wait_for_timeout(2500)
+
+                  matches = page.locator('a[data-controller="protected-link"]').filter(has_text=candidate['title'])
+                  if matches.count() == 0:
+                      # Fallback to the distinctive title fragment.
+                      phrase = next((x for x in TARGET_PHRASES if x in candidate['title']), '华润建材科技')
+                      matches = page.locator('a[data-controller="protected-link"]').filter(has_text=phrase)
+                  if matches.count() == 0:
+                      page.close()
+                      raise RuntimeError(f"Could not find clickable card on page {candidate['page']}: {candidate['title']}")
+
+                  matches.first.click()
+                  try:
+                      page.wait_for_url(re.compile(r'https://www\.hangyan\.co/reports/\d+'), timeout=60000)
+                  except PlaywrightTimeoutError:
+                      print('URL_WAIT_TIMEOUT', page.url)
+                  page.wait_for_load_state('domcontentloaded', timeout=120000)
+                  page.wait_for_timeout(12000)
+                  detail_url = page.url
+                  detail_title = page.title()
+                  print('DETAIL', detail_url, detail_title)
+
+                  data = b''
+                  source_url = ''
+                  iframe = page.locator('iframe[data-native-pdf-target="iframe"]')
+                  if iframe.count():
+                      for _ in range(30):
+                          src = iframe.first.get_attribute('src') or ''
+                          if src.startswith('http'):
+                              source_url = src
+                              break
+                          page.wait_for_timeout(1000)
+                  if source_url:
+                      print('PDF_SRC', source_url)
+                      r = session.get(source_url, headers={'Referer': detail_url, 'User-Agent': UA}, timeout=120)
+                      print('PDF_HTTP', r.status_code, r.headers.get('content-type'), len(r.content))
+                      data = r.content
+
+                  if not data.lstrip().startswith(b'%PDF'):
+                      button = page.locator('button[data-action*="native-pdf#download"]')
+                      if button.count() and button.first.is_visible():
+                          try:
+                              with page.expect_download(timeout=60000) as dl_info:
+                                  button.first.click()
+                              dl = dl_info.value
+                              tmp = OUT / sanitize(dl.suggested_filename or 'report.pdf')
+                              dl.save_as(str(tmp))
+                              data = tmp.read_bytes()
+                              source_url = detail_url + '#download'
+                              tmp.unlink(missing_ok=True)
+                          except Exception as exc:
+                              print('DOWNLOAD_BUTTON_ERROR', repr(exc))
+
+                  if not data.lstrip().startswith(b'%PDF') or len(data) < 100000:
+                      page.close()
+                      raise RuntimeError(f'Invalid PDF for {candidate}: {len(data)} bytes, source={source_url}')
+
+                  filename = sanitize(candidate['title']) + '.pdf'
+                  pdf_path = PDF_DIR / filename
+                  pdf_path.write_bytes(data)
+                  reader = PdfReader(str(pdf_path), strict=False)
+                  pages = len(reader.pages)
+                  sample = ' '.join((pg.extract_text() or '') for pg in reader.pages[:3])[:4000]
+                  print('VALIDATED', filename, pages, len(data), sample[:500])
+                  if pages < 10:
+                      page.close()
+                      raise RuntimeError(f'Target report is unexpectedly short ({pages} pages): {candidate}')
+                  if '华润建材科技' not in sample and '华润水泥' not in sample:
+                      page.close()
+                      raise RuntimeError(f'Company name not found in PDF text: {candidate}')
+
+                  saved.append({
+                      'file': filename,
+                      'pages': pages,
+                      'bytes': len(data),
+                      'sha256': hashlib.sha256(data).hexdigest(),
+                      'detail_url': detail_url,
+                      'source_url': source_url,
+                      'title': candidate['title'],
+                      'meta': candidate['meta'],
+                  })
+                  page.close()
+
+              browser.close()
+
+          if len(saved) != 2:
+              raise SystemExit(f'Expected 2 validated PDFs, got {len(saved)}')
+
+          manifest_path = OUT / 'manifest.json'
+          manifest_path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme_lines = [
+              '华润建材科技（01313.HK）券商深度报告',
+              '',
+              '本压缩包包含2份经校验的完整PDF。',
+              '',
+          ]
+          for idx, item in enumerate(saved, 1):
+              readme_lines.append(f"{idx}. {item['title']}")
+              readme_lines.append(f"   页数：{item['pages']}页；文件大小：{item['bytes']}字节")
+          readme_lines += ['', '文件仅供个人研究使用，请遵守原报告版权与使用条款。']
+          (OUT / 'README.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  pdfs/{x['file']}" for x in saved) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'CR_Building_Materials_01313_Broker_Deep_Reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for pdf in sorted(PDF_DIR.glob('*.pdf')):
+                  zf.write(pdf, arcname=pdf.name)
+              zf.write(OUT / 'README.txt', arcname='README.txt')
+              zf.write(manifest_path, arcname='manifest.json')
+              zf.write(OUT / 'SHA256SUMS.txt', arcname='SHA256SUMS.txt')
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'Corrupt ZIP member: {bad}')
+          print('ZIP_READY', zip_path, zip_path.stat().st_size)
+          PY
+          python /tmp/download_reports.py
+      - name: Upload validated ZIP and PDFs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crbmt-validated-deep-reports
+          path: out
+          retention-days: 1
+          compression-level: 0
