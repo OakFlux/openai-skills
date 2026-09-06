@@ -1,0 +1,140 @@
+name: Temporary Aixin Hangyan report-tab search
+
+on:
+  push:
+    branches:
+      - tmp-aixin-hangyan-reporttab-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet playwright pypdf
+          python -m playwright install --with-deps chromium
+      - name: Search report catalogue and test public downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import io, json, re
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+          from pypdf import PdfReader
+
+          out=Path('output'); out.mkdir(exist_ok=True)
+          queries=['爱芯元智','踏智驾及边缘AI之浪','AI终端平台公司','高端启新 智驱全球','上市后首次中报营收维持高增长']
+          report_ids={}
+          query_results={}
+          with sync_playwright() as p:
+            browser=p.chromium.launch(headless=True,args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'])
+            context=browser.new_context(
+              viewport={'width':1440,'height':1200}, locale='zh-CN', timezone_id='Asia/Shanghai', accept_downloads=True,
+              user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              extra_http_headers={'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+            )
+            context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            page=context.new_page()
+            for index,query in enumerate(queries,1):
+              row={'query':query}
+              try:
+                response=page.goto('https://www.hangyan.co/',wait_until='domcontentloaded',timeout=120000)
+                row['home_status']=response.status if response else None
+                page.wait_for_timeout(2500)
+                search=page.locator('#autocomplete-0-input')
+                search.click(); search.fill(query); page.wait_for_timeout(3000)
+                report_link=page.locator('a[href^="/reports?q="]')
+                row['report_link_count']=report_link.count()
+                if not report_link.count():
+                  raise RuntimeError('report search suggestion not found')
+                row['report_href']=report_link.first.get_attribute('href')
+                row['report_text']=' '.join(report_link.first.inner_text().split())
+                report_link.first.click(timeout=10000)
+                try: page.wait_for_load_state('domcontentloaded',timeout=30000)
+                except PWTimeout: pass
+                page.wait_for_timeout(7000)
+                row['final_url']=page.url; row['title']=page.title(); row['body']=' '.join(page.locator('body').inner_text().split())[:80000]
+                links=page.eval_on_selector_all('a[href*="/reports/"]','els => els.map(e => ({href:e.href,text:(e.innerText||e.textContent||"").trim(),context:(e.closest("article,li,div")?.innerText||e.parentElement?.innerText||"").trim()}))')
+                unique={}
+                for item in links:
+                  match=re.search(r'/reports/(\d+)',item.get('href',''))
+                  if not match: continue
+                  rid=match.group(1)
+                  combined=' '.join(((item.get('text') or '')+' '+(item.get('context') or '')).split())
+                  rec={'id':rid,'href':item.get('href'),'text':' '.join((item.get('text') or '').split()),'context':combined[:5000],'source_query':query}
+                  unique[rid]=rec
+                  if '爱芯元智' in combined or any(term in combined for term in ['踏智驾及边缘AI之浪','AI终端平台公司','高端启新','上市后首次中报','中报超预期','IPO申购指南','IPO点评','新股预览']):
+                    report_ids[rid]=rec
+                    print('REPORT_MATCH',json.dumps(rec,ensure_ascii=False),flush=True)
+                row['links']=list(unique.values())
+                row['matched_ids']=[rid for rid in unique if rid in report_ids]
+                page.screenshot(path=str(out/f'query_{index}.png'),full_page=True)
+                (out/f'query_{index}.html').write_text(page.content(),encoding='utf-8')
+                print('QUERY_OK',query,row['final_url'],'links',len(unique),'matched',len(row['matched_ids']),flush=True)
+              except Exception as error:
+                row['error']=repr(error)
+                print('QUERY_ERROR',query,repr(error),flush=True)
+              query_results[query]=row
+
+            details=[]
+            # Add the known public IPO guide page as a fallback candidate.
+            report_ids.setdefault('3821532897978877046',{'id':'3821532897978877046','href':'https://www.hangyan.co/reports/3821532897978877046','text':'IPO申购指南：爱芯元智','context':'国元国际控股 港股公司研究','source_query':'known public index'})
+            for rid,record in report_ids.items():
+              detail=dict(record)
+              try:
+                response=page.goto(record['href'],wait_until='domcontentloaded',timeout=120000)
+                detail['status']=response.status if response else None
+                try: page.wait_for_load_state('networkidle',timeout=35000)
+                except PWTimeout: detail['networkidle_timeout']=True
+                page.wait_for_timeout(5000)
+                detail['final_url']=page.url; detail['title']=page.title(); detail['body']=' '.join(page.locator('body').inner_text().split())[:80000]
+                native=page.locator('[data-controller~="native-pdf"]')
+                detail['native_pdf_count']=native.count()
+                if native.count():
+                  attrs=page.evaluate('el => Object.fromEntries(Array.from(el.attributes).map(a => [a.name,a.value]))',native.first.element_handle())
+                  detail['native_pdf_attributes']=attrs
+                button=page.locator('button[data-action*="native-pdf#download"]')
+                detail['download_button_count']=button.count()
+                if button.count() and button.first.is_visible():
+                  try:
+                    with page.expect_download(timeout=30000) as pending:
+                      button.first.click(timeout=10000)
+                    download=pending.value
+                    target=out/f'{rid}_{download.suggested_filename}'
+                    download.save_as(str(target))
+                    data=target.read_bytes()
+                    info={'file':target.name,'suggested_filename':download.suggested_filename,'bytes':len(data),'is_pdf':b'%PDF-' in data[:1024]}
+                    if info['is_pdf'] and len(data)>50000:
+                      info['pages']=len(PdfReader(io.BytesIO(data),strict=False).pages)
+                    detail['download']=info
+                    print('DOWNLOAD_OK',rid,json.dumps(info,ensure_ascii=False),flush=True)
+                  except Exception as error:
+                    detail['download_error']=repr(error)
+                    print('DOWNLOAD_ERROR',rid,repr(error),flush=True)
+                page.screenshot(path=str(out/f'detail_{rid}.png'),full_page=True)
+                (out/f'detail_{rid}.html').write_text(page.content(),encoding='utf-8')
+                print('DETAIL_OK',rid,detail.get('title'),detail.get('native_pdf_attributes'),flush=True)
+              except Exception as error:
+                detail['error']=repr(error)
+                print('DETAIL_ERROR',rid,repr(error),flush=True)
+              details.append(detail)
+            (out/'query_results.json').write_text(json.dumps(query_results,ensure_ascii=False,indent=2),encoding='utf-8')
+            (out/'report_records.json').write_text(json.dumps(list(report_ids.values()),ensure_ascii=False,indent=2),encoding='utf-8')
+            (out/'details.json').write_text(json.dumps(details,ensure_ascii=False,indent=2),encoding='utf-8')
+            browser.close()
+          print('REPORT_COUNT',len(report_ids),flush=True)
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: aixin-hangyan-reporttab-results
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
