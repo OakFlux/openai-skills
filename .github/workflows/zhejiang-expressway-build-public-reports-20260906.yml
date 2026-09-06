@@ -1,0 +1,153 @@
+name: Build verified Zhejiang Expressway broker report package 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhejiang-expressway-build-public-reports-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pillow pypdf pymupdf
+      - name: Download intended public full-view pages and build PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, subprocess, time, zipfile
+          from pathlib import Path
+          import pymupdf, requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          package='浙江沪杭甬_券商研究报告_完整PDF_2份'
+          out=Path(package); out.mkdir(exist_ok=True)
+          work=Path('_zhejiang_reports_work'); work.mkdir(exist_ok=True)
+          renders=work/'renders'; renders.mkdir(exist_ok=True)
+
+          reports=[
+            dict(id=5345667, broker='西南证券', title='路网扩张提效，双业协同进阶', report_date='2026-04-06', platform_date='2026-04-09', authors='王湘杰、杨蕊', rating='买入（首次覆盖）', image_date='2026/04/09', min_pages=5, detail_url='https://www.fxbaogao.com/detail/5345667', view_url='https://www.fxbaogao.com/view?id=5345667'),
+            dict(id=5494602, broker='太平洋证券', title='2025年报点评，稳健分红，H+A正在推进中', report_date='2026-06-25', platform_date='2026-06-25', authors='程志峰', rating='增持（首次覆盖）', image_date='2026/06/25', min_pages=2, detail_url='https://www.fxbaogao.com/detail/5494602', view_url='https://www.fxbaogao.com/view?id=5494602'),
+          ]
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          def fetch_page(report, n, dest):
+            base=f"https://public.fxbaogao.com/report-image/{report['image_date']}/{report['id']}-{n}.png"
+            errors=[]
+            for attempt in range(1,4):
+              try:
+                r=s.get(base,headers={'Referer':report['view_url'],'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'},timeout=(20,150),allow_redirects=True)
+                sig=r.content[:16]
+                image_sig=sig.startswith(b'\x89PNG') or sig.startswith(b'\xff\xd8\xff') or sig.startswith(b'RIFF')
+                print('PAGE',report['id'],n,'TRY',attempt,'HTTP',r.status_code,'BYTES',len(r.content),'CT',r.headers.get('content-type'),'URL',r.url,flush=True)
+                if r.status_code==200 and image_sig and len(r.content)>10000:
+                  dest.write_bytes(r.content)
+                  with Image.open(dest) as im:
+                    im.verify()
+                  with Image.open(dest) as im:
+                    w,h=im.size
+                  if w<500 or h<700: raise RuntimeError(f'small image {w}x{h}')
+                  return {'page':n,'url':base,'bytes':len(r.content),'width':w,'height':h,'sha256':hashlib.sha256(r.content).hexdigest()}
+                if r.status_code in (403,404,410): return None
+                if r.status_code==200 and not image_sig: return None
+                errors.append(f'{r.status_code}/{len(r.content)}')
+              except Exception as e:
+                errors.append(repr(e))
+              time.sleep(attempt*2)
+            print('FETCH_FAILED',report['id'],n,errors,flush=True)
+            return None
+
+          records=[]
+          for order,report in enumerate(reports,1):
+            idir=work/f"images_{report['id']}"; idir.mkdir(exist_ok=True)
+            images=[]; manifest=[]; seen=set(); missing_streak=0
+            for n in range(1,81):
+              p=idir/f'{n:03d}.png'
+              meta=fetch_page(report,n,p)
+              if meta is None:
+                missing_streak += 1
+                if missing_streak>=2: break
+                continue
+              if missing_streak:
+                raise RuntimeError(f"non-contiguous page sequence for {report['id']} before page {n}")
+              missing_streak=0
+              if meta['sha256'] in seen: raise RuntimeError(f"duplicate page image {report['id']} page {n}")
+              seen.add(meta['sha256']); images.append(p); manifest.append(meta)
+            if len(images)<report['min_pages']:
+              raise RuntimeError(f"report {report['id']} only yielded {len(images)} intended public viewer pages; expected at least {report['min_pages']}")
+            pdf=work/f"{report['id']}.pdf"
+            doc=pymupdf.open()
+            for p in images:
+              with Image.open(p) as im: w,h=im.size
+              page=doc.new_page(width=w,height=h)
+              page.insert_image(page.rect,filename=str(p),keep_proportion=False)
+            doc.set_metadata({'title':report['title'],'author':report['broker'],'subject':'浙江沪杭甬（00576.HK）券商研究报告'})
+            doc.save(str(pdf),garbage=4,deflate=True,clean=True); doc.close()
+            data=pdf.read_bytes()
+            if data[:5]!=b'%PDF-': raise RuntimeError('bad PDF header')
+            reader=PdfReader(str(pdf),strict=False)
+            if len(reader.pages)!=len(images): raise RuntimeError('page count mismatch')
+            q=subprocess.run(['qpdf','--check',str(pdf)],capture_output=True,text=True)
+            print('QPDF',report['id'],q.returncode,q.stdout[-1000:],q.stderr[-1000:],flush=True)
+            if q.returncode not in (0,3): raise RuntimeError('qpdf structural validation failed')
+            d=pymupdf.open(str(pdf)); rendered=[]
+            for pno in sorted(set([0,len(images)//2,len(images)-1])):
+              pix=d.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1,1),alpha=False)
+              rp=renders/f"{report['id']}_{pno+1:03d}.png"; pix.save(str(rp))
+              if rp.stat().st_size<5000 or pix.width<400 or pix.height<500: raise RuntimeError('render validation failed')
+              rendered.append(pno+1)
+            d.close()
+            digest=hashlib.sha256(data).hexdigest()
+            filename=f"{order:02d}_{report['broker']}_{report['report_date'].replace('-','')}_{report['id']}.pdf"
+            (out/filename).write_bytes(data)
+            rec={**report,'filename':filename,'pages':len(images),'bytes':len(data),'sha256':digest,'rendered_pages':rendered,'source_type':'发现报告公开“免费查看完整报告”页面所提供的逐页原版图像，按原页序合成PDF'}
+            records.append(rec)
+            (work/f"page_manifest_{report['id']}.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          lines=['浙江沪杭甬（00576.HK）券商研究报告','',f'本包包含{len(records)}份可离线打开的完整PDF正文，共{sum(r["pages"] for r in records)}页。','来源页面明确提供“免费查看完整报告”；本包按公开完整查看页的原始顺序合成PDF，未裁切、未重排。','']
+          for i,r in enumerate(records,1):
+            lines += [f"{i}. {r['broker']}：《{r['title']}》",f"   报告日期：{r['report_date']}；作者：{r['authors']}；评级：{r['rating']}",f"   实际页数：{r['pages']}页；文件大小：{r['bytes']/1048576:.2f} MB",f"   来源页面：{r['detail_url']}",f"   完整查看页：{r['view_url']}",f"   SHA-256：{r['sha256']}",'']
+          lines += ['核验项目：逐页文件签名、图像尺寸、页面连续性、页面去重、PDF文件头、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256与ZIP CRC。','PDF由公开逐页图像按原页序生成，可正常阅读和打印；全文文本检索能力可能弱于券商原生矢量PDF。','历史评级与盈利预测不构成当前投资建议。']
+          (out/'报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          public=[{k:v for k,v in r.items() if k not in ('image_date','min_pages')} for r in records]
+          (out/'manifest.json').write_text(json.dumps(public,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+          zp=Path(package+'.zip')
+          with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+            for p in sorted(out.iterdir()): z.write(p,arcname=f'{package}/{p.name}')
+          with zipfile.ZipFile(zp) as z:
+            bad=z.testzip()
+            if bad: raise RuntimeError('ZIP CRC failed '+bad)
+            pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if len(pdfs)!=2: raise RuntimeError(f'PDF count mismatch: {pdfs}')
+          print('FINAL_ZIP',zp,zp.stat().st_size,'REPORTS',len(records),'PAGES',sum(r['pages'] for r in records),flush=True)
+          print('MANIFEST',json.dumps(public,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhejiang-expressway-broker-reports-final
+          path: 浙江沪杭甬_券商研究报告_完整PDF_2份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhejiang-expressway-broker-reports-diagnostics
+          path: _zhejiang_reports_work/
+          if-no-files-found: ignore
+          retention-days: 7
