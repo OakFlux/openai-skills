@@ -1,0 +1,205 @@
+name: Build KLN broker report package
+
+on:
+  push:
+    branches:
+      - tmp-kln-broker-reports-build-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Download and verify official DBS research PDFs
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+          mkdir -p deliverable/package deliverable/renders
+          cat > /tmp/build_kln_reports.py <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('deliverable')
+          WORK = OUT / 'package'
+          RENDERS = OUT / 'renders'
+          WORK.mkdir(parents=True, exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'en-HK,en;q=0.9,zh-CN;q=0.8',
+          })
+
+          def fetch(url, referer=None, attempts=6, timeout=(20, 100)):
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      headers = {'Referer': referer} if referer else None
+                      response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      if response.status_code == 200:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code} for {url}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(2 ** attempt, 10))
+              raise RuntimeError(f'Failed to fetch {url}: {last}')
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          reports = [
+              {
+                  'page': 'https://www.dbs.com.hk/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/032025/636_HK_03312025.xml',
+                  'date': '2025-03-31',
+                  'broker': 'DBS Bank (Hong Kong)',
+                  'title': 'Kerry Logistics Network - Quality play in uncertain times',
+                  'file': '2025-03-31_DBS_Quality_play_in_uncertain_times.pdf',
+              },
+              {
+                  'page': 'https://www.dbs.com.hk/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/082025/636_HK_08292025.xml',
+                  'date': '2025-08-29',
+                  'broker': 'DBS Bank (Hong Kong)',
+                  'title': 'KLN Logistics Group - Solid SEA presence underpinned outperformance',
+                  'file': '2025-08-29_DBS_Solid_SEA_presence_underpinned_outperformance.pdf',
+              },
+              {
+                  'page': 'https://www.dbs.com.hk/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/032026/636_HK_03312026.xml',
+                  'date': '2026-03-31',
+                  'broker': 'DBS Bank (Hong Kong)',
+                  'title': 'KLN Logistics Group - Diversification and growth underpin resilience',
+                  'file': '2026-03-31_DBS_Diversification_and_growth_underpin_resilience.pdf',
+              },
+          ]
+
+          manifest = []
+          for report in reports:
+              page_response = fetch(report['page'])
+              html = page_response.text
+              soup = BeautifulSoup(html, 'html.parser')
+              page_title = soup.title.get_text(' ', strip=True) if soup.title else ''
+
+              patterns = [
+                  r'ReportPdfPath\\?"\s*:\s*\\?"([^"\\]+\.pdf)',
+                  r'"ReportPdfPath"\s*:\s*"([^"]+\.pdf)',
+                  r'ReportPdfPath[^/]*(/content/article/pdf/[^"\\<]+\.pdf)',
+              ]
+              pdf_path = None
+              for pattern in patterns:
+                  match = re.search(pattern, html, re.I)
+                  if match:
+                      pdf_path = match.group(1).replace('\\u002F', '/').replace('\\/', '/')
+                      break
+              if not pdf_path:
+                  raise RuntimeError(f'ReportPdfPath not found on {report["page"]}')
+              pdf_url = urljoin('https://www.dbs.com.hk/', pdf_path)
+              pdf_response = fetch(pdf_url, referer=report['page'])
+              data = pdf_response.content
+              if not data.lstrip().startswith(b'%PDF') or len(data) < 30000:
+                  raise RuntimeError(f'Invalid PDF from {pdf_url}: {len(data)} bytes, {pdf_response.headers.get("content-type")}')
+
+              pdf_file = WORK / report['file']
+              pdf_file.write_bytes(data)
+              reader = PdfReader(str(pdf_file), strict=False)
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'Unexpected page count {pages}: {pdf_file.name}')
+              sample_text = ''.join((page.extract_text() or '') for page in reader.pages[:min(8, pages)])
+              compact = re.sub(r'\s+', '', sample_text).lower()
+              expected = ['kerrylogistics', 'klnlogistics', '636hk', '00636']
+              if not any(term in compact for term in expected):
+                  raise RuntimeError(f'Issuer/code not found in extracted text: {pdf_file.name}')
+
+              # Render first and last pages to verify visual readability.
+              doc = fitz.open(str(pdf_file))
+              render_dir = RENDERS / pdf_file.stem
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for page_no, label in [(0, 'first'), (pages - 1, 'last')]:
+                  page = doc.load_page(page_no)
+                  pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                  render_path = render_dir / f'{label}.png'
+                  pix.save(str(render_path))
+                  if render_path.stat().st_size < 10000 or pix.width < 500 or pix.height < 500:
+                      raise RuntimeError(f'Render validation failed: {pdf_file.name}, page {page_no + 1}')
+              doc.close()
+
+              digest = sha256(data)
+              manifest.append({
+                  'company': 'KLN Logistics Group Limited (formerly Kerry Logistics Network Limited)',
+                  'stock_code': '00636.HK',
+                  'broker': report['broker'],
+                  'report_date': report['date'],
+                  'title': report['title'],
+                  'official_page_title': page_title,
+                  'file': report['file'],
+                  'pages': pages,
+                  'size_bytes': len(data),
+                  'sha256': digest,
+                  'official_research_page': report['page'],
+                  'official_pdf_url': pdf_url,
+                  'source': 'DBS Bank (Hong Kong) official research website',
+                  'access_type': 'publicly accessible original broker PDF',
+              })
+              print('REPORT_OK', report['date'], pages, len(data), digest, pdf_url)
+
+          manifest_path = WORK / 'manifest.json'
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          readme_lines = [
+              'KLN Logistics Group（00636.HK，原嘉里物流联网）券商研究报告资料包',
+              '',
+              '整理日期：2026-09-06',
+              '共收录3份由DBS Bank (Hong Kong)官方网站公开提供的原始研究报告PDF。',
+              '这些报告属于公司研究/业绩分析报告；公开市场中可直接下载的近期长篇“首次覆盖深度报告”较少，因此优先收录来源权威、文件完整且时间较新的原始券商PDF。',
+              '',
+              '文件清单：',
+          ]
+          for index, item in enumerate(manifest, 1):
+              readme_lines.append(f"{index}. {item['report_date']}｜{item['broker']}｜{item['title']}｜{item['pages']}页")
+          readme_lines += [
+              '',
+              'manifest.json记录每份文件的官方研究页面、原始PDF地址、页数、大小及SHA-256。',
+              'SHA256SUMS.txt可用于校验文件完整性。',
+              '报告版权归原券商及作者所有，仅供个人研究与查阅。',
+          ]
+          (WORK / 'README_来源说明.txt').write_text('\n'.join(readme_lines) + '\n', encoding='utf-8')
+
+          sums = [f"{item['sha256']}  {item['file']}" for item in manifest]
+          sums.append(f"{sha256(manifest_path.read_bytes())}  manifest.json")
+          (WORK / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'kln_broker_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(WORK.iterdir(), key=lambda p: p.name):
+                  archive.write(path, path.name)
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 3:
+                  raise RuntimeError(f'Expected 3 PDFs, found {len(pdf_names)}')
+
+          print('PACKAGE_OK', zip_path.stat().st_size, sha256(zip_path.read_bytes()), len(manifest))
+          PY
+          python /tmp/build_kln_reports.py
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kln-broker-reports
+          path: deliverable/kln_broker_reports.zip
+          retention-days: 1
+          compression-level: 0
