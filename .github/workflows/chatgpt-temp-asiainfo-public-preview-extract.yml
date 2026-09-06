@@ -1,0 +1,168 @@
+name: chatgpt-temp-asiainfo-public-preview-extract
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-asiainfo-public-preview-extract.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract public report files and previews
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pillow pypdf playwright
+          python <<'PY'
+          import asyncio, hashlib, io, json, os, re, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+          from playwright.async_api import async_playwright
+
+          root=Path('asiainfo_public_extract'); pdfdir=root/'PDF'; pagesdir=root/'pages'
+          pdfdir.mkdir(parents=True,exist_ok=True);pagesdir.mkdir(parents=True,exist_ok=True)
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          s=requests.Session();s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          logs=[]; manifest=[]
+          def L(x):x=str(x);print(x,flush=True);logs.append(x)
+          def save_pdf_from_images(label,title,institution,date,urls,original_pages=None):
+            d=pagesdir/label;d.mkdir(parents=True,exist_ok=True)
+            images=[];meta=[];seen=set()
+            for i,u in enumerate(urls,1):
+              try:
+                rr=s.get(u,headers={'Referer':'https://www.fxbaogao.com/','Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'},timeout=90,allow_redirects=True)
+                L(f'IMG {label} {i} HTTP={rr.status_code} bytes={len(rr.content)} type={rr.headers.get("content-type")} final={rr.url}')
+                if rr.status_code!=200 or len(rr.content)<10000:continue
+                im=Image.open(io.BytesIO(rr.content));im.load()
+                if im.width<600 or im.height<700:continue
+                rawsha=hashlib.sha256(rr.content).hexdigest()
+                if rawsha in seen:continue
+                seen.add(rawsha)
+                rgb=im.convert('RGB')
+                p=d/f'page_{len(images)+1:02d}.png';rgb.save(p,'PNG',optimize=True)
+                images.append(rgb.copy());meta.append({'url':rr.url,'width':im.width,'height':im.height,'bytes':len(rr.content)})
+              except Exception as e:L(f'IMG ERROR {label} {u} {e!r}')
+            if not images:return None
+            suffix=f'公开试读{len(images)}页' + (f'_原报告{original_pages}页' if original_pages else '')
+            fn=re.sub(r'[\\/:*?"<>|]+','_',f'{date}_{institution}_亚信科技_{title}_{suffix}')+'.pdf'
+            out=pdfdir/fn
+            images[0].save(out,'PDF',save_all=True,append_images=images[1:],resolution=160.0)
+            pc=len(PdfReader(str(out),strict=False).pages)
+            data=out.read_bytes()
+            rec={'filename':fn,'title':title,'institution':institution,'date':date,'public_preview_pages':pc,'original_pages':original_pages,'size_bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'images':meta}
+            manifest.append(rec);L('VALID PREVIEW '+json.dumps(rec,ensure_ascii=False));return rec
+
+          # FXBaogao's documented public preview endpoint; only public preview images are used.
+          fx_reports=[
+            ('guoxin','AI大模型交付龙头，不断拓展新领域','国信证券','2026-05-13','5415424',None),
+            ('huasheng','宏观环境冲击行业，三新业务砥砺前行','华盛证券','2024-02-29','4154738',None),
+          ]
+          endpoint='https://api.fxbaogao.com/mofoun/report/report/getReportPreviewImages'
+          for label,title,inst,date,rid,orig in fx_reports:
+            try:
+              r=s.get(endpoint,params={'reportId':rid},headers={'Referer':f'https://www.fxbaogao.com/detail/{rid}','Origin':'https://www.fxbaogao.com','Accept':'application/json,text/plain,*/*'},timeout=60)
+              L(f'FX API {rid} HTTP={r.status_code} bytes={len(r.content)} text={r.text[:1000]}')
+              obj=r.json();paths=obj.get('data') or []
+              urls=[]
+              for p in paths:
+                if isinstance(p,str):
+                  p=p.replace('\\/','/')
+                  if p.startswith('http'):u=p
+                  else:u='https://public.fxbaogao.com/'+p.lstrip('/')
+                  urls.append(u)
+              save_pdf_from_images(label,title,inst,date,urls,orig)
+            except Exception as e:L(f'FX ERROR {rid} {e!r}')
+
+          # Inspect Sdyanbao's public page and browser-visible preview pages. No authentication is used.
+          detail='https://www.sdyanbao.com/detail/892714'
+          captured=[];response_meta=[];dom={}
+          async def browse():
+            async with async_playwright() as p:
+              exe=next((x for x in ['/usr/bin/google-chrome','/usr/bin/google-chrome-stable','/usr/bin/chromium'] if os.path.exists(x)),None)
+              browser=await p.chromium.launch(headless=True,executable_path=exe,args=['--no-sandbox','--disable-dev-shm-usage'])
+              page=await browser.new_page(viewport={'width':1440,'height':1000},user_agent=ua,locale='zh-CN')
+              async def on_response(resp):
+                u=resp.url
+                if any(k in u.lower() for k in ['download','report','preview','.pdf','.png','.jpg','.jpeg','.webp','api/']):
+                  captured.append(u)
+                  try:
+                    response_meta.append({'url':u,'status':resp.status,'content_type':(await resp.all_headers()).get('content-type')})
+                  except:pass
+              page.on('response',on_response)
+              await page.goto(detail,wait_until='domcontentloaded',timeout=90000)
+              await page.wait_for_timeout(8000)
+              for y in range(0,22000,700):
+                try:await page.evaluate(f'window.scrollTo(0,{y})')
+                except:pass
+                await page.wait_for_timeout(120)
+              await page.wait_for_timeout(5000)
+              imgs=await page.eval_on_selector_all('img','els=>els.map(e=>({src:e.currentSrc||e.src,data:e.getAttribute("data-src")||e.getAttribute("data-original")||"",w:e.naturalWidth,h:e.naturalHeight,alt:e.alt||""}))')
+              anchors=await page.eval_on_selector_all('a','els=>els.map(e=>({href:e.href,text:(e.innerText||"").trim(),outer:e.outerHTML.slice(0,1000)}))')
+              buttons=await page.eval_on_selector_all('button','els=>els.map(e=>({text:(e.innerText||"").trim(),outer:e.outerHTML.slice(0,2000)}))')
+              scripts=await page.eval_on_selector_all('script','els=>els.map(e=>({src:e.src||"",text:(e.textContent||"").slice(0,5000)}))')
+              dom.update({'images':imgs,'anchors':anchors,'buttons':buttons,'scripts':scripts,'html':(await page.content())})
+              # Click one visible public download control only to observe whether it exposes a public URL or asks for login.
+              try:
+                target=page.get_by_text('立即下载',exact=True).first
+                if await target.count():
+                  await target.click(timeout=5000)
+                  await page.wait_for_timeout(4000)
+                  dom['after_click_url']=page.url
+                  dom['after_click_text']=(await page.locator('body').inner_text())[-5000:]
+              except Exception as e:dom['click_error']=repr(e)
+              await browser.close()
+          try:asyncio.run(browse())
+          except Exception as e:L('BROWSER ERROR '+repr(e))
+          (root/'sdyanbao_dom.json').write_text(json.dumps(dom,ensure_ascii=False,indent=2),encoding='utf-8')
+          (root/'sdyanbao_network.json').write_text(json.dumps({'captured':list(dict.fromkeys(captured)),'responses':response_meta},ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Collect browser-visible public preview images.
+          image_urls=[]
+          for x in dom.get('images',[]):
+            for key in ['src','data']:
+              u=x.get(key) or ''
+              if u.startswith('//'):u='https:'+u
+              if u.startswith('/'):
+                u=urllib.parse.urljoin(detail,u)
+              if u.startswith('http') and (x.get('w',0)>=600 or re.search(r'(preview|report|pdf|page)',u,re.I)) and u not in image_urls:
+                image_urls.append(u)
+          for u in captured:
+            if re.search(r'\.(?:png|jpe?g|webp)(?:\?|$)',u,re.I) and u not in image_urls:image_urls.append(u)
+          # Extract image URLs embedded in page scripts.
+          html=dom.get('html','')
+          for m in re.finditer(r'https?:\\?/\\?/[^"\'<> ]+?\.(?:png|jpe?g|webp)(?:\?[^"\'<> ]*)?',html,re.I):
+            u=m.group(0).replace('\\/','/')
+            if u not in image_urls:image_urls.append(u)
+          (root/'sdyanbao_image_candidates.json').write_text(json.dumps(image_urls,ensure_ascii=False,indent=2),encoding='utf-8')
+          save_pdf_from_images('cmschina','三十载筑基数智化转型，AI大模型交付定义行业新范式','招商证券','2025-05-28',image_urls,30)
+
+          # Test any openly exposed direct PDF URLs from network/DOM. Do not submit credentials or bypass login.
+          direct=[]
+          for u in list(dict.fromkeys(captured+[x.get('href','') for x in dom.get('anchors',[])])):
+            if '.pdf' in u.lower() or 'download' in u.lower():
+              try:
+                rr=s.get(u,headers={'Referer':detail,'Accept':'application/pdf,*/*'},timeout=120,allow_redirects=True)
+                L(f'DIRECT {u} HTTP={rr.status_code} bytes={len(rr.content)} type={rr.headers.get("content-type")} final={rr.url}')
+                if rr.status_code==200 and rr.content.startswith(b'%PDF-') and len(rr.content)>100000:
+                  sha=hashlib.sha256(rr.content).hexdigest()
+                  if any(x['sha256']==sha for x in manifest):continue
+                  out=pdfdir/'2025-05-28_招商证券_亚信科技_三十载筑基数智化转型_AI大模型交付定义行业新范式_完整版.pdf'
+                  out.write_bytes(rr.content);pc=len(PdfReader(str(out),strict=False).pages)
+                  rec={'filename':out.name,'title':'三十载筑基数智化转型，AI大模型交付定义行业新范式','institution':'招商证券','date':'2025-05-28','pages':pc,'size_bytes':len(rr.content),'sha256':sha,'url':rr.url,'full_pdf':True}
+                  manifest.append(rec);direct.append(rec);L('VALID FULL '+json.dumps(rec,ensure_ascii=False))
+              except Exception as e:L(f'DIRECT ERROR {u} {e!r}')
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (root/'run.log').write_text('\n'.join(logs)+'\n',encoding='utf-8')
+          print('FINAL '+json.dumps({'files':len(manifest),'pdfs':[x['filename'] for x in manifest]},ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AsiaInfo-Public-Reports-and-Previews
+          path: asiainfo_public_extract
+          retention-days: 1
+          compression-level: 6
