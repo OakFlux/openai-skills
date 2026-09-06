@@ -1,0 +1,265 @@
+name: Build two complete Zhejiang Expressway broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhejiang-expressway-two-complete-reports-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pillow pypdf pymupdf
+      - name: Download, assemble, and validate complete reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests, pymupdf
+          from PIL import Image
+          from pypdf import PdfReader
+
+          package = '浙江沪杭甬_券商研究报告_完整PDF_2份'
+          out = Path(package)
+          work = Path('_zhejiang_two_complete_work')
+          renders = work / 'renders'
+          out.mkdir(exist_ok=True)
+          renders.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              dict(id=724544, broker='华泰证券', title='浙江沪杭甬：改扩建启动，资本开支加码', report_date='2024-03-27', authors='沈晓峰', rating='买入（维持）', pages=7, kind='公司研究/年报点评'),
+              dict(id=682827, broker='华泰证券', title='浙江沪杭甬：完成供股，迈入资本开支新周期', report_date='2023-12-15', authors='沈晓峰', rating='买入（维持）', pages=7, kind='公司研究/更新报告'),
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def fetch_detail(report):
+              detail_url = f"https://www.sdyanbao.com/detail/{report['id']}"
+              errs = []
+              for attempt in range(1, 6):
+                  try:
+                      r = session.get(detail_url, timeout=(20, 180), allow_redirects=True)
+                      print('DETAIL', report['id'], attempt, r.status_code, len(r.content), r.url, flush=True)
+                      r.raise_for_status()
+                      html = r.text
+                      patterns = [
+                          r'page_url:"([^"]+)"',
+                          r'"page_url":"([^"]+)"',
+                          r'page_url\\":\\"([^\\"]+)',
+                      ]
+                      value = None
+                      for pat in patterns:
+                          m = re.search(pat, html)
+                          if m:
+                              value = m.group(1)
+                              break
+                      if not value:
+                          raise RuntimeError('page_url not found')
+                      page_url = value.replace('\\u002F', '/').replace('\\/', '/').replace('\\u003A', ':')
+                      page_url = page_url.replace('https:////', 'https://', 1)
+                      if not page_url.startswith('https://oss.sdyanbao.com/page/'):
+                          raise RuntimeError('unexpected page_url: ' + page_url)
+                      return detail_url, page_url
+                  except Exception as exc:
+                      errs.append(repr(exc))
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f"detail failed {report['id']}: {errs}")
+
+          def fetch_image(report, detail_url, page_url, index, destination):
+              errs = []
+              for suffix in ('.png', '.jpg', '.jpeg'):
+                  url = f'{page_url}/{index}{suffix}'
+                  for attempt in range(1, 5):
+                      try:
+                          r = session.get(
+                              url,
+                              headers={
+                                  'Referer': detail_url,
+                                  'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                              },
+                              timeout=(20, 180),
+                              allow_redirects=True,
+                          )
+                          sig = r.content[:16]
+                          valid_sig = sig.startswith(b'\x89PNG') or sig.startswith(b'\xff\xd8\xff') or sig.startswith(b'RIFF')
+                          print('PAGE', report['id'], index, suffix, attempt, r.status_code, len(r.content), r.url, flush=True)
+                          if r.status_code == 200 and valid_sig and len(r.content) > 10000:
+                              destination.write_bytes(r.content)
+                              with Image.open(destination) as im:
+                                  im.verify()
+                              with Image.open(destination) as im:
+                                  width, height = im.size
+                              if width < 600 or height < 800:
+                                  raise RuntimeError(f'small image {width}x{height}')
+                              return {
+                                  'page': index + 1,
+                                  'url': url,
+                                  'bytes': len(r.content),
+                                  'width': width,
+                                  'height': height,
+                                  'sha256': hashlib.sha256(r.content).hexdigest(),
+                              }
+                          errs.append(f'{url}: HTTP {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errs.append(f'{url}: {exc!r}')
+                      time.sleep(attempt)
+              raise RuntimeError(f"image failed report={report['id']} page={index+1}: {errs[-10:]}")
+
+          records = []
+          report_hashes = set()
+          for order, report in enumerate(reports, 1):
+              detail_url, page_url = fetch_detail(report)
+              image_dir = work / f"images_{report['id']}"
+              image_dir.mkdir(exist_ok=True)
+              page_files = []
+              page_manifest = []
+              page_hashes = set()
+
+              for index in range(report['pages']):
+                  image_path = image_dir / f'{index:03d}.img'
+                  meta = fetch_image(report, detail_url, page_url, index, image_path)
+                  if meta['sha256'] in page_hashes:
+                      raise RuntimeError(f"duplicate page in report {report['id']} at page {index+1}")
+                  page_hashes.add(meta['sha256'])
+                  page_files.append(image_path)
+                  page_manifest.append(meta)
+
+              # Verify that the next page is unavailable, supporting completeness of the 7-page set.
+              next_url = f"{page_url}/{report['pages']}.png"
+              next_resp = session.get(next_url, headers={'Referer': detail_url}, timeout=(20, 90), allow_redirects=True)
+              print('NEXT_PAGE_CHECK', report['id'], next_resp.status_code, len(next_resp.content), next_url, flush=True)
+              if next_resp.status_code == 200 and (next_resp.content.startswith(b'\x89PNG') or next_resp.content.startswith(b'\xff\xd8\xff')) and len(next_resp.content) > 10000:
+                  raise RuntimeError(f"unexpected page {report['pages']+1} exists for report {report['id']}; metadata page count may be wrong")
+
+              pdf_path = work / f"{report['id']}.pdf"
+              doc = pymupdf.open()
+              for image_path in page_files:
+                  with Image.open(image_path) as im:
+                      width, height = im.size
+                  page = doc.new_page(width=width, height=height)
+                  page.insert_image(page.rect, filename=str(image_path), keep_proportion=False)
+              doc.set_metadata({
+                  'title': report['title'],
+                  'author': report['broker'],
+                  'subject': '浙江沪杭甬（00576.HK）券商公司研究报告',
+              })
+              doc.save(str(pdf_path), garbage=4, deflate=True, clean=True)
+              doc.close()
+
+              data = pdf_path.read_bytes()
+              if data[:5] != b'%PDF-':
+                  raise RuntimeError('invalid PDF header')
+              reader = PdfReader(str(pdf_path), strict=False)
+              if reader.is_encrypted:
+                  raise RuntimeError('encrypted output PDF')
+              if len(reader.pages) != report['pages']:
+                  raise RuntimeError(f"PDF page mismatch for {report['id']}: {len(reader.pages)}")
+              q = subprocess.run(['qpdf', '--check', str(pdf_path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError('qpdf validation failed: ' + q.stderr[-1000:])
+
+              render_doc = pymupdf.open(str(pdf_path))
+              rendered_pages = []
+              for pno in sorted(set([0, report['pages']//2, report['pages']-1])):
+                  pix = render_doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1, 1), alpha=False)
+                  render_path = renders / f"{report['id']}_{pno+1:03d}.png"
+                  pix.save(str(render_path))
+                  if render_path.stat().st_size < 5000 or pix.width < 400 or pix.height < 500:
+                      raise RuntimeError('render validation failed')
+                  rendered_pages.append(pno + 1)
+              render_doc.close()
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in report_hashes:
+                  raise RuntimeError('duplicate report content')
+              report_hashes.add(digest)
+              filename = f"{order:02d}_{report['broker']}_{report['report_date'].replace('-', '')}_{report['id']}.pdf"
+              (out / filename).write_bytes(data)
+              record = {
+                  **report,
+                  'filename': filename,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'detail_url': detail_url,
+                  'page_url': page_url,
+                  'rendered_pages': rendered_pages,
+                  'source_type': '公开逐页原版图像按原页序合成PDF（未裁切、未重排）',
+              }
+              records.append(record)
+              (work / f"page_manifest_{report['id']}.json").write_text(json.dumps(page_manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme_lines = [
+              '浙江沪杭甬（00576.HK）券商公司研究报告合集',
+              '',
+              '本压缩包包含2份完整PDF，共14页。',
+              '两份报告均为华泰证券针对浙江沪杭甬发布的公司研究报告。',
+              '公开来源提供逐页原版图像，本包仅按原始页序合成为PDF，未裁切、未重排或改写正文。',
+              '',
+          ]
+          for i, record in enumerate(records, 1):
+              readme_lines += [
+                  f"{i}. {record['broker']}：《{record['title']}》",
+                  f"   类型：{record['kind']}；报告日期：{record['report_date']}；作者：{record['authors']}；评级：{record['rating']}",
+                  f"   完整页数：{record['pages']}页；文件大小：{record['bytes']/1048576:.2f} MB",
+                  f"   来源页面：{record['detail_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ]
+          readme_lines += [
+              '核验项目：逐页图像签名与尺寸、页面连续性、页面去重、末页后不存在下一页、PDF文件头、页数、qpdf结构、首页/中间页/末页渲染、SHA-256和ZIP CRC。',
+              '说明：此前检索到的申万宏源21页首次覆盖深度报告，公开端仅能取得前15页，故未放入本压缩包冒充完整版。',
+              '报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。',
+          ]
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(package + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for file_path in sorted(out.iterdir()):
+                  zf.write(file_path, arcname=f'{package}/{file_path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_names = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != 2:
+                  raise RuntimeError(f'archive PDF count mismatch: {pdf_names}')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'REPORTS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          print('ZIP_SHA256', hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhejiang-expressway-two-complete-reports
+          path: 浙江沪杭甬_券商研究报告_完整PDF_2份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhejiang-expressway-two-complete-diagnostics
+          path: _zhejiang_two_complete_work/
+          if-no-files-found: ignore
+          retention-days: 7
