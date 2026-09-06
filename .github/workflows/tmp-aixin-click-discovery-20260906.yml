@@ -1,0 +1,232 @@
+name: Temporary Aixin report click discovery
+
+on:
+  push:
+    branches:
+      - tmp-aixin-click-discovery-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet playwright requests pypdf
+          python -m playwright install --with-deps chromium
+      - name: Click report cards and capture targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          from urllib.parse import quote
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+          out = Path('output')
+          out.mkdir(exist_ok=True)
+          search_url = 'https://www.fxbaogao.com/rp?keywords=' + quote('爱芯元智') + '&order=2&nop=-1'
+          targets = [
+              ('guosheng_43p', '踏智驾及边缘AI之浪，启高端芯片之航'),
+              ('bocom_33p', '乘端侧及边缘AI浪潮；首予买入'),
+              ('guotai_7p', 'AI终端平台公司，智能汽车打开增量空间'),
+              ('zhongyou_5p', '高端启新，智驱全球'),
+          ]
+          results = {}
+
+          fiber_script = r'''(el) => {
+            const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+            const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps$'));
+            function clean(value, depth=0, seen=new WeakSet()) {
+              if (value === null || value === undefined) return value;
+              const t = typeof value;
+              if (t === 'string') return value.length > 2000 ? value.slice(0,2000) : value;
+              if (t === 'number' || t === 'boolean') return value;
+              if (t === 'function') return `[Function ${value.name || ''}]`;
+              if (t !== 'object') return String(value);
+              if (depth >= 5) return '[MaxDepth]';
+              if (seen.has(value)) return '[Circular]';
+              seen.add(value);
+              if (Array.isArray(value)) return value.slice(0,50).map(v => clean(v, depth+1, seen));
+              const out = {};
+              let count = 0;
+              for (const [k,v] of Object.entries(value)) {
+                if (['children','_owner','return','child','sibling','stateNode','alternate'].includes(k)) continue;
+                if (++count > 100) break;
+                try { out[k] = clean(v, depth+1, seen); } catch(e) { out[k] = `[Error ${e}]`; }
+              }
+              return out;
+            }
+            const chain = [];
+            let f = fiberKey ? el[fiberKey] : null;
+            for (let depth=0; f && depth<18; depth++, f=f.return) {
+              let typeName = '';
+              try { typeName = typeof f.elementType === 'string' ? f.elementType : (f.elementType?.displayName || f.elementType?.name || ''); } catch(e) {}
+              chain.push({
+                depth,
+                tag: f.tag,
+                key: f.key,
+                typeName,
+                memoizedProps: clean(f.memoizedProps),
+                pendingProps: clean(f.pendingProps),
+                memoizedState: clean(f.memoizedState),
+              });
+            }
+            return {
+              outerHTML: el.outerHTML,
+              directProps: propsKey ? clean(el[propsKey]) : null,
+              fiberChain: chain,
+            };
+          }'''
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'])
+              context = browser.new_context(
+                  viewport={'width': 1440, 'height': 1200},
+                  locale='zh-CN',
+                  timezone_id='Asia/Shanghai',
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                  extra_http_headers={'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','DNT':'1'},
+                  accept_downloads=True,
+              )
+              context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.__openedUrls = [];
+                const oldOpen = window.open;
+                window.open = function(...args) { window.__openedUrls.push(args.map(String)); return oldOpen.apply(this,args); };
+              """)
+
+              for key, title_text in targets:
+                  page = context.new_page()
+                  network = []
+                  def record_request(req):
+                      u=req.url
+                      if any(tok in u.lower() for tok in ['api.fxbaogao','detail','view','download','reportid','report/list','search']):
+                          network.append({'kind':'request','method':req.method,'url':u,'post_data':req.post_data})
+                  def record_response(resp):
+                      u=resp.url
+                      ct=resp.headers.get('content-type','')
+                      if any(tok in u.lower() for tok in ['api.fxbaogao','detail','view','download','reportid','report/list','search']) or 'json' in ct.lower() or 'pdf' in ct.lower():
+                          item={'kind':'response','url':u,'status':resp.status,'content_type':ct}
+                          try:
+                              if 'json' in ct.lower() and len(resp.body()) < 5_000_000:
+                                  item['body']=resp.text()[:2_000_000]
+                          except Exception as exc:
+                              item['body_error']=repr(exc)
+                          network.append(item)
+                  page.on('request', record_request)
+                  page.on('response', record_response)
+                  result={'title_text':title_text,'search_url':search_url}
+                  try:
+                      response=page.goto(search_url,wait_until='domcontentloaded',timeout=120000)
+                      result['search_status']=response.status if response else None
+                      try: page.wait_for_load_state('networkidle',timeout=45000)
+                      except PlaywrightTimeoutError: pass
+                      page.wait_for_timeout(7000)
+                      anchor=page.locator('a.read-0').filter(has_text=title_text).first
+                      count=anchor.count()
+                      result['anchor_count']=count
+                      if not count:
+                          # fall back to any anchor containing target text
+                          anchor=page.get_by_text(title_text,exact=False).first
+                          result['fallback_count']=anchor.count()
+                      anchor.scroll_into_view_if_needed(timeout=30000)
+                      result['anchor_text']=anchor.inner_text(timeout=30000)
+                      result['anchor_html']=anchor.evaluate('(e)=>e.outerHTML')
+                      result['fiber']=anchor.evaluate(fiber_script)
+                      card=anchor.locator("xpath=ancestor::div[contains(@class,'_3n6WByoMZcVqAskskc6LKT')][1]")
+                      result['card_html']=card.evaluate('(e)=>e.outerHTML') if card.count() else ''
+                      result['card_fiber']=card.evaluate(fiber_script) if card.count() else None
+                      print('FOUND',key,result['anchor_text'],flush=True)
+
+                      # Click report title and capture the resulting tab or navigation.
+                      before_urls=[pg.url for pg in context.pages]
+                      popup=None
+                      try:
+                          with context.expect_page(timeout=20000) as pending:
+                              anchor.click(timeout=30000,no_wait_after=True)
+                          popup=pending.value
+                      except Exception as exc:
+                          result['title_click_expect_error']=repr(exc)
+                          try: anchor.click(timeout=10000,no_wait_after=True)
+                          except Exception as click_exc: result['title_click_error']=repr(click_exc)
+                      page.wait_for_timeout(6000)
+                      opened_urls=page.evaluate('window.__openedUrls || []')
+                      result['window_open_calls']=opened_urls
+                      after_pages=context.pages
+                      new_pages=[pg for pg in after_pages if pg.url not in before_urls or pg is popup]
+                      if popup is not None and popup not in new_pages: new_pages.append(popup)
+                      result['pages_after_title_click']=[pg.url for pg in after_pages]
+                      detail_pages=[]
+                      for index,pg in enumerate(new_pages):
+                          try:
+                              pg.wait_for_load_state('domcontentloaded',timeout=60000)
+                          except Exception: pass
+                          pg.wait_for_timeout(2500)
+                          info={'url':pg.url,'title':pg.title()}
+                          try: info['body_text']=pg.locator('body').inner_text(timeout=15000)[:10000]
+                          except Exception: info['body_text']=''
+                          try:
+                              (out/f'{key}_opened_{index}.html').write_text(pg.content(),encoding='utf-8',errors='ignore')
+                              pg.screenshot(path=str(out/f'{key}_opened_{index}.png'),full_page=True)
+                          except Exception as exc: info['capture_error']=repr(exc)
+                          detail_pages.append(info)
+                      result['opened_pages']=detail_pages
+
+                      # Re-open the search and try the card's Download button.
+                      page.goto(search_url,wait_until='domcontentloaded',timeout=120000)
+                      try: page.wait_for_load_state('networkidle',timeout=45000)
+                      except PlaywrightTimeoutError: pass
+                      page.wait_for_timeout(6000)
+                      anchor=page.locator('a.read-0').filter(has_text=title_text).first
+                      card=anchor.locator("xpath=ancestor::div[contains(@class,'_3n6WByoMZcVqAskskc6LKT')][1]")
+                      button=card.locator('button.for-download').first
+                      result['download_button_count']=button.count()
+                      if button.count():
+                          try:
+                              with page.expect_download(timeout=25000) as pending_download:
+                                  button.click(timeout=30000,no_wait_after=True)
+                              download=pending_download.value
+                              target_path=out/f'{key}_{download.suggested_filename}'
+                              download.save_as(str(target_path))
+                              result['download']={'file':target_path.name,'bytes':target_path.stat().st_size,'suggested_filename':download.suggested_filename}
+                              print('DOWNLOAD_OK',key,target_path,target_path.stat().st_size,flush=True)
+                          except Exception as exc:
+                              result['download_error']=repr(exc)
+                              page.wait_for_timeout(4000)
+                              try: result['post_download_body']=page.locator('body').inner_text(timeout=10000)[-10000:]
+                              except Exception: pass
+                              try: page.screenshot(path=str(out/f'{key}_after_download.png'),full_page=True)
+                              except Exception: pass
+                      result['network']=network
+                      (out/f'{key}_result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+                      print('RESULT',key,json.dumps({k:v for k,v in result.items() if k not in ['fiber','card_fiber','card_html','network','post_download_body']},ensure_ascii=False)[:10000],flush=True)
+                  except Exception as exc:
+                      result['fatal_error']=repr(exc)
+                      result['network']=network
+                      (out/f'{key}_result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+                      print('FATAL',key,repr(exc),flush=True)
+                  finally:
+                      for pg in list(context.pages):
+                          if pg is not page:
+                              try: pg.close()
+                              except Exception: pass
+                      try: page.close()
+                      except Exception: pass
+              browser.close()
+          (out/'all_results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload discovery files
+        uses: actions/upload-artifact@v4
+        with:
+          name: aixin-click-discovery
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
