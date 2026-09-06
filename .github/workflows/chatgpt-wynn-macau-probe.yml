@@ -1,0 +1,256 @@
+name: Probe public Wynn Macau report download routes
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-wynn-macau-reports-20260906
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf playwright
+          python -m playwright install --with-deps chromium
+      - name: Inspect public report pages and download controls
+        shell: bash
+        run: |
+          cat > /tmp/probe.py <<'PY'
+          from __future__ import annotations
+          import asyncio, io, json, re, sys, time, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+          OUT = Path('wynn_probe_output')
+          OUT.mkdir(exist_ok=True)
+          PDFOUT = OUT / 'pdf_candidates'
+          PDFOUT.mkdir(exist_ok=True)
+          LOG = []
+
+          TARGETS = {
+              'sdy_htsc_2025q1': 'https://www.sdyanbao.com/detail/888721',
+              'sdy_htsc_2025_outlook': 'https://www.sdyanbao.com/detail/856304',
+              'fxb_dw_2024q2': 'https://www.fxbaogao.com/detail/4442715',
+              'fxb_dw_2024q1': 'https://www.fxbaogao.com/detail/4296230',
+              'nxny_stock': 'https://www.nxny.com/stock/stock_01128/',
+              'sgpjbg_label': 'https://www.sgpjbg.com/labels/yonglidichanfazhannianbao.html',
+          }
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36'
+          sess = requests.Session()
+          sess.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          def log(*parts):
+              s = ' '.join(str(x) for x in parts)
+              LOG.append(s)
+              print(s, flush=True)
+
+          def safe_name(s: str) -> str:
+              return re.sub(r'[^A-Za-z0-9_.-]+', '_', s)[:150]
+
+          def validate_pdf(data: bytes, source: str, filename: str):
+              if len(data) < 15000 or b'%PDF' not in data[:4096]:
+                  return None
+              try:
+                  reader = PdfReader(io.BytesIO(data), strict=False)
+                  pages = len(reader.pages)
+                  text = ''
+                  for p in reader.pages[:3]:
+                      try:
+                          text += (p.extract_text() or '') + '\n'
+                      except Exception:
+                          pass
+                  low = text.lower()
+                  relevant = any(k in text for k in ['永利澳门','永利澳門']) or 'wynn macau' in low or '1128' in text
+                  out = PDFOUT / filename
+                  out.write_bytes(data)
+                  meta = {'file': str(out), 'source': source, 'bytes': len(data), 'pages': pages, 'relevant': relevant, 'text_head': text[:2500]}
+                  (PDFOUT / (filename + '.json')).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+                  log('PDF', filename, 'pages=', pages, 'bytes=', len(data), 'relevant=', relevant, 'source=', source)
+                  return meta
+              except Exception as e:
+                  log('PDF_PARSE_ERR', source, repr(e))
+                  return None
+
+          # Static page and JS inspection
+          for key, url in TARGETS.items():
+              try:
+                  r = sess.get(url, timeout=60, allow_redirects=True)
+                  log('GET', key, r.status_code, r.url, r.headers.get('content-type'), len(r.content))
+                  (OUT / f'{key}.html').write_bytes(r.content)
+                  if b'%PDF' in r.content[:4096]:
+                      validate_pdf(r.content, r.url, f'{key}.pdf')
+                      continue
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  rows = []
+                  for tag in soup.find_all(True):
+                      attrs = {}
+                      for attr, val in tag.attrs.items():
+                          if isinstance(val, list): val = ' '.join(val)
+                          if any(x in attr.lower() for x in ('href','src','action','url','file','download','pdf','data')):
+                              attrs[attr] = str(val)
+                      txt = ' '.join(tag.get_text(' ', strip=True).split())[:300]
+                      if attrs or any(x in txt.lower() for x in ('下载','download','pdf')):
+                          rows.append({'tag': tag.name, 'text': txt, 'attrs': attrs})
+                  (OUT / f'{key}_dom.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+                  for row in rows:
+                      blob = json.dumps(row, ensure_ascii=False)
+                      if any(x in blob.lower() for x in ('pdf','download','下载','file')):
+                          log('DOM', key, blob[:1200])
+                  scripts = []
+                  for s in soup.find_all('script', src=True):
+                      scripts.append(urllib.parse.urljoin(r.url, s['src']))
+                  for i, jsurl in enumerate(dict.fromkeys(scripts)):
+                      try:
+                          jr = sess.get(jsurl, timeout=60)
+                          body = jr.text
+                          (OUT / f'{key}_script_{i:02d}.js').write_bytes(jr.content)
+                          pats = re.findall(r'[^\"\'\s<>]{0,180}(?:download|pdf|file|report|detail|api)[^\"\'\s<>]{0,500}', body, re.I)
+                          for hit in list(dict.fromkeys(pats))[:300]:
+                              if any(x in hit.lower() for x in ('download','pdf','/api/','fileurl','file_url')):
+                                  log('JS', key, hit[:1000])
+                      except Exception as e:
+                          log('JSERR', key, jsurl, repr(e))
+              except Exception as e:
+                  log('GETERR', key, url, repr(e))
+
+          async def browser_probe():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context(user_agent=UA, accept_downloads=True, locale='zh-CN')
+                  for key, url in TARGETS.items():
+                      page = await context.new_page()
+                      net = []
+                      async def on_response(resp):
+                          try:
+                              ct = (resp.headers.get('content-type') or '').lower()
+                              u = resp.url
+                              if any(x in u.lower() for x in ('pdf','download','report','file','api')) or 'application/pdf' in ct:
+                                  rec = {'status': resp.status, 'url': u, 'content_type': ct}
+                                  net.append(rec)
+                                  log('RESP', key, resp.status, ct, u)
+                              if 'application/pdf' in ct or u.lower().split('?')[0].endswith('.pdf'):
+                                  try:
+                                      body = await resp.body()
+                                      validate_pdf(body, u, f'{key}_resp_{safe_name(str(len(net)))}.pdf')
+                                  except Exception as e:
+                                      log('RESP_BODY_ERR', key, u, repr(e))
+                          except Exception:
+                              pass
+                      page.on('response', on_response)
+                      try:
+                          await page.goto(url, wait_until='networkidle', timeout=90000)
+                      except Exception as e:
+                          log('GOTOERR', key, repr(e))
+                      try:
+                          html = await page.content()
+                          (OUT / f'{key}_browser.html').write_text(html, encoding='utf-8')
+                          title = await page.title()
+                          log('TITLE', key, title)
+                          links = await page.locator('a').all()
+                          linkrows = []
+                          for a in links[:500]:
+                              try:
+                                  linkrows.append({'text': (await a.inner_text())[:300], 'href': await a.get_attribute('href')})
+                              except Exception:
+                                  pass
+                          buttons = await page.locator('button, [role=button], input[type=button], input[type=submit]').all()
+                          btnrows=[]
+                          for b in buttons[:300]:
+                              try:
+                                  btnrows.append({'text': (await b.inner_text())[:300], 'value': await b.get_attribute('value'), 'onclick': await b.get_attribute('onclick')})
+                              except Exception:
+                                  pass
+                          (OUT / f'{key}_browser_elements.json').write_text(json.dumps({'links':linkrows,'buttons':btnrows}, ensure_ascii=False, indent=2), encoding='utf-8')
+                          for row in linkrows + btnrows:
+                              blob=json.dumps(row,ensure_ascii=False)
+                              if any(x in blob.lower() for x in ('下载','download','pdf')):
+                                  log('ELEMENT', key, blob[:1200])
+
+                          # SGpjbg: first follow exact report link if present
+                          if key == 'sgpjbg_label':
+                              exact = page.get_by_text('VIP疲弱竞争加剧永利加码投入能否破局', exact=False)
+                              if await exact.count():
+                                  try:
+                                      await exact.first.click(timeout=15000)
+                                      await page.wait_for_load_state('networkidle', timeout=60000)
+                                      log('SGP_DETAIL', page.url, await page.title())
+                                      (OUT/'sgpjbg_detail_browser.html').write_text(await page.content(), encoding='utf-8')
+                                  except Exception as e:
+                                      log('SGP_CLICK_ERR', repr(e))
+
+                          # Click public download controls only; do not authenticate or bypass login/paywall.
+                          selectors = [
+                              'text=立即下载',
+                              'text=下载PDF',
+                              'text=下载报告',
+                              'a:has-text("下载")',
+                              'button:has-text("下载")',
+                          ]
+                          clicked = 0
+                          for sel in selectors:
+                              loc = page.locator(sel)
+                              count = min(await loc.count(), 4)
+                              for idx in range(count):
+                                  try:
+                                      el = loc.nth(idx)
+                                      if not await el.is_visible():
+                                          continue
+                                      before = page.url
+                                      try:
+                                          async with page.expect_download(timeout=12000) as di:
+                                              await el.click(timeout=12000)
+                                          dl = await di.value
+                                          path = PDFOUT / f'{key}_download_{clicked}_{safe_name(dl.suggested_filename)}'
+                                          await dl.save_as(str(path))
+                                          data=path.read_bytes()
+                                          if not validate_pdf(data, dl.url, path.name):
+                                              log('DOWNLOAD_NONPDF', key, path.name, len(data), dl.url)
+                                          clicked += 1
+                                      except PlaywrightTimeoutError:
+                                          await page.wait_for_timeout(2500)
+                                          log('CLICK_NO_DOWNLOAD', key, sel, idx, 'before=', before, 'after=', page.url, 'title=', await page.title())
+                                          bodytext=(await page.locator('body').inner_text())[:3000]
+                                          if any(x in bodytext for x in ['登录','注册','积分','会员','VIP','加密报告']):
+                                              log('ACCESS_NOTICE', key, bodytext[-1200:])
+                                      except Exception as e:
+                                          log('CLICKERR', key, sel, idx, repr(e))
+                                  except Exception:
+                                      pass
+                          await page.wait_for_timeout(2000)
+                          (OUT / f'{key}_network.json').write_text(json.dumps(net, ensure_ascii=False, indent=2), encoding='utf-8')
+                      except Exception as e:
+                          log('BROWSERERR', key, repr(e))
+                      await page.close()
+                  await context.close()
+                  await browser.close()
+
+          asyncio.run(browser_probe())
+          (OUT/'probe.log').write_text('\n'.join(LOG), encoding='utf-8')
+          metas=[]
+          for p in PDFOUT.glob('*.json'):
+              try: metas.append(json.loads(p.read_text('utf-8')))
+              except Exception: pass
+          (OUT/'pdf_summary.json').write_text(json.dumps(metas, ensure_ascii=False, indent=2), encoding='utf-8')
+          log('DONE pdf_count=', len(metas))
+          PY
+          python /tmp/probe.py
+      - name: Upload inspection artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wynn_Macau_Report_Probe
+          path: wynn_probe_output
+          retention-days: 2
+          if-no-files-found: error
