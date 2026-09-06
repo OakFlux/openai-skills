@@ -1,0 +1,288 @@
+name: chatgpt-temp-boreton-filings-20260906
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-boreton-filings-20260906.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download, verify and package official filings
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf pillow
+          python <<'PY'
+          import hashlib, io, json, re, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+
+          ROOT = Path('boreton_filings_work')
+          FINAL = ROOT / '博雷顿_01333_年报_招股说明书_最新财务报告'
+          (FINAL / '01_招股说明书').mkdir(parents=True, exist_ok=True)
+          (FINAL / '02_年度报告').mkdir(parents=True, exist_ok=True)
+          (FINAL / '03_中期报告').mkdir(parents=True, exist_ok=True)
+          (FINAL / '04_最新财务披露').mkdir(parents=True, exist_ok=True)
+          QA = ROOT / '_qa_renders'
+          QA.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh-TW;q=0.9,en;q=0.8',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/'
+          })
+
+          log = []
+          def L(msg):
+              msg = str(msg)
+              print(msg, flush=True)
+              log.append(msg)
+
+          def norm(s):
+              return re.sub(r'\s+', '', str(s or '')).replace('（','(').replace('）',')').lower()
+
+          title_pages = []
+          params_base = {
+              'category': '0', 'market': 'SEHK', 'stockId': '1000258801',
+              'documentType': '-1', 'searchType': '0', 't1code': '-2',
+              't2Gcode': '-2', 't2code': '-2', 'from': '20240101', 'to': '20300101'
+          }
+          for lang in ['ZH', 'EN']:
+              for extra in [{}, {'from':'20260820','to':'20260906'}, {'from':'20250401','to':'20260510'}]:
+                  p = dict(params_base); p.update(extra); p['lang'] = lang
+                  url = 'https://www1.hkexnews.hk/search/titlesearch.xhtml'
+                  for attempt in range(3):
+                      try:
+                          r = session.get(url, params=p, timeout=60)
+                          L(f'TITLE {lang} {p["from"]}..{p["to"]} HTTP={r.status_code} bytes={len(r.content)} url={r.url}')
+                          if r.status_code == 200 and len(r.content) > 5000:
+                              title_pages.append((lang, r.url, r.text))
+                              (ROOT / f'titles_{lang}_{p["from"]}_{p["to"]}.html').write_bytes(r.content)
+                              break
+                      except Exception as e:
+                          L(f'TITLE ERROR {lang} attempt={attempt+1} {e!r}')
+                      time.sleep(2)
+
+          anchors = []
+          for lang, base, html in title_pages:
+              soup = BeautifulSoup(html, 'html.parser')
+              for a in soup.find_all('a', href=True):
+                  text = ' '.join(a.get_text(' ', strip=True).split())
+                  href = urljoin(base, a['href'])
+                  if '.pdf' in href.lower():
+                      anchors.append({'lang':lang, 'text':text, 'href':href})
+              # Regex fallback for links embedded in scripts/markup.
+              for m in re.finditer(r'(?:https?:)?//www1\.hkexnews\.hk/listedco/listconews/sehk/[^"\'<> ]+?\.pdf|/listedco/listconews/sehk/[^"\'<> ]+?\.pdf', html, re.I):
+                  href = urljoin(base, m.group(0))
+                  anchors.append({'lang':lang, 'text':'', 'href':href})
+          # De-duplicate anchors.
+          uniq = []
+          seen = set()
+          for a in anchors:
+              key = (a['lang'], a['href'])
+              if key not in seen:
+                  seen.add(key); uniq.append(a)
+          anchors = uniq
+          (ROOT / 'parsed_pdf_links.json').write_text(json.dumps(anchors, ensure_ascii=False, indent=2), encoding='utf-8')
+          for a in anchors:
+              if any(k in norm(a['text']) for k in ['年度報告','年報','annualreport','中期報告','interimreport','中期業績','interimresults','招股章程','prospectus']):
+                  L('LINK ' + json.dumps(a, ensure_ascii=False))
+
+          def find_link(lang, include_groups, year=None, exclude=()):
+              candidates = []
+              for a in anchors:
+                  if a['lang'] != lang: continue
+                  t = norm(a['text'])
+                  if year and str(year) not in t: continue
+                  if any(norm(x) in t for x in exclude): continue
+                  ok = all(any(norm(term) in t for term in group) for group in include_groups)
+                  if ok: candidates.append(a)
+              if candidates:
+                  # Prefer direct listedco PDFs, then shortest/cleanest title.
+                  candidates.sort(key=lambda x: (0 if '/listedco/listconews/' in x['href'] else 1, len(x['text'])))
+                  return candidates[0]['href']
+              return None
+
+          zh_annual_2025 = find_link('ZH', [["年度報告","年報"]], 2025)
+          en_annual_2025 = find_link('EN', [["annual report"]], 2025)
+          zh_interim_2025 = find_link('ZH', [["中期報告"]], 2025, exclude=('業績',))
+          en_interim_2025 = find_link('EN', [["interim report"]], 2025, exclude=('results',))
+          zh_latest_2026 = find_link('ZH', [["中期業績"]], 2026)
+          en_latest_2026 = find_link('EN', [["interim results"]], 2026)
+          zh_interim_2026 = find_link('ZH', [["中期報告"]], 2026, exclude=('業績',))
+          en_interim_2026 = find_link('EN', [["interim report"]], 2026, exclude=('results',))
+
+          # Known official HKEX fallbacks verified from the issuer title search.
+          known = {
+              'en_annual_2025':'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0429/2026042902748.pdf',
+              'en_interim_2025':'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0925/2025092501012.pdf',
+              'zh_prospectus':'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0425/2025042500056_c.pdf',
+              'en_prospectus':'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0425/2025042500056.pdf',
+          }
+          if not en_annual_2025: en_annual_2025 = known['en_annual_2025']
+          if not en_interim_2025: en_interim_2025 = known['en_interim_2025']
+
+          # If Chinese counterpart was not parsed, probe conventional HKEX Chinese variants and nearby document IDs.
+          def nearby_candidates(url):
+              vals = []
+              if not url: return vals
+              vals.append(url)
+              if url.endswith('.pdf') and not url.endswith('_c.pdf'):
+                  vals.append(url[:-4] + '_c.pdf')
+              m = re.search(r'/(\d{13})(?:_c)?\.pdf$', url)
+              if m:
+                  n = int(m.group(1))
+                  prefix = url[:m.start(1)]
+                  for d in range(-4,5):
+                      vals.append(f'{prefix}{n+d:013d}_c.pdf')
+              return list(dict.fromkeys(vals))
+
+          records = []
+          def fetch_pdf(label, urls, dest, expected_hint=None, required=True):
+              urls = [u for u in urls if u]
+              tried = []
+              for u in urls:
+                  for attempt in range(3):
+                      try:
+                          r = session.get(u, headers={'Referer':'https://www1.hkexnews.hk/'}, timeout=180, allow_redirects=True)
+                          tried.append({'url':u,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'final':r.url})
+                          L(f'PDF {label} HTTP={r.status_code} bytes={len(r.content)} type={r.headers.get("content-type")} url={r.url}')
+                          if r.status_code != 200 or not r.content.startswith(b'%PDF-') or len(r.content) < 30000:
+                              break
+                          dest.parent.mkdir(parents=True, exist_ok=True)
+                          dest.write_bytes(r.content)
+                          reader = PdfReader(str(dest), strict=False)
+                          pages = len(reader.pages)
+                          text = ''
+                          for p in reader.pages[:3]:
+                              try: text += '\n' + (p.extract_text() or '')
+                              except: pass
+                          if expected_hint and expected_hint.lower() not in text.lower() and expected_hint not in text:
+                              L(f'WARN hint not found for {label}: {expected_hint!r}')
+                          # Render first and last pages and reject blank/corrupt output.
+                          doc = fitz.open(str(dest))
+                          render_meta = []
+                          for page_no, suffix in [(0,'first'),(max(0,pages-1),'last')]:
+                              pix = doc.load_page(page_no).get_pixmap(matrix=fitz.Matrix(1.2,1.2), alpha=False)
+                              png = QA / f'{dest.stem}_{suffix}.png'
+                              pix.save(str(png))
+                              im = Image.open(png).convert('L').resize((64,64))
+                              stat = ImageStat.Stat(im)
+                              if stat.stddev[0] < 1.0:
+                                  raise RuntimeError(f'blank render {png}')
+                              render_meta.append({'page':page_no+1,'stddev':stat.stddev[0]})
+                          doc.close()
+                          data = dest.read_bytes()
+                          rec = {
+                              'label':label,'filename':str(dest.relative_to(FINAL)),'source_url':r.url,
+                              'pages':pages,'size_bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),
+                              'render_checks':render_meta,'tried':tried
+                          }
+                          records.append(rec)
+                          L('VALID ' + json.dumps(rec, ensure_ascii=False))
+                          return rec
+                      except Exception as e:
+                          L(f'PDF ERROR {label} attempt={attempt+1} {u} {e!r}')
+                          if dest.exists(): dest.unlink()
+                          time.sleep(2)
+              if required:
+                  raise RuntimeError(f'Unable to download required PDF {label}; tried={json.dumps(tried,ensure_ascii=False)}')
+              return None
+
+          # Prospectus: include both Chinese and English final versions.
+          fetch_pdf('2025招股章程中文', [known['zh_prospectus']], FINAL/'01_招股说明书'/'2025-04-25_博雷顿_全球发售招股章程_中文.pdf', expected_hint='博雷')
+          fetch_pdf('2025ProspectusEnglish', [known['en_prospectus']], FINAL/'01_招股说明书'/'2025-04-25_Breton_Global_Offering_Prospectus_English.pdf', expected_hint='BRETON')
+
+          # Annual report: Chinese preferred plus English official counterpart.
+          fetch_pdf('2025年度报告中文', nearby_candidates(zh_annual_2025 or en_annual_2025), FINAL/'02_年度报告'/'2025_博雷顿_年度报告_中文.pdf', expected_hint='博雷')
+          fetch_pdf('2025AnnualReportEnglish', [en_annual_2025], FINAL/'02_年度报告'/'2025_Breton_Annual_Report_English.pdf', expected_hint='ANNUAL REPORT')
+
+          # Keep the most recent full interim report available and the newest interim-results disclosure.
+          # If a full 2026 interim report has appeared, include it; otherwise retain the 2025 full interim report.
+          if zh_interim_2026 or en_interim_2026:
+              fetch_pdf('2026中期报告中文', nearby_candidates(zh_interim_2026 or en_interim_2026), FINAL/'03_中期报告'/'2026_博雷顿_中期报告_中文.pdf', expected_hint='中期')
+              if en_interim_2026:
+                  fetch_pdf('2026InterimReportEnglish', [en_interim_2026], FINAL/'03_中期报告'/'2026_Breton_Interim_Report_English.pdf', expected_hint='INTERIM REPORT', required=False)
+          else:
+              fetch_pdf('2025中期报告中文', nearby_candidates(zh_interim_2025 or en_interim_2025), FINAL/'03_中期报告'/'2025_博雷顿_中期报告_中文.pdf', expected_hint='中期')
+              fetch_pdf('2025InterimReportEnglish', [en_interim_2025], FINAL/'03_中期报告'/'2025_Breton_Interim_Report_English.pdf', expected_hint='INTERIM REPORT')
+
+          if not zh_latest_2026 and not en_latest_2026:
+              # Last-resort regex over title pages for PDFs released on 2026-08-28, then content-test candidates.
+              date_urls = []
+              for _, base, html in title_pages:
+                  for m in re.finditer(r'(?:https?:)?//www1\.hkexnews\.hk/listedco/listconews/sehk/2026/0828/[^"\'<> ]+?\.pdf|/listedco/listconews/sehk/2026/0828/[^"\'<> ]+?\.pdf', html, re.I):
+                      date_urls.append(urljoin(base,m.group(0)))
+              date_urls = list(dict.fromkeys(date_urls))
+              L('20260828 fallback urls=' + json.dumps(date_urls,ensure_ascii=False))
+              zh_latest_2026 = next((u for u in date_urls if u.endswith('_c.pdf')), None)
+              en_latest_2026 = next((u for u in date_urls if not u.endswith('_c.pdf')), None)
+          fetch_pdf('2026中期业绩公告中文', nearby_candidates(zh_latest_2026 or en_latest_2026), FINAL/'04_最新财务披露'/'2026H1_博雷顿_中期业绩公告_中文.pdf', expected_hint='中期')
+          if en_latest_2026:
+              fetch_pdf('2026InterimResultsEnglish', [en_latest_2026], FINAL/'04_最新财务披露'/'2026H1_Breton_Interim_Results_English.pdf', expected_hint='INTERIM RESULTS', required=False)
+
+          # Add explanatory manifest.
+          notes = [
+              '博雷顿科技股份公司（01333.HK）官方财务文件包',
+              '',
+              '说明：',
+              '1. 公司于2025年5月7日在港交所上市，因此截至2026年9月6日，上市后独立年度报告仅有2025年度报告。',
+              '2. 招股说明书收录港交所最终版中文及英文招股章程，不收录申请版本草稿。',
+              '3. 港股发行人通常不按A股格式披露一季报/三季报；本包以截至2026年6月30日止六个月的中期业绩公告作为最新财务披露。',
+              '4. 若港交所尚未刊发2026年完整中期报告，本包同时保留最新可取得的完整中期报告（2025年中期报告）。',
+              '5. 所有PDF均来自港交所披露易，已校验PDF文件头、页数，并渲染检查首尾页。',
+              '',
+              '文件清单：'
+          ]
+          for i, rec in enumerate(records,1):
+              notes.append(f'{i}. {rec["filename"]} | {rec["pages"]}页 | {rec["size_bytes"]} bytes | 来源：{rec["source_url"]}')
+          (FINAL/'文件说明.txt').write_text('\n'.join(notes), encoding='utf-8')
+          (FINAL/'manifest.json').write_text(json.dumps({'company':'博雷顿科技股份公司','stock_code':'01333.HK','as_of':'2026-09-06','files':records},ensure_ascii=False,indent=2),encoding='utf-8')
+          sha_lines = [f'{r["sha256"]}  {r["filename"]}' for r in records]
+          (FINAL/'SHA256SUMS.txt').write_text('\n'.join(sha_lines)+'\n',encoding='utf-8')
+          (ROOT/'run.log').write_text('\n'.join(log),encoding='utf-8')
+
+          # Verify exactly one annual-report year exists, and required categories are present.
+          names = [r['filename'] for r in records]
+          assert any('02_年度报告' in n and '2025' in n for n in names), names
+          assert sum('02_年度报告' in n and '中文' in n for n in names) == 1, names
+          assert any('01_招股说明书' in n and '中文' in n for n in names), names
+          assert any('04_最新财务披露' in n for n in names), names
+
+          zip_path = ROOT/'博雷顿_01333_年报_招股说明书_最新财务报告.zip'
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for p in sorted(FINAL.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=str(Path(FINAL.name)/p.relative_to(FINAL)))
+          # ZIP integrity and member checks.
+          with zipfile.ZipFile(zip_path,'r') as z:
+              bad = z.testzip()
+              if bad: raise RuntimeError(f'ZIP CRC failure: {bad}')
+              members = z.namelist()
+              if len([m for m in members if m.lower().endswith('.pdf')]) < 6:
+                  raise RuntimeError(f'Unexpected PDF count: {members}')
+          zdata = zip_path.read_bytes()
+          (ROOT/'zip_metadata.json').write_text(json.dumps({'filename':zip_path.name,'size_bytes':len(zdata),'sha256':hashlib.sha256(zdata).hexdigest(),'pdf_count':len(records)},ensure_ascii=False,indent=2),encoding='utf-8')
+          L(f'FINAL ZIP {zip_path} bytes={len(zdata)} sha256={hashlib.sha256(zdata).hexdigest()} pdfs={len(records)}')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Boreton-01333-Official-Financial-Reports
+          path: |
+            boreton_filings_work/博雷顿_01333_年报_招股说明书_最新财务报告.zip
+            boreton_filings_work/zip_metadata.json
+            boreton_filings_work/run.log
+            boreton_filings_work/parsed_pdf_links.json
+          retention-days: 1
+          compression-level: 0
