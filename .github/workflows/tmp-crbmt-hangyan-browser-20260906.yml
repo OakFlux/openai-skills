@@ -1,0 +1,123 @@
+name: Capture public Hangyan PDF download
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install browser tools
+        run: |
+          python -m pip install --quiet playwright pypdf
+          python -m playwright install --with-deps chromium
+      - name: Open public report page and save public PDF response
+        run: |
+          mkdir -p out
+          cat > /tmp/capture.py <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from pypdf import PdfReader
+
+          report_url = "https://www.hangyan.co/reports/3399260180989347557"
+          out = Path("out")
+          saved = []
+          network = []
+
+          def safe_name(value: str) -> str:
+              value = re.sub(r"[^0-9A-Za-z._-]+", "_", value)
+              return value[-180:] or "file.pdf"
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(
+                  accept_downloads=True,
+                  locale="zh-CN",
+                  user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+              )
+              page = context.new_page()
+
+              def handle_response(response):
+                  try:
+                      ctype = response.headers.get("content-type", "")
+                      url = response.url
+                      if any(token in url.lower() for token in ["pdf", "qingstor", "hangyan-prod", "webviewer"]) or "application/pdf" in ctype.lower():
+                          record = {"url": url, "status": response.status, "content_type": ctype}
+                          network.append(record)
+                          try:
+                              body = response.body()
+                          except Exception as exc:
+                              record["body_error"] = repr(exc)
+                              return
+                          record["size"] = len(body)
+                          record["magic"] = repr(body[:16])
+                          if body.lstrip().startswith(b"%PDF") and len(body) > 30000:
+                              digest = hashlib.sha256(body).hexdigest()
+                              if digest not in {item["sha256"] for item in saved}:
+                                  filename = safe_name(Path(url.split("?", 1)[0]).name or "hangyan_report.pdf")
+                                  if not filename.lower().endswith(".pdf"):
+                                      filename += ".pdf"
+                                  path = out / filename
+                                  path.write_bytes(body)
+                                  saved.append({"file": path.name, "sha256": digest, "size": len(body), "source_url": url})
+                      
+                  except Exception as exc:
+                      network.append({"url": getattr(response, "url", ""), "handler_error": repr(exc)})
+
+              page.on("response", handle_response)
+              page.goto(report_url, wait_until="domcontentloaded", timeout=120000)
+              page.wait_for_timeout(20000)
+              iframe = page.locator('iframe[data-native-pdf-target="iframe"]')
+              if iframe.count():
+                  network.append({"iframe_src": iframe.first.get_attribute("src")})
+              page.screenshot(path=str(out / "page.png"), full_page=False)
+              (out / "page.html").write_text(page.content(), encoding="utf-8")
+
+              button = page.locator('button[data-action*="native-pdf#download"]')
+              if button.count() and button.first.is_visible():
+                  try:
+                      with page.expect_download(timeout=30000) as download_info:
+                          button.first.click()
+                      download = download_info.value
+                      suggested = safe_name(download.suggested_filename or "hangyan_download.pdf")
+                      path = out / suggested
+                      download.save_as(str(path))
+                      data = path.read_bytes()
+                      if data.lstrip().startswith(b"%PDF") and len(data) > 30000:
+                          digest = hashlib.sha256(data).hexdigest()
+                          if digest not in {item["sha256"] for item in saved}:
+                              saved.append({"file": path.name, "sha256": digest, "size": len(data), "source_url": report_url + "#public-download"})
+                      else:
+                          network.append({"download_file": path.name, "invalid_size": len(data), "magic": repr(data[:16])})
+                  except PlaywrightTimeoutError:
+                      network.append({"download_timeout": True})
+                  except Exception as exc:
+                      network.append({"download_error": repr(exc)})
+              page.wait_for_timeout(5000)
+              browser.close()
+
+          for item in saved:
+              path = out / item["file"]
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  item["pages"] = len(reader.pages)
+                  item["sample_text"] = " ".join((page.extract_text() or "") for page in reader.pages[:2])[:1000]
+              except Exception as exc:
+                  item["pdf_error"] = repr(exc)
+          (out / "result.json").write_text(json.dumps({"saved": saved, "network": network}, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps({"saved": saved, "network": network[-30:]}, ensure_ascii=False, indent=2))
+          if not saved:
+              raise SystemExit("No public PDF response was captured")
+          PY
+          python /tmp/capture.py
+      - name: Upload captured files
+        uses: actions/upload-artifact@v4
+        with:
+          name: crbmt-hangyan-public-pdf
+          path: out
+          retention-days: 1
+          compression-level: 0
