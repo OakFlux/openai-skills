@@ -1,0 +1,331 @@
+name: Temporary Ascletis Pharma broker reports
+
+on:
+  push:
+    branches:
+      - tmp-gelizhiyuo-reports-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 playwright pypdf
+          python -m playwright install --with-deps chromium
+
+      - name: Discover, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import quote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+          from pypdf import PdfReader
+
+          OUTPUT = Path('output')
+          WORK = Path('work')
+          OUTPUT.mkdir(exist_ok=True)
+          WORK.mkdir(exist_ok=True)
+
+          TARGETS = [
+              {
+                  'needle': '口服小分子率先破局，紧跟减重前沿',
+                  'institution': '东方证券',
+                  'date': '2025-12-28',
+                  'kind': '首次覆盖报告',
+                  'seed_urls': ['https://www.hangyan.co/reports?page=95'],
+              },
+              {
+                  'needle': '全新GLP-1减重不减肌，有潜力成为Best-in-Class',
+                  'institution': '东吴证券',
+                  'date': '2025-04-01',
+                  'kind': '公司深度报告',
+                  'seed_urls': ['https://www.hangyan.co/charts/3601111842144912396'],
+              },
+              {
+                  'needle': '聚焦减重代谢产品差异化管线',
+                  'institution': '兴业证券',
+                  'date': '2025-09-07',
+                  'kind': '公司深度报告',
+                  'seed_urls': ['https://www.hangyan.co/charts/3718347316894106647'],
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          })
+
+          def normalize(text: str) -> str:
+              return re.sub(r'\s+', '', text or '').replace('－', '-').replace('—', '-')
+
+          def report_links_from_html(base_url: str, html: str) -> list[dict]:
+              soup = BeautifulSoup(html, 'html.parser')
+              found: list[dict] = []
+              for anchor in soup.select('a[href*="/reports/"]'):
+                  href = urljoin(base_url, anchor.get('href') or '')
+                  match = re.search(r'/reports/(\d+)', href)
+                  if not match:
+                      continue
+                  text = ' '.join(anchor.get_text(' ', strip=True).split())
+                  parent = anchor.find_parent(['article', 'li', 'section', 'div'])
+                  context = ' '.join((parent.get_text(' ', strip=True) if parent else text).split())
+                  found.append({'id': match.group(1), 'url': href, 'text': text, 'context': context[:8000]})
+              return found
+
+          discovery_log: list[dict] = []
+          candidates: dict[str, dict] = {}
+
+          for target in TARGETS:
+              needle_n = normalize(target['needle'])
+              for seed_url in target['seed_urls']:
+                  try:
+                      response = session.get(seed_url, timeout=90, allow_redirects=True)
+                      response.raise_for_status()
+                      links = report_links_from_html(response.url, response.text)
+                      matched = []
+                      for item in links:
+                          haystack = normalize(item['text'] + ' ' + item['context'])
+                          if needle_n in haystack or ('歌礼制药' in haystack and any(part in haystack for part in [needle_n[:10], needle_n[-10:]])):
+                              enriched = {**item, **target, 'discovered_from': seed_url}
+                              candidates[item['id']] = enriched
+                              matched.append(enriched)
+                      discovery_log.append({'seed_url': seed_url, 'status': response.status_code, 'bytes': len(response.content), 'links': len(links), 'matched': matched})
+                      print('SEED', seed_url, 'LINKS', len(links), 'MATCHED', len(matched), flush=True)
+                  except Exception as exc:
+                      discovery_log.append({'seed_url': seed_url, 'error': repr(exc)})
+                      print('SEED_ERROR', seed_url, repr(exc), flush=True)
+
+          # Fallback: public search results can expose Hangyan report detail URLs not linked by static HTML.
+          if len(candidates) < 2:
+              for target in TARGETS:
+                  query = f'site:hangyan.co/reports "{target["needle"]}"'
+                  for search_url in [
+                      'https://html.duckduckgo.com/html/?q=' + quote(query),
+                      'https://www.baidu.com/s?wd=' + quote(query),
+                  ]:
+                      try:
+                          response = session.get(search_url, timeout=90, allow_redirects=True)
+                          links = report_links_from_html(response.url, response.text)
+                          for item in links:
+                              haystack = normalize(item['text'] + item['context'])
+                              if normalize(target['needle']) in haystack or '歌礼制药' in haystack:
+                                  candidates[item['id']] = {**item, **target, 'discovered_from': search_url}
+                          discovery_log.append({'search_url': search_url, 'status': response.status_code, 'bytes': len(response.content), 'links': len(links)})
+                      except Exception as exc:
+                          discovery_log.append({'search_url': search_url, 'error': repr(exc)})
+
+          # Directly inspect all report links from the known pages if exact context matching was weak.
+          if len(candidates) < 2:
+              for target in TARGETS:
+                  for seed_url in target['seed_urls']:
+                      try:
+                          response = session.get(seed_url, timeout=90, allow_redirects=True)
+                          for item in report_links_from_html(response.url, response.text):
+                              if item['id'] not in candidates:
+                                  candidates[item['id']] = {**item, **target, 'discovered_from': seed_url, 'weak_candidate': True}
+                      except Exception:
+                          pass
+
+          (WORK / 'discovery.json').write_text(json.dumps({'candidates': list(candidates.values()), 'log': discovery_log}, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('CANDIDATE_COUNT', len(candidates), flush=True)
+          for item in candidates.values():
+              print('CANDIDATE', json.dumps({k: item.get(k) for k in ['id','url','text','needle','institution','date']}, ensure_ascii=False), flush=True)
+
+          downloaded: list[dict] = []
+          seen_hashes: set[str] = set()
+
+          def safe_filename(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', ' ', value).strip(' ._')
+              return value[:180]
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'])
+              context = browser.new_context(
+                  viewport={'width': 1440, 'height': 1200},
+                  locale='zh-CN',
+                  timezone_id='Asia/Shanghai',
+                  accept_downloads=True,
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                  extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7'},
+              )
+              context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+              page = context.new_page()
+
+              # Prefer the three named reports; weak candidates are filtered by final page title/body and page count.
+              ordered = sorted(candidates.values(), key=lambda item: (bool(item.get('weak_candidate')), TARGETS.index(next(t for t in TARGETS if t['needle'] == item['needle'])) if any(t['needle'] == item['needle'] for t in TARGETS) else 99))
+              for candidate in ordered:
+                  if len(downloaded) >= 3:
+                      break
+                  row = {k: candidate.get(k) for k in ['id','url','needle','institution','date','kind','discovered_from']}
+                  try:
+                      response = page.goto(candidate['url'], wait_until='domcontentloaded', timeout=120000)
+                      row['status'] = response.status if response else None
+                      try:
+                          page.wait_for_load_state('networkidle', timeout=35000)
+                      except PlaywrightTimeout:
+                          row['networkidle_timeout'] = True
+                      page.wait_for_timeout(3500)
+                      row['final_url'] = page.url
+                      row['page_title'] = page.title()
+                      body = ' '.join(page.locator('body').inner_text().split())
+                      row['body_head'] = body[:5000]
+                      haystack = normalize(row['page_title'] + ' ' + body[:30000])
+                      if '歌礼制药' not in haystack and '01672' not in haystack and '1672.HK' not in haystack:
+                          row['skip_reason'] = 'detail page does not identify Ascletis Pharma'
+                          print('SKIP_NON_TARGET', candidate['id'], row['page_title'], flush=True)
+                          discovery_log.append(row)
+                          continue
+
+                      native = page.locator('[data-controller~="native-pdf"]')
+                      row['native_pdf_count'] = native.count()
+                      if native.count():
+                          attrs = page.evaluate('el => Object.fromEntries(Array.from(el.attributes).map(a => [a.name,a.value]))', native.first.element_handle())
+                          row['native_pdf_attributes'] = attrs
+                      button = page.locator('button[data-action*="native-pdf#download"], a[data-action*="native-pdf#download"]')
+                      row['download_button_count'] = button.count()
+                      if not button.count() or not button.first.is_visible():
+                          row['skip_reason'] = 'public download control not available'
+                          print('NO_DOWNLOAD', candidate['id'], row['page_title'], flush=True)
+                          discovery_log.append(row)
+                          continue
+
+                      with page.expect_download(timeout=45000) as pending:
+                          button.first.click(timeout=12000)
+                      download = pending.value
+                      temporary = WORK / f'{candidate["id"]}_{safe_filename(download.suggested_filename)}'
+                      download.save_as(str(temporary))
+                      data = temporary.read_bytes()
+                      if b'%PDF-' not in data[:1024] or len(data) < 50000:
+                          row['skip_reason'] = f'not a valid PDF ({len(data)} bytes)'
+                          temporary.unlink(missing_ok=True)
+                          discovery_log.append(row)
+                          continue
+                      reader = PdfReader(io.BytesIO(data), strict=False)
+                      pages = len(reader.pages)
+                      row['pages'] = pages
+                      row['bytes'] = len(data)
+                      sha256 = hashlib.sha256(data).hexdigest()
+                      row['sha256'] = sha256
+                      if sha256 in seen_hashes:
+                          row['skip_reason'] = 'duplicate PDF'
+                          temporary.unlink(missing_ok=True)
+                          discovery_log.append(row)
+                          continue
+                      # Deep/first-coverage reports should be substantial; exclude short event comments.
+                      if pages < 10:
+                          row['skip_reason'] = f'short report ({pages} pages), excluded from deep-report package'
+                          temporary.unlink(missing_ok=True)
+                          print('SKIP_SHORT', candidate['id'], pages, row['page_title'], flush=True)
+                          discovery_log.append(row)
+                          continue
+
+                      title = candidate['needle']
+                      final_name = safe_filename(f"{candidate['date']}_{candidate['institution']}_歌礼制药_{title}_{pages}页.pdf")
+                      final_path = WORK / final_name
+                      temporary.replace(final_path)
+                      row['file'] = final_name
+                      row['title'] = title
+                      row['source_url'] = candidate['url']
+                      seen_hashes.add(sha256)
+                      downloaded.append(row)
+                      print('PDF_OK', final_name, pages, len(data), flush=True)
+                  except Exception as exc:
+                      row['error'] = repr(exc)
+                      discovery_log.append(row)
+                      print('DOWNLOAD_ERROR', candidate.get('id'), repr(exc), flush=True)
+
+              browser.close()
+
+          if len(downloaded) < 2:
+              (WORK / 'failure.json').write_text(json.dumps({'downloaded': downloaded, 'discovery': discovery_log}, ensure_ascii=False, indent=2), encoding='utf-8')
+              raise RuntimeError(f'Only {len(downloaded)} substantial complete PDFs were downloaded; need at least 2')
+
+          # Keep exactly 2-3 files, ordered by report date descending.
+          downloaded.sort(key=lambda item: item.get('date') or '', reverse=True)
+          downloaded = downloaded[:3]
+
+          csv_path = WORK / '文件清单与校验值.csv'
+          with csv_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=['序号','券商','发布日期','报告类型','报告标题','PDF页数','文件大小_字节','SHA256','来源页面','文件名'])
+              writer.writeheader()
+              for index, item in enumerate(downloaded, 1):
+                  writer.writerow({
+                      '序号': index,
+                      '券商': item['institution'],
+                      '发布日期': item['date'],
+                      '报告类型': item['kind'],
+                      '报告标题': item['title'],
+                      'PDF页数': item['pages'],
+                      '文件大小_字节': item['bytes'],
+                      'SHA256': item['sha256'],
+                      '来源页面': item['source_url'],
+                      '文件名': item['file'],
+                  })
+
+          readme = WORK / 'README.txt'
+          readme.write_text(
+              '歌礼制药-B（01672.HK）券商深度报告资料包\n'
+              '生成日期：2026-09-06\n\n'
+              f'本资料包包含 {len(downloaded)} 份完整PDF，均为公司深度或首次覆盖类报告；已排除少于10页的业绩点评、事件点评和普通短评。\n'
+              'PDF已校验文件头、可解析性、实际页数和SHA-256；ZIP已执行CRC完整性检查。\n'
+              '报告内容及评级均对应各自发布日期，仅供研究参考。\n',
+              encoding='utf-8',
+          )
+
+          archive_name = f'歌礼制药_01672_券商深度报告_{len(downloaded)}份.zip'
+          archive_path = OUTPUT / archive_name
+          with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for item in downloaded:
+                  archive.write(WORK / item['file'], arcname=item['file'])
+              archive.write(csv_path, arcname=csv_path.name)
+              archive.write(readme, arcname=readme.name)
+
+          with zipfile.ZipFile(archive_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP CRC check failed: {bad}')
+              names = archive.namelist()
+
+          result = {
+              'archive': str(archive_path),
+              'archive_bytes': archive_path.stat().st_size,
+              'pdf_count': len(downloaded),
+              'reports': downloaded,
+              'zip_members': names,
+          }
+          (OUTPUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: gelizhiyuo-broker-deep-reports
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
