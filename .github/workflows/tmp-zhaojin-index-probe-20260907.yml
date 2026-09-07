@@ -1,0 +1,119 @@
+name: Probe public indexes for Zhaojin Mining broker reports
+on:
+  push:
+    branches:
+      - tmp-zhaojin-index-probe-20260907
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Probe indexes and application search configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re
+          from pathlib import Path
+          from urllib.parse import quote
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('output')
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          result={'sdyanbao':[],'hangyan_js':{},'sitemaps':[],'search_engines':[]}
+
+          # Sdyanbao public API; record complete metadata for exact company/title matches.
+          ss=requests.Session(); ss.headers.update({'User-Agent':ua,'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','Content-Type':'application/json;charset=UTF-8','Accept':'application/json, text/plain, */*'})
+          keywords=['招金矿业','优质老牌金企','海域金矿打开量增和降本空间','深聚潜力 招金而来','01818.HK']
+          for kw in keywords:
+              for page in range(1,8):
+                  row={'keyword':kw,'page':page}
+                  try:
+                      body={'device':1,'hideTrader':0,'onlyTitle':0,'order':1,'page':page,'pageSize':100,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','keyword':kw}
+                      r=ss.post('https://api.sdyanbao.com/api/file/search',json=body,timeout=90)
+                      row.update({'status':r.status_code,'bytes':len(r.content)})
+                      obj=r.json(); row['response']=obj
+                      files=((obj.get('data') or {}).get('files') or []) if isinstance(obj,dict) else []
+                      matches=[]
+                      for item in files:
+                          hay=' '.join(str(item.get(k) or '') for k in ['name','content','title','file_name'])+' '+json.dumps(item,ensure_ascii=False)
+                          if any(t.lower() in hay.lower() for t in ['招金矿业','优质老牌金企','深聚潜力','01818.hk']):
+                              matches.append(item)
+                              print('SD_MATCH',kw,page,json.dumps(item,ensure_ascii=False)[:12000],flush=True)
+                      row['matches']=matches
+                      result['sdyanbao'].append(row)
+                      print('SD_PAGE',kw,page,'files',len(files),'matches',len(matches),'total',(obj.get('data') or {}).get('total') if isinstance(obj,dict) else None,flush=True)
+                      if len(files)<100: break
+                  except Exception as exc:
+                      row['error']=repr(exc); result['sdyanbao'].append(row); print('SD_ERR',kw,page,repr(exc),flush=True); break
+
+          # Fetch Hangyan application JS and extract strings around search/autocomplete/routes.
+          try:
+              r=requests.get('https://cdn.hangyan.co/assets/application-ec845e69.js',headers={'User-Agent':ua},timeout=120)
+              result['hangyan_js'].update({'status':r.status_code,'bytes':len(r.content),'headers':dict(r.headers)})
+              (out/'hangyan_application.js').write_bytes(r.content)
+              text=r.text
+              urls=sorted(set(re.findall(r'https?://[^"\'`<>\\\s]+',text)))
+              result['hangyan_js']['interesting_urls']=[u for u in urls if any(k in u.lower() for k in ['search','report','algolia','api','document'])][:500]
+              strings=[]
+              for pat in ['autocomplete','getSources','/search','/reports','documents','native-pdf','algolia','query']:
+                  for m in re.finditer(re.escape(pat),text,re.I):
+                      strings.append({'pattern':pat,'offset':m.start(),'context':text[max(0,m.start()-500):m.start()+1000]})
+                      if sum(1 for x in strings if x['pattern']==pat)>=20: break
+              result['hangyan_js']['contexts']=strings[:200]
+              print('JS',r.status_code,len(r.content),'urls',len(urls),'contexts',len(strings),flush=True)
+          except Exception as exc:
+              result['hangyan_js']['error']=repr(exc); print('JS_ERR',repr(exc),flush=True)
+
+          # Common sitemap paths and robots.
+          for url in ['https://www.hangyan.co/robots.txt','https://www.hangyan.co/sitemap.xml','https://www.hangyan.co/sitemap_index.xml','https://www.hangyan.co/sitemaps/sitemap.xml','https://www.hangyan.co/reports/sitemap.xml']:
+              row={'url':url}
+              try:
+                  r=requests.get(url,headers={'User-Agent':ua},timeout=90,allow_redirects=True)
+                  row.update({'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'text':r.text[:200000]})
+                  print('SITEMAP',url,r.status_code,len(r.content),flush=True)
+              except Exception as exc: row['error']=repr(exc)
+              result['sitemaps'].append(row)
+
+          # Public search pages from multiple engines for exact titles, preserve links.
+          queries=[
+              '"优质老牌金企，海域金矿打开量增和降本空间"',
+              '"招金矿业" "中信证券" "41页"',
+              '"招金矿业投资价值分析报告" 230816',
+              '"深聚潜力" "招金矿业"',
+          ]
+          for q in queries:
+              for engine in [
+                  'https://www.bing.com/search?q='+quote(q)+'&count=50',
+                  'https://cn.bing.com/search?q='+quote(q)+'&count=50',
+                  'https://html.duckduckgo.com/html/?q='+quote(q),
+                  'https://www.sogou.com/web?query='+quote(q),
+              ]:
+                  row={'query':q,'url':engine}
+                  try:
+                      r=requests.get(engine,headers={'User-Agent':ua},timeout=90,allow_redirects=True)
+                      soup=BeautifulSoup(r.text,'lxml'); links=[]
+                      for a in soup.find_all('a',href=True):
+                          href=a.get('href'); text=' '.join(a.get_text(' ',strip=True).split())
+                          if href and href.startswith('http') and any(k in (href+' '+text).lower() for k in ['招金','zhaojin','nxny','hangyan','reportify','fxbaogao','sdyanbao','sgpjbg','vzkoo','book118','pdf']):
+                              links.append({'href':href,'text':text})
+                      row.update({'status':r.status_code,'bytes':len(r.content),'links':links[:300]})
+                      print('SEARCH',q,engine,r.status_code,'links',len(links),flush=True)
+                  except Exception as exc: row['error']=repr(exc)
+                  result['search_engines'].append(row)
+
+          (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload probe results
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhaojin-index-probe
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
