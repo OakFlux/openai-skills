@@ -1,0 +1,120 @@
+name: Capture public Vzkoo Haitian report
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install browser tools
+        run: |
+          python -m pip install --quiet playwright pypdf
+          python -m playwright install --with-deps chromium
+      - name: Browse public pages and capture report files
+        run: |
+          mkdir -p out
+          cat > /tmp/capture.py <<'PY'
+          import hashlib,json,re,time
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          from pypdf import PdfReader
+
+          out=Path('out')
+          read_url='https://www.vzkoo.com/read/20250212ef6ac1cf6810c0f2c6fe2cff.html'
+          doc_url='https://www.vzkoo.com/document/20250212a3620dec69fd01197f1eed2f.html?from=report'
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          saved=[]; events=[]
+
+          def maybe_save(url,body,ctype,method):
+              if len(body)>50000 and body.lstrip().startswith(b'%PDF'):
+                  digest=hashlib.sha256(body).hexdigest()
+                  if digest not in {x['sha256'] for x in saved}:
+                      p=out/f'captured_{len(saved)+1}.pdf'; p.write_bytes(body)
+                      try: pages=len(PdfReader(str(p),strict=False).pages)
+                      except Exception: pages=None
+                      rec={'file':p.name,'url':url,'content_type':ctype,'method':method,'bytes':len(body),'sha256':digest,'pages':pages}
+                      saved.append(rec); print('SAVED_PDF',json.dumps(rec,ensure_ascii=False))
+
+          with sync_playwright() as pw:
+              browser=pw.chromium.launch(headless=True)
+              ctx=browser.new_context(user_agent=ua,locale='zh-CN',accept_downloads=True,viewport={'width':1440,'height':1000})
+              page=ctx.new_page()
+              def on_request(req):
+                  u=req.url.lower()
+                  if any(k in u for k in ['pdf','document','download','cdnfiles','oss','file','check.php']):
+                      events.append({'type':'request','url':req.url,'method':req.method})
+              def on_response(resp):
+                  try:
+                      u=resp.url; ct=(resp.headers.get('content-type') or '').lower()
+                      if any(k in u.lower() for k in ['pdf','document','download','cdnfiles','oss','file','check.php']) or 'application/pdf' in ct:
+                          rec={'type':'response','url':u,'status':resp.status,'content_type':ct}
+                          events.append(rec)
+                          try:
+                              body=resp.body(); rec['bytes']=len(body); rec['magic']=repr(body[:16]); maybe_save(u,body,ct,'network')
+                          except Exception as exc: rec['body_error']=repr(exc)
+                  except Exception as exc: events.append({'handler_error':repr(exc)})
+              page.on('request',on_request); page.on('response',on_response)
+
+              for idx,u in enumerate([read_url,doc_url],1):
+                  print('GOTO',u)
+                  try: page.goto(u,wait_until='domcontentloaded',timeout=120000)
+                  except Exception as exc: print('GOTO_ERROR',repr(exc))
+                  page.wait_for_timeout(12000)
+                  print('AT',page.url,'TITLE',page.title())
+                  page.screenshot(path=str(out/f'page_{idx}.png'),full_page=False)
+                  (out/f'page_{idx}.html').write_text(page.content(),encoding='utf-8')
+                  bodytext=page.locator('body').inner_text()[:3000] if page.locator('body').count() else ''
+                  print('BODY',bodytext)
+                  # Follow ordinary public verification link if present.
+                  verify=page.locator('a[href*="aq.vzkoo.com/html/check.php"]')
+                  if verify.count():
+                      print('VERIFY_LINK',verify.first.get_attribute('href'))
+                      try: verify.first.click(); page.wait_for_timeout(15000)
+                      except Exception as exc: print('VERIFY_CLICK_ERROR',repr(exc))
+                      print('AFTER_VERIFY',page.url,page.title())
+                      page.screenshot(path=str(out/f'page_{idx}_after_verify.png'),full_page=False)
+                      (out/f'page_{idx}_after_verify.html').write_text(page.content(),encoding='utf-8')
+                  # Click the report-document link on the public read page.
+                  target=page.locator('a[href*="/document/20250212a3620dec69fd01197f1eed2f"]')
+                  if target.count():
+                      href=target.first.get_attribute('href'); print('DOC_LINK',href)
+                      try:
+                          target.first.click(); page.wait_for_timeout(15000)
+                      except Exception as exc: print('DOC_CLICK_ERROR',repr(exc))
+                      print('AFTER_DOC_CLICK',page.url,page.title())
+                  # Inspect public PDF/download buttons.
+                  buttons=page.locator('a,button')
+                  for i in range(min(buttons.count(),300)):
+                      el=buttons.nth(i)
+                      try:
+                          text=(el.inner_text() or '').strip(); href=el.get_attribute('href') or ''; onclick=el.get_attribute('onclick') or ''
+                          if any(k in (text+' '+href+' '+onclick).lower() for k in ['下载','download','.pdf','原文']):
+                              print('CONTROL',i,text[:200],href[:500],onclick[:500])
+                      except Exception: pass
+                  page.wait_for_timeout(5000)
+
+              # Try URLs seen in network with browser request context.
+              urls=[]
+              for e in events:
+                  u=e.get('url','')
+                  if u.startswith('http') and u not in urls and ('.pdf' in u.lower() or 'download' in u.lower()): urls.append(u)
+              for u in urls[:30]:
+                  try:
+                      rr=ctx.request.get(u,headers={'Referer':page.url,'User-Agent':ua},timeout=120000)
+                      body=rr.body(); print('REQUEST_TRY',rr.status,len(body),rr.headers.get('content-type'),u)
+                      maybe_save(u,body,rr.headers.get('content-type',''),'request-context')
+                  except Exception as exc: print('REQUEST_ERROR',u,repr(exc))
+              browser.close()
+
+          (out/'result.json').write_text(json.dumps({'saved':saved,'events':events},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps({'saved':saved,'event_count':len(events)},ensure_ascii=False,indent=2))
+          PY
+          python /tmp/capture.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vzkoo-haitian-capture
+          path: out
+          retention-days: 1
+          compression-level: 0
