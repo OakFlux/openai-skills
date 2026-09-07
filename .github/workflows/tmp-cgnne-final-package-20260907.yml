@@ -1,0 +1,299 @@
+name: Package CGN New Energy broker research reports
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet requests pillow pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+      - name: Download, reconstruct, validate and package reports
+        run: |
+          mkdir -p out/pdfs out/source_images out/renders
+          cat > /tmp/package_cgnne.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('out')
+          PDF_DIR = OUT / 'pdfs'
+          IMG_DIR = OUT / 'source_images'
+          RENDER_DIR = OUT / 'renders'
+          UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def download(url: str, referer: str, min_bytes: int = 1_000) -> bytes:
+              response = session.get(url, headers={'Referer': referer, 'User-Agent': UA}, timeout=120)
+              print('GET', response.status_code, response.headers.get('content-type'), len(response.content), url)
+              response.raise_for_status()
+              if len(response.content) < min_bytes:
+                  raise RuntimeError(f'File unexpectedly small: {url} ({len(response.content)} bytes)')
+              return response.content
+
+          def make_image_pdf(
+              *,
+              base_url: str,
+              pages: int,
+              referer: str,
+              output: Path,
+              image_subdir: str,
+          ) -> tuple[int, int, str]:
+              subdir = IMG_DIR / image_subdir
+              subdir.mkdir(parents=True, exist_ok=True)
+              images: list[Image.Image] = []
+              total_source_bytes = 0
+              expected_size = None
+
+              for page_no in range(1, pages + 1):
+                  url = f'{base_url}{page_no}.gif'
+                  data = download(url, referer, min_bytes=10_000)
+                  total_source_bytes += len(data)
+                  image_path = subdir / f'{page_no:02d}.gif'
+                  image_path.write_bytes(data)
+                  try:
+                      with Image.open(io.BytesIO(data)) as source:
+                          source.load()
+                          if source.format != 'GIF':
+                              raise RuntimeError(f'Unexpected image format on page {page_no}: {source.format}')
+                          rgb = source.convert('RGB')
+                          if rgb.width < 700 or rgb.height < 900:
+                              raise RuntimeError(f'Unexpected page dimensions on page {page_no}: {rgb.size}')
+                          if expected_size is None:
+                              expected_size = rgb.size
+                          elif rgb.size != expected_size:
+                              print('WARNING_PAGE_SIZE', page_no, rgb.size, 'expected', expected_size)
+                          images.append(rgb.copy())
+                  except Exception as exc:
+                      raise RuntimeError(f'Unable to decode public reader image {url}: {exc!r}') from exc
+
+              if len(images) != pages:
+                  raise RuntimeError(f'Expected {pages} images, obtained {len(images)}')
+
+              first, rest = images[0], images[1:]
+              first.save(
+                  output,
+                  'PDF',
+                  save_all=True,
+                  append_images=rest,
+                  resolution=150.0,
+                  quality=95,
+                  subsampling=0,
+              )
+              for image in images:
+                  image.close()
+
+              data = output.read_bytes()
+              if not data.startswith(b'%PDF') or len(data) < 100_000:
+                  raise RuntimeError(f'Generated PDF is invalid: {output}')
+              reader = PdfReader(str(output), strict=False)
+              if len(reader.pages) != pages:
+                  raise RuntimeError(f'Generated PDF page count mismatch: {len(reader.pages)} vs {pages}')
+              return len(data), total_source_bytes, sha256_bytes(data)
+
+          def validate_pdf(path: Path, min_pages: int, identity_terms: tuple[str, ...] = ()) -> tuple[int, str]:
+              data = path.read_bytes()
+              if not data.lstrip().startswith(b'%PDF'):
+                  raise RuntimeError(f'Not a PDF: {path.name}')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{path.name} has only {pages} pages; expected at least {min_pages}')
+              text_parts: list[str] = []
+              for page in reader.pages[: min(10, pages)]:
+                  try:
+                      text_parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              sample = ' '.join(text_parts)
+              if identity_terms and sample and not any(term.lower() in sample.lower() for term in identity_terms):
+                  raise RuntimeError(f'Issuer identity not found in text of {path.name}')
+              prefix = RENDER_DIR / path.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-r', '100', '-png', '-singlefile', str(path), str(prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+              )
+              render = Path(str(prefix) + '.png')
+              if not render.exists() or render.stat().st_size < 5_000:
+                  raise RuntimeError(f'First-page render failed for {path.name}')
+              return pages, sample[:1200]
+
+          manifest: list[dict[str, object]] = []
+
+          # Report 1: 2021 Guosen Securities first-coverage report.
+          # The public reader explicitly exposes only pages 1-15 of the 47-page original.
+          source_2021 = 'https://www.sgpjbg.com/baogao/44868.html'
+          base_2021 = 'https://file.sgpjbg.com/fileroot_temp1/2021-7/12/901e5f45-b61f-49e1-952e-99789841657f/901e5f45-b61f-49e1-952e-99789841657f'
+          pdf_2021 = PDF_DIR / '2021-07-11_Guosen_CGN_New_Energy_First_Coverage_Public_Preview_15_of_47.pdf'
+          size_2021, source_bytes_2021, hash_2021 = make_image_pdf(
+              base_url=base_2021,
+              pages=15,
+              referer=source_2021,
+              output=pdf_2021,
+              image_subdir='2021_guosen_preview',
+          )
+          pages_2021, _ = validate_pdf(pdf_2021, min_pages=15)
+          manifest.append({
+              'file': pdf_2021.name,
+              'broker': '国信证券',
+              'date': '2021-07-11',
+              'title': '清洁能源新栋梁，直挂云帆济沧海',
+              'report_type': '首次覆盖报告',
+              'version': '公开预览版：原报告47页，本文件收录网站公开展示的前15页；由公开逐页图像合成为PDF，非券商原始PDF文件',
+              'pages_in_file': pages_2021,
+              'original_report_pages': 47,
+              'bytes': size_2021,
+              'source_image_bytes': source_bytes_2021,
+              'sha256': hash_2021,
+              'source_page': source_2021,
+          })
+
+          # Report 2: 2022 Guosen Securities (Hong Kong) report.
+          # The public reader exposes all 15/15 pages, reconstructed without adding or omitting pages.
+          source_2022 = 'https://www.sgpjbg.com/baogao/70108.html'
+          base_2022 = 'https://file.sgpjbg.com/fileroot_temp1/2022-4/28/4458eb71-fd8f-41a7-80b7-0a6b0cb96bed/4458eb71-fd8f-41a7-80b7-0a6b0cb96bed'
+          pdf_2022 = PDF_DIR / '2022-04-22_Guosen_HK_CGN_New_Energy_Growing_Steadily_Public_Full_Reader_15p.pdf'
+          size_2022, source_bytes_2022, hash_2022 = make_image_pdf(
+              base_url=base_2022,
+              pages=15,
+              referer=source_2022,
+              output=pdf_2022,
+              image_subdir='2022_guosen_full_reader',
+          )
+          pages_2022, _ = validate_pdf(pdf_2022, min_pages=15)
+          manifest.append({
+              'file': pdf_2022.name,
+              'broker': '国信证券（香港）',
+              'date': '2022-04-22',
+              'title': '稳步成长的新能源运营商',
+              'report_type': '公司研究报告',
+              'version': '公开完整阅读版：15/15页；由网站公开逐页图像合成为PDF，版面与公开阅读页一致，但非券商原始PDF文件',
+              'pages_in_file': pages_2022,
+              'original_report_pages': 15,
+              'bytes': size_2022,
+              'source_image_bytes': source_bytes_2022,
+              'sha256': hash_2022,
+              'source_page': source_2022,
+          })
+
+          # Report 3: 2024 Guosen Securities (Hong Kong) original public PDF, useful as a recent update.
+          source_2024_page = 'https://www.hangyan.co/reports/3374738651710752209'
+          source_2024_pdf = 'https://cdn.hangyan.co/documents/b2/b296673f29ffc4388c06a0074bce5a2fda22200d37250074660b406c803eb1d9.pdf'
+          pdf_2024 = PDF_DIR / '2024-05-23_Guosen_HK_CGN_New_Energy_Valuation_Recovery_Update.pdf'
+          data_2024 = download(source_2024_pdf, source_2024_page, min_bytes=50_000)
+          if not data_2024.lstrip().startswith(b'%PDF'):
+              raise RuntimeError('The 2024 source is not a PDF')
+          pdf_2024.write_bytes(data_2024)
+          pages_2024, sample_2024 = validate_pdf(
+              pdf_2024,
+              min_pages=2,
+              identity_terms=('中广核新能源', 'CGN New Energy', '1811.HK', '1811 HK'),
+          )
+          manifest.append({
+              'file': pdf_2024.name,
+              'broker': '国信证券（香港）',
+              'date': '2024-05-23',
+              'title': '稳健增长，估值修复行情持续',
+              'report_type': '公司研究更新（补充近期观点）',
+              'version': '公开原始券商PDF',
+              'pages_in_file': pages_2024,
+              'original_report_pages': pages_2024,
+              'bytes': len(data_2024),
+              'sha256': sha256_bytes(data_2024),
+              'source_page': source_2024_page,
+              'pdf_source_url': source_2024_pdf,
+              'validation_text_sample': sample_2024,
+          })
+
+          hashes = [str(item['sha256']) for item in manifest]
+          if len(hashes) != 3 or len(set(hashes)) != 3:
+              raise RuntimeError('Report count or duplicate-file check failed')
+
+          readme = [
+              '中广核新能源（01811.HK）券商研究报告资料包',
+              '',
+              '本资料包共3份PDF：',
+              '',
+              f"1. 国信证券｜2021-07-11｜《清洁能源新栋梁，直挂云帆济沧海》｜本包15页。原报告47页；公开来源仅展示前15页，因此明确标为公开预览版。",
+              f"2. 国信证券（香港）｜2022-04-22｜《稳步成长的新能源运营商》｜{pages_2022}页。公开阅读页完整展示15/15页，本包据逐页公开图像合成为PDF。",
+              f"3. 国信证券（香港）｜2024-05-23｜《稳健增长，估值修复行情持续》｜{pages_2024}页。公开原始券商PDF，作为较新的经营与估值更新。",
+              '',
+              '版本说明：',
+              '- 第1份不是47页完整原版，未绕过登录、VIP或付费限制，只收录公开展示的前15页。',
+              '- 第2份涵盖公开阅读器展示的全部15页，但文件由公开逐页图像合成，非券商原始PDF容器。',
+              '- 第3份为公开原始PDF，但属于公司研究更新，不是长篇首次覆盖报告。',
+              '',
+              '所有文件均已完成页数、图像/PDF文件头、首屏渲染、重复内容及ZIP完整性检查。',
+              '文件仅供个人研究使用，版权归原券商、作者及相关权利人所有。',
+          ]
+          (OUT / 'README_CN.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{item['sha256']}  {item['file']}" for item in manifest) + '\n',
+              encoding='utf-8',
+          )
+
+          zip_path = OUT / 'cgnne_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for item in manifest:
+                  zf.write(PDF_DIR / str(item['file']), arcname=str(item['file']))
+              for name in ['README_CN.txt', 'manifest.json', 'SHA256SUMS.txt']:
+                  zf.write(OUT / name, arcname=name)
+
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              members = zf.namelist()
+              pdf_members = [name for name in members if name.lower().endswith('.pdf')]
+              if bad is not None:
+                  raise RuntimeError(f'Corrupt ZIP member: {bad}')
+              if len(pdf_members) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdf_members)} PDFs, expected 3')
+
+          package_info = {
+              'file': zip_path.name,
+              'bytes': zip_path.stat().st_size,
+              'sha256': sha256_bytes(zip_path.read_bytes()),
+              'pdf_count': 3,
+              'reports': [
+                  {key: item[key] for key in ['broker', 'date', 'title', 'report_type', 'version', 'pages_in_file']}
+                  for item in manifest
+              ],
+          }
+          (OUT / 'PACKAGE_INFO.json').write_text(json.dumps(package_info, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_READY', json.dumps(package_info, ensure_ascii=False))
+          PY
+          python /tmp/package_cgnne.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cgnne-broker-research-package
+          path: |
+            out/cgnne_reports.zip
+            out/PACKAGE_INFO.json
+            out/manifest.json
+            out/renders
+          retention-days: 1
+          compression-level: 0
