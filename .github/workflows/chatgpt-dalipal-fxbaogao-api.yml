@@ -1,0 +1,120 @@
+name: Download Dalipal reports through configured report API
+on:
+  push:
+    branches:
+      - chatgpt-dalipal-reports-20260907
+  workflow_dispatch:
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FXBAOGAO_API_KEY: ${{ secrets.FXBAOGAO_API_KEY }}
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+      - name: Search and download matching PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pdfs
+          python - <<'PY'
+          from __future__ import annotations
+          import io, json, os, re, hashlib
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from pypdf import PdfReader
+
+          key=os.getenv('FXBAOGAO_API_KEY','')
+          print('API_KEY_PRESENT', bool(key), 'LENGTH', len(key), flush=True)
+          if not key:
+              raise SystemExit('FXBAOGAO_API_KEY is not configured')
+          api='https://api.fxbaogao.com'
+          pdfbase='https://dr.fxbaogao.com/'
+          s=requests.Session(); s.trust_env=False
+          headers={'Authorization':f'Bearer {key}','Accept':'application/json','User-Agent':'fxbaogao-mcp/1.0.2'}
+          queries=['达力普控股','达力普','能源装备高端制造企业','价值兼具成长 能源高端装备巨匠','大步迈进国际化 把握海外景气周期','中东生产基地将于年内开工','专业石油管及无缝钢管制造企业']
+          reports={}; search_logs=[]
+          for q in queries:
+              for p in range(1,11):
+                  body={'keywords':q,'orgNames':[],'pageNum':p}
+                  try:
+                      r=s.post(api+'/mofoun/agent/search',json=body,headers={**headers,'Content-Type':'application/json'},timeout=(15,90))
+                      print('SEARCH',repr(q),p,r.status_code,len(r.content),flush=True)
+                      r.raise_for_status(); j=r.json(); search_logs.append({'q':q,'p':p,'response':j})
+                      data=j.get('data')
+                      if isinstance(data,list): rows=data
+                      elif isinstance(data,dict) and isinstance(data.get('dataList'),list): rows=data['dataList']
+                      else: rows=[]
+                      for x in rows:
+                          blob=json.dumps(x,ensure_ascii=False)
+                          if any(t in blob for t in ['达力普控股','達力普控股','1921.HK','01921','DALIPAL','Dalipal']):
+                              rid=x.get('reportId') or x.get('id')
+                              if rid is not None:
+                                  reports[str(rid)]=x
+                                  print('MATCH',rid,json.dumps(x,ensure_ascii=False),flush=True)
+                      # stop when no rows
+                      if not rows: break
+                  except Exception as e:
+                      print('SEARCH_FAIL',repr(q),p,repr(e),flush=True); break
+
+          def extract_urls(v):
+              out=[]
+              def walk(x):
+                  if isinstance(x,dict):
+                      for k,c in x.items():
+                          if isinstance(c,str) and str(k).lower() in {'pdfurl','url','fileurl','downloadurl','data'}:
+                              z=c.strip()
+                              if z and (z.startswith(('http://','https://','/')) or '.pdf' in z.lower()):
+                                  out.append(z if z.startswith(('http://','https://')) else urljoin(pdfbase,z.lstrip('/')))
+                          else: walk(c)
+                  elif isinstance(x,list):
+                      for c in x: walk(c)
+              walk(v)
+              return list(dict.fromkeys(out))
+
+          records=[]
+          for rid,x in reports.items():
+              try:
+                  r=s.get(api+f'/mofoun/agent/download?reportId={rid}',headers=headers,timeout=(15,90));
+                  print('DOWNLOAD_META',rid,r.status_code,len(r.content),flush=True); r.raise_for_status(); meta=r.json()
+                  urls=extract_urls(meta)
+                  print('URLS',rid,json.dumps(urls,ensure_ascii=False),flush=True)
+                  saved=False
+                  for u in urls:
+                      dh={'Accept':'application/pdf,*/*','User-Agent':'fxbaogao-mcp/1.0.2'}
+                      if u.startswith(api): dh['Authorization']=f'Bearer {key}'
+                      rr=s.get(u,headers=dh,timeout=(20,180),allow_redirects=True)
+                      ok=rr.status_code==200 and b'%PDF' in rr.content[:4096] and len(rr.content)>30000
+                      print('PDF',rid,rr.status_code,len(rr.content),rr.headers.get('content-type'),u,'OK',ok,flush=True)
+                      if not ok: continue
+                      try:
+                          reader=PdfReader(io.BytesIO(rr.content),strict=False)
+                          pages=len(reader.pages)
+                          text=''.join((reader.pages[i].extract_text() or '') for i in range(min(3,pages)))[:6000]
+                      except Exception as e:
+                          print('PARSE_FAIL',rid,repr(e),flush=True); continue
+                      title=str(x.get('title') or x.get('reportTitle') or x.get('name') or f'report_{rid}')
+                      org=str(x.get('orgName') or x.get('organizationName') or x.get('org') or '')
+                      date=str(x.get('publishTime') or x.get('publishDate') or x.get('date') or '')
+                      clean=re.sub(r'[\\/:*?"<>|]+','_',title).strip()[:110]
+                      fn=f'{rid}_{clean}.pdf'
+                      path=Path('out/pdfs')/fn; path.write_bytes(rr.content)
+                      rec={'reportId':rid,'title':title,'org':org,'date':date,'pages':pages,'bytes':len(rr.content),'sha256':hashlib.sha256(rr.content).hexdigest(),'url':u,'text_prefix':text,'metadata':x,'download_meta':meta,'filename':fn}
+                      records.append(rec); print('SAVED',json.dumps({k:rec[k] for k in ['reportId','title','org','date','pages','bytes','filename']},ensure_ascii=False),flush=True)
+                      saved=True; break
+                  if not saved: print('NO_VALID_PDF',rid,flush=True)
+              except Exception as e:
+                  print('REPORT_FAIL',rid,repr(e),flush=True)
+
+          Path('out/results.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/search_logs.json').write_text(json.dumps(search_logs,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_REPORT_COUNT',len(records),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dalipal-fxbaogao-downloads
+          path: out/
+          retention-days: 3
+          if-no-files-found: error
