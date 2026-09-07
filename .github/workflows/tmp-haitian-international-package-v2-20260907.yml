@@ -1,0 +1,386 @@
+name: Package Haitian International broker reports v2
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          python -m pip install --quiet playwright requests beautifulsoup4 pypdf
+          python -m playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+      - name: Download, render, validate and package
+        run: |
+          mkdir -p out/pdfs out/renders out/diagnostics
+          cat > /tmp/package_haitian_v2.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from pypdf import PdfReader
+
+          OUT = Path('out')
+          PDF_DIR = OUT / 'pdfs'
+          RENDER_DIR = OUT / 'renders'
+          DIAG_DIR = OUT / 'diagnostics'
+          UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+
+          def digest(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def is_pdf(data: bytes) -> bool:
+              return len(data) > 80_000 and data.lstrip().startswith(b'%PDF')
+
+          def pdf_text(path: Path, max_pages: int = 60) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              parts: list[str] = []
+              for page in reader.pages[: min(pages, max_pages)]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, repr(exc))
+              return pages, re.sub(r'\s+', ' ', ' '.join(parts)).strip()
+
+          def render_check(path: Path, stem: str) -> None:
+              prefix = RENDER_DIR / stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-r', '120', '-png', '-singlefile', str(path), str(prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+              )
+              image = Path(str(prefix) + '.png')
+              if not image.exists() or image.stat().st_size < 2000:
+                  raise RuntimeError(f'Render check failed: {path.name}')
+
+          def capture_public_hangyan_pdf(context, source_page: str) -> tuple[bytes, str, str]:
+              page = context.new_page()
+              captured: list[tuple[bytes, str, str]] = []
+
+              def on_response(response):
+                  try:
+                      ctype = (response.headers.get('content-type') or '').lower()
+                      if 'application/pdf' not in ctype and '.pdf' not in response.url.lower():
+                          return
+                      body = response.body()
+                      if is_pdf(body):
+                          captured.append((body, response.url, 'network-response'))
+                  except Exception as exc:
+                      print('CAPTURE_WARNING', repr(exc))
+
+              page.on('response', on_response)
+              page.goto(source_page, wait_until='domcontentloaded', timeout=120_000)
+              page.wait_for_timeout(15_000)
+              (DIAG_DIR / 'dongwu.html').write_text(page.content(), encoding='utf-8')
+              page.screenshot(path=str(DIAG_DIR / 'dongwu.png'), full_page=False)
+
+              iframe = page.locator('iframe[data-native-pdf-target="iframe"]')
+              if iframe.count():
+                  src = ''
+                  for _ in range(15):
+                      src = iframe.first.get_attribute('src') or ''
+                      if src.startswith('http'):
+                          break
+                      page.wait_for_timeout(1000)
+                  if src.startswith('http'):
+                      try:
+                          response = context.request.get(src, headers={'Referer': source_page, 'User-Agent': UA}, timeout=120_000)
+                          body = response.body()
+                          print('IFRAME', response.status, len(body), src)
+                          if is_pdf(body):
+                              captured.insert(0, (body, src, 'iframe-request'))
+                      except Exception as exc:
+                          print('IFRAME_WARNING', repr(exc))
+
+              button = page.locator('button[data-action*="native-pdf#download"]')
+              if button.count() and button.first.is_visible():
+                  try:
+                      with page.expect_download(timeout=60_000) as info:
+                          button.first.click()
+                      dl = info.value
+                      tmp = DIAG_DIR / 'dongwu_download.bin'
+                      dl.save_as(str(tmp))
+                      body = tmp.read_bytes()
+                      print('DOWNLOAD', dl.suggested_filename, len(body))
+                      if is_pdf(body):
+                          captured.insert(0, (body, source_page + '#download', 'download-button'))
+                  except PlaywrightTimeoutError:
+                      print('DOWNLOAD_TIMEOUT')
+                  except Exception as exc:
+                      print('DOWNLOAD_WARNING', repr(exc))
+              page.close()
+
+              unique: list[tuple[bytes, str, str]] = []
+              seen: set[str] = set()
+              for body, url, method in captured:
+                  h = digest(body)
+                  if h not in seen:
+                      seen.add(h)
+                      unique.append((body, url, method))
+              if not unique:
+                  raise RuntimeError('No public PDF captured from Dongwu report page')
+              return unique[0]
+
+          def fetch_vzkoo_full_article(session: requests.Session) -> tuple[str, str] | None:
+              urls = [
+                  'https://www.vzkoo.com/read/20250212ef6ac1cf6810c0f2c6fe2cff.html',
+                  'https://www.vzkoo.com/read/20250212a3620dec69fd01197f1eed2f.html',
+              ]
+              for index, url in enumerate(urls, 1):
+                  try:
+                      response = session.get(url, headers={'Referer': 'https://www.vzkoo.com/'}, timeout=120, allow_redirects=True)
+                      (DIAG_DIR / f'vzkoo_requests_{index}.html').write_bytes(response.content)
+                      text = BeautifulSoup(response.text, 'html.parser').get_text(' ', strip=True)
+                      print('VZKOO_REQUEST', index, response.status_code, len(response.content), response.url, text[:180])
+                      required = ['全球注塑机龙头', '中信建投证券', '持续产品迭代', '他山之石']
+                      if response.status_code == 200 and all(term in text for term in required):
+                          return response.text, response.url
+                  except Exception as exc:
+                      print('VZKOO_REQUEST_WARNING', url, repr(exc))
+              return None
+
+          def load_vzkoo_in_browser(context) -> tuple[object, str] | None:
+              urls = [
+                  'https://www.vzkoo.com/read/20250212ef6ac1cf6810c0f2c6fe2cff.html',
+                  'https://www.vzkoo.com/read/20250212a3620dec69fd01197f1eed2f.html',
+              ]
+              for index, url in enumerate(urls, 1):
+                  page = context.new_page()
+                  try:
+                      page.goto('https://www.vzkoo.com/', wait_until='domcontentloaded', timeout=120_000)
+                      page.wait_for_timeout(2000)
+                      response = page.goto(url, wait_until='domcontentloaded', timeout=120_000)
+                      page.wait_for_timeout(10_000)
+                      text = re.sub(r'\s+', ' ', page.locator('body').inner_text()).strip()
+                      (DIAG_DIR / f'vzkoo_browser_{index}.html').write_text(page.content(), encoding='utf-8')
+                      page.screenshot(path=str(DIAG_DIR / f'vzkoo_browser_{index}.png'), full_page=False)
+                      print('VZKOO_BROWSER', index, None if response is None else response.status, page.url, page.title(), text[:180])
+                      required = ['全球注塑机龙头', '中信建投证券', '持续产品迭代', '他山之石']
+                      if all(term in text for term in required):
+                          return page, page.url
+                  except Exception as exc:
+                      print('VZKOO_BROWSER_WARNING', url, repr(exc))
+                  page.close()
+              return None
+
+          def clean_vzkoo_article(page) -> None:
+              page.evaluate(r'''
+              () => {
+                const required = ['全球注塑机龙头', '他山之石'];
+                const nodes = Array.from(document.querySelectorAll('article,main,section,div'))
+                  .filter(el => {
+                    const t = (el.innerText || '');
+                    return required.every(x => t.includes(x)) && t.length > 3000;
+                  })
+                  .sort((a,b) => (a.innerText || '').length - (b.innerText || '').length);
+                const source = nodes[0] || document.body;
+                const clone = source.cloneNode(true);
+                for (const el of Array.from(clone.querySelectorAll('nav,header,footer,aside,form,button,input,video,script,style'))) el.remove();
+                for (const el of Array.from(clone.querySelectorAll('*'))) {
+                  const t = (el.innerText || '').trim();
+                  if (t === '相关深度报告REPORTS' || t === '登录/注册') el.remove();
+                }
+                document.body.innerHTML = '';
+                const note = document.createElement('section');
+                note.className = 'source-note';
+                note.innerHTML = '<strong>公开全文研读版（非券商原始排版）</strong><br>来源：未来智库公开报告精读页面；原报告机构：中信建投证券；原报告日期：2025-02-11。';
+                document.body.appendChild(note);
+                document.body.appendChild(clone);
+                for (const a of document.querySelectorAll('a')) { a.removeAttribute('href'); a.style.color='inherit'; a.style.textDecoration='none'; }
+                for (const img of document.querySelectorAll('img')) { img.style.maxWidth='100%'; img.style.height='auto'; img.loading='eager'; }
+              }
+              ''')
+
+          def build_9fzt_fallback_html(session: requests.Session) -> tuple[str, str]:
+              url = 'https://gmg.9fzt.com/report/HKSE/01882/792586570112.html'
+              response = session.get(url, timeout=120)
+              response.raise_for_status()
+              (DIAG_DIR / '9fzt_source.html').write_bytes(response.content)
+              soup = BeautifulSoup(response.text, 'html.parser')
+              title_node = soup.find('p', string=lambda s: s and '全球注塑机龙头' in s)
+              if title_node is None:
+                  title_node = next((p for p in soup.find_all(['p','h1','h2']) if '全球注塑机龙头' in p.get_text(' ', strip=True)), None)
+              content_node = soup.find('div', class_=lambda c: c and any(str(x).startswith('content_wrap') for x in (c if isinstance(c, list) else str(c).split())))
+              if content_node is None:
+                  content_node = next((d for d in soup.find_all('div') if '核心观点' in d.get_text(' ', strip=True) and len(d.get_text(' ', strip=True)) > 1500), None)
+              if title_node is None or content_node is None:
+                  raise RuntimeError('Unable to extract 9fzt detailed public report text')
+              title = title_node.get_text(' ', strip=True)
+              content_html = str(content_node)
+              document = f'''<!doctype html><html><head><meta charset="utf-8"><style>
+              @page {{ size:A4; margin:15mm 16mm 17mm; }}
+              body {{ font-family:"Noto Sans CJK SC","WenQuanYi Zen Hei",Arial,sans-serif; color:#111; font-size:10.5pt; line-height:1.65; }}
+              h1 {{ font-size:20pt; line-height:1.35; }}
+              .note {{ border:1px solid #777; background:#f6f6f6; padding:4mm; margin-bottom:6mm; font-size:9.5pt; }}
+              p {{ text-align:justify; margin:0 0 3mm; }}
+              </style></head><body>
+              <div class="note"><strong>公开详细研读版（非券商原始排版，也非48页原版全文）</strong><br>来源：九方智投公开研报摘要页面；原报告机构：中信建投证券；原报告日期：2025-02-11。</div>
+              <h1>{html.escape(title)}</h1>{content_html}</body></html>'''
+              return document, url
+
+          session = requests.Session()
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
+          manifest: list[dict[str, object]] = []
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(accept_downloads=True, locale='zh-CN', user_agent=UA, viewport={'width':1440,'height':1000})
+
+              # Report 1: original public Dongwu Securities PDF.
+              source1 = 'https://www.hangyan.co/reports/3410524510766499573'
+              data1, pdf_url1, method1 = capture_public_hangyan_pdf(context, source1)
+              path1 = PDF_DIR / '2024-07-12_Dongwu_Securities_Haitian_International_Deep_Report.pdf'
+              path1.write_bytes(data1)
+              pages1, text1 = pdf_text(path1, 15)
+              low1 = text1.lower()
+              if pages1 < 20 or not any(x in low1 for x in ['海天国际','haitian international','01882','1882 hk']):
+                  raise RuntimeError(f'Invalid Dongwu report: {pages1} pages')
+              render_check(path1, 'dongwu')
+              manifest.append({
+                  'file': path1.name,
+                  'broker': '东吴证券',
+                  'date': '2024-07-12',
+                  'title': '注塑机全球龙头架海擎天，千亿海外市场大有可为',
+                  'version': '公开原始券商PDF',
+                  'source_page': source1,
+                  'pdf_source_url': pdf_url1,
+                  'capture_method': method1,
+                  'pages': pages1,
+                  'bytes': len(data1),
+                  'sha256': digest(data1),
+              })
+              print('REPORT1', json.dumps(manifest[-1], ensure_ascii=False))
+
+              # Report 2: prefer the freely accessible Vzkoo full-text reading page; transparently fall back to 9fzt detailed public abstract.
+              page2 = None
+              source2 = ''
+              version2 = ''
+              raw = fetch_vzkoo_full_article(session)
+              if raw is not None:
+                  raw_html, source2 = raw
+                  page2 = context.new_page()
+                  if '<head' in raw_html.lower():
+                      raw_html = re.sub(r'(?i)<head[^>]*>', lambda m: m.group(0) + '<base href="https://www.vzkoo.com/">', raw_html, count=1)
+                  page2.set_content(raw_html, wait_until='domcontentloaded', timeout=120_000)
+                  page2.wait_for_timeout(5000)
+                  clean_vzkoo_article(page2)
+                  version2 = '公开全文研读版PDF（由公开网页打印生成，非券商原始排版）'
+              else:
+                  browser_result = load_vzkoo_in_browser(context)
+                  if browser_result is not None:
+                      page2, source2 = browser_result
+                      clean_vzkoo_article(page2)
+                      version2 = '公开全文研读版PDF（由公开网页打印生成，非券商原始排版）'
+
+              if page2 is None:
+                  fallback_html, source2 = build_9fzt_fallback_html(session)
+                  page2 = context.new_page()
+                  page2.set_content(fallback_html, wait_until='domcontentloaded', timeout=120_000)
+                  version2 = '公开详细研读版PDF（公开摘要页面打印生成，非券商原始排版、非原版全文）'
+
+              page2.add_style_tag(content='''
+                @page { size:A4; margin:15mm 16mm 17mm 16mm; }
+                html, body { background:white !important; color:#111 !important; }
+                body { font-family:"Noto Sans CJK SC","WenQuanYi Zen Hei",Arial,sans-serif; font-size:10.5pt; line-height:1.65; max-width:900px; margin:0 auto; }
+                h1 { font-size:20pt; line-height:1.35; margin:5mm 0; }
+                h2 { font-size:15pt; break-after:avoid-page; }
+                h3 { font-size:12.5pt; break-after:avoid-page; }
+                p { text-align:justify; margin:0 0 3mm; }
+                img { display:block; max-width:100% !important; height:auto !important; margin:4mm auto; break-inside:avoid; }
+                .source-note, .note { border:1px solid #777; padding:4mm; margin-bottom:6mm; background:#f6f6f6; font-size:9.5pt; }
+                nav,header,footer,aside,form,button,input,video { display:none !important; }
+              ''')
+              page2.emulate_media(media='print')
+              path2 = PDF_DIR / '2025-02-11_CSCI_Haitian_International_Public_Reading_Version.pdf'
+              page2.pdf(path=str(path2), format='A4', print_background=True, prefer_css_page_size=True, margin={'top':'0mm','right':'0mm','bottom':'0mm','left':'0mm'})
+              page2.screenshot(path=str(DIAG_DIR / 'report2_clean.png'), full_page=False)
+              page2.close()
+
+              data2 = path2.read_bytes()
+              if not is_pdf(data2):
+                  raise RuntimeError('Second report PDF is invalid')
+              pages2, text2 = pdf_text(path2, 80)
+              low2 = text2.lower()
+              if pages2 < 3 or '全球注塑机龙头' not in text2 or '中信建投证券' not in text2:
+                  raise RuntimeError(f'Second report validation failed: {pages2} pages; sample={text2[:400]}')
+              render_check(path2, 'csci_reading')
+              manifest.append({
+                  'file': path2.name,
+                  'broker': '中信建投证券',
+                  'date': '2025-02-11',
+                  'title': '全球注塑机龙头，制造业产能再分布的深度受益者',
+                  'version': version2,
+                  'source_page': source2,
+                  'pages': pages2,
+                  'bytes': len(data2),
+                  'sha256': digest(data2),
+              })
+              print('REPORT2', json.dumps(manifest[-1], ensure_ascii=False))
+              browser.close()
+
+          if len(manifest) != 2 or len({str(x['sha256']) for x in manifest}) != 2:
+              raise RuntimeError('Report count or duplicate validation failed')
+
+          readme = [
+              '海天国际（01882.HK）券商深度报告资料包',
+              '',
+              f"1. 东吴证券｜2024-07-12｜《注塑机全球龙头架海擎天，千亿海外市场大有可为》｜{manifest[0]['pages']}页｜{manifest[0]['version']}。",
+              f"2. 中信建投证券｜2025-02-11｜《全球注塑机龙头，制造业产能再分布的深度受益者》｜{manifest[1]['pages']}页｜{manifest[1]['version']}。",
+              '',
+              '说明：第1份为公开原始券商PDF；第2份的具体版本已写入文件清单和manifest.json。原始中信建投48页版的公开文档入口存在访问限制，本资料包没有绕过登录、付费或安全验证。',
+              '所有PDF均已核验公司名称、页数、文件头及首屏渲染；ZIP已完成完整性检查。',
+              '文件仅供个人研究使用，版权归原券商、作者及相关权利人所有。',
+          ]
+          (OUT / 'README_CN.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['file']}" for x in manifest) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'haitian_international_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for item in manifest:
+                  zf.write(PDF_DIR / str(item['file']), arcname=str(item['file']))
+              for name in ['README_CN.txt','manifest.json','SHA256SUMS.txt']:
+                  zf.write(OUT / name, arcname=name)
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != 2:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdf_count={len(pdfs)}')
+
+          info = {
+              'file': zip_path.name,
+              'bytes': zip_path.stat().st_size,
+              'sha256': digest(zip_path.read_bytes()),
+              'pdf_count': 2,
+              'reports': [{k:x[k] for k in ['broker','date','title','version','pages']} for x in manifest],
+          }
+          (OUT / 'PACKAGE_INFO.json').write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_READY', json.dumps(info, ensure_ascii=False))
+          PY
+          python /tmp/package_haitian_v2.py
+      - name: Upload final package and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: haitian-international-broker-reports-v2
+          path: |
+            out/haitian_international_reports.zip
+            out/PACKAGE_INFO.json
+            out/manifest.json
+            out/diagnostics
+          retention-days: 1
+          compression-level: 0
