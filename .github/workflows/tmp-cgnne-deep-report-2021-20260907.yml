@@ -1,0 +1,125 @@
+name: Capture 2021 CGN New Energy deep report
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet playwright pypdf requests beautifulsoup4
+          python -m playwright install --with-deps chromium
+      - name: Capture public PDF
+        run: |
+          mkdir -p out
+          cat > /tmp/capture.py <<'PY'
+          import hashlib, json, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from pypdf import PdfReader
+
+          OUT=Path('out')
+          URL='https://www.sgpjbg.com/baogao/44868.html'
+          UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          captured=[]; events=[]
+
+          def maybe_save(body,url,method):
+              if len(body)>100000 and body.lstrip().startswith(b'%PDF'):
+                  h=hashlib.sha256(body).hexdigest()
+                  if h not in {x['sha256'] for x in captured}:
+                      path=OUT/f'captured_{len(captured)+1}.pdf'
+                      path.write_bytes(body)
+                      pages=len(PdfReader(str(path),strict=False).pages)
+                      rec={'file':path.name,'url':url,'method':method,'bytes':len(body),'sha256':h,'pages':pages}
+                      captured.append(rec); print('SAVED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True)
+              ctx=browser.new_context(user_agent=UA,locale='zh-CN',accept_downloads=True,viewport={'width':1440,'height':1000})
+              page=ctx.new_page()
+              def on_response(resp):
+                  try:
+                      ct=(resp.headers.get('content-type') or '').lower(); u=resp.url
+                      if 'application/pdf' in ct or '.pdf' in u.lower() or 'download' in u.lower():
+                          rec={'url':u,'status':resp.status,'content_type':ct}; events.append(rec)
+                          try:
+                              body=resp.body(); rec['bytes']=len(body); rec['magic']=repr(body[:16]); maybe_save(body,u,'network')
+                          except Exception as exc: rec['body_error']=repr(exc)
+                  except Exception as exc: events.append({'handler_error':repr(exc)})
+              page.on('response',on_response)
+              page.goto(URL,wait_until='domcontentloaded',timeout=120000)
+              page.wait_for_timeout(12000)
+              (OUT/'page.html').write_text(page.content(),encoding='utf-8')
+              page.screenshot(path=str(OUT/'page.png'),full_page=False)
+              print('TITLE',page.title(),'URL',page.url,flush=True)
+              print('BODY',page.locator('body').inner_text()[:5000],flush=True)
+
+              # Inspect iframe/embed/object links and ordinary links/buttons.
+              candidates=[]
+              for sel,attr in [('iframe','src'),('embed','src'),('object','data'),('a','href')]:
+                  loc=page.locator(sel)
+                  for i in range(min(loc.count(),1000)):
+                      el=loc.nth(i)
+                      try:
+                          val=el.get_attribute(attr) or ''
+                          txt=(el.inner_text() or '').strip() if sel=='a' else ''
+                          if val and any(k in (val+' '+txt).lower() for k in ['pdf','download','44868','立即下载','下载']):
+                              full=urljoin(page.url,val); candidates.append(full); print('CANDIDATE',sel,txt[:150],full,flush=True)
+                      except Exception: pass
+
+              # Try browser request for candidates.
+              for u in list(dict.fromkeys(candidates))[:100]:
+                  try:
+                      rr=ctx.request.get(u,headers={'Referer':URL,'User-Agent':UA},timeout=120000)
+                      body=rr.body(); print('REQUEST',rr.status,len(body),rr.headers.get('content-type'),u,flush=True)
+                      maybe_save(body,u,'request-context')
+                  except Exception as exc: print('REQUEST_ERROR',u,repr(exc),flush=True)
+
+              # Click visible download-like controls without bypassing authentication or verification.
+              controls=page.locator('a,button')
+              for i in range(min(controls.count(),1000)):
+                  el=controls.nth(i)
+                  try:
+                      text=(el.inner_text() or '').strip(); href=el.get_attribute('href') or ''
+                      marker=(text+' '+href).lower()
+                      if not any(k in marker for k in ['立即下载','下载pdf','免费下载','download']): continue
+                      print('CONTROL',i,text[:200],href[:500],flush=True)
+                      try:
+                          with page.expect_download(timeout=15000) as info:
+                              el.click(timeout=10000)
+                          dl=info.value; tmp=OUT/f'download_{i}.bin'; dl.save_as(str(tmp)); body=tmp.read_bytes()
+                          print('DOWNLOAD',dl.suggested_filename,len(body),flush=True); maybe_save(body,URL+'#control','download-button')
+                      except PlaywrightTimeoutError:
+                          print('NO_DOWNLOAD',i,'AT',page.url,flush=True)
+                      except Exception as exc: print('CONTROL_ERROR',i,repr(exc),flush=True)
+                      if captured: break
+                  except Exception: pass
+
+              browser.close()
+
+          # Validate an actual 47-page report if captured.
+          valid=[]
+          for rec in captured:
+              path=OUT/rec['file']; reader=PdfReader(str(path),strict=False)
+              text=' '.join((pg.extract_text() or '') for pg in reader.pages[:8])
+              if rec['pages']>=40 and ('中广核新能源' in text or '1811.HK' in text or '1811' in text) and ('国信证券' in text or 'GUOSEN' in text.upper()):
+                  final=OUT/'2021-07-11_Guosen_CGN_New_Energy_First_Coverage_47p.pdf'
+                  final.write_bytes(path.read_bytes())
+                  rec['final_file']=final.name; valid.append(rec)
+          (OUT/'result.json').write_text(json.dumps({'captured':captured,'valid':valid,'events':events},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps({'captured':captured,'valid':valid},ensure_ascii=False,indent=2),flush=True)
+          if not valid:
+              raise SystemExit('No publicly downloadable valid 40+ page CGN New Energy report captured')
+          PY
+          python /tmp/capture.py
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cgnne-2021-deep-report
+          path: out
+          retention-days: 1
+          compression-level: 0
