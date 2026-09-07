@@ -1,0 +1,245 @@
+name: Build Zhaojin Mining broker deep report archive
+
+on:
+  push:
+    branches:
+      - tmp-zhaojin-repack-v3-20260907
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests pillow img2pdf pypdf pymupdf
+
+      - name: Download, verify, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/reports work/pages work/renders
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw, ImageFont
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('output')
+          WORK = Path('work')
+          REPORTS = WORK / 'reports'
+          PAGES = WORK / 'pages'
+          RENDERS = WORK / 'renders'
+
+          specs = [
+              {
+                  'date': '2025-09-08',
+                  'broker': '湘财证券',
+                  'title': '招金矿业（1818.HK）：海外项目加快落地，未来增长可期',
+                  'page_url': 'https://oss.sdyanbao.com/page/2025/9/8/1245066',
+                  'page_count': 30,
+                  'filename': '2025-09-08_湘财证券_海外项目加快落地_未来增长可期.pdf',
+              },
+              {
+                  'date': '2025-08-04',
+                  'broker': '中邮证券',
+                  'title': '招金矿业（1818.HK）深度报告：海域金矿投产有望显著增厚公司业绩',
+                  'page_url': 'https://oss.sdyanbao.com/page/2025/8/4/1218250',
+                  'page_count': 29,
+                  'filename': '2025-08-04_中邮证券_海域金矿投产有望显著增厚公司业绩.pdf',
+              },
+              {
+                  'date': '2025-07-14',
+                  'broker': '华泰证券',
+                  'title': '招金矿业（1818.HK）：资源外扩开花结果，公司业绩或迎高增',
+                  'page_url': 'https://oss.sdyanbao.com/page/2025/7/14/1212889',
+                  'page_count': 28,
+                  'filename': '2025-07-14_华泰证券_资源外扩开花结果_公司业绩或迎高增.pdf',
+              },
+          ]
+
+          retry = Retry(
+              total=6,
+              connect=6,
+              read=6,
+              status=6,
+              backoff_factor=1.2,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=frozenset(['GET']),
+          )
+          session = requests.Session()
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          records = []
+          contact_cards = []
+
+          for report_no, spec in enumerate(specs, 1):
+              report_dir = PAGES / f'report_{report_no}'
+              report_dir.mkdir(parents=True, exist_ok=True)
+              page_paths = []
+              page_hashes = []
+              dimensions = []
+
+              for page_index in range(spec['page_count']):
+                  url = f"{spec['page_url']}/{page_index}.png"
+                  response = session.get(
+                      url,
+                      headers={
+                          'Referer': spec['page_url'],
+                          'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                      },
+                      timeout=(30, 180),
+                  )
+                  response.raise_for_status()
+                  data = response.content
+                  if len(data) < 8_000:
+                      raise RuntimeError(f"Downloaded page is unexpectedly small: {url}, {len(data)} bytes")
+
+                  try:
+                      with Image.open(io.BytesIO(data)) as image:
+                          image.verify()
+                      with Image.open(io.BytesIO(data)) as image:
+                          width, height = image.size
+                          fmt = image.format
+                  except Exception as exc:
+                      raise RuntimeError(f"Invalid image page: {url}: {exc}") from exc
+
+                  if width < 600 or height < 600:
+                      raise RuntimeError(f"Unexpected image dimensions: {url}: {width}x{height}")
+
+                  digest = hashlib.sha256(data).hexdigest()
+                  output_page = report_dir / f'{page_index + 1:03d}.png'
+                  output_page.write_bytes(data)
+                  page_paths.append(output_page)
+                  page_hashes.append(digest)
+                  dimensions.append([width, height])
+                  print('PAGE_OK', report_no, page_index + 1, len(data), width, height, fmt, digest[:12], flush=True)
+
+              if len(set(page_hashes)) != len(page_hashes):
+                  raise RuntimeError(f"Duplicate page image detected in report {report_no}")
+
+              pdf_path = REPORTS / spec['filename']
+              pdf_path.write_bytes(img2pdf.convert([str(path) for path in page_paths]))
+              pdf_data = pdf_path.read_bytes()
+              if not pdf_data.startswith(b'%PDF'):
+                  raise RuntimeError(f"Generated file is not a PDF: {pdf_path}")
+
+              reader = PdfReader(io.BytesIO(pdf_data), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != spec['page_count']:
+                  raise RuntimeError(
+                      f"PDF page count mismatch for {pdf_path.name}: expected {spec['page_count']}, got {actual_pages}"
+                  )
+
+              document = pymupdf.open(pdf_path)
+              pixmap = document[0].get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+              render_path = RENDERS / f'report_{report_no}_first_page.png'
+              pixmap.save(str(render_path))
+              document.close()
+
+              with Image.open(render_path) as rendered:
+                  rendered_rgb = rendered.convert('RGB')
+                  rendered_rgb.thumbnail((600, 760))
+                  card = Image.new('RGB', (660, 860), 'white')
+                  card.paste(rendered_rgb, ((660 - rendered_rgb.width) // 2, 20))
+                  draw = ImageDraw.Draw(card)
+                  draw.text((20, 800), f"{report_no}. {spec['broker']} | {spec['date']} | {actual_pages} pages", fill='black')
+                  contact_cards.append(card)
+
+              records.append({
+                  '序号': report_no,
+                  '券商': spec['broker'],
+                  '发布日期': spec['date'],
+                  '报告标题': spec['title'],
+                  '实际PDF页数': actual_pages,
+                  '文件大小_字节': len(pdf_data),
+                  'SHA256': hashlib.sha256(pdf_data).hexdigest(),
+                  '公开页面来源': spec['page_url'],
+                  '文件名': spec['filename'],
+                  '图像尺寸集合': sorted({f'{width}x{height}' for width, height in dimensions}),
+              })
+
+          sheet = Image.new('RGB', (660 * len(contact_cards), 860), 'white')
+          for index, card in enumerate(contact_cards):
+              sheet.paste(card, (index * 660, 0))
+              card.close()
+          sheet.save(OUT / 'first_page_contact_sheet.jpg', quality=92)
+          sheet.close()
+
+          manifest_path = REPORTS / '文件清单与校验值.csv'
+          with manifest_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=list(records[0].keys()))
+              writer.writeheader()
+              writer.writerows(records)
+
+          readme_lines = [
+              '招金矿业（01818.HK）券商深度报告资料包',
+              '打包日期：2026-09-07',
+              '',
+              '本资料包收录3份较完整的公司深度/长篇公司研究报告。',
+              '报告页面取自公开展示的原报告逐页图像，并按原页序无删减合并为PDF。',
+              '已检查每一页图像、PDF页数、ZIP CRC及SHA-256。',
+              '',
+          ]
+          for record in records:
+              readme_lines.extend([
+                  f"{record['序号']}. {record['券商']} | {record['发布日期']} | {record['报告标题']} | {record['实际PDF页数']}页",
+                  f"   文件：{record['文件名']}",
+                  f"   来源：{record['公开页面来源']}",
+                  '',
+              ])
+          (REPORTS / 'README.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+
+          archive_path = OUT / 'Zhaojin_Mining_01818_Broker_Deep_Reports_3_Repacked.zip'
+          with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(archive_path, 'r') as archive:
+              bad = archive.testzip()
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed at {bad}")
+              if len(pdf_names) != 3:
+                  raise RuntimeError(f"Expected 3 PDFs in ZIP, found {len(pdf_names)}")
+
+          result = {
+              'ok': True,
+              'archive': archive_path.name,
+              'archive_bytes': archive_path.stat().st_size,
+              'zip_crc_ok': True,
+              'pdf_count': 3,
+              'records': records,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhaojin-mining-broker-deep-reports-repacked
+          path: output/*
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
