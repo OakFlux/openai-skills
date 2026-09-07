@@ -1,0 +1,348 @@
+name: Temporary DanNuo Pharma broker report archive
+
+on:
+  push:
+    branches:
+      - tmp-dannuo-broker-reports-20260907
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml pillow pypdf
+
+      - name: Download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageFile
+          from pypdf import PdfReader
+
+          ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+          OUT = Path('output')
+          WORK = Path('work')
+          OUT.mkdir(exist_ok=True)
+          WORK.mkdir(exist_ok=True)
+
+          REPORTS = [
+              {
+                  'id': '5423907',
+                  'date': '2026-05-17',
+                  'broker': '国投证券（香港）',
+                  'title': 'IPO点评：丹诺医药—B',
+                  'type': 'IPO点评',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5423907',
+              },
+              {
+                  'id': '5420103',
+                  'date': '2026-05-14',
+                  'broker': '国元国际',
+                  'title': 'IPO申购指南：丹诺医药-B',
+                  'type': 'IPO申购指南',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5420103',
+              },
+              {
+                  'id': '5418235',
+                  'date': '2026-05-14',
+                  'broker': '中国光大证券国际',
+                  'title': '新股预览：丹诺医药',
+                  'type': '新股预览',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5418235',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          })
+
+          diagnostics = []
+          completed = []
+
+          def safe_name(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', ' ', value).strip(' ._')
+              return value[:180]
+
+          def discover_cover(detail_url: str, report_id: str) -> tuple[str | None, dict]:
+              row = {'detail_url': detail_url, 'report_id': report_id}
+              try:
+                  response = session.get(detail_url, timeout=90, allow_redirects=True)
+                  row.update({
+                      'detail_status': response.status_code,
+                      'detail_final_url': response.url,
+                      'detail_bytes': len(response.content),
+                      'detail_content_type': response.headers.get('content-type'),
+                  })
+                  response.raise_for_status()
+                  text = response.text.replace('\\/', '/').replace('&amp;', '&')
+                  soup = BeautifulSoup(text, 'lxml')
+                  row['page_title'] = soup.title.get_text(' ', strip=True) if soup.title else None
+                  row['h1'] = ' '.join((soup.find('h1').get_text(' ', strip=True) if soup.find('h1') else '').split())
+                  patterns = [
+                      rf'https?://public\.fxbaogao\.com/report-image/[^"\'<>\s]+/{report_id}-1\.png(?:\?[^"\'<>\s]*)?',
+                      rf'https?://[^"\'<>\s]+/report-image/[^"\'<>\s]+/{report_id}-1\.png(?:\?[^"\'<>\s]*)?',
+                      rf'/report-image/[^"\'<>\s]+/{report_id}-1\.png(?:\?[^"\'<>\s]*)?',
+                  ]
+                  urls = []
+                  for pattern in patterns:
+                      urls.extend(re.findall(pattern, text, flags=re.I))
+                  for image in soup.find_all('img'):
+                      for attr in ['src', 'data-src', 'data-original']:
+                          value = image.get(attr)
+                          if value and f'{report_id}-1.png' in value:
+                              urls.append(urljoin(response.url, value))
+                  urls = [urljoin(response.url, item).split('?')[0] for item in urls]
+                  urls = list(dict.fromkeys(urls))
+                  row['cover_candidates'] = urls
+                  if urls:
+                      return urls[0], row
+
+                  # Fallback to the stable public image pattern using the report date embedded in the page.
+                  date_match = re.search(r'(20\d{2})[-年/](\d{1,2})[-月/](\d{1,2})', soup.get_text(' ', strip=True))
+                  if date_match:
+                      y, m, d = map(int, date_match.groups())
+                      fallback = f'https://public.fxbaogao.com/report-image/{y:04d}/{m:02d}/{d:02d}/{report_id}-1.png'
+                      row['fallback_cover'] = fallback
+                      return fallback, row
+              except Exception as exc:
+                  row['detail_error'] = repr(exc)
+              return None, row
+
+          def fetch_pages(cover_url: str, detail_url: str, report_id: str) -> tuple[list[Path], list[dict]]:
+              page_paths = []
+              attempts = []
+              base = re.sub(r'-1\.png$', '-{page}.png', cover_url.split('?')[0])
+              if '{page}' not in base:
+                  raise RuntimeError(f'Unable to derive page URL pattern from {cover_url}')
+              misses = 0
+              seen_hashes = set()
+              report_dir = WORK / report_id
+              report_dir.mkdir(parents=True, exist_ok=True)
+
+              for page_no in range(1, 81):
+                  url = base.format(page=page_no)
+                  item = {'page': page_no, 'url': url}
+                  try:
+                      response = session.get(
+                          url,
+                          headers={
+                              'Referer': detail_url,
+                              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                          },
+                          timeout=(20, 120),
+                          allow_redirects=True,
+                      )
+                      data = response.content
+                      item.update({
+                          'status': response.status_code,
+                          'bytes': len(data),
+                          'content_type': response.headers.get('content-type'),
+                          'final_url': response.url,
+                      })
+                      valid = response.status_code == 200 and len(data) > 5000
+                      if valid:
+                          try:
+                              image = Image.open(io.BytesIO(data))
+                              image.verify()
+                              image = Image.open(io.BytesIO(data))
+                              item['format'] = image.format
+                              item['size'] = list(image.size)
+                              valid = image.width >= 500 and image.height >= 500
+                          except Exception as exc:
+                              item['image_error'] = repr(exc)
+                              valid = False
+                      if valid:
+                          digest = hashlib.sha256(data).hexdigest()
+                          item['sha256'] = digest
+                          if digest in seen_hashes:
+                              item['duplicate'] = True
+                              valid = False
+                          else:
+                              seen_hashes.add(digest)
+                      if valid:
+                          path = report_dir / f'{page_no:03d}.png'
+                          path.write_bytes(data)
+                          page_paths.append(path)
+                          misses = 0
+                          item['saved'] = str(path)
+                          print('PAGE_OK', report_id, page_no, len(data), item.get('format'), item.get('size'), flush=True)
+                      else:
+                          misses += 1
+                          print('PAGE_MISS', report_id, page_no, response.status_code, len(data), response.headers.get('content-type'), flush=True)
+                          if page_paths and misses >= 3:
+                              attempts.append(item)
+                              break
+                  except Exception as exc:
+                      item['error'] = repr(exc)
+                      misses += 1
+                      print('PAGE_ERROR', report_id, page_no, repr(exc), flush=True)
+                      if page_paths and misses >= 3:
+                          attempts.append(item)
+                          break
+                  attempts.append(item)
+              return page_paths, attempts
+
+          def images_to_pdf(image_paths: list[Path], destination: Path) -> None:
+              images = []
+              for path in image_paths:
+                  image = Image.open(path)
+                  if image.mode in ('RGBA', 'LA'):
+                      background = Image.new('RGB', image.size, 'white')
+                      background.paste(image, mask=image.getchannel('A'))
+                      image = background
+                  else:
+                      image = image.convert('RGB')
+                  images.append(image)
+              if not images:
+                  raise RuntimeError('No images supplied')
+              first, rest = images[0], images[1:]
+              first.save(destination, 'PDF', resolution=150.0, save_all=True, append_images=rest, quality=95)
+              for image in images:
+                  image.close()
+
+          for report in REPORTS:
+              report_diag = {**report}
+              cover_url, detail_diag = discover_cover(report['detail_url'], report['id'])
+              report_diag['detail'] = detail_diag
+              if not cover_url:
+                  report_diag['error'] = 'cover image URL not found'
+                  diagnostics.append(report_diag)
+                  print('NO_COVER', report['id'], flush=True)
+                  continue
+              report_diag['cover_url'] = cover_url
+              pages, attempts = fetch_pages(cover_url, report['detail_url'], report['id'])
+              report_diag['page_attempts'] = attempts
+              report_diag['downloaded_pages'] = len(pages)
+              if not pages:
+                  report_diag['error'] = 'no public page images downloaded'
+                  diagnostics.append(report_diag)
+                  continue
+
+              output_name = safe_name(f"{report['date']}_{report['broker']}_{report['title']}_{len(pages)}页.pdf")
+              pdf_path = WORK / output_name
+              images_to_pdf(pages, pdf_path)
+              data = pdf_path.read_bytes()
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              parsed_pages = len(reader.pages)
+              if parsed_pages != len(pages):
+                  raise RuntimeError(f"Page count mismatch for {report['id']}: images={len(pages)}, pdf={parsed_pages}")
+              sha256 = hashlib.sha256(data).hexdigest()
+              record = {
+                  **report,
+                  'filename': output_name,
+                  'pdf_path': str(pdf_path),
+                  'pages': parsed_pages,
+                  'bytes': len(data),
+                  'sha256': sha256,
+                  'cover_url': cover_url,
+              }
+              completed.append(record)
+              report_diag['completed'] = record
+              diagnostics.append(report_diag)
+              print('PDF_OK', report['id'], output_name, parsed_pages, len(data), flush=True)
+
+          (OUT / 'diagnostics.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Keep only full reports with at least two pages. The company listed recently, so the available broker material is IPO research rather than post-listing initiation coverage.
+          completed = [item for item in completed if item['pages'] >= 2]
+          if len(completed) < 2:
+              result = {'ok': False, 'report_count': len(completed), 'reports': completed, 'message': 'Fewer than two complete public broker PDFs were retrievable.'}
+              (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('PACKAGE_NOT_READY', json.dumps(result, ensure_ascii=False), flush=True)
+          else:
+              completed = completed[:3]
+              manifest_path = WORK / '文件清单与校验值.csv'
+              with manifest_path.open('w', encoding='utf-8-sig', newline='') as handle:
+                  writer = csv.DictWriter(handle, fieldnames=['序号','券商','发布日期','报告类型','报告标题','PDF页数','文件大小_字节','SHA256','来源页面','文件名'])
+                  writer.writeheader()
+                  for index, item in enumerate(completed, 1):
+                      writer.writerow({
+                          '序号': index,
+                          '券商': item['broker'],
+                          '发布日期': item['date'],
+                          '报告类型': item['type'],
+                          '报告标题': item['title'],
+                          'PDF页数': item['pages'],
+                          '文件大小_字节': item['bytes'],
+                          'SHA256': item['sha256'],
+                          '来源页面': item['detail_url'],
+                          '文件名': item['filename'],
+                      })
+
+              readme_path = WORK / 'README.txt'
+              readme_lines = [
+                  '丹诺医药-B（06872.HK）券商研究报告资料包',
+                  '生成日期：2026-09-07',
+                  '',
+                  f'收录完整PDF：{len(completed)}份。',
+                  '说明：丹诺医药于2026年5月22日上市，公开可获取的券商材料目前以IPO点评、申购指南和新股预览为主，尚未检索到2份以上正式的上市后深度覆盖报告。因此本资料包收录现阶段最接近公司深度研究的完整券商IPO报告，并未用媒体文章或招股书凑数。',
+                  '所有PDF均由公开逐页原报告图像按原始页序合并，已检查文件头、可解析性、实际页数和SHA-256；ZIP已执行CRC完整性校验。',
+                  '',
+              ]
+              for index, item in enumerate(completed, 1):
+                  readme_lines.extend([
+                      f"{index}. {item['broker']}｜{item['date']}｜{item['title']}｜{item['pages']}页",
+                      f"   来源：{item['detail_url']}",
+                  ])
+              readme_path.write_text('\n'.join(readme_lines), encoding='utf-8')
+
+              archive_name = f"丹诺医药_06872_券商研究报告_{len(completed)}份.zip"
+              archive_path = OUT / archive_name
+              with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+                  for item in completed:
+                      archive.write(item['pdf_path'], arcname=item['filename'])
+                  archive.write(manifest_path, arcname=manifest_path.name)
+                  archive.write(readme_path, arcname=readme_path.name)
+              with zipfile.ZipFile(archive_path, 'r') as archive:
+                  bad = archive.testzip()
+                  pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if bad is not None or len(pdf_names) != len(completed):
+                      raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={pdf_names}')
+              result = {
+                  'ok': True,
+                  'archive': archive_name,
+                  'archive_bytes': archive_path.stat().st_size,
+                  'report_count': len(completed),
+                  'zip_crc_ok': True,
+                  'reports': completed,
+              }
+              (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload archive and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dannuo-broker-report-archive
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
