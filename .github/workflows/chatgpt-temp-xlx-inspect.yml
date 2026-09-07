@@ -1,0 +1,132 @@
+name: chatgpt-temp-xlx-inspect
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-xlx-inspect.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect report preview pages and image endpoints
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 playwright pillow
+          python <<'PY'
+          import asyncio, hashlib, json, os, re, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from playwright.async_api import async_playwright
+
+          W=Path('xlx_inspect'); W.mkdir(exist_ok=True)
+          targets={
+            'huaxi_hibor':'https://www.hibor.com.cn/repinfodetail_5296221.html',
+            'huaxi_hibor_wap':'https://wap.hibor.com.cn/repinfodetail_5296221.html',
+            'gtjai_fxbaogao':'https://www.fxbaogao.com/detail/4362016',
+            'anxin_sgpjbg':'https://www.sgpjbg.com/baogao/141113.html',
+            'anxin_sgpjbg_down':'https://www.sgpjbg.com/bgdown/141113.html',
+            'anxin_hangyan':'https://www.hangyan.co/reports/3196655258814121279',
+          }
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          summary={}
+          for key,u in targets.items():
+            try:
+              r=s.get(u,timeout=90,allow_redirects=True)
+              print('REQ',key,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              W.joinpath(key+'.html').write_bytes(r.content)
+              text=r.content.decode(r.apparent_encoding or 'utf-8','ignore')
+              soup=BeautifulSoup(text,'html.parser')
+              urls=[]
+              for tag in soup.find_all(True):
+                for attr in ['src','href','data-src','data-original','data-url','data-lazy','data-file','data-pdf','content']:
+                  v=tag.get(attr)
+                  if isinstance(v,str) and v.strip(): urls.append(urllib.parse.urljoin(r.url,v.strip()))
+              for pat in [r'https?://[^"\'<>\s]+',r'//[^"\'<>\s]+',r'/[A-Za-z0-9_./?=&%:+~-]+']:
+                for v in re.findall(pat,text):
+                  urls.append('https:'+v if v.startswith('//') else urllib.parse.urljoin(r.url,v))
+              urls=list(dict.fromkeys(urls))
+              interesting=[x for x in urls if any(t in x.lower() for t in ['.png','.jpg','.jpeg','.webp','.pdf','preview','report-image','document','download','page','oss','image'])]
+              summary[key]={'status':r.status_code,'url':r.url,'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'interesting':interesting[:2000]}
+              print('INTERESTING',key,json.dumps(interesting[:300],ensure_ascii=False),flush=True)
+              for term in ['5296221','4362016','141113','report-image','pdfurl','pdf_url','preview','pageCount','totalPage','文件地址','报告原文']:
+                idx=0; count=0
+                while True:
+                  idx=text.lower().find(term.lower(),idx)
+                  if idx<0: break
+                  print('CTX',key,term,text[max(0,idx-500):idx+1200].replace('\n',' ')[:1800],flush=True)
+                  idx+=len(term); count+=1
+                  if count>=10: break
+            except Exception as e:
+              print('REQ_ERR',key,repr(e),flush=True); summary[key]={'error':repr(e)}
+
+          # Probe deterministic Fxbaogao page-image pattern.
+          probes=[]
+          for n in range(1,25):
+            for suffix in ['png','jpg']:
+              u=f'https://public.fxbaogao.com/report-image/2024/06/21/4362016-{n}.{suffix}'
+              try:
+                r=s.get(u,timeout=60,headers={'Referer':'https://www.fxbaogao.com/detail/4362016'})
+                rec={'url':u,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'head':r.content[:20].hex()}
+                if r.status_code==200 and len(r.content)>5000 and (r.content.startswith(b'\x89PNG') or r.content.startswith(b'\xff\xd8')):
+                  p=W/f'fx_{n:02d}.{suffix}';p.write_bytes(r.content)
+                  try:
+                    im=Image.open(p); rec['size']=im.size; rec['format']=im.format
+                  except Exception as e: rec['img_error']=repr(e)
+                probes.append(rec); print('PROBE',json.dumps(rec,ensure_ascii=False),flush=True)
+              except Exception as e: probes.append({'url':u,'error':repr(e)})
+          W.joinpath('requests_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          W.joinpath('probes.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          browser_events=[]
+          async def main():
+            async with async_playwright() as p:
+              exe=next((x for x in ['/usr/bin/google-chrome','/usr/bin/google-chrome-stable','/usr/bin/chromium'] if os.path.exists(x)),None)
+              browser=await p.chromium.launch(headless=True,executable_path=exe,args=['--no-sandbox','--disable-dev-shm-usage'])
+              ctx=await browser.new_context(viewport={'width':1440,'height':1200},user_agent=ua,locale='zh-CN')
+              for key,u in targets.items():
+                page=await ctx.new_page(); local=[]
+                async def on_resp(resp):
+                  url=resp.url; h=await resp.all_headers(); ct=h.get('content-type','')
+                  if any(t in url.lower() for t in ['image','preview','report','pdf','page','download','document','oss']) or ct.startswith('image/') or 'pdf' in ct:
+                    rec={'target':key,'url':url,'status':resp.status,'content_type':ct,'method':resp.request.method,'post_data':resp.request.post_data}
+                    try:
+                      body=await resp.body(); rec['bytes']=len(body); rec['sha256']=hashlib.sha256(body).hexdigest()
+                      if (ct.startswith('image/') or body.startswith(b'%PDF-')) and 2000 < len(body) < 20_000_000:
+                        ext='.pdf' if body.startswith(b'%PDF-') else ('.png' if body.startswith(b'\x89PNG') else '.jpg' if body.startswith(b'\xff\xd8') else '.bin')
+                        fn=f'{key}_resp_{len(local):04d}{ext}'; W.joinpath(fn).write_bytes(body); rec['file']=fn
+                    except Exception as e: rec['error']=repr(e)
+                    local.append(rec); browser_events.append(rec); print('RESP',json.dumps(rec,ensure_ascii=False),flush=True)
+                page.on('response',on_resp)
+                try:
+                  await page.goto(u,wait_until='domcontentloaded',timeout=120000)
+                  await page.wait_for_timeout(10000)
+                  for y in range(0,20000,800):
+                    try: await page.evaluate(f'window.scrollTo(0,{y})')
+                    except: pass
+                    await page.wait_for_timeout(120)
+                  await page.wait_for_timeout(5000)
+                  W.joinpath(key+'_browser.html').write_text(await page.content(),encoding='utf-8')
+                  try: W.joinpath(key+'_body.txt').write_text(await page.locator('body').inner_text(),encoding='utf-8')
+                  except: pass
+                  imgs=await page.locator('img').evaluate_all("els => els.map(e=>({src:e.src, currentSrc:e.currentSrc, data:[...e.attributes].reduce((a,x)=>(a[x.name]=x.value,a),{}), w:e.naturalWidth,h:e.naturalHeight}))")
+                  W.joinpath(key+'_imgs.json').write_text(json.dumps(imgs,ensure_ascii=False,indent=2),encoding='utf-8')
+                  print('IMGS',key,json.dumps([x for x in imgs if x.get('w',0)>500 or any(t in (x.get('src') or '').lower() for t in ['preview','report','image','page'])][:300],ensure_ascii=False),flush=True)
+                except Exception as e: print('PAGE_ERR',key,repr(e),flush=True)
+                await page.close()
+              await browser.close()
+          try: asyncio.run(main())
+          except Exception as e: print('BROWSER_ERR',repr(e),flush=True)
+          W.joinpath('browser_events.json').write_text(json.dumps(browser_events,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XLX-Report-Source-Inspect
+          path: xlx_inspect
+          retention-days: 1
+          compression-level: 6
