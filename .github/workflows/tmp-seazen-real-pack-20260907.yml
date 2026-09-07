@@ -1,0 +1,402 @@
+name: Build verified Seazen broker report archive
+on:
+  push:
+    branches:
+      - tmp-seazen-real-pack-20260907
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml pillow pypdf playwright
+          python -m playwright install --with-deps chromium
+      - name: Build and validate archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageFile
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+          ImageFile.LOAD_TRUNCATED_IMAGES = True
+          OUT = Path('output')
+          WORK = Path('work')
+          PAGES = WORK / 'pages'
+          FINAL = WORK / 'final'
+          OUT.mkdir(exist_ok=True)
+          PAGES.mkdir(parents=True, exist_ok=True)
+          FINAL.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf,image/avif,image/webp,image/apng,*/*;q=0.8',
+          })
+
+          diagnostics = []
+          reports = []
+
+          def safe_name(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', ' ', value).strip(' ._')
+              return value[:170] or 'report'
+
+          def validate_image(data: bytes) -> tuple[bool, dict]:
+              meta = {'bytes': len(data)}
+              if len(data) < 5000:
+                  return False, meta
+              try:
+                  im = Image.open(io.BytesIO(data))
+                  im.verify()
+                  im = Image.open(io.BytesIO(data))
+                  meta.update({'format': im.format, 'width': im.width, 'height': im.height})
+                  return im.width >= 600 and im.height >= 700, meta
+              except Exception as exc:
+                  meta['error'] = repr(exc)
+                  return False, meta
+
+          def images_to_pdf(paths: list[Path], destination: Path) -> None:
+              images = []
+              for path in paths:
+                  im = Image.open(path)
+                  if im.mode in ('RGBA', 'LA'):
+                      bg = Image.new('RGB', im.size, 'white')
+                      bg.paste(im, mask=im.getchannel('A'))
+                      im = bg
+                  else:
+                      im = im.convert('RGB')
+                  images.append(im)
+              if not images:
+                  raise RuntimeError('No images supplied')
+              images[0].save(destination, 'PDF', resolution=150.0, save_all=True, append_images=images[1:], quality=95)
+              for im in images:
+                  im.close()
+
+          def parse_pdf(path: Path) -> int:
+              data = path.read_bytes()
+              if not data.lstrip().startswith(b'%PDF') or len(data) < 50000:
+                  raise RuntimeError(f'Invalid PDF: {path}')
+              return len(PdfReader(io.BytesIO(data), strict=False).pages)
+
+          def build_fxbaogao(report_id: str, filename_prefix: str, expected_min: int, expected_max: int = 80) -> dict | None:
+              detail_url = f'https://www.fxbaogao.com/detail/{report_id}'
+              diag = {'source': 'fxbaogao', 'report_id': report_id, 'detail_url': detail_url}
+              try:
+                  r = session.get(detail_url, timeout=90, allow_redirects=True)
+                  diag.update({'status': r.status_code, 'final_url': r.url, 'detail_bytes': len(r.content)})
+                  r.raise_for_status()
+                  html = r.text.replace('\\/', '/').replace('&amp;', '&')
+                  soup = BeautifulSoup(html, 'lxml')
+                  h1 = soup.find('h1')
+                  title = ' '.join(h1.get_text(' ', strip=True).split()) if h1 else filename_prefix
+                  text = ' '.join(soup.get_text(' ', strip=True).split())
+                  date_match = re.search(r'20\d{2}-\d{2}-\d{2}', text)
+                  date = date_match.group(0) if date_match else '日期不详'
+                  broker = ''
+                  for name in ['国泰海通证券','广发证券','东北证券','国泰君安证券','国泰君安','开源证券','西南证券']:
+                      if name in text:
+                          broker = name
+                          break
+                  pattern = re.compile(rf'https?://public\.fxbaogao\.com/report-image/[^"\'<>\s]+/{report_id}-1\.png(?:\?[^"\'<>\s]*)?', re.I)
+                  candidates = pattern.findall(html)
+                  if not candidates:
+                      for img in soup.find_all('img'):
+                          src = img.get('src') or img.get('data-src') or ''
+                          if f'{report_id}-1.png' in src:
+                              candidates.append(urljoin(r.url, src))
+                  if not candidates:
+                      raise RuntimeError('Public first-page image URL not found')
+                  first = candidates[0].split('?')[0]
+                  base = re.sub(r'-1\.png$', '-{page}.png', first)
+                  if '{page}' not in base:
+                      raise RuntimeError(f'Cannot derive page pattern: {first}')
+                  report_dir = PAGES / report_id
+                  report_dir.mkdir(parents=True, exist_ok=True)
+                  paths = []
+                  page_attempts = []
+                  misses = 0
+                  seen = set()
+                  for page_no in range(1, expected_max + 1):
+                      url = base.format(page=page_no)
+                      try:
+                          pr = session.get(url, headers={'Referer': detail_url, 'Accept': 'image/*,*/*;q=0.8'}, timeout=(20, 120), allow_redirects=True)
+                          data = pr.content
+                          ok, meta = validate_image(data)
+                          row = {'page': page_no, 'url': url, 'status': pr.status_code, **meta}
+                          if pr.status_code == 200 and ok:
+                              digest = hashlib.sha256(data).hexdigest()
+                              if digest in seen:
+                                  row['duplicate'] = True
+                                  ok = False
+                              else:
+                                  seen.add(digest)
+                          if pr.status_code == 200 and ok:
+                              path = report_dir / f'{page_no:03d}.png'
+                              path.write_bytes(data)
+                              paths.append(path)
+                              row['saved'] = str(path)
+                              misses = 0
+                              print('FX_PAGE_OK', report_id, page_no, len(data), flush=True)
+                          else:
+                              misses += 1
+                              print('FX_PAGE_MISS', report_id, page_no, pr.status_code, len(data), flush=True)
+                          page_attempts.append(row)
+                          if paths and misses >= 3:
+                              break
+                      except Exception as exc:
+                          page_attempts.append({'page': page_no, 'url': url, 'error': repr(exc)})
+                          misses += 1
+                          if paths and misses >= 3:
+                              break
+                  diag['page_attempts'] = page_attempts
+                  diag['downloaded_pages'] = len(paths)
+                  if len(paths) < expected_min:
+                      raise RuntimeError(f'Only {len(paths)} public pages retrieved; require {expected_min}')
+                  output_name = safe_name(f'{date}_{broker or "券商"}_{title}_{len(paths)}页') + '.pdf'
+                  pdf_path = FINAL / output_name
+                  images_to_pdf(paths, pdf_path)
+                  parsed = parse_pdf(pdf_path)
+                  if parsed != len(paths):
+                      raise RuntimeError(f'Page mismatch: images={len(paths)}, PDF={parsed}')
+                  data = pdf_path.read_bytes()
+                  record = {
+                      'filename': output_name,
+                      'path': str(pdf_path),
+                      'broker': broker or '券商研究',
+                      'date': date,
+                      'title': title,
+                      'pages': parsed,
+                      'bytes': len(data),
+                      'sha256': hashlib.sha256(data).hexdigest(),
+                      'source_url': detail_url,
+                      'format_note': '公开原报告逐页图像按页序合并为PDF',
+                  }
+                  diag['result'] = record
+                  diagnostics.append(diag)
+                  return record
+              except Exception as exc:
+                  diag['error'] = repr(exc)
+                  diagnostics.append(diag)
+                  print('FX_REPORT_FAILED', report_id, repr(exc), flush=True)
+                  return None
+
+          def build_vzkoo_article() -> dict | None:
+              urls = [
+                  'https://www.vzkoo.com/read/202509107ba393e9b743196d76e59843.html',
+                  'https://m.vzkoo.com/read/202509107ba393e9b743196d76e59843.html',
+              ]
+              diag = {'source': 'vzkoo_public_fulltext', 'urls': urls, 'attempts': []}
+              try:
+                  with sync_playwright() as p:
+                      browser = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'])
+                      for url in urls:
+                          ctx = browser.new_context(viewport={'width': 1280, 'height': 1600}, locale='zh-CN', user_agent=UA, extra_http_headers={'Accept-Language':'zh-CN,zh;q=0.9'}, java_script_enabled=True)
+                          ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+                          page = ctx.new_page()
+                          attempt = {'url': url}
+                          try:
+                              resp = page.goto(url, wait_until='domcontentloaded', timeout=120000)
+                              try:
+                                  page.wait_for_load_state('networkidle', timeout=25000)
+                              except PlaywrightTimeout:
+                                  pass
+                              page.wait_for_timeout(5000)
+                              title = page.title()
+                              body_text = ' '.join(page.locator('body').inner_text().split())
+                              attempt.update({'status': resp.status if resp else None, 'final_url': page.url, 'title': title, 'body_chars': len(body_text), 'body_head': body_text[:1000]})
+                              if '新城发展' not in body_text or '云销雨霁' not in body_text or len(body_text) < 10000:
+                                  raise RuntimeError('Public full-text page not sufficiently loaded')
+                              # Select the content region containing the report title and the largest amount of article text.
+                              handle = page.evaluate_handle("""
+                                  () => {
+                                    const nodes = Array.from(document.querySelectorAll('article, main, section, div'));
+                                    const candidates = nodes.filter(n => (n.innerText || '').includes('云销雨霁') && (n.innerText || '').length > 8000);
+                                    candidates.sort((a,b) => (a.innerText || '').length - (b.innerText || '').length);
+                                    return candidates[0] || document.querySelector('main') || document.body;
+                                  }
+                              """)
+                              element = handle.as_element()
+                              if not element:
+                                  raise RuntimeError('Article element not found')
+                              page.evaluate("""
+                                  (el) => {
+                                    const clone = el.cloneNode(true);
+                                    document.body.innerHTML = '';
+                                    document.body.appendChild(clone);
+                                    document.querySelectorAll('script,style,nav,header,footer,aside,button,form,.ad,.ads,.advertisement,.login,.modal,.fixed').forEach(x => x.remove());
+                                    const style = document.createElement('style');
+                                    style.textContent = `
+                                      @page { size: A4; margin: 16mm 15mm 18mm 15mm; }
+                                      html,body { background:white !important; color:#111 !important; font-family: Arial, 'Noto Sans CJK SC', sans-serif !important; line-height:1.65 !important; }
+                                      body { max-width: 100% !important; margin:0 !important; padding:0 !important; }
+                                      img { max-width:100% !important; height:auto !important; break-inside:avoid; }
+                                      h1,h2,h3 { break-after:avoid; color:#111 !important; }
+                                      a { color:#111 !important; text-decoration:none !important; }
+                                      * { box-shadow:none !important; }
+                                    `;
+                                    document.head.appendChild(style);
+                                  }
+                              """, element)
+                              page.wait_for_timeout(2500)
+                              output_name = '2025-09-04_广发证券_新城发展研究报告_云销雨霁彩彻区明_公开全文精读版.pdf'
+                              pdf_path = FINAL / output_name
+                              page.pdf(path=str(pdf_path), format='A4', print_background=True, prefer_css_page_size=True, margin={'top':'10mm','bottom':'10mm','left':'8mm','right':'8mm'})
+                              pages = parse_pdf(pdf_path)
+                              if pages < 8:
+                                  raise RuntimeError(f'Printed full-text PDF has only {pages} pages')
+                              data = pdf_path.read_bytes()
+                              record = {
+                                  'filename': output_name,
+                                  'path': str(pdf_path),
+                                  'broker': '广发证券',
+                                  'date': '2025-09-04',
+                                  'title': '新城发展研究报告：云销雨霁，彩彻区明',
+                                  'pages': pages,
+                                  'bytes': len(data),
+                                  'sha256': hashlib.sha256(data).hexdigest(),
+                                  'source_url': url,
+                                  'format_note': '未来智库公开报告精读全文网页转PDF；不是券商原始35页排版文件',
+                              }
+                              attempt['result'] = record
+                              diag['attempts'].append(attempt)
+                              diag['result'] = record
+                              diagnostics.append(diag)
+                              ctx.close()
+                              browser.close()
+                              return record
+                          except Exception as exc:
+                              attempt['error'] = repr(exc)
+                              diag['attempts'].append(attempt)
+                              print('VZKOO_ATTEMPT_FAILED', url, repr(exc), flush=True)
+                              ctx.close()
+                      browser.close()
+                  diagnostics.append(diag)
+                  return None
+              except Exception as exc:
+                  diag['error'] = repr(exc)
+                  diagnostics.append(diag)
+                  print('VZKOO_FAILED', repr(exc), flush=True)
+                  return None
+
+          # Primary long-form initiation report.
+          first = build_fxbaogao('5253520', '不止于开发从平衡到引领', expected_min=20, expected_max=40)
+          if first:
+              reports.append(first)
+
+          # A second distinct long-form report from a public full-text page.
+          second = build_vzkoo_article()
+          if second:
+              reports.append(second)
+
+          # Additional full broker company report, used as a third item or fallback if the public full-text page is unavailable.
+          third = build_fxbaogao('5345567', '利润率筑底回升商业保持发力', expected_min=2, expected_max=20)
+          if third:
+              reports.append(third)
+
+          # Deduplicate by title; retain up to three distinct reports.
+          unique = []
+          seen_titles = set()
+          for report in reports:
+              key = re.sub(r'\W+', '', report['title']).lower()
+              if key in seen_titles:
+                  continue
+              seen_titles.add(key)
+              unique.append(report)
+          reports = unique[:3]
+
+          (OUT / 'diagnostics.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+          if len(reports) < 2:
+              result = {'ok': False, 'report_count': len(reports), 'reports': reports, 'message': 'Fewer than two verified report PDFs could be built.'}
+              (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+              raise RuntimeError(result['message'])
+
+          manifest = FINAL / '文件清单与校验值.csv'
+          with manifest.open('w', encoding='utf-8-sig', newline='') as fh:
+              writer = csv.DictWriter(fh, fieldnames=['序号','券商','发布日期','报告标题','PDF页数','文件大小_字节','SHA256','来源','版本说明','文件名'])
+              writer.writeheader()
+              for idx, report in enumerate(reports, 1):
+                  writer.writerow({
+                      '序号': idx,
+                      '券商': report['broker'],
+                      '发布日期': report['date'],
+                      '报告标题': report['title'],
+                      'PDF页数': report['pages'],
+                      '文件大小_字节': report['bytes'],
+                      'SHA256': report['sha256'],
+                      '来源': report['source_url'],
+                      '版本说明': report['format_note'],
+                      '文件名': report['filename'],
+                  })
+
+          readme = FINAL / 'README.txt'
+          lines = [
+              '新城发展（01030.HK）券商研究报告资料包',
+              '重新打包日期：2026-09-07',
+              '',
+              f'收录PDF数量：{len(reports)}份。',
+              '本次重新生成的是实际存在并完成校验的压缩包。',
+              '报告优先采用公开原报告逐页图像合并；如来源仅公开报告精读全文，则文件名和清单中明确标注“公开全文精读版”，不冒充券商原始排版PDF。',
+              '',
+          ]
+          for idx, report in enumerate(reports, 1):
+              lines.extend([
+                  f"{idx}. {report['broker']}｜{report['date']}｜{report['title']}｜{report['pages']}页",
+                  f"   版本：{report['format_note']}",
+                  f"   来源：{report['source_url']}",
+              ])
+          readme.write_text('\n'.join(lines), encoding='utf-8')
+
+          archive = OUT / f'新城发展_01030_券商研究报告_{len(reports)}份_重新打包.zip'
+          with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for report in reports:
+                  zf.write(report['path'], arcname=report['filename'])
+              zf.write(manifest, arcname=manifest.name)
+              zf.write(readme, arcname=readme.name)
+          with zipfile.ZipFile(archive, 'r') as zf:
+              bad = zf.testzip()
+              pdfs = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != len(reports):
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={pdfs}')
+
+          result = {
+              'ok': True,
+              'archive': archive.name,
+              'archive_bytes': archive.stat().st_size,
+              'report_count': len(reports),
+              'zip_crc_ok': True,
+              'reports': reports,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: seazen-verified-broker-report-package
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
