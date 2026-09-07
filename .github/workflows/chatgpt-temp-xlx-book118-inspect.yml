@@ -1,0 +1,130 @@
+name: chatgpt-temp-xlx-book118-inspect
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-xlx-book118-inspect.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect public preview resources and browser network
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 playwright pillow
+          python <<'PY'
+          import asyncio, json, os, re, urllib.parse, hashlib, io
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from playwright.async_api import async_playwright
+
+          W=Path('xlx_book118_inspect'); W.mkdir(exist_ok=True)
+          targets={
+            'gpf_2025':'https://max.book118.com/html/2025/0702/5300133140012234.shtm',
+            'huaxi_2026':'https://max.book118.com/html/2026/0731/5233031143013301.shtm',
+            'report_2024':'https://max.book118.com/html/2024/0204/7152046162006036.shtm',
+          }
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          req_out={}
+          for key,u in targets.items():
+            try:
+              r=s.get(u,timeout=90,allow_redirects=True)
+              print('REQ',key,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              W.joinpath(key+'.html').write_bytes(r.content)
+              t=r.content.decode(r.apparent_encoding or 'utf-8','ignore')
+              soup=BeautifulSoup(t,'html.parser')
+              urls=[]
+              for tag in soup.find_all(True):
+                for attr in ['src','href','data-src','data-original','data-url','data-file','data-pdf','content']:
+                  v=tag.get(attr)
+                  if isinstance(v,str) and v.strip(): urls.append(urllib.parse.urljoin(r.url,v.strip()))
+              for pat in [r'https?://[^"\'<>\s]+',r'//[^"\'<>\s]+',r'/[A-Za-z0-9_./?=&%:+~-]+']:
+                for v in re.findall(pat,t): urls.append('https:'+v if v.startswith('//') else urllib.parse.urljoin(r.url,v))
+              urls=list(dict.fromkeys(urls))
+              interesting=[x for x in urls if any(w in x.lower() for w in ['preview','image','page','pdf','document','view','file','oss','office','html'])]
+              req_out[key]={'url':r.url,'status':r.status_code,'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'interesting':interesting}
+              print('URLS',key,json.dumps(interesting[:500],ensure_ascii=False),flush=True)
+              for term in ['preview','office','view','pageCount','pagecount','totalPage','totalpage','docId','docid','aid','mid','fileId','fileid','pdf','srcList','imgList','pageData','showDoc']:
+                starts=[m.start() for m in re.finditer(term,t,re.I)]
+                for pos in starts[:15]:
+                  print('CTX',key,term,t[max(0,pos-500):pos+1200].replace('\n',' ')[:1800],flush=True)
+            except Exception as e:
+              print('REQ_ERR',key,repr(e),flush=True); req_out[key]={'error':repr(e)}
+          W.joinpath('request_summary.json').write_text(json.dumps(req_out,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          events=[]
+          async def main():
+            async with async_playwright() as p:
+              exe=next((x for x in ['/usr/bin/google-chrome','/usr/bin/google-chrome-stable','/usr/bin/chromium'] if os.path.exists(x)),None)
+              browser=await p.chromium.launch(headless=True,executable_path=exe,args=['--no-sandbox','--disable-dev-shm-usage'])
+              ctx=await browser.new_context(viewport={'width':1500,'height':1200},user_agent=ua,locale='zh-CN',accept_downloads=True)
+              for key,u in targets.items():
+                page=await ctx.new_page(); local=[]
+                async def on_resp(resp):
+                  url=resp.url; h=await resp.all_headers(); ct=h.get('content-type','')
+                  if any(x in url.lower() for x in ['book118','preview','image','page','pdf','office','view','doc','file','oss']) or ct.startswith('image/') or 'pdf' in ct:
+                    rec={'target':key,'url':url,'status':resp.status,'content_type':ct,'method':resp.request.method,'post_data':resp.request.post_data}
+                    try:
+                      body=await resp.body(); rec['bytes']=len(body); rec['sha256']=hashlib.sha256(body).hexdigest()
+                      is_img=ct.startswith('image/') or body.startswith((b'\x89PNG',b'\xff\xd8',b'GIF8',b'RIFF'))
+                      if (is_img or body.startswith(b'%PDF-') or ('json' in ct and len(body)<5_000_000)) and 100 < len(body) < 20_000_000:
+                        if body.startswith(b'%PDF-'): ext='.pdf'
+                        elif body.startswith(b'\x89PNG'): ext='.png'
+                        elif body.startswith(b'\xff\xd8'): ext='.jpg'
+                        elif body.startswith(b'GIF8'): ext='.gif'
+                        elif 'json' in ct: ext='.json'
+                        else: ext='.bin'
+                        fn=f'{key}_resp_{len(local):04d}{ext}'; W.joinpath(fn).write_bytes(body); rec['file']=fn
+                        if is_img:
+                          try:
+                            im=Image.open(io.BytesIO(body)); rec['dimensions']=im.size; rec['format']=im.format
+                          except Exception as e: rec['img_error']=repr(e)
+                    except Exception as e: rec['error']=repr(e)
+                    local.append(rec); events.append(rec)
+                    if rec.get('bytes',0)>5000 or rec.get('post_data'):
+                      print('RESP',json.dumps(rec,ensure_ascii=False),flush=True)
+                page.on('response',on_resp)
+                try:
+                  await page.goto(u,wait_until='domcontentloaded',timeout=120000)
+                  await page.wait_for_timeout(12000)
+                  # close simple overlays if available
+                  for label in ['关闭预览','关闭','我知道了','继续阅读','展开全文']:
+                    try:
+                      loc=page.get_by_text(label,exact=False).first
+                      if await loc.count() and await loc.is_visible(): await loc.click(timeout=2000)
+                    except: pass
+                  for y in range(0,30000,650):
+                    try: await page.evaluate(f'window.scrollTo(0,{y})')
+                    except: pass
+                    await page.wait_for_timeout(150)
+                  await page.wait_for_timeout(8000)
+                  W.joinpath(key+'_browser.html').write_text(await page.content(),encoding='utf-8')
+                  try: W.joinpath(key+'_body.txt').write_text(await page.locator('body').inner_text(),encoding='utf-8')
+                  except: pass
+                  imgs=await page.locator('img').evaluate_all("els => els.map(e=>({src:e.src,currentSrc:e.currentSrc,w:e.naturalWidth,h:e.naturalHeight,attrs:[...e.attributes].reduce((a,x)=>(a[x.name]=x.value,a),{})}))")
+                  canvases=await page.locator('canvas').evaluate_all("els => els.map(e=>({w:e.width,h:e.height,outer:e.outerHTML.slice(0,500)}))")
+                  frames=[f.url for f in page.frames]
+                  W.joinpath(key+'_imgs.json').write_text(json.dumps(imgs,ensure_ascii=False,indent=2),encoding='utf-8')
+                  W.joinpath(key+'_canvases.json').write_text(json.dumps(canvases,ensure_ascii=False,indent=2),encoding='utf-8')
+                  W.joinpath(key+'_frames.json').write_text(json.dumps(frames,ensure_ascii=False,indent=2),encoding='utf-8')
+                  print('DOM_IMGS',key,json.dumps([x for x in imgs if x['w']>500 or x['h']>700][:200],ensure_ascii=False),flush=True)
+                  print('FRAMES',key,json.dumps(frames,ensure_ascii=False),flush=True)
+                except Exception as e: print('PAGE_ERR',key,repr(e),flush=True)
+                await page.close()
+              await browser.close()
+          try: asyncio.run(main())
+          except Exception as e: print('BROWSER_ERR',repr(e),flush=True)
+          W.joinpath('events.json').write_text(json.dumps(events,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XLX-Book118-Public-Preview-Inspect
+          path: xlx_book118_inspect
+          retention-days: 1
+          compression-level: 6
