@@ -1,0 +1,349 @@
+name: Package TenNor prospectus and latest financial reports
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PDF tools
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+      - name: Discover, download, validate and package HKEX PDFs
+        run: |
+          mkdir -p out/pdfs out/renders out/diagnostics
+          cat > /tmp/package_tennor.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          BASE = "https://www1.hkexnews.hk"
+          SEARCH_URL = BASE + "/search/titlesearch.xhtml"
+          STOCK_ID = "1000303225"
+          STOCK_CODE = "06872"
+          OUT = Path("out")
+          PDF_DIR = OUT / "pdfs"
+          RENDER_DIR = OUT / "renders"
+          DIAG_DIR = OUT / "diagnostics"
+          TODAY = "20260907"
+          UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": UA,
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def normalize(text: str) -> str:
+              return re.sub(r"\s+", " ", text or "").strip().lower()
+
+          def fetch_links(date_from: str, date_to: str, lang: str) -> list[dict[str, str]]:
+              params = {
+                  "category": "0",
+                  "documentType": "-1",
+                  "from": date_from,
+                  "lang": lang,
+                  "market": "SEHK",
+                  "searchType": "0",
+                  "stockId": STOCK_ID,
+                  "t1code": "-2",
+                  "t2Gcode": "-2",
+                  "t2code": "-2",
+                  "to": date_to,
+              }
+              response = session.get(SEARCH_URL, params=params, timeout=90)
+              print("SEARCH", lang, response.status_code, len(response.content), response.url)
+              response.raise_for_status()
+              (DIAG_DIR / f"titles_{lang}_{date_from}_{date_to}.html").write_bytes(response.content)
+              soup = BeautifulSoup(response.text, "html.parser")
+              rows: list[dict[str, str]] = []
+              seen: set[str] = set()
+              for anchor in soup.find_all("a", href=True):
+                  href = urljoin(response.url, anchor["href"])
+                  if "/listedco/listconews/" not in href.lower() or ".pdf" not in href.lower():
+                      continue
+                  if href in seen:
+                      continue
+                  seen.add(href)
+                  title = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True)).strip()
+                  rows.append({"title": title, "url": href, "lang": lang})
+              return rows
+
+          def download(url: str, destination: Path) -> tuple[int, str]:
+              with session.get(
+                  url,
+                  headers={"Referer": SEARCH_URL, "User-Agent": UA},
+                  stream=True,
+                  timeout=240,
+              ) as response:
+                  print("DOWNLOAD", response.status_code, response.headers.get("content-type"), url)
+                  response.raise_for_status()
+                  with destination.open("wb") as fh:
+                      for chunk in response.iter_content(chunk_size=1024 * 1024):
+                          if chunk:
+                              fh.write(chunk)
+              data = destination.read_bytes()
+              if not data.lstrip().startswith(b"%PDF"):
+                  raise RuntimeError(f"Not a PDF: {url}; magic={data[:32]!r}")
+              if len(data) < 40_000:
+                  raise RuntimeError(f"PDF too small ({len(data)} bytes): {url}")
+              return len(data), hashlib.sha256(data).hexdigest()
+
+          def validate(path: Path, expected: str) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < 1:
+                  raise RuntimeError(f"No pages in {path.name}")
+              sample_parts: list[str] = []
+              for page in reader.pages[: min(12, pages)]:
+                  try:
+                      sample_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = normalize(" ".join(sample_parts))
+              identity_tokens = (
+                  "tennor therapeutics",
+                  "丹诺医药",
+                  "丹諾醫藥",
+              )
+              if not any(token in sample for token in identity_tokens):
+                  raise RuntimeError(f"Issuer identity not found in {path.name}")
+              if expected == "prospectus" and pages < 300:
+                  raise RuntimeError(f"Prospectus unexpectedly short: {pages} pages")
+              if expected == "annual" and pages < 50:
+                  raise RuntimeError(f"Annual report unexpectedly short: {pages} pages")
+              if expected == "periodic" and pages < 5:
+                  raise RuntimeError(f"Latest financial disclosure unexpectedly short: {pages} pages")
+
+              render_prefix = RENDER_DIR / path.stem
+              subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-r", "72", "-png", "-singlefile", str(path), str(render_prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+              )
+              render_path = Path(str(render_prefix) + ".png")
+              if not render_path.exists() or render_path.stat().st_size < 1000:
+                  raise RuntimeError(f"First-page render failed: {path.name}")
+              return pages, sample[:1800]
+
+          all_links: list[dict[str, str]] = []
+          for lang in ("ZH", "EN"):
+              all_links.extend(fetch_links("20260101", TODAY, lang))
+              time.sleep(0.5)
+
+          # De-duplicate while preserving Chinese-first discovery order.
+          unique_links: list[dict[str, str]] = []
+          seen_urls: set[str] = set()
+          for row in all_links:
+              if row["url"] not in seen_urls:
+                  seen_urls.add(row["url"])
+                  unique_links.append(row)
+
+          manifest: list[dict[str, object]] = []
+
+          def save_candidate(candidate: dict[str, str], filename: str, expected: str) -> dict[str, object]:
+              tmp = PDF_DIR / (filename + ".download")
+              final = PDF_DIR / filename
+              size, sha = download(candidate["url"], tmp)
+              tmp.replace(final)
+              pages, sample = validate(final, expected)
+              record: dict[str, object] = {
+                  "file": filename,
+                  "document_title": candidate["title"],
+                  "source_url": candidate["url"],
+                  "source_language": candidate["lang"],
+                  "pages": pages,
+                  "bytes": size,
+                  "sha256": sha,
+                  "validation_sample": sample,
+              }
+              manifest.append(record)
+              print("VALIDATED", filename, pages, size, sha)
+              return record
+
+          # 1) Final prospectus. The formal notice has the same title, so download candidates
+          # and accept the first one that validates as a long prospectus.
+          prospectus_candidates = [
+              row for row in unique_links
+              if (
+                  "全球發售" in row["title"]
+                  or "全球发售" in row["title"]
+                  or "global offering" in normalize(row["title"])
+              )
+          ]
+          prospectus_saved = False
+          prospectus_errors: list[str] = []
+          for candidate in prospectus_candidates:
+              try:
+                  save_candidate(candidate, "TenNor_2026_Prospectus.pdf", "prospectus")
+                  prospectus_saved = True
+                  break
+              except Exception as exc:
+                  prospectus_errors.append(f"{candidate}: {exc!r}")
+                  (PDF_DIR / "TenNor_2026_Prospectus.pdf").unlink(missing_ok=True)
+                  (PDF_DIR / "TenNor_2026_Prospectus.pdf.download").unlink(missing_ok=True)
+          if not prospectus_saved:
+              raise RuntimeError("Final prospectus not found or failed validation: " + " | ".join(prospectus_errors))
+
+          # 2) All annual reports published by the listed issuer. As a May-2026 IPO,
+          # there should normally be none yet; still search and include any valid report found.
+          annual_candidates: list[dict[str, str]] = []
+          for row in unique_links:
+              t = normalize(row["title"])
+              is_annual = (
+                  "annual report" in t
+                  or "年報" in row["title"]
+                  or "年报" in row["title"]
+                  or "年度報告" in row["title"]
+                  or "年度报告" in row["title"]
+              )
+              excluded = any(x in t for x in ("annual results", "sustainability", "environmental", "esg"))
+              if is_annual and not excluded:
+                  annual_candidates.append(row)
+
+          annual_seen_hashes: set[str] = set()
+          annual_index = 0
+          for candidate in annual_candidates:
+              annual_index += 1
+              filename = f"TenNor_Annual_Report_{annual_index}.pdf"
+              try:
+                  record = save_candidate(candidate, filename, "annual")
+                  digest = str(record["sha256"])
+                  if digest in annual_seen_hashes:
+                      (PDF_DIR / filename).unlink(missing_ok=True)
+                      manifest.pop()
+                  else:
+                      annual_seen_hashes.add(digest)
+              except Exception as exc:
+                  print("ANNUAL_CANDIDATE_SKIPPED", candidate, repr(exc))
+                  (PDF_DIR / filename).unlink(missing_ok=True)
+                  (PDF_DIR / (filename + ".download")).unlink(missing_ok=True)
+
+          # 3) Latest periodic financial disclosure. Prefer a formal interim/quarterly report;
+          # otherwise use the latest interim results announcement.
+          priority_groups = [
+              [row for row in unique_links if (
+                  ("中期報告" in row["title"] or "中期报告" in row["title"] or "interim report" in normalize(row["title"]))
+                  and "results" not in normalize(row["title"])
+              )],
+              [row for row in unique_links if (
+                  "季度報告" in row["title"] or "季度报告" in row["title"] or "quarterly report" in normalize(row["title"])
+              )],
+              [row for row in unique_links if (
+                  "中期業績" in row["title"] or "中期业绩" in row["title"] or "interim results" in normalize(row["title"])
+              )],
+          ]
+          latest_saved = False
+          latest_kind = ""
+          latest_errors: list[str] = []
+          for group_index, group in enumerate(priority_groups):
+              for candidate in group:
+                  try:
+                      save_candidate(candidate, "TenNor_2026_Latest_Financial_Report.pdf", "periodic")
+                      latest_saved = True
+                      latest_kind = ["formal interim report", "quarterly report", "interim results announcement"][group_index]
+                      break
+                  except Exception as exc:
+                      latest_errors.append(f"{candidate}: {exc!r}")
+                      (PDF_DIR / "TenNor_2026_Latest_Financial_Report.pdf").unlink(missing_ok=True)
+                      (PDF_DIR / "TenNor_2026_Latest_Financial_Report.pdf.download").unlink(missing_ok=True)
+              if latest_saved:
+                  break
+          if not latest_saved:
+              raise RuntimeError("No latest periodic financial disclosure found: " + " | ".join(latest_errors))
+
+          annual_records = [row for row in manifest if str(row["file"]).startswith("TenNor_Annual_Report_")]
+          readme = [
+              "丹诺医药（06872.HK）年报、招股说明书及最新财务披露资料包",
+              "",
+              "来源：香港交易所披露易（HKEXnews）官方披露文件。",
+              "",
+              "收录文件：",
+              "- 2026年最终版招股说明书；",
+              f"- 最新财务披露：{latest_kind}。",
+              "",
+          ]
+          if annual_records:
+              readme.append(f"已收录上市后年度报告 {len(annual_records)} 份。")
+          else:
+              readme += [
+                  "年度报告说明：",
+                  "- 丹诺医药于2026年5月22日在港交所上市；",
+                  "- 截至2026年9月7日，港交所尚未刊发其上市后的独立年度报告，因此本包没有伪造或以其他文件冒充年报；",
+                  "- 2023-2025年的经审计历史财务资料已包含在最终版招股说明书内。",
+              ]
+          readme += [
+              "",
+              "季度报告说明：",
+              "- 港股主板发行人通常不按A股格式强制披露季度报告；",
+              "- 截至打包日未检索到丹诺医药独立季度报告，因此收录当前最新的半年期财务披露。",
+              "",
+              "文件清单：",
+          ]
+          for row in manifest:
+              readme.append(
+                  f"- {row['file']} | {row['pages']}页 | {row['bytes']}字节 | SHA-256 {row['sha256']}"
+              )
+          readme += ["", "文件仅供个人研究使用，请遵守发行人、港交所及原文件的版权与使用条款。"]
+
+          (OUT / "README_CN.txt").write_text("\n".join(readme) + "\n", encoding="utf-8")
+          (OUT / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          (OUT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{row['sha256']}  {row['file']}" for row in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = OUT / "tennor_reports.zip"
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for row in manifest:
+                  zf.write(PDF_DIR / str(row["file"]), arcname=str(row["file"]))
+              zf.write(OUT / "README_CN.txt", arcname="README_CN.txt")
+              zf.write(OUT / "manifest.json", arcname="manifest.json")
+              zf.write(OUT / "SHA256SUMS.txt", arcname="SHA256SUMS.txt")
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"Corrupt ZIP member: {bad}")
+              pdf_members = [name for name in zf.namelist() if name.lower().endswith(".pdf")]
+              if len(pdf_members) < 2:
+                  raise RuntimeError(f"Expected at least prospectus and latest report, got {len(pdf_members)} PDFs")
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          package_info = {
+              "file": zip_path.name,
+              "bytes": zip_path.stat().st_size,
+              "sha256": zip_sha,
+              "pdf_count": len([x for x in manifest if str(x["file"]).lower().endswith(".pdf")]),
+              "annual_report_count": len(annual_records),
+              "latest_document_kind": latest_kind,
+          }
+          (OUT / "PACKAGE_INFO.json").write_text(json.dumps(package_info, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_READY", json.dumps(package_info, ensure_ascii=False))
+          PY
+          python /tmp/package_tennor.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tennor-financial-reports-package
+          path: |
+            out/tennor_reports.zip
+            out/PACKAGE_INFO.json
+            out/manifest.json
+          retention-days: 1
+          compression-level: 0
