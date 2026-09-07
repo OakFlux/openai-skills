@@ -1,0 +1,430 @@
+name: Temporary CGN New Energy report package
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-cgn-new-energy-reports-20260907
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download, validate, render, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet 'httpx[http2]' beautifulsoup4 pypdf pymupdf
+          cat > /tmp/package_cgn_new_energy.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import unicodedata
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import httpx
+          import pymupdf
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          HKEX_HOME = "https://www1.hkexnews.hk/search/titlesearch.xhtml"
+          HKEX_SEARCH = "https://www1.hkexnews.hk/search/titleSearchServlet.do"
+          STOCK_ID = "112365"
+          STOCK_CODE = "01811"
+          TODAY = "20260907"
+
+          OUT = Path("package_files")
+          OUT.mkdir(parents=True, exist_ok=True)
+          VERIFY = Path("verification")
+          VERIFY.mkdir(parents=True, exist_ok=True)
+
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          }
+          client = httpx.Client(
+              http2=True,
+              follow_redirects=True,
+              timeout=httpx.Timeout(600.0, connect=30.0),
+              headers=HEADERS,
+          )
+
+          def plain_title(value: object) -> str:
+              text = html.unescape(str(value or ""))
+              text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+              return re.sub(r"\s+", " ", text).strip()
+
+          def normalize_records(value: object) -> list[dict]:
+              if isinstance(value, str):
+                  value = json.loads(value)
+              if isinstance(value, list):
+                  return [x for x in value if isinstance(x, dict)]
+              if isinstance(value, dict):
+                  for key in ("result", "data", "rows", "items", "records"):
+                      if key in value:
+                          try:
+                              rows = normalize_records(value[key])
+                          except Exception:
+                              rows = []
+                          if rows:
+                              return rows
+              return []
+
+          def hkex_search(from_date: str, to_date: str, title: str, lang: str, t1code: str, t2code: str) -> list[dict]:
+              params = {
+                  "sortDir": "1",
+                  "sortByOptions": "DateTime",
+                  "category": "0",
+                  "market": "SEHK",
+                  "stockId": STOCK_ID,
+                  "documentType": "-1",
+                  "fromDate": from_date,
+                  "toDate": to_date,
+                  "title": title,
+                  "searchType": "1",
+                  "t1code": t1code,
+                  "t2Gcode": "-2",
+                  "t2code": t2code,
+                  "rowRange": "2000",
+                  "lang": lang,
+              }
+              client.get(
+                  HKEX_HOME,
+                  params={"lang": lang, "market": "SEHK", "stockId": STOCK_ID, "category": "0"},
+              )
+              response = client.get(
+                  HKEX_SEARCH,
+                  params=params,
+                  headers={**HEADERS, "Accept": "application/json,text/plain,*/*", "Referer": HKEX_HOME},
+              )
+              print(
+                  f"HKEX status={response.status_code} lang={lang} title={title!r} t1={t1code} t2={t2code} bytes={len(response.content)}",
+                  flush=True,
+              )
+              response.raise_for_status()
+              outer = response.json()
+              records = normalize_records(outer.get("result", outer) if isinstance(outer, dict) else outer)
+              clean: list[dict] = []
+              for row in records:
+                  code = re.sub(r"\D", "", str(row.get("STOCK_CODE", ""))).zfill(5)
+                  if code != STOCK_CODE:
+                      continue
+                  item = dict(row)
+                  item["_TITLE"] = plain_title(item.get("TITLE"))
+                  item["_LANG"] = lang
+                  clean.append(item)
+              print(f"matched rows={len(clean)}", flush=True)
+              for item in clean[:60]:
+                  print("  ", item.get("DATE_TIME"), item.get("_TITLE"), item.get("FILE_LINK"), flush=True)
+              return clean
+
+          def row_url(row: dict) -> str | None:
+              link = str(row.get("FILE_LINK") or row.get("FILEPATH") or row.get("URL") or "").strip()
+              return urljoin("https://www1.hkexnews.hk/", link) if link else None
+
+          def parse_date(value: object) -> datetime:
+              text = str(value or "").strip()
+              for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                  try:
+                      return datetime.strptime(text, fmt)
+                  except ValueError:
+                      pass
+              return datetime.min
+
+          rows: list[dict] = []
+          seen = set()
+          queries = [
+              ("20210101", TODAY, "", "zh", "40000", "40100"),
+              ("20210101", TODAY, "年度報告", "zh", "40000", "40100"),
+              ("20210101", TODAY, "年報", "zh", "40000", "40100"),
+              ("20210101", TODAY, "", "EN", "40000", "40100"),
+              ("20210101", TODAY, "ANNUAL REPORT", "EN", "40000", "40100"),
+              ("20260801", TODAY, "", "zh", "40000", "40200"),
+              ("20260801", TODAY, "中期報告", "zh", "40000", "40200"),
+              ("20260801", TODAY, "", "EN", "40000", "40200"),
+              ("20260801", TODAY, "INTERIM REPORT", "EN", "40000", "40200"),
+              ("20260801", TODAY, "", "zh", "-2", "-2"),
+              ("20260801", TODAY, "中期業績", "zh", "-2", "-2"),
+              ("20260801", TODAY, "六個月", "zh", "-2", "-2"),
+              ("20260801", TODAY, "", "EN", "-2", "-2"),
+              ("20260801", TODAY, "INTERIM RESULTS", "EN", "-2", "-2"),
+              ("20260801", TODAY, "SIX MONTHS ENDED", "EN", "-2", "-2"),
+          ]
+          for query in queries:
+              try:
+                  found = hkex_search(*query)
+              except Exception as exc:
+                  print(f"query failed {query}: {type(exc).__name__}: {exc}", flush=True)
+                  continue
+              for row in found:
+                  key = (row_url(row), row.get("_TITLE"), row.get("DATE_TIME"), row.get("_LANG"))
+                  if key not in seen:
+                      seen.add(key)
+                      rows.append(row)
+
+          def normalized(text: str) -> str:
+              return unicodedata.normalize("NFKC", text).replace("〇", "零").replace("○", "零")
+
+          cn_digits = {"0": "零", "1": "一", "2": "二", "3": "三", "4": "四", "5": "五", "6": "六", "7": "七", "8": "八", "9": "九"}
+
+          def cn_year(year: int) -> str:
+              return "".join(cn_digits[c] for c in str(year))
+
+          def annual_score(row: dict, year: int) -> int:
+              title = normalized(str(row.get("_TITLE") or ""))
+              upper = title.upper()
+              if row_url(row) is None:
+                  return -100000
+              if str(year) not in title and cn_year(year) not in title:
+                  return -100000
+              if not ("年度報告" in title or "年度报告" in title or "年報" in title or "年报" in title or "ANNUAL REPORT" in upper):
+                  return -100000
+              excluded = (
+                  "中期", "INTERIM", "摘要", "SUMMARY", "業績", "业绩", "RESULTS",
+                  "補充", "补充", "SUPPLEMENT", "環境", "环境", "ESG", "SUSTAINABILITY",
+              )
+              if any(term in title or term in upper for term in excluded):
+                  return -100000
+              score = 0
+              if row.get("_LANG") == "zh":
+                  score += 100
+              if "年度報告" in title or "年度报告" in title:
+                  score += 50
+              if "年報" in title or "年报" in title:
+                  score += 40
+              if "ANNUAL REPORT" in upper:
+                  score += 30
+              score += min(max((parse_date(row.get("DATE_TIME")) - datetime(2000, 1, 1)).days, 0), 20000) // 1000
+              return score
+
+          def choose_annual(year: int) -> dict:
+              ranked = sorted(((annual_score(row, year), row) for row in rows), key=lambda x: x[0], reverse=True)
+              if not ranked or ranked[0][0] < 0:
+                  raise RuntimeError(f"No annual report found for {year}; available titles={[r.get('_TITLE') for r in rows]}")
+              score, row = ranked[0]
+              print(f"Selected annual {year}: score={score} {row.get('_TITLE')} {row_url(row)}", flush=True)
+              return row
+
+          def full_interim_score(row: dict) -> tuple[int, datetime]:
+              title = normalized(str(row.get("_TITLE") or ""))
+              upper = title.upper()
+              if row_url(row) is None:
+                  return (-100000, datetime.min)
+              if not ("2026" in title or cn_year(2026) in title):
+                  return (-100000, datetime.min)
+              if not ("中期報告" in title or "中期报告" in title or "INTERIM REPORT" in upper or "HALF-YEAR REPORT" in upper):
+                  return (-100000, datetime.min)
+              if any(term in title or term in upper for term in ("業績公告", "业绩公告", "RESULTS ANNOUNCEMENT", "摘要", "SUMMARY")):
+                  return (-100000, datetime.min)
+              points = 150 if row.get("_LANG") == "zh" else 50
+              return (points, parse_date(row.get("DATE_TIME")))
+
+          def interim_results_score(row: dict) -> tuple[int, datetime]:
+              title = normalized(str(row.get("_TITLE") or ""))
+              upper = title.upper()
+              if row_url(row) is None:
+                  return (-100000, datetime.min)
+              if not ("2026" in title or cn_year(2026) in title):
+                  return (-100000, datetime.min)
+              matched = (
+                  "中期業績" in title or "中期业绩" in title or
+                  (("六個月" in title or "六个月" in title) and ("業績" in title or "业绩" in title)) or
+                  "INTERIM RESULTS" in upper or
+                  "RESULTS ANNOUNCEMENT FOR THE SIX MONTHS" in upper or
+                  "RESULTS FOR THE SIX MONTHS" in upper
+              )
+              if not matched:
+                  return (-100000, datetime.min)
+              excluded = (
+                  "股息", "DIVIDEND", "盈利預告", "盈利预告", "PROFIT WARNING", "POSITIVE PROFIT",
+                  "董事會", "董事会", "BOARD MEETING", "發電量", "发电量", "POWER GENERATION",
+                  "經營數據", "经营数据", "OPERATIONAL DATA", "MONTHLY RETURN",
+              )
+              if any(term in title or term in upper for term in excluded):
+                  return (-100000, datetime.min)
+              points = 130 if row.get("_LANG") == "zh" else 30
+              if "公告" in title or "ANNOUNCEMENT" in upper:
+                  points += 10
+              return (points, parse_date(row.get("DATE_TIME")))
+
+          latest_row = None
+          latest_kind = None
+          full_interim = sorted(rows, key=full_interim_score, reverse=True)
+          if full_interim and full_interim_score(full_interim[0])[0] >= 0:
+              latest_row = full_interim[0]
+              latest_kind = "2026年中期报告"
+          else:
+              results = sorted(rows, key=interim_results_score, reverse=True)
+              if results and interim_results_score(results[0])[0] >= 0:
+                  latest_row = results[0]
+                  latest_kind = "2026年中期业绩公告"
+          if latest_row is None:
+              raise RuntimeError("Unable to find CGN New Energy 2026 interim report or interim results announcement")
+          print(f"Selected latest periodic disclosure: {latest_kind} | {latest_row.get('_TITLE')} | {row_url(latest_row)}", flush=True)
+
+          documents: list[dict] = []
+          for index, year in enumerate(range(2020, 2026), start=1):
+              row = choose_annual(year)
+              documents.append({
+                  "filename": f"{index:02d}_中广核新能源_{year}年年度报告.pdf",
+                  "period": f"{year}年年度报告",
+                  "document_title": row.get("_TITLE"),
+                  "release_time": row.get("DATE_TIME"),
+                  "language": row.get("_LANG"),
+                  "url": row_url(row),
+                  "min_pages": 100,
+              })
+          documents.append({
+              "filename": f"07_中广核新能源_{latest_kind}.pdf",
+              "period": latest_kind,
+              "document_title": latest_row.get("_TITLE"),
+              "release_time": latest_row.get("DATE_TIME"),
+              "language": latest_row.get("_LANG"),
+              "url": row_url(latest_row),
+              "min_pages": 25 if latest_kind == "2026年中期报告" else 8,
+          })
+
+          manifest: list[dict] = []
+          for index, item in enumerate(documents, start=1):
+              dest = OUT / item["filename"]
+              part = Path(str(dest) + ".part")
+              errors: list[str] = []
+              for attempt in range(1, 4):
+                  try:
+                      print(f"Downloading {dest.name}, attempt={attempt}, url={item['url']}", flush=True)
+                      with client.stream(
+                          "GET",
+                          item["url"],
+                          headers={**HEADERS, "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8", "Referer": "https://www1.hkexnews.hk/"},
+                      ) as response:
+                          if response.status_code >= 400:
+                              raise RuntimeError(f"HTTP {response.status_code}; content-type={response.headers.get('content-type')}")
+                          with part.open("wb") as fh:
+                              for chunk in response.iter_bytes(1024 * 1024):
+                                  if chunk:
+                                      fh.write(chunk)
+                          final_url = str(response.url)
+                      size = part.stat().st_size
+                      with part.open("rb") as fh:
+                          magic = fh.read(5)
+                      if magic != b"%PDF-":
+                          raise RuntimeError(f"not PDF; magic={magic!r}; bytes={size}")
+                      if size < 80_000:
+                          raise RuntimeError(f"file too small: {size}")
+                      reader = PdfReader(str(part), strict=False)
+                      pages = len(reader.pages)
+                      if pages < int(item["min_pages"]):
+                          raise RuntimeError(f"too few pages: {pages} < {item['min_pages']}")
+
+                      doc = pymupdf.open(part)
+                      pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+                      render_path = VERIFY / f"cover_{index:02d}.png"
+                      pix.save(render_path)
+                      sample = "\n".join(doc[p].get_text("text") for p in range(min(doc.page_count, 20))).lower()
+                      doc.close()
+                      if not render_path.exists() or render_path.stat().st_size < 1500:
+                          raise RuntimeError("cover render validation failed")
+                      issuer_tokens = (
+                          "中廣核新能源", "中广核新能源", "cgn new energy", "cgn new energy holdings",
+                      )
+                      issuer_text_check = any(token.lower() in sample for token in issuer_tokens) if sample.strip() else None
+                      if issuer_text_check is False and len(sample.strip()) > 500:
+                          raise RuntimeError("issuer name absent from extracted opening pages")
+
+                      part.replace(dest)
+                      digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+                      manifest.append({
+                          "filename": dest.name,
+                          "period": item["period"],
+                          "document_title": item["document_title"],
+                          "release_time": item["release_time"],
+                          "language": item["language"],
+                          "pages": pages,
+                          "size_bytes": size,
+                          "sha256": digest,
+                          "source_url": final_url,
+                          "issuer_text_check": issuer_text_check,
+                      })
+                      print(f"OK: {dest.name} | pages={pages} | bytes={size} | issuer_text_check={issuer_text_check}", flush=True)
+                      break
+                  except Exception as exc:
+                      errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+                      part.unlink(missing_ok=True)
+                      dest.unlink(missing_ok=True)
+                      time.sleep(attempt * 2)
+              else:
+                  raise RuntimeError(f"Failed {dest.name}: " + "; ".join(errors))
+
+          if len(manifest) != 7:
+              raise RuntimeError(f"Expected 7 PDFs, got {len(manifest)}")
+
+          note = [
+              "中广核新能源控股有限公司（01811.HK）定期报告资料包",
+              "",
+              "资料范围：2020—2025年完整年度报告，以及截至2026年9月7日最新可获得的定期财务披露。",
+              f"最新定期财务披露口径：{latest_kind}。",
+              "港股发行人通常不按A股口径定期披露第一、第三季度财务报告；如完整2026年中期报告尚未发布，本包采用最新中期业绩公告。",
+              "所有PDF均来自港交所公开披露页面，为原始披露文件，未重新排版、转码或删页。",
+              "",
+              "文件清单与校验信息：",
+          ]
+          for row in manifest:
+              note.extend([
+                  f"- {row['filename']}",
+                  f"  报告口径：{row['period']}",
+                  f"  公告标题：{row['document_title']}",
+                  f"  披露时间：{row['release_time']}",
+                  f"  语言：{row['language']}",
+                  f"  页数：{row['pages']}",
+                  f"  文件大小：{row['size_bytes']} 字节",
+                  f"  SHA-256：{row['sha256']}",
+                  f"  来源：{row['source_url']}",
+              ])
+          (OUT / "00_文件清单与来源说明.txt").write_text("\n".join(note) + "\n", encoding="utf-8")
+          (OUT / "00_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          with (OUT / "SHA256SUMS.txt").open("w", encoding="utf-8") as fh:
+              for row in manifest:
+                  fh.write(f"{row['sha256']}  {row['filename']}\n")
+
+          test_zip = Path("CGN_New_Energy_local_integrity_check.zip")
+          with zipfile.ZipFile(test_zip, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for path in sorted(OUT.iterdir(), key=lambda p: p.name):
+                  zf.write(path, path.name)
+          with zipfile.ZipFile(test_zip, "r") as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failure: {bad}")
+              if len([name for name in zf.namelist() if name.lower().endswith(".pdf")]) != 7:
+                  raise RuntimeError("ZIP PDF count mismatch")
+          test_zip.unlink()
+
+          summary = {
+              "pdf_count": len(manifest),
+              "total_pages": sum(x["pages"] for x in manifest),
+              "total_pdf_bytes": sum(x["size_bytes"] for x in manifest),
+              "latest_kind": latest_kind,
+              "documents": manifest,
+          }
+          (VERIFY / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE READY " + json.dumps(summary, ensure_ascii=False), flush=True)
+          PY
+          python /tmp/package_cgn_new_energy.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cgn-new-energy-report-package
+          path: package_files/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
