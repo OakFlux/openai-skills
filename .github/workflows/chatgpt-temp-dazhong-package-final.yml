@@ -1,0 +1,239 @@
+name: chatgpt-temp-dazhong-package-final
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-dazhong-package-final.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt-temp-dazhong-reports-20260907-v2
+      - name: Find download verify and package reports
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pypdf pymupdf pillow beautifulsoup4
+          python <<'PY'
+          import hashlib, io, json, re, time, urllib.parse, zipfile
+          from datetime import datetime
+          from pathlib import Path
+          import requests
+          import pymupdf
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+          from bs4 import BeautifulSoup
+
+          work=Path('_work_dazhong'); allpdf=work/'all_pdf'; allpdf.mkdir(parents=True,exist_ok=True)
+          final=work/'大众公用_600635_01635_券商深度报告'; final.mkdir(parents=True,exist_ok=True)
+          qa=work/'qa';qa.mkdir(parents=True,exist_ok=True)
+          outdir=Path('generated/dazhong');outdir.mkdir(parents=True,exist_ok=True)
+          s=requests.Session();s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8','Referer':'https://data.eastmoney.com/report/'
+          })
+          logs=[]; records=[]; seen=set(); candidates=[]
+          def L(x):x=str(x);print(x,flush=True);logs.append(x)
+          def norm(x):return re.sub(r'[\s:：()（）“”"\-—_、，,。]+','',str(x or '')).lower()
+          def parse_obj(t):
+            try:return json.loads(t)
+            except:pass
+            a=t.find('{');b=t.rfind('}')
+            if a>=0 and b>a:
+              try:return json.loads(t[a:b+1])
+              except:pass
+            return {}
+          def get_rows(o):
+            x=o.get('data') or o.get('result',{}).get('data') or []
+            if isinstance(x,dict):x=x.get('data') or x.get('list') or x.get('items') or []
+            return x if isinstance(x,list) else []
+          def add_record(rec,src):
+            txt=json.dumps(rec,ensure_ascii=False)
+            if not any(k in txt for k in ['大众公用','600635','01635','Dazhong Public Utilities']):return
+            key=rec.get('infoCode') or rec.get('INFO_CODE') or rec.get('reportId') or rec.get('id') or hashlib.sha1(txt.encode()).hexdigest()
+            if key in seen:return
+            seen.add(key);r=dict(rec);r['_src']=src;records.append(r);L('RECORD '+json.dumps(r,ensure_ascii=False))
+
+          # Direct Eastmoney company-report calls.
+          for code in ['600635','600635.SH','SH600635','01635','01635.HK','HK01635']:
+            for begin,end in [('2008-01-01','2014-12-31'),('2015-01-01','2019-12-31'),('2020-01-01','2024-12-31'),('2025-01-01','2026-09-07')]:
+              for qtype in [0,1,2]:
+                for page in range(1,10):
+                  p={'cb':'jQuery1124','pageSize':100,'pageNo':page,'qType':qtype,'beginTime':begin,'endTime':end,'code':code,'fields':'','orgCode':'','author':'','industryCode':'*','industry':'*','rating':'','ratingChange':'','rcode':'','_':int(time.time()*1000)}
+                  try:
+                    rr=s.get('https://reportapi.eastmoney.com/report/list',params=p,timeout=45)
+                    o=parse_obj(rr.text);rows=get_rows(o)
+                    L(f'EM GET code={code} {begin} q={qtype} p={page} HTTP={rr.status_code} rows={len(rows)} total={o.get("TotalPage")}')
+                    for r in rows:add_record(r,'eastmoney-list')
+                    total=int(o.get('TotalPage') or 1)
+                    if not rows or page>=total:break
+                  except Exception as e:L(f'EM GET ERROR {code} {begin} q={qtype} p={page} {e!r}');break
+                  time.sleep(.05)
+            # post endpoint
+            for page in range(1,10):
+              body={'pageSize':100,'pageNo':page,'p':page,'pageNum':page,'pageNumber':page,'beginTime':'2008-01-01','endTime':'2026-09-07','code':code,'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''}
+              try:
+                rr=s.post('https://reportapi.eastmoney.com/report/list2',json=body,headers={'Content-Type':'application/json'},timeout=45)
+                o=parse_obj(rr.text);rows=get_rows(o)
+                L(f'EM POST code={code} p={page} HTTP={rr.status_code} rows={len(rows)} total={o.get("TotalPage")}')
+                for r in rows:add_record(r,'eastmoney-list2')
+                total=int(o.get('TotalPage') or 1)
+                if not rows or page>=total:break
+              except Exception as e:L(f'EM POST ERROR {code} p={page} {e!r}');break
+
+          # Also parse the public company report pages for infoCode values.
+          for code in ['600635','01635']:
+            for u in [f'https://data.eastmoney.com/report/{code}.html',f'https://data.eastmoney.com/report/stock.jshtml?encodeUrl=&stockCode={code}']:
+              try:
+                rr=s.get(u,timeout=45)
+                L(f'EM PAGE {u} HTTP={rr.status_code} bytes={len(rr.content)}')
+                for m in re.finditer(r'AP\d{10,}',rr.text):
+                  key=m.group(0)
+                  if key not in seen:
+                    seen.add(key);records.append({'infoCode':key,'title':'大众公用研究报告','stockName':'大众公用','_src':'eastmoney-html'})
+              except Exception as e:L(f'EM PAGE ERROR {u} {e!r}')
+
+          # Download every Eastmoney PDF and verify page count.
+          for rec in records:
+            info=rec.get('infoCode') or rec.get('INFO_CODE')
+            if not info:continue
+            title=str(rec.get('title') or rec.get('TITLE') or rec.get('reportTitle') or '大众公用研究报告')
+            org=str(rec.get('orgSName') or rec.get('orgName') or rec.get('ORG_SNAME') or rec.get('institution') or '券商')
+            date=str(rec.get('publishDate') or rec.get('PUBLISH_DATE') or rec.get('date') or '')[:10]
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',date):date='日期未知'
+            for u in [f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',f'https://pdf.dfcfw.com/pdf/{info}_1.pdf']:
+              try:
+                rr=s.get(u,headers={'Referer':'https://data.eastmoney.com/'},timeout=180,allow_redirects=True)
+                L(f'EM PDF {info} HTTP={rr.status_code} bytes={len(rr.content)} type={rr.headers.get("content-type")}')
+                if rr.status_code!=200 or not rr.content.startswith(b'%PDF-') or len(rr.content)<60000:continue
+                sha=hashlib.sha256(rr.content).hexdigest()
+                if any(x['sha256']==sha for x in candidates):break
+                safe=re.sub(r'[\\/:*?"<>|]+','_',f'{date}_{org}_大众公用_{title}')[:180]+'.pdf'
+                p=allpdf/safe;p.write_bytes(rr.content)
+                try:
+                  pc=len(PdfReader(str(p),strict=False).pages)
+                  if pc<2:raise RuntimeError('too few pages')
+                  doc=pymupdf.open(str(p));
+                  if doc.page_count!=pc:raise RuntimeError('page count mismatch')
+                  # render first and last pages
+                  for no,suf in [(0,'first'),(pc-1,'last')]:
+                    pix=doc.load_page(no).get_pixmap(matrix=pymupdf.Matrix(0.8,0.8),alpha=False)
+                    img=Image.open(io.BytesIO(pix.tobytes('png'))).convert('L').resize((32,32))
+                    if ImageStat.Stat(img).stddev[0]<0.8:raise RuntimeError(f'blank render {suf}')
+                  doc.close()
+                except Exception as e:
+                  L(f'INVALID PDF {safe} {e!r}');p.unlink(missing_ok=True);continue
+                nt=norm(title)
+                exclusions=['点评','简评','快评','季报','年报点评','半年报点评','中报点评','业绩快报','业绩预告','事件点评','公告点评','跟踪报告','日报','周报','月报','晨会','策略']
+                deep_hint=['深度','首次覆盖','公司研究','双轮驱动','价值重估','燃气','创投','公用事业','综合金融']
+                score=pc*10
+                if any(k in title for k in exclusions):score-=100
+                if any(k in title for k in deep_hint):score+=60
+                try:score+=datetime.strptime(date,'%Y-%m-%d').year-2000
+                except:pass
+                candidate={'path':str(p),'filename':safe,'title':title,'institution':org,'date':date,'pages':pc,'size_bytes':len(rr.content),'sha256':sha,'source_url':rr.url,'score':score,'kind':'完整PDF'}
+                candidates.append(candidate);L('VALID '+json.dumps(candidate,ensure_ascii=False));break
+              except Exception as e:L(f'EM PDF ERROR {u} {e!r}')
+
+          # Public fallback: discover FXBaogao detail IDs and build only the explicitly public preview pages.
+          if len([x for x in candidates if x['pages']>=8])<2:
+            detail_ids=[]
+            queries=['site:fxbaogao.com/detail 大众公用','site:fxbaogao.com/detail 600635 大众公用','大众公用 公司深度 发现报告']
+            for q in queries:
+              for base in ['https://www.bing.com/search?q=','https://www.baidu.com/s?wd=']:
+                try:
+                  rr=s.get(base+urllib.parse.quote(q),timeout=45)
+                  L(f'SEARCH {q} HTTP={rr.status_code} bytes={len(rr.content)}')
+                  text=rr.text.replace('\\/','/')
+                  for m in re.finditer(r'(?:fxbaogao\.com/detail/|/detail/)(\d{5,9})',text):
+                    if m.group(1) not in detail_ids:detail_ids.append(m.group(1))
+                except Exception as e:L(f'SEARCH ERROR {q} {e!r}')
+            L('FX IDS '+json.dumps(detail_ids))
+            endpoint='https://api.fxbaogao.com/mofoun/report/report/getReportPreviewImages'
+            for rid in detail_ids[:30]:
+              try:
+                detail=f'https://www.fxbaogao.com/detail/{rid}'
+                hr=s.get(detail,timeout=45); plain=BeautifulSoup(hr.text,'html.parser').get_text(' ',strip=True)
+                if '大众公用' not in plain:continue
+                title_match=re.search(r'(?:title|报告名称)[：:\s]*([^|]{5,80})',plain)
+                title=(title_match.group(1) if title_match else '大众公用券商研究报告').strip()
+                if len(title)>100:title='大众公用券商研究报告'
+                inst='券商';
+                for name in ['国泰君安','海通证券','申万宏源','招商证券','中信证券','中信建投','天风证券','东吴证券','国金证券','华泰证券','光大证券','广发证券','国信证券','兴业证券','华鑫证券','东兴证券','长江证券','安信证券','民生证券','中银国际']:
+                  if name in plain:inst=name;break
+                dm=re.search(r'20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}',plain);date=dm.group(0).replace('年','-').replace('月','-').replace('日','').replace('/','.') if dm else '日期未知'
+                date=date.replace('.','-')
+                ar=s.get(endpoint,params={'reportId':rid},headers={'Referer':detail,'Origin':'https://www.fxbaogao.com','Accept':'application/json,text/plain,*/*'},timeout=45)
+                paths=(ar.json().get('data') or [])
+                ims=[]
+                for pp in paths:
+                  u=pp if str(pp).startswith('http') else 'https://public.fxbaogao.com/'+str(pp).lstrip('/')
+                  ir=s.get(u,headers={'Referer':detail},timeout=90)
+                  if ir.status_code==200 and len(ir.content)>10000:
+                    im=Image.open(io.BytesIO(ir.content));im.load()
+                    if im.width>=600 and im.height>=700:
+                      rgba=im.convert('RGBA');bg=Image.new('RGBA',rgba.size,'white');bg.alpha_composite(rgba);ims.append(bg.convert('RGB'))
+                if len(ims)<2:continue
+                safe=re.sub(r'[\\/:*?"<>|]+','_',f'{date}_{inst}_大众公用_{title}_公开试读{len(ims)}页')[:180]+'.pdf'
+                p=allpdf/safe;ims[0].save(p,'PDF',save_all=True,append_images=ims[1:],resolution=160)
+                data=p.read_bytes();pc=len(PdfReader(str(p),strict=False).pages);sha=hashlib.sha256(data).hexdigest()
+                if any(x['sha256']==sha for x in candidates):continue
+                candidate={'path':str(p),'filename':safe,'title':title,'institution':inst,'date':date,'pages':pc,'size_bytes':len(data),'sha256':sha,'source_url':detail,'score':pc*10-200,'kind':f'公开试读{pc}页'}
+                candidates.append(candidate);L('VALID PREVIEW '+json.dumps(candidate,ensure_ascii=False))
+              except Exception as e:L(f'FX ERROR {rid} {e!r}')
+
+          # Rank: full PDFs first; exclude short earnings comments where possible; diversify institutions.
+          candidates.sort(key=lambda x:(1 if x['kind']=='完整PDF' else 0,x['score'],x['pages'],x['date']),reverse=True)
+          selected=[];institutions=set()
+          for x in candidates:
+            if x['kind']=='完整PDF' and x['pages']<8:continue
+            if x['institution'] in institutions and len(selected)<2:continue
+            selected.append(x);institutions.add(x['institution'])
+            if len(selected)>=3:break
+          if len(selected)<2:
+            for x in candidates:
+              if x not in selected:
+                selected.append(x)
+                if len(selected)>=2:break
+          if len(selected)<2:
+            raise RuntimeError('Fewer than two usable brokerage reports were found')
+
+          # Copy selected PDFs and write manifest.
+          final_records=[]
+          for x in selected[:3]:
+            src=Path(x['path']);dst=final/x['filename'];dst.write_bytes(src.read_bytes())
+            y={k:v for k,v in x.items() if k!='path'};final_records.append(y)
+          notes=['大众公用（600635.SH / 01635.HK）券商研究报告包','资料整理日期：2026-09-07','','收录说明：']
+          for i,r in enumerate(final_records,1):
+            notes.append(f"{i}. {r['institution']}｜{r['date']}｜《{r['title']}》｜{r['pages']}页｜{r['kind']}｜来源：{r['source_url']}")
+          notes += ['', '校验说明：所有PDF均已检查文件头、页数并渲染首尾页；文件名中如标注“公开试读”，表示公开来源只展示这些页面，未冒充完整版。']
+          (final/'文件说明.txt').write_text('\n'.join(notes)+'\n',encoding='utf-8')
+          (final/'manifest.json').write_text(json.dumps({'company':'大众公用','codes':['600635.SH','01635.HK'],'checked_as_of':'2026-09-07','files':final_records},ensure_ascii=False,indent=2),encoding='utf-8')
+          (final/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['filename']}" for r in final_records)+'\n',encoding='utf-8')
+          (work/'run.log').write_text('\n'.join(logs)+'\n',encoding='utf-8')
+          (work/'all_candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          zpath=outdir/f"大众公用_600635_01635_券商深度报告_{len(final_records)}份.zip"
+          with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(final.rglob('*')):
+              if p.is_file():z.write(p,arcname=str(Path(final.name)/p.relative_to(final)))
+          with zipfile.ZipFile(zpath,'r') as z:
+            bad=z.testzip();pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if bad:raise RuntimeError(f'ZIP CRC failed {bad}')
+            if len(pdfs)!=len(final_records):raise RuntimeError(f'ZIP PDF count mismatch {pdfs}')
+          zd=zpath.read_bytes();meta={'zip':zpath.name,'size_bytes':len(zd),'sha256':hashlib.sha256(zd).hexdigest(),'files':final_records}
+          (outdir/'result.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          (outdir/'run.log').write_text('\n'.join(logs)+'\n',encoding='utf-8')
+          print('FINAL '+json.dumps(meta,ensure_ascii=False),flush=True)
+          PY
+      - name: Commit generated package
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add generated/dazhong
+          git commit -m "Add verified Dazhong Public Utilities brokerage report package" || true
+          git push origin HEAD:chatgpt-temp-dazhong-reports-20260907-v2
