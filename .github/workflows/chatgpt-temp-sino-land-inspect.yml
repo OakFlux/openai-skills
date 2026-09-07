@@ -1,0 +1,139 @@
+name: chatgpt-temp-sino-land-inspect
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-sino-land-inspect.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect report pages and capture PDF/download links
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 playwright
+          python <<'PY'
+          import asyncio, json, os, re, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          W=Path('sino_land_inspect'); W.mkdir(exist_ok=True)
+          targets={
+            'dbs_equity_20260302':'https://www.dbs.com.hk/treasures/aics/templatedata/article/equity/data/en/DBSV/012014/83_HK.xml',
+            'dbs_result_20260302':'https://www.dbs.com.hk/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/032026/83_HK_03022026.xml',
+            'dbs_20250828':'https://www.dbs.com.hk/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/082025/83_HK_08282025.xml',
+            'dbs_20250103':'https://www.dbs.com.hk/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/012025/83_HK_01032025.xml',
+            'hibor_huayuan_20260329':'https://wap.hibor.com.cn/repinfodetail_5007827.html',
+          }
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          summary={}
+          for key,u in targets.items():
+            try:
+              r=s.get(u,timeout=90,allow_redirects=True)
+              print('REQ',key,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              W.joinpath(key+'.html').write_bytes(r.content)
+              text=r.content.decode(r.apparent_encoding or 'utf-8','ignore')
+              soup=BeautifulSoup(text,'html.parser')
+              links=[]
+              for a in soup.find_all('a',href=True):
+                links.append({'text':' '.join(a.get_text(' ',strip=True).split()),'href':urllib.parse.urljoin(r.url,a['href']),'attrs':dict(a.attrs)})
+              assets=[]
+              for tag in soup.find_all(['img','iframe','embed','object','source','script']):
+                for attr in ['src','data-src','data-original','data','href']:
+                  if tag.get(attr): assets.append(urllib.parse.urljoin(r.url,tag.get(attr)))
+              raw_urls=[]
+              for pat in [r'https?://[^"\'<>\s]+',r'//[^"\'<>\s]+',r'/[A-Za-z0-9_./?=&%:+-]+']:
+                raw_urls += re.findall(pat,text)
+              raw_urls=[('https:'+x if x.startswith('//') else urllib.parse.urljoin(r.url,x)) for x in raw_urls]
+              candidates=[]
+              for x in [z['href'] for z in links]+assets+raw_urls:
+                lx=x.lower()
+                if any(k in lx for k in ['.pdf','download','report','attachment','document','pdfurl','fileurl','print']):
+                  candidates.append(x)
+              candidates=list(dict.fromkeys(candidates))
+              snippets=[]
+              for term in ['Download PDF','downloadPdf','downloadpdf','pdfUrl','pdfurl','.pdf','打开报告原文','报告原文']:
+                pos=0
+                while True:
+                  pos=text.find(term,pos)
+                  if pos<0: break
+                  snippets.append({'term':term,'snippet':text[max(0,pos-500):pos+1000]})
+                  pos += len(term)
+                  if len(snippets)>100: break
+              summary[key]={'url':r.url,'status':r.status_code,'title':soup.title.get_text(' ',strip=True) if soup.title else '',
+                            'links':links,'assets':assets,'candidates':candidates,'snippets':snippets}
+              print('CANDIDATES',key,json.dumps(candidates[:200],ensure_ascii=False),flush=True)
+              for sn in snippets[:30]: print('SNIP',key,sn['term'],sn['snippet'][:1200].replace('\n',' '),flush=True)
+            except Exception as e:
+              print('REQ_ERR',key,repr(e),flush=True); summary[key]={'error':repr(e)}
+          W.joinpath('requests_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          async def browser_main():
+            events=[]
+            async with async_playwright() as p:
+              exe=next((x for x in ['/usr/bin/google-chrome','/usr/bin/google-chrome-stable','/usr/bin/chromium'] if os.path.exists(x)),None)
+              browser=await p.chromium.launch(headless=True,executable_path=exe,args=['--no-sandbox','--disable-dev-shm-usage'])
+              ctx=await browser.new_context(viewport={'width':1440,'height':1100},user_agent=ua,locale='zh-CN',accept_downloads=True)
+              for key,u in targets.items():
+                page=await ctx.new_page(); local=[]
+                async def on_resp(resp):
+                  url=resp.url; ct=(await resp.all_headers()).get('content-type','')
+                  if any(k in url.lower() for k in ['pdf','download','report','document','attachment','file']) or 'pdf' in ct.lower():
+                    rec={'kind':'response','target':key,'url':url,'status':resp.status,'content_type':ct,'request_method':resp.request.method,'post_data':resp.request.post_data}
+                    try:
+                      body=await resp.body(); rec['bytes']=len(body)
+                      if body.startswith(b'%PDF-') or len(body)<3_000_000:
+                        fn=f'{key}_resp_{len(local):04d}.bin'; W.joinpath(fn).write_bytes(body); rec['file']=fn
+                    except Exception as e: rec['error']=repr(e)
+                    local.append(rec); events.append(rec); print('RESP',json.dumps(rec,ensure_ascii=False),flush=True)
+                page.on('response',on_resp)
+                try:
+                  await page.goto(u,wait_until='domcontentloaded',timeout=90000)
+                  await page.wait_for_timeout(7000)
+                  W.joinpath(key+'_browser_before.html').write_text(await page.content(),encoding='utf-8')
+                  try: W.joinpath(key+'_body.txt').write_text(await page.locator('body').inner_text(),encoding='utf-8')
+                  except: pass
+                  anchors=await page.locator('a').evaluate_all("els => els.map(e => ({text:(e.innerText||'').trim(),href:e.href,outer:e.outerHTML.slice(0,1000)}))")
+                  W.joinpath(key+'_anchors.json').write_text(json.dumps(anchors,ensure_ascii=False,indent=2),encoding='utf-8')
+                  print('ANCHORS',key,json.dumps([x for x in anchors if any(t in (x['text']+' '+x['href']).lower() for t in ['pdf','download','报告原文','下载报告'])][:100],ensure_ascii=False),flush=True)
+                  # Try clicking public download controls without logging in.
+                  labels=['Download PDF','下载报告','打开报告原文']
+                  for label in labels:
+                    loc=page.get_by_text(label,exact=False).first
+                    try:
+                      if await loc.count()==0: continue
+                      print('CLICK_TRY',key,label,flush=True)
+                      download=None; popup=None
+                      try:
+                        async with page.expect_download(timeout=6000) as di:
+                          await loc.click(timeout=5000)
+                        download=await di.value
+                      except Exception as de:
+                        print('NO_DOWNLOAD_EVENT',key,label,repr(de),flush=True)
+                      if download:
+                        out=W/f'{key}_download_{re.sub(r"[^A-Za-z0-9._-]+","_",download.suggested_filename)}'
+                        await download.save_as(str(out)); rec={'kind':'download','target':key,'label':label,'path':str(out),'suggested_filename':download.suggested_filename,'url':download.url}
+                        events.append(rec);print('DOWNLOAD',json.dumps(rec,ensure_ascii=False),flush=True)
+                      await page.wait_for_timeout(3000)
+                      print('AFTER_CLICK_URL',key,label,page.url,flush=True)
+                    except Exception as e: print('CLICK_ERR',key,label,repr(e),flush=True)
+                  W.joinpath(key+'_browser_after.html').write_text(await page.content(),encoding='utf-8')
+                except Exception as e: print('PAGE_ERR',key,repr(e),flush=True)
+                await page.close()
+              await browser.close()
+            W.joinpath('browser_events.json').write_text(json.dumps(events,ensure_ascii=False,indent=2),encoding='utf-8')
+          try: asyncio.run(browser_main())
+          except Exception as e: print('BROWSER_MAIN_ERR',repr(e),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sino-Land-Report-Source-Inspect
+          path: sino_land_inspect
+          retention-days: 1
+          compression-level: 6
