@@ -1,0 +1,174 @@
+name: Build final China Hongqiao broker report package
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet playwright pypdf requests
+          python -m playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+      - name: Download validate and package reports
+        run: |
+          mkdir -p out/pdfs out/renders out/diagnostics
+          cat > /tmp/build.py <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, zipfile
+          from pathlib import Path
+          import requests
+          from playwright.sync_api import sync_playwright
+          from pypdf import PdfReader
+
+          OUT=Path('out'); PDF_DIR=OUT/'pdfs'; RENDER_DIR=OUT/'renders'; DIAG_DIR=OUT/'diagnostics'
+          UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          records=[]
+
+          def validate(path: Path, min_pages: int):
+              reader=PdfReader(str(path), strict=False)
+              pages=len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{path.name}: only {pages} pages, expected >= {min_pages}')
+              parts=[]
+              for pg in reader.pages[:min(12,pages)]:
+                  try: parts.append(pg.extract_text() or '')
+                  except Exception: pass
+              text=re.sub(r'\s+',' ',' '.join(parts)).strip()
+              low=text.lower()
+              if not any(x in low for x in ['china hongqiao','中国宏桥','中國宏橋','01378','1378 hk','1378.hk']):
+                  raise RuntimeError(f'{path.name}: China Hongqiao identity not found')
+              prefix=RENDER_DIR/path.stem
+              subprocess.run(['pdftoppm','-f','1','-l','1','-r','90','-png','-singlefile',str(path),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+              render=Path(str(prefix)+'.png')
+              if not render.exists() or render.stat().st_size < 1000:
+                  raise RuntimeError(f'{path.name}: first-page render failed')
+              return pages, text[:1600]
+
+          def add_record(path, broker, date, title, source_page, pdf_url, min_pages):
+              pages,sample=validate(path,min_pages)
+              data=path.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+              if any(r['sha256']==sha for r in records):
+                  raise RuntimeError(f'duplicate PDF: {path.name}')
+              row={'file':path.name,'broker':broker,'date':date,'title':title,'source_page':source_page,'pdf_url':pdf_url,'pages':pages,'bytes':len(data),'sha256':sha,'validation_sample':sample}
+              records.append(row)
+              print('VALIDATED',json.dumps({k:v for k,v in row.items() if k!='validation_sample'},ensure_ascii=False))
+
+          # 1. Cinda 2024 full 30-page report, captured from public viewer/download button.
+          cinda_page='https://www.hangyan.co/reports/3369212359292749530'
+          captured=[]
+          with sync_playwright() as pw:
+              browser=pw.chromium.launch(headless=True)
+              ctx=browser.new_context(user_agent=UA,locale='zh-CN',accept_downloads=True)
+              page=ctx.new_page()
+              def on_response(resp):
+                  try:
+                      ct=(resp.headers.get('content-type') or '').lower()
+                      if 'application/pdf' in ct or '.pdf' in resp.url.lower():
+                          body=resp.body()
+                          if len(body)>50000 and body.lstrip().startswith(b'%PDF'):
+                              captured.append((resp.url,body,'network'))
+                  except Exception: pass
+              page.on('response',on_response)
+              page.goto(cinda_page,wait_until='domcontentloaded',timeout=120000)
+              page.wait_for_timeout(15000)
+              iframe=page.locator('iframe[data-native-pdf-target="iframe"]')
+              if iframe.count():
+                  src=iframe.first.get_attribute('src') or ''
+                  if src.startswith('http'):
+                      try:
+                          rr=ctx.request.get(src,headers={'Referer':cinda_page,'User-Agent':UA},timeout=120000); body=rr.body()
+                          if len(body)>50000 and body.lstrip().startswith(b'%PDF'): captured.insert(0,(src,body,'iframe'))
+                      except Exception as exc: print('CINDA_IFRAME_ERROR',repr(exc))
+              button=page.locator('button[data-action*="native-pdf#download"]')
+              if button.count() and button.first.is_visible():
+                  try:
+                      with page.expect_download(timeout=60000) as info: button.first.click()
+                      dl=info.value; tmp=DIAG_DIR/'cinda_download.bin'; dl.save_as(str(tmp)); body=tmp.read_bytes()
+                      if len(body)>50000 and body.lstrip().startswith(b'%PDF'): captured.insert(0,(cinda_page+'#download',body,'download'))
+                  except Exception as exc: print('CINDA_DOWNLOAD_ERROR',repr(exc))
+              page.close(); browser.close()
+          if not captured: raise RuntimeError('No public Cinda PDF captured')
+          cinda_path=PDF_DIR/'2024-05-16_Cinda_China_Hongqiao_Deep_Report.pdf'
+          seen=set(); cinda_ok=False; last=None
+          for url,body,method in captured:
+              sha=hashlib.sha256(body).hexdigest()
+              if sha in seen: continue
+              seen.add(sha); cinda_path.write_bytes(body)
+              try:
+                  add_record(cinda_path,'信达证券','2024-05-16','铝产业链一体化龙头，有望享高盈利弹性',cinda_page,url,20)
+                  cinda_ok=True; break
+              except Exception as exc:
+                  last=exc; cinda_path.unlink(missing_ok=True)
+          if not cinda_ok: raise RuntimeError(f'Cinda PDF validation failed: {last!r}')
+
+          # 2-3. Official DBS PDF files exposed by the DBS research pages.
+          dbs_specs=[
+              {
+                'url':'https://www.dbs.com.hk/content/article/pdf/1378_HK_Equity/2024/09/1378_HK_Equity_57_27092024.pdf',
+                'file':'2024-09-26_DBS_China_Hongqiao_Integrated_Value_Chain.pdf',
+                'broker':'DBS Bank (Hong Kong)','date':'2024-09-26',
+                'title':'Superior cost advantage from an integrated value chain',
+                'page':'https://www.dbs.com.hk/private-banking/aics/templatedata/article/recentdevelopment/data/en/DBSV/092024/1378_HK_09262024.xml',
+                'min_pages':5,'required':True
+              },
+              {
+                'url':'https://www.dbs.com.hk/content/article/pdf/000000_HK/1378_HK.pdf',
+                'file':'2026-03-24_DBS_China_Hongqiao_Equity_Report.pdf',
+                'broker':'DBS Group Research','date':'2026-03-24',
+                'title':'China Hongqiao Group equity research update',
+                'page':'https://www.dbs.com.hk/private-banking/aics/templatedata/article/equity/data/en/DBSV/012014/1378_HK.xml',
+                'min_pages':5,'required':False
+              }
+          ]
+          session=requests.Session(); session.headers.update({'User-Agent':UA,'Accept-Language':'en-US,en;q=0.9'})
+          for spec in dbs_specs:
+              path=PDF_DIR/spec['file']
+              try:
+                  response=session.get(spec['url'],headers={'Referer':spec['page'],'User-Agent':UA},timeout=180,allow_redirects=True)
+                  print('DBS_DOWNLOAD',response.status_code,response.url,response.headers.get('content-type'),len(response.content))
+                  response.raise_for_status()
+                  if not response.content.lstrip().startswith(b'%PDF') or len(response.content)<50000:
+                      raise RuntimeError('DBS response is not a valid PDF')
+                  path.write_bytes(response.content)
+                  add_record(path,spec['broker'],spec['date'],spec['title'],spec['page'],response.url,spec['min_pages'])
+              except Exception as exc:
+                  path.unlink(missing_ok=True)
+                  print('DBS_REPORT_SKIPPED',spec['url'],repr(exc))
+                  if spec['required']: raise
+
+          if len(records) < 2 or len(records) > 3:
+              raise RuntimeError(f'Expected 2-3 validated reports, got {len(records)}')
+
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          readme=['中国宏桥（01378.HK）券商深度/公司研究报告资料包','',f'共收录 {len(records)} 份公开原始PDF：']
+          for i,r in enumerate(records,1): readme.append(f"{i}. {r['broker']}｜{r['date']}｜{r['title']}｜{r['pages']}页")
+          readme += ['', '文件均来自公开报告页面或券商官方网站，仅供个人研究使用；版权归原券商及作者所有。']
+          (OUT/'README_CN.txt').write_text('\n'.join(readme)+'\n',encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['file']}" for r in records)+'\n',encoding='utf-8')
+          z=OUT/'hongqiao_broker_reports.zip'
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as f:
+              for r in records: f.write(PDF_DIR/r['file'],arcname=r['file'])
+              for name in ['README_CN.txt','manifest.json','SHA256SUMS.txt']: f.write(OUT/name,arcname=name)
+          with zipfile.ZipFile(z) as f:
+              bad=f.testzip()
+              if bad: raise RuntimeError(f'ZIP corrupt: {bad}')
+              if len([n for n in f.namelist() if n.lower().endswith('.pdf')]) != len(records): raise RuntimeError('ZIP PDF count mismatch')
+          info={'file':z.name,'bytes':z.stat().st_size,'sha256':hashlib.sha256(z.read_bytes()).hexdigest(),'pdf_count':len(records),'reports':[{k:r[k] for k in ['broker','date','title','pages']} for r in records]}
+          (OUT/'PACKAGE_INFO.json').write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PACKAGE_READY',json.dumps(info,ensure_ascii=False))
+          PY
+          python /tmp/build.py
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hongqiao-final-broker-package
+          path: |
+            out/hongqiao_broker_reports.zip
+            out/PACKAGE_INFO.json
+            out/manifest.json
+          retention-days: 1
+          compression-level: 0
