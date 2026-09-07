@@ -1,0 +1,268 @@
+name: Package China Communications Construction broker deep reports
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PDF tools
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+      - name: Download, validate and package public original PDFs
+        run: |
+          mkdir -p out/pdfs out/renders out/diagnostics
+          cat > /tmp/package_ccc.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('out')
+          PDF_DIR = OUT / 'pdfs'
+          RENDER_DIR = OUT / 'renders'
+          DIAG_DIR = OUT / 'diagnostics'
+          UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+
+          REPORTS = [
+              {
+                  'info_code': 'AP202405271634715420',
+                  'broker': '开源证券',
+                  'date': '2024-05-27',
+                  'title': '公司首次覆盖报告：交通基建央企龙头，海外布局广泛全产业链掘金',
+                  'filename': '2024-05-27_Kaiyuan_Securities_China_Communications_Construction_Initiation.pdf',
+                  'min_pages': 25,
+              },
+              {
+                  'info_code': 'AP202303221584475454',
+                  'broker': '国信证券',
+                  'date': '2023-03-22',
+                  'title': '交通基建领军者，国际工程与运营业务迎来复苏',
+                  'filename': '2023-03-22_Guosen_Securities_China_Communications_Construction_Deep_Report.pdf',
+                  'min_pages': 30,
+              },
+              {
+                  'info_code': 'AP202202251549047094',
+                  'broker': '东兴证券',
+                  'date': '2022-02-25',
+                  'title': '首次覆盖报告：央企基建巨头资产价值提升，乘风而上',
+                  'filename': '2022-02-25_Dongxing_Securities_China_Communications_Construction_Initiation.pdf',
+                  'min_pages': 20,
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def normalize(value: str) -> str:
+              return re.sub(r'\s+', ' ', value or '').strip().lower()
+
+          def discover_pdf_url(info_code: str) -> tuple[str, str]:
+              page_url = f'https://data.eastmoney.com/report/info/{info_code}.html'
+              response = session.get(page_url, headers={'Referer': 'https://data.eastmoney.com/report/'}, timeout=90)
+              print('INFO_PAGE', info_code, response.status_code, len(response.content), response.url)
+              response.raise_for_status()
+              (DIAG_DIR / f'{info_code}.html').write_bytes(response.content)
+              soup = BeautifulSoup(response.text, 'html.parser')
+              candidates = []
+              for anchor in soup.find_all('a', href=True):
+                  text = normalize(anchor.get_text(' ', strip=True))
+                  href = urljoin(response.url, anchor['href'])
+                  if '查看pdf原文' in text or ('.pdf' in href.lower() and 'dfcfw.com' in href.lower()):
+                      candidates.append(href)
+              # Stable public CDN URL patterns as fallbacks.
+              candidates.extend([
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+              ])
+              unique = []
+              for value in candidates:
+                  if value not in unique:
+                      unique.append(value)
+              if not unique:
+                  raise RuntimeError(f'No PDF URL discovered for {info_code}')
+              return page_url, unique[0]
+
+          def download_pdf(page_url: str, discovered_url: str, info_code: str, destination: Path) -> tuple[str, int, str]:
+              urls = [discovered_url]
+              for fallback in [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+              ]:
+                  if fallback not in urls:
+                      urls.append(fallback)
+              errors = []
+              for url in urls:
+                  try:
+                      with session.get(
+                          url,
+                          headers={
+                              'User-Agent': UA,
+                              'Referer': page_url,
+                              'Accept': 'application/pdf,*/*;q=0.8',
+                          },
+                          timeout=180,
+                          stream=True,
+                      ) as response:
+                          print('PDF_ATTEMPT', info_code, response.status_code, response.headers.get('content-type'), url)
+                          response.raise_for_status()
+                          with destination.open('wb') as fh:
+                              for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                  if chunk:
+                                      fh.write(chunk)
+                      data = destination.read_bytes()
+                      if not data.lstrip().startswith(b'%PDF'):
+                          raise RuntimeError(f'not PDF, magic={data[:32]!r}')
+                      if len(data) < 100_000:
+                          raise RuntimeError(f'PDF too small: {len(data)} bytes')
+                      return url, len(data), hashlib.sha256(data).hexdigest()
+                  except Exception as exc:
+                      destination.unlink(missing_ok=True)
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError(' | '.join(errors))
+
+          def validate_pdf(spec: dict, path: Path) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < int(spec['min_pages']):
+                  raise RuntimeError(f"{path.name}: only {pages} pages, expected >= {spec['min_pages']}")
+
+              parts = []
+              sample_indices = list(range(min(12, pages)))
+              if pages > 12:
+                  sample_indices.append(pages - 1)
+              for index in sample_indices:
+                  try:
+                      parts.append(reader.pages[index].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, index, repr(exc))
+              text = normalize(' '.join(parts))
+              issuer_tokens = [
+                  '中国交建',
+                  '中国交通建设',
+                  'china communications construction',
+                  '601800',
+                  '1800.hk',
+                  '1800 hk',
+              ]
+              if not any(token in text for token in issuer_tokens):
+                  raise RuntimeError(f'{path.name}: issuer identity not found in extracted text')
+              broker_token = normalize(str(spec['broker']))
+              if broker_token not in text:
+                  print('BROKER_TEXT_WARNING', path.name, broker_token)
+
+              render_prefix = RENDER_DIR / path.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-r', '120', '-png', '-singlefile', str(path), str(render_prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+              )
+              render_path = Path(str(render_prefix) + '.png')
+              if not render_path.exists() or render_path.stat().st_size < 2_000:
+                  raise RuntimeError(f'{path.name}: first-page render failed')
+              return pages, text[:2400]
+
+          manifest = []
+          for spec in REPORTS:
+              page_url, discovered_url = discover_pdf_url(spec['info_code'])
+              destination = PDF_DIR / spec['filename']
+              source_url, size, digest = download_pdf(page_url, discovered_url, spec['info_code'], destination)
+              pages, sample = validate_pdf(spec, destination)
+              record = {
+                  'file': spec['filename'],
+                  'broker': spec['broker'],
+                  'date': spec['date'],
+                  'title': spec['title'],
+                  'company': '中国交通建设股份有限公司（中国交建，601800.SH / 01800.HK）',
+                  'source_page': page_url,
+                  'pdf_source_url': source_url,
+                  'pages': pages,
+                  'bytes': size,
+                  'sha256': digest,
+                  'validation_sample': sample,
+              }
+              manifest.append(record)
+              print('VALIDATED', json.dumps({k: v for k, v in record.items() if k != 'validation_sample'}, ensure_ascii=False))
+              time.sleep(0.5)
+
+          if len(manifest) != 3:
+              raise RuntimeError(f'Expected 3 reports, got {len(manifest)}')
+          if len({row['sha256'] for row in manifest}) != 3:
+              raise RuntimeError('Duplicate report content detected')
+
+          readme = [
+              '中国交通建设股份有限公司（中国交建，601800.SH / 01800.HK）券商深度报告资料包',
+              '',
+              '本资料包包含3份公开可直接获取的原始券商PDF：',
+          ]
+          for index, row in enumerate(manifest, 1):
+              readme.append(f"{index}. {row['broker']}｜{row['date']}｜{row['title']}｜{row['pages']}页")
+          readme += [
+              '',
+              '所有PDF均已核验公司名称、页数、文件头、重复内容和首屏渲染。',
+              '文件仅供个人研究使用，版权归原券商及作者所有，请遵守原报告的版权与使用条款。',
+          ]
+          (OUT / 'README_CN.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{row['sha256']}  {row['file']}" for row in manifest) + '\n',
+              encoding='utf-8',
+          )
+
+          zip_path = OUT / 'china_communications_construction_broker_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for row in manifest:
+                  zf.write(PDF_DIR / row['file'], arcname=row['file'])
+              zf.write(OUT / 'README_CN.txt', arcname='README_CN.txt')
+              zf.write(OUT / 'manifest.json', arcname='manifest.json')
+              zf.write(OUT / 'SHA256SUMS.txt', arcname='SHA256SUMS.txt')
+
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'Corrupt ZIP member: {bad}')
+              pdf_members = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdf_members)} PDFs, expected 3')
+
+          package_info = {
+              'file': zip_path.name,
+              'bytes': zip_path.stat().st_size,
+              'sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'pdf_count': 3,
+              'reports': [
+                  {k: row[k] for k in ['broker', 'date', 'title', 'pages']}
+                  for row in manifest
+              ],
+          }
+          (OUT / 'PACKAGE_INFO.json').write_text(json.dumps(package_info, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_READY', json.dumps(package_info, ensure_ascii=False))
+          PY
+          python /tmp/package_ccc.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-communications-construction-broker-reports
+          path: |
+            out/china_communications_construction_broker_reports.zip
+            out/PACKAGE_INFO.json
+            out/manifest.json
+          retention-days: 1
+          compression-level: 0
