@@ -1,0 +1,140 @@
+name: Probe public Hangyan sources for Zhaojin Mining reports
+on:
+  push:
+    branches:
+      - tmp-zhaojin-hangyan-probe-20260907
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml playwright pypdf
+          python -m playwright install --with-deps chromium
+      - name: Inspect report pages and downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import io, json, re
+          from pathlib import Path
+          from urllib.parse import quote, urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          out = Path('output')
+          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36'
+          pages = [
+              'https://www.hangyan.co/reports/3466271943412417652',
+              'https://www.hangyan.co/reports?q=' + quote('招金矿业 优质老牌金企 海域金矿'),
+              'https://www.hangyan.co/reports?q=' + quote('招金矿业'),
+          ]
+          result = {'requests': [], 'browser': []}
+          s = requests.Session(); s.headers.update({'User-Agent': ua, 'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          for idx, url in enumerate(pages, 1):
+              row = {'url': url}
+              try:
+                  r = s.get(url, timeout=90, allow_redirects=True)
+                  row.update({'status': r.status_code, 'final_url': r.url, 'bytes': len(r.content), 'content_type': r.headers.get('content-type')})
+                  (out / f'requests_{idx}.html').write_bytes(r.content)
+                  soup = BeautifulSoup(r.text, 'lxml')
+                  row['title'] = soup.title.get_text(' ', strip=True) if soup.title else None
+                  row['links'] = []
+                  for a in soup.find_all('a', href=True):
+                      href = urljoin(r.url, a['href'])
+                      text = ' '.join(a.get_text(' ', strip=True).split())
+                      if any(k in (href + ' ' + text).lower() for k in ['download', '.pdf', '下载', '原文', '/reports/']):
+                          row['links'].append({'href': href, 'text': text, 'attrs': dict(a.attrs)})
+                  decoded = r.text.replace('\\/', '/').replace('\\u0026', '&')
+                  row['urls'] = sorted(set(re.findall(r'https?://[^"\'<>\s\\]+', decoded)))
+                  row['interesting_urls'] = [u for u in row['urls'] if any(k in u.lower() for k in ['pdf','download','report','file','oss','cos','cdn'])][:1000]
+              except Exception as exc:
+                  row['error'] = repr(exc)
+              result['requests'].append(row)
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'])
+              for idx, url in enumerate(pages, 1):
+                  ctx = browser.new_context(viewport={'width':1440,'height':1200}, locale='zh-CN', accept_downloads=True, user_agent=ua, extra_http_headers={'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+                  ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+                  page = ctx.new_page(); reqs=[]; resps=[]
+                  page.on('request', lambda x: reqs.append({'url':x.url,'method':x.method,'type':x.resource_type,'post_data':x.post_data}) if any(k in x.url.lower() for k in ['report','download','pdf','file','api']) else None)
+                  def on_response(x):
+                      if any(k in x.url.lower() for k in ['report','download','pdf','file','api']):
+                          rec={'url':x.url,'status':x.status,'headers':dict(x.headers)}
+                          try:
+                              ctype=x.headers.get('content-type') or ''
+                              if 'json' in ctype or 'text' in ctype:
+                                  rec['body']=x.text()[:200000]
+                          except Exception as exc:
+                              rec['body_error']=repr(exc)
+                          resps.append(rec)
+                  page.on('response', on_response)
+                  brow={'url':url}
+                  try:
+                      rr=page.goto(url, wait_until='domcontentloaded', timeout=120000)
+                      try: page.wait_for_load_state('networkidle', timeout=30000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(6000)
+                      body=' '.join(page.locator('body').inner_text().split())
+                      brow.update({'status': rr.status if rr else None, 'final_url': page.url, 'title': page.title(), 'body_chars': len(body), 'body': body[:100000]})
+                      (out / f'browser_{idx}.html').write_text(page.content(), encoding='utf-8')
+                      page.screenshot(path=str(out/f'browser_{idx}.png'), full_page=True)
+                      anchors=page.eval_on_selector_all('a','els=>els.map(e=>({href:e.href,text:(e.innerText||e.textContent||"").trim(),html:e.outerHTML}))')
+                      buttons=page.eval_on_selector_all('button','els=>els.map(e=>({text:(e.innerText||e.textContent||"").trim(),html:e.outerHTML}))')
+                      brow['anchors']=[x for x in anchors if any(k in ((x.get('href') or '')+' '+(x.get('text') or '')).lower() for k in ['download','.pdf','下载','原文','报告'])][:1000]
+                      brow['buttons']=[x for x in buttons if any(k in (x.get('text') or '').lower() for k in ['下载','原文','pdf','查看'])][:1000]
+                      clicks=[]
+                      selectors=['button:has-text("下载")','a:has-text("下载")','button:has-text("查看原文")','a:has-text("查看原文")','button[data-action*="download"]','a[href*="download"]']
+                      for sel in selectors:
+                          loc=page.locator(sel)
+                          for j in range(min(loc.count(),10)):
+                              item=loc.nth(j)
+                              try:
+                                  if not item.is_visible(): continue
+                                  click={'selector':sel,'index':j,'text':item.inner_text(),'html':item.evaluate('e=>e.outerHTML')}
+                                  try:
+                                      with page.expect_download(timeout=18000) as pending:
+                                          item.click(timeout=10000)
+                                      dl=pending.value
+                                      dest=out/('download_'+str(idx)+'_'+re.sub(r'[^A-Za-z0-9._-]+','_',dl.suggested_filename))
+                                      dl.save_as(str(dest))
+                                      data=dest.read_bytes()
+                                      click['download']={'filename':dl.suggested_filename,'path':str(dest),'bytes':len(data),'head':data[:20].hex()}
+                                      if b'%PDF-' in data[:2048]:
+                                          click['download']['pages']=len(PdfReader(io.BytesIO(data),strict=False).pages)
+                                  except Exception as exc:
+                                      click['error']=repr(exc)
+                                      page.wait_for_timeout(2500)
+                                      click['after_url']=page.url
+                                      click['after_body']=' '.join(page.locator('body').inner_text().split())[:30000]
+                                  clicks.append(click)
+                              except Exception as exc:
+                                  clicks.append({'selector':sel,'index':j,'error':repr(exc)})
+                      brow['clicks']=clicks
+                  except Exception as exc:
+                      brow['error']=repr(exc)
+                  brow['requests']=reqs[-3000:]
+                  brow['responses']=resps[-3000:]
+                  result['browser'].append(brow)
+                  ctx.close()
+              browser.close()
+
+          (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'request_pages':len(result['requests']),'browser_pages':len(result['browser'])},ensure_ascii=False),flush=True)
+          PY
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhaojin-hangyan-probe
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
