@@ -1,0 +1,170 @@
+name: Discover public Huabao International broker reports
+
+on:
+  push:
+    branches:
+      - chatgpt-huabao-international-reports-20260907
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pillow
+      - name: Query public report API and test complete page availability
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p discovery
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time
+          from pathlib import Path
+          import requests
+          from PIL import Image
+          from io import BytesIO
+
+          OUT = Path('discovery')
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Origin': 'https://www.sdyanbao.com',
+              'device': '1',
+          })
+
+          keywords = [
+              '华宝国际', '华宝国际 00336', '00336.HK',
+              '国泰海通 华宝国际', '国联民生 华宝国际',
+              '东北证券 华宝国际', '国金证券 华宝国际',
+              '香精行业龙头 业务多元', '爆珠 HNB薄片 海外订单',
+              '烟用原料 华宝国际', '香精 食品配料 华宝国际'
+          ]
+          api = 'https://api.sdyanbao.com/api/file/search'
+          allrows = {}
+          query_log = []
+          for keyword in keywords:
+              for only_title in (1, 0):
+                  for page in range(1, 6):
+                      body = {
+                          'device': 1, 'hideTrader': 0, 'onlyTitle': only_title,
+                          'order': 0, 'page': page, 'pageSize': 100,
+                          'keyword': keyword, 'pageCount': '', 'dateRange': '',
+                          'startTime': '', 'endTime': '', 'typeIds': [],
+                          'industryIds': [], 'opFrom': 1
+                      }
+                      try:
+                          r = s.post(api, json=body, timeout=(20, 120))
+                          r.raise_for_status()
+                          payload = r.json()
+                          rows = (payload.get('data') or {}).get('files') or []
+                          total = int((payload.get('data') or {}).get('total') or 0)
+                          query_log.append({'keyword':keyword,'only_title':only_title,'page':page,'rows':len(rows),'total':total,'status':r.status_code})
+                          print('QUERY', keyword, 'TITLE', only_title, 'PAGE', page, 'ROWS', len(rows), 'TOTAL', total, flush=True)
+                      except Exception as e:
+                          query_log.append({'keyword':keyword,'only_title':only_title,'page':page,'error':repr(e)})
+                          print('QUERY_FAIL', keyword, only_title, page, repr(e), flush=True)
+                          break
+                      for x in rows:
+                          blob = json.dumps(x, ensure_ascii=False).replace(' ', '').lower()
+                          if any(t in blob for t in ('华宝国际','華寶國際','huabaointernational','00336.hk','00336')):
+                              allrows[str(x.get('id'))] = x
+                      if not rows or page * 100 >= total:
+                          break
+                      time.sleep(0.2)
+
+          compact = []
+          for x in allrows.values():
+              org = (x.get('organization') or {}).get('name')
+              researcher = (x.get('researcher') or {}).get('name')
+              rec = {
+                  'id': x.get('id'),
+                  'name': x.get('name'),
+                  'date': x.get('time_text'),
+                  'page_count': x.get('page_count'),
+                  'page_url': x.get('page_url'),
+                  'share_url': x.get('share_url'),
+                  'data_source': x.get('data_source'),
+                  'data_source_uuid': x.get('data_source_uuid'),
+                  'type': (x.get('type') or {}).get('name'),
+                  'organization': org,
+                  'researcher': researcher,
+                  'stock': x.get('stock'),
+              }
+              compact.append(rec)
+
+          def page_urls(base: str, index: int):
+              base = (base or '').rstrip('/')
+              return [f'{base}/{index}.png', f'{base}/{index}.jpg', f'{base}/{index}.jpeg']
+
+          tested = []
+          for rec in compact:
+              try:
+                  pages = int(rec.get('page_count') or 0)
+              except Exception:
+                  pages = 0
+              base = rec.get('page_url') or ''
+              result = dict(rec)
+              result['page_count_int'] = pages
+              result['accessible_pages'] = 0
+              result['first_missing_page'] = None
+              result['page_probe'] = []
+              if not base or pages <= 0 or pages > 120:
+                  result['probe_error'] = 'missing/invalid page_url or page_count'
+                  tested.append(result)
+                  continue
+              # Test every page. Stop at first unavailable page; complete means all advertised pages available.
+              for idx in range(pages):
+                  ok = False
+                  last = None
+                  for url in page_urls(base, idx):
+                      try:
+                          rr = s.get(url, headers={'Referer': f"https://www.sdyanbao.com/detail/{rec['id']}", 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'}, timeout=(20, 90))
+                          last = {'url':url,'status':rr.status_code,'bytes':len(rr.content),'content_type':rr.headers.get('content-type')}
+                          sig = rr.content[:16]
+                          image_sig = sig.startswith(b'\x89PNG') or sig.startswith(b'\xff\xd8\xff') or sig.startswith(b'RIFF')
+                          if rr.status_code == 200 and image_sig and len(rr.content) > 10000:
+                              try:
+                                  with Image.open(BytesIO(rr.content)) as im:
+                                      w,h = im.size
+                                      im.verify()
+                                  if w >= 500 and h >= 700:
+                                      ok = True
+                                      last.update({'width':w,'height':h,'sha256':hashlib.sha256(rr.content).hexdigest()})
+                                      break
+                              except Exception as e:
+                                  last['image_error'] = repr(e)
+                      except Exception as e:
+                          last = {'url':url,'error':repr(e)}
+                  result['page_probe'].append({'index':idx,'ok':ok,'last':last})
+                  print('PAGE_TEST', rec['id'], idx, 'OK', ok, 'LAST', json.dumps(last, ensure_ascii=False), flush=True)
+                  if not ok:
+                      result['first_missing_page'] = idx + 1
+                      break
+                  result['accessible_pages'] += 1
+              result['complete_public_pages'] = result['accessible_pages'] == pages and pages > 0
+              tested.append(result)
+
+          tested.sort(key=lambda z: (bool(z.get('complete_public_pages')), str(z.get('date') or ''), int(z.get('page_count_int') or 0)), reverse=True)
+          OUT.joinpath('query_log.json').write_text(json.dumps(query_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('all_matches_raw.json').write_text(json.dumps(list(allrows.values()),ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('tested_matches.json').write_text(json.dumps(tested,ensure_ascii=False,indent=2),encoding='utf-8')
+          summary = [{k:v for k,v in r.items() if k != 'page_probe'} for r in tested]
+          OUT.joinpath('summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('RESULTS', json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+          print('TOTAL_MATCHES', len(summary), 'COMPLETE', sum(bool(x.get('complete_public_pages')) for x in summary), flush=True)
+          PY
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: huabao-international-report-discovery
+          path: discovery/
+          retention-days: 3
+          if-no-files-found: error
