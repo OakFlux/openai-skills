@@ -1,0 +1,112 @@
+name: Inspect SGPJBG Haitian International report
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python -m pip install --quiet requests beautifulsoup4 playwright pypdf
+      - run: python -m playwright install --with-deps chromium
+      - name: Locate and capture public report PDF
+        run: |
+          mkdir -p out
+          cat > /tmp/run.py <<'PY'
+          import hashlib,json,re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+          from pypdf import PdfReader
+
+          out=Path('out')
+          urls=[
+            'https://bg.sgpjbg.com/zhuanti/haitianguojibaogao.html',
+            'https://www.sgpjbg.com/labels/haitianguojinianbao.html',
+          ]
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9'})
+          pages=[]
+          target_phrase='注塑机全球龙头架海擎天'
+          for i,u in enumerate(urls,1):
+            r=s.get(u,timeout=90,allow_redirects=True)
+            print('PAGE',i,r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+            (out/f'page_{i}.html').write_bytes(r.content)
+            soup=BeautifulSoup(r.text,'html.parser')
+            for a in soup.find_all('a',href=True):
+              text=' '.join(a.get_text(' ',strip=True).split())
+              href=urljoin(r.url,a['href'])
+              if target_phrase in text or ('海天国际' in text and '240712' in text):
+                rec={'text':text,'href':href,'outer':str(a)[:3000]}
+                pages.append(rec); print('TARGET_LINK',json.dumps(rec,ensure_ascii=False))
+            # inspect raw contexts and URLs
+            for m in re.finditer(target_phrase,r.text):
+              print('RAW_CONTEXT',r.text[max(0,m.start()-1200):m.end()+2500])
+          pages_unique=[]
+          for x in pages:
+            if x['href'] not in [y['href'] for y in pages_unique]: pages_unique.append(x)
+
+          saved=[]; events=[]
+          def save_pdf(url,body,method):
+            if len(body)>50000 and body.lstrip().startswith(b'%PDF'):
+              sha=hashlib.sha256(body).hexdigest()
+              if sha not in [x['sha256'] for x in saved]:
+                p=out/f'report_{len(saved)+1}.pdf'; p.write_bytes(body)
+                try: n=len(PdfReader(str(p),strict=False).pages)
+                except Exception: n=None
+                rec={'file':p.name,'url':url,'method':method,'bytes':len(body),'sha256':sha,'pages':n}
+                saved.append(rec); print('SAVED',json.dumps(rec,ensure_ascii=False))
+
+          with sync_playwright() as pw:
+            browser=pw.chromium.launch(headless=True)
+            ctx=pw.chromium.launch(headless=True) if False else None
+            context=browser.new_context(user_agent=ua,locale='zh-CN',accept_downloads=True)
+            candidates=[x['href'] for x in pages_unique]
+            for u in candidates[:10]:
+              page=context.new_page()
+              def on_response(resp):
+                try:
+                  ct=(resp.headers.get('content-type') or '').lower(); ru=resp.url
+                  if '.pdf' in ru.lower() or 'application/pdf' in ct or any(k in ru.lower() for k in ['download','file','report']):
+                    rec={'url':ru,'status':resp.status,'content_type':ct}; events.append(rec)
+                    try:
+                      b=resp.body(); rec['bytes']=len(b); rec['magic']=repr(b[:16]); save_pdf(ru,b,'network')
+                    except Exception as e: rec['body_error']=repr(e)
+                except Exception: pass
+              page.on('response',on_response)
+              print('OPEN_TARGET',u)
+              try: page.goto(u,wait_until='domcontentloaded',timeout=120000)
+              except Exception as e: print('OPEN_ERROR',repr(e))
+              page.wait_for_timeout(12000)
+              print('AT',page.url,page.title())
+              (out/'target.html').write_text(page.content(),encoding='utf-8')
+              page.screenshot(path=str(out/'target.png'),full_page=False)
+              # inspect links and click obvious public download/view buttons
+              controls=[]
+              for el in page.locator('a,button').all():
+                try:
+                  txt=(el.inner_text() or '').strip(); href=el.get_attribute('href') or ''; onclick=el.get_attribute('onclick') or ''
+                  if any(k in (txt+' '+href+' '+onclick).lower() for k in ['下载','download','pdf','立即下载','查看']):
+                    controls.append((txt,href,onclick)); print('CONTROL',txt[:200],href[:800],onclick[:800])
+                    if href.startswith('http') or href.startswith('/'):
+                      try:
+                        rr=context.request.get(urljoin(page.url,href),headers={'Referer':page.url,'User-Agent':ua},timeout=120000)
+                        b=rr.body(); print('CONTROL_GET',rr.status,len(b),rr.headers.get('content-type'),urljoin(page.url,href)); save_pdf(urljoin(page.url,href),b,'control-get')
+                      except Exception as e: print('CONTROL_GET_ERROR',repr(e))
+                except Exception: pass
+              page.close()
+            browser.close()
+          (out/'result.json').write_text(json.dumps({'pages':pages_unique,'saved':saved,'events':events},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps({'pages':pages_unique,'saved':saved,'event_count':len(events)},ensure_ascii=False,indent=2))
+          if not saved: raise SystemExit('No public PDF captured')
+          PY
+          python /tmp/run.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sgpjbg-haitian-report
+          path: out
+          retention-days: 1
+          compression-level: 0
