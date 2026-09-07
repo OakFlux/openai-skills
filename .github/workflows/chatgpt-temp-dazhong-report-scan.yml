@@ -1,0 +1,146 @@
+name: chatgpt-temp-dazhong-report-scan
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-dazhong-report-scan.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan Eastmoney and public report indexes
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pypdf beautifulsoup4
+          python <<'PY'
+          import json, re, time, hashlib, urllib.parse
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+          from bs4 import BeautifulSoup
+
+          out=Path('dazhong_report_scan'); pdfdir=out/'PDF'; pdfdir.mkdir(parents=True,exist_ok=True)
+          s=requests.Session(); s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept':'application/json,text/javascript,text/html,*/*;q=0.8',
+            'Accept-Language':'zh-CN,zh;q=0.9',
+            'Referer':'https://data.eastmoney.com/report/'
+          })
+          logs=[]; records=[]; seen=set()
+          def L(x): x=str(x); print(x,flush=True); logs.append(x)
+          def parse_obj(t):
+            try:return json.loads(t)
+            except:pass
+            a=t.find('{');b=t.rfind('}')
+            if a>=0 and b>a:
+              try:return json.loads(t[a:b+1])
+              except:pass
+            return {}
+          def rows(obj):
+            x=obj.get('data') or obj.get('result',{}).get('data') or []
+            if isinstance(x,dict):x=x.get('data') or x.get('list') or x.get('items') or []
+            return x if isinstance(x,list) else []
+          def add(rec,source):
+            txt=json.dumps(rec,ensure_ascii=False)
+            stock=str(rec.get('stockName') or rec.get('STOCK_NAME') or rec.get('secuName') or '')
+            code=str(rec.get('stockCode') or rec.get('STOCK_CODE') or rec.get('secuCode') or rec.get('code') or '')
+            title=str(rec.get('title') or rec.get('TITLE') or rec.get('reportTitle') or '')
+            if ('大众公用' in txt or '600635' in txt or '01635' in txt or '1635.HK' in txt or 'Dazhong Public Utilities' in txt):
+              key=rec.get('infoCode') or rec.get('INFO_CODE') or rec.get('reportId') or rec.get('id') or (title+'|'+source)
+              if key not in seen:
+                seen.add(key); rec=dict(rec);rec['_source']=source;records.append(rec);L('MATCH '+json.dumps(rec,ensure_ascii=False))
+
+          # Eastmoney GET endpoint, with multiple company-code parameter conventions.
+          windows=[('2010-01-01','2014-12-31'),('2015-01-01','2019-12-31'),('2020-01-01','2024-12-31'),('2025-01-01','2026-09-07')]
+          code_param_sets=[
+            {'code':'600635'}, {'scode':'600635'}, {'stockCode':'600635'}, {'secuCode':'600635.SH'},
+            {'code':'01635'}, {'scode':'01635'}, {'stockCode':'01635'}, {'secuCode':'01635.HK'}
+          ]
+          for begin,end in windows:
+            for endpoint in ['list','jg']:
+              for cps in code_param_sets:
+                for qtype in [0,1,2]:
+                  for page in range(1,12):
+                    p={'cb':'jQuery1124','pageSize':100,'pageNo':page,'qType':qtype,'beginTime':begin,'endTime':end,'fields':'','orgCode':'','author':'','industryCode':'*','industry':'*','rating':'','ratingChange':'','rcode':'','_':int(time.time()*1000)}
+                    p.update(cps)
+                    try:
+                      r=s.get(f'https://reportapi.eastmoney.com/report/{endpoint}',params=p,timeout=45)
+                      o=parse_obj(r.text); rr=rows(o)
+                      L(f'GET {endpoint} {begin} {cps} q={qtype} p={page} HTTP={r.status_code} rows={len(rr)} total={o.get("TotalPage")}')
+                      for rec in rr:add(rec,'eastmoney-'+endpoint)
+                      total=int(o.get('TotalPage') or 1)
+                      if not rr or page>=total:break
+                    except Exception as e:
+                      L(f'GET ERROR {endpoint} {begin} {cps} q={qtype} p={page} {e!r}');break
+                    time.sleep(.03)
+
+          # Eastmoney POST endpoint variants.
+          for code in ['600635','600635.SH','SH600635','01635','01635.HK','HK01635']:
+            for page in range(1,20):
+              body={'pageSize':100,'pageNo':page,'p':page,'pageNum':page,'pageNumber':page,'beginTime':'2010-01-01','endTime':'2026-09-07','code':code,'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''}
+              try:
+                r=s.post('https://reportapi.eastmoney.com/report/list2',json=body,headers={'Content-Type':'application/json'},timeout=45)
+                o=parse_obj(r.text);rr=rows(o)
+                L(f'POST list2 code={code} p={page} HTTP={r.status_code} rows={len(rr)} total={o.get("TotalPage")}')
+                for rec in rr:add(rec,'eastmoney-list2')
+                total=int(o.get('TotalPage') or 1)
+                if not rr or page>=total:break
+              except Exception as e:L(f'POST ERROR {code} p={page} {e!r}');break
+              time.sleep(.03)
+
+          # Search engines: collect candidate detail/PDF links for diagnostics.
+          queries=['大众公用 券商 深度报告 PDF','大众公用 600635 公司深度报告','大众公用 01635 研究报告','Dazhong Public Utilities research report PDF']
+          search_links=[]
+          for q in queries:
+            for base in ['https://www.baidu.com/s?wd=','https://www.bing.com/search?q=']:
+              try:
+                u=base+urllib.parse.quote(q);r=s.get(u,timeout=45)
+                L(f'SEARCH {q} {base} HTTP={r.status_code} bytes={len(r.content)}')
+                soup=BeautifulSoup(r.text,'html.parser')
+                for a in soup.find_all('a',href=True):
+                  h=a['href'];t=' '.join(a.get_text(' ',strip=True).split())
+                  if any(k in (h+' '+t) for k in ['大众公用','600635','01635','pdf.dfcfw','fxbaogao','hibor','sdyanbao','sgpjbg']):
+                    search_links.append({'query':q,'text':t,'href':h})
+              except Exception as e:L(f'SEARCH ERROR {q} {base} {e!r}')
+          (out/'search_links.json').write_text(json.dumps(search_links,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          downloaded=[]
+          for rec in records:
+            info=rec.get('infoCode') or rec.get('INFO_CODE')
+            if not info:continue
+            title=rec.get('title') or rec.get('TITLE') or rec.get('reportTitle') or '大众公用研究报告'
+            org=rec.get('orgSName') or rec.get('orgName') or rec.get('ORG_SNAME') or rec.get('institution') or '券商'
+            dt=str(rec.get('publishDate') or rec.get('PUBLISH_DATE') or rec.get('date') or '')[:10]
+            urls=[f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',f'https://pdf.dfcfw.com/pdf/{info}_1.pdf']
+            for u in urls:
+              try:
+                r=s.get(u,headers={'Referer':'https://data.eastmoney.com/'},timeout=180,allow_redirects=True)
+                L(f'PDF {info} HTTP={r.status_code} bytes={len(r.content)} type={r.headers.get("content-type")} url={r.url}')
+                if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>70000:
+                  fn=re.sub(r'[\\/:*?"<>|]+','_',f'{dt}_{org}_大众公用_{title}')[:200]+'.pdf'
+                  p=pdfdir/fn;p.write_bytes(r.content)
+                  try:pc=len(PdfReader(str(p),strict=False).pages)
+                  except Exception as e:L(f'BAD PDF {fn} {e!r}');p.unlink(missing_ok=True);continue
+                  dl={'filename':fn,'pages':pc,'size_bytes':len(r.content),'sha256':hashlib.sha256(r.content).hexdigest(),'url':r.url,'record':rec}
+                  downloaded.append(dl);L('VALID '+json.dumps(dl,ensure_ascii=False));break
+              except Exception as e:L(f'PDF ERROR {u} {e!r}')
+          # Deduplicate by SHA and rank likely deep reports by page count.
+          uniq={}
+          for x in downloaded:
+            if x['sha256'] not in uniq:uniq[x['sha256']]=x
+          downloaded=list(uniq.values())
+          downloaded.sort(key=lambda x:(x['pages'],x['size_bytes']),reverse=True)
+          (out/'downloaded.json').write_text(json.dumps(downloaded,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'run.log').write_text('\n'.join(logs)+'\n',encoding='utf-8')
+          print('FINAL '+json.dumps({'records':len(records),'downloaded':len(downloaded),'top':downloaded[:10]},ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dazhong-Public-Utilities-Report-Scan
+          path: dazhong_report_scan
+          retention-days: 1
+          compression-level: 6
