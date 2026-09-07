@@ -1,0 +1,188 @@
+name: Probe public Quark share for Seazen report
+on:
+  push:
+    branches:
+      - tmp-quark-seazen-api-20260907
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet requests playwright pypdf
+          python -m playwright install --with-deps chromium
+      - name: Probe Quark share
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import io, json, re, time
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import requests
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          out=Path('output')
+          pwd_id='ad367a3102aa'
+          share_url=f'https://pan.quark.cn/s/{pwd_id}'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36'
+          base_params={'pr':'ucpro','fr':'pc','uc_param_str':'','__dt':'1000','__t':str(int(time.time()*1000))}
+          headers={'User-Agent':ua,'Origin':'https://pan.quark.cn','Referer':share_url,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Content-Type':'application/json;charset=UTF-8','Accept':'application/json, text/plain, */*'}
+          s=requests.Session(); s.headers.update(headers)
+          result={'pwd_id':pwd_id,'share_url':share_url,'api':[],'browser':{}}
+
+          stokens=[]
+          for host in ['https://drive-h.quark.cn/1/clouddrive','https://drive.quark.cn/1/clouddrive','https://drive-pc.quark.cn/1/clouddrive']:
+              row={'host':host}
+              try:
+                  url=host+'/share/sharepage/token'
+                  body={'pwd_id':pwd_id,'passcode':'','support_visit_limit_private_share':True}
+                  r=s.post(url,params=base_params,json=body,timeout=90)
+                  row.update({'token_status':r.status_code,'token_url':r.url,'token_headers':dict(r.headers),'token_text':r.text[:100000]})
+                  try:
+                      obj=r.json(); row['token_json']=obj
+                      stoken=((obj.get('data') or {}).get('stoken'))
+                      if stoken: stokens.append((host,stoken))
+                  except Exception as e: row['token_json_error']=repr(e)
+              except Exception as e: row['token_error']=repr(e)
+              result['api'].append(row)
+              print('TOKEN',host,row.get('token_status'),bool(row.get('token_json',{}).get('data',{}).get('stoken') if isinstance(row.get('token_json'),dict) else False),flush=True)
+
+          details=[]
+          for host,stoken in stokens:
+              params={**base_params,'ver':'2','pwd_id':pwd_id,'stoken':stoken,'pdir_fid':'0','force':'0','_page':'1','_size':'100','_fetch_banner':'1','_fetch_share':'1','fetch_relate_conversation':'1','_fetch_total':'1','_sort':'file_type:asc,file_name:asc'}
+              for detail_host in [host,'https://drive-h.quark.cn/1/clouddrive','https://drive.quark.cn/1/clouddrive','https://drive-pc.quark.cn/1/clouddrive']:
+                  row={'token_host':host,'detail_host':detail_host,'stoken':stoken}
+                  try:
+                      r=s.get(detail_host+'/share/sharepage/detail',params=params,timeout=90)
+                      row.update({'status':r.status_code,'url':r.url,'headers':dict(r.headers),'text':r.text[:300000]})
+                      try: row['json']=r.json()
+                      except Exception as e: row['json_error']=repr(e)
+                  except Exception as e: row['error']=repr(e)
+                  details.append(row)
+                  print('DETAIL',host,'->',detail_host,row.get('status'),len(row.get('text','')),flush=True)
+          result['details']=details
+
+          # Try public share download-like endpoints against every file returned.
+          files=[]
+          for row in details:
+              obj=row.get('json')
+              if not isinstance(obj,dict): continue
+              data=obj.get('data') or {}
+              for key in ['list','items','files']:
+                  value=data.get(key)
+                  if isinstance(value,list):
+                      for item in value:
+                          if isinstance(item,dict): files.append(item)
+          unique=[]; seen=set()
+          for item in files:
+              fid=str(item.get('fid') or item.get('file_id') or '')
+              token=str(item.get('share_fid_token') or item.get('fid_token') or '')
+              key=(fid,token,item.get('file_name'))
+              if key in seen: continue
+              seen.add(key); unique.append(item)
+          result['files']=unique
+          print('FILES',len(unique),flush=True)
+          for item in unique:
+              print('FILE',json.dumps(item,ensure_ascii=False)[:5000],flush=True)
+
+          endpoint_attempts=[]
+          for item in unique:
+              if item.get('dir') is True or item.get('file_type')==0 and item.get('obj_category')=='folder': continue
+              fid=str(item.get('fid') or '')
+              fid_token=str(item.get('share_fid_token') or '')
+              name=str(item.get('file_name') or 'file')
+              stoken=stokens[0][1] if stokens else ''
+              bodies=[
+                  {'fid_list':[fid],'fid_token_list':[fid_token],'pwd_id':pwd_id,'stoken':stoken},
+                  {'fids':[fid],'fid_tokens':[fid_token],'pwd_id':pwd_id,'stoken':stoken},
+                  {'fid':fid,'fid_token':fid_token,'pwd_id':pwd_id,'stoken':stoken},
+              ]
+              paths=['/share/sharepage/download','/share/sharepage/file/download','/file/download','/share/download']
+              for host in ['https://drive-h.quark.cn/1/clouddrive','https://drive.quark.cn/1/clouddrive','https://drive-pc.quark.cn/1/clouddrive']:
+                  for path in paths:
+                      for body in bodies:
+                          row={'host':host,'path':path,'body':body,'file_name':name}
+                          try:
+                              r=s.post(host+path,params=base_params,json=body,timeout=90,allow_redirects=True)
+                              data=r.content
+                              row.update({'status':r.status_code,'url':r.url,'headers':dict(r.headers),'bytes':len(data),'text':data[:3000].decode('utf-8','replace')})
+                              if b'%PDF-' in data[:2048] and len(data)>50000:
+                                  path_out=out/('download_'+re.sub(r'[^A-Za-z0-9._-]+','_',name))
+                                  if not path_out.name.lower().endswith('.pdf'): path_out=Path(str(path_out)+'.pdf')
+                                  path_out.write_bytes(data); row['saved']=str(path_out); row['pages']=len(PdfReader(io.BytesIO(data),strict=False).pages)
+                          except Exception as e: row['error']=repr(e)
+                          endpoint_attempts.append(row)
+                          if row.get('saved'): break
+                      if endpoint_attempts[-1].get('saved'): break
+                  if endpoint_attempts[-1].get('saved'): break
+          result['endpoint_attempts']=endpoint_attempts
+          for row in endpoint_attempts:
+              print('ENDPOINT',row.get('host'),row.get('path'),row.get('status'),row.get('bytes'),row.get('saved'),row.get('text','')[:300].replace('\n',' '),flush=True)
+
+          # Browser network capture and visible download attempts.
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True,args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'])
+              ctx=browser.new_context(viewport={'width':1440,'height':1200},locale='zh-CN',accept_downloads=True,user_agent=ua,extra_http_headers={'Accept-Language':'zh-CN,zh;q=0.9'})
+              ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+              page=ctx.new_page(); reqs=[]; resps=[]
+              page.on('request',lambda x:reqs.append({'url':x.url,'method':x.method,'type':x.resource_type,'post_data':x.post_data}) if any(k in x.url.lower() for k in ['sharepage','download','preview','file','clouddrive']) else None)
+              def on_response(x):
+                  if any(k in x.url.lower() for k in ['sharepage','download','preview','file','clouddrive']):
+                      rec={'url':x.url,'status':x.status,'headers':dict(x.headers)}
+                      try:
+                          if 'application/json' in (x.headers.get('content-type') or ''): rec['body']=x.text()[:300000]
+                      except Exception as e: rec['body_error']=repr(e)
+                      resps.append(rec)
+              page.on('response',on_response)
+              brow={'url':share_url}
+              try:
+                  rr=page.goto(share_url,wait_until='domcontentloaded',timeout=120000)
+                  try: page.wait_for_load_state('networkidle',timeout=30000)
+                  except PWTimeout: pass
+                  page.wait_for_timeout(8000)
+                  brow.update({'status':rr.status if rr else None,'final_url':page.url,'title':page.title(),'body':' '.join(page.locator('body').inner_text().split())[:50000]})
+                  (out/'share.html').write_text(page.content(),encoding='utf-8')
+                  page.screenshot(path=str(out/'share.png'),full_page=True)
+                  anchors=page.eval_on_selector_all('a','els=>els.map(e=>({href:e.href,text:(e.innerText||e.textContent||"").trim(),html:e.outerHTML}))')
+                  buttons=page.eval_on_selector_all('button','els=>els.map(e=>({text:(e.innerText||e.textContent||"").trim(),html:e.outerHTML}))')
+                  brow['anchors']=anchors[:1000]; brow['buttons']=buttons[:1000]
+                  clicks=[]
+                  for sel in ['button:has-text("下载")','a:has-text("下载")','button:has-text("保存")','a:has-text("保存")']:
+                      loc=page.locator(sel)
+                      for i in range(min(loc.count(),10)):
+                          it=loc.nth(i)
+                          try:
+                              if not it.is_visible(): continue
+                              c={'selector':sel,'index':i,'text':it.inner_text(),'html':it.evaluate('e=>e.outerHTML')}
+                              try:
+                                  with page.expect_download(timeout=15000) as pending: it.click(timeout=10000)
+                                  d=pending.value; dest=out/('browser_'+re.sub(r'[^A-Za-z0-9._-]+','_',d.suggested_filename)); d.save_as(str(dest)); c['download']={'name':d.suggested_filename,'path':str(dest),'bytes':dest.stat().st_size}
+                              except Exception as de:
+                                  c['error']=repr(de); page.wait_for_timeout(3000); c['after_url']=page.url; c['after_body']=' '.join(page.locator('body').inner_text().split())[:50000]
+                              clicks.append(c)
+                          except Exception as ce: clicks.append({'selector':sel,'index':i,'error':repr(ce)})
+                  brow['clicks']=clicks
+              except Exception as e: brow['error']=repr(e)
+              brow['requests']=reqs[-5000:]; brow['responses']=resps[-5000:]
+              result['browser']=brow
+              print('BROWSER',json.dumps({'status':brow.get('status'),'title':brow.get('title'),'body':brow.get('body','')[:500],'clicks':brow.get('clicks',[])},ensure_ascii=False)[:20000],flush=True)
+              for rec in resps:
+                  if rec.get('body'): print('BROWSER_JSON',rec['url'],rec['status'],rec['body'][:5000],flush=True)
+              browser.close()
+
+          (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: quark-seazen-probe
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
