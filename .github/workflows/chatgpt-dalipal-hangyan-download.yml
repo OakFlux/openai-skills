@@ -1,0 +1,149 @@
+name: Download and verify public Dalipal broker reports
+on:
+  push:
+    branches:
+      - chatgpt-dalipal-reports-20260907
+  workflow_dispatch:
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml cryptography pypdf pymupdf
+      - name: Resolve public PDF links, download and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pdfs out/renders
+          python - <<'PY'
+          from __future__ import annotations
+          import base64, hashlib, io, json, math, re, subprocess, time
+          from pathlib import Path
+          import requests
+          import pymupdf
+          from bs4 import BeautifulSoup
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+          from cryptography.hazmat.primitives import padding
+          from pypdf import PdfReader
+
+          REPORT_IDS = [
+              '2773386358276752690',  # 2022 Anxin International Chinese initiation/deep report
+              '3133539418510460530',  # 2023 CMB International English company report
+              '3285682015210309396',  # 2024 Anxin International English company report
+              '3539353692769617112',  # 2025 SDICSI Chinese company update
+          ]
+          PREFIX = 'cv_'
+          SUFFIX = 'zIDfwokaoIUFlw'
+          PERIOD = 120
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          s = requests.Session(); s.trust_env = False
+          s.headers.update({'User-Agent': UA, 'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          def key_for(epoch: int) -> bytes:
+              bucket = math.floor(epoch / PERIOD)
+              text = (PREFIX + str(bucket) + SUFFIX)[:32].ljust(32, '0')
+              return text.encode('utf-8')
+
+          def decrypt_url(token: str) -> tuple[str, int, str]:
+              raw = base64.urlsafe_b64decode(token + '=' * ((4 - len(token) % 4) % 4))
+              if len(raw) < 32 or (len(raw) - 16) % 16:
+                  raise ValueError(f'bad encrypted payload length {len(raw)}')
+              iv, ciphertext = raw[:16], raw[16:]
+              now = int(time.time())
+              errors = []
+              for delta in range(-2, 3):
+                  epoch = now + delta * PERIOD
+                  key = key_for(epoch)
+                  try:
+                      decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+                      padded = decryptor.update(ciphertext) + decryptor.finalize()
+                      unpadder = padding.PKCS7(128).unpadder()
+                      plain = unpadder.update(padded) + unpadder.finalize()
+                      url = plain.decode('utf-8')
+                      if url.startswith(('https://','http://')):
+                          return url, delta, key.decode('utf-8')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+              raise RuntimeError(f'could not decrypt current public link: {errors[-3:]}')
+
+          def attr(soup: BeautifulSoup, name: str) -> str:
+              node = soup.select_one('[data-controller~="native-pdf"]')
+              if not node:
+                  raise RuntimeError('native-pdf element not found')
+              val = node.get(name)
+              if val is None:
+                  raise RuntimeError(f'missing {name}')
+              return str(val)
+
+          records=[]
+          for rid in REPORT_IDS:
+              page_url=f'https://www.hangyan.co/reports/{rid}'
+              print('\nFETCH_PAGE', rid, page_url, flush=True)
+              r=s.get(page_url,timeout=(15,120),allow_redirects=True)
+              print('PAGE_RESPONSE',r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              r.raise_for_status()
+              soup=BeautifulSoup(r.text,'lxml')
+              token=attr(soup,'data-native-pdf-cache-key-value')
+              filename=attr(soup,'data-native-pdf-filename-value')
+              declared_page=int(attr(soup,'data-native-pdf-page-num-value') or '0')
+              title_node=soup.select_one('h1')
+              title=title_node.get_text(' ',strip=True) if title_node else filename
+              info={}
+              for p in soup.select('#left .box p'):
+                  text=p.get_text(' ',strip=True)
+                  if ':' in text:
+                      k,v=text.split(':',1); info[k.strip()]=v.strip()
+              pdf_url,delta,key_text=decrypt_url(token)
+              print('DECRYPTED',rid,'DELTA',delta,'URL',pdf_url,flush=True)
+              pdf=s.get(pdf_url,headers={'User-Agent':UA,'Referer':page_url,'Accept':'application/pdf,*/*'},timeout=(20,240),allow_redirects=True)
+              print('PDF_RESPONSE',rid,pdf.status_code,len(pdf.content),pdf.url,pdf.headers.get('content-type'),flush=True)
+              pdf.raise_for_status()
+              data=pdf.content
+              if b'%PDF' not in data[:4096] or len(data)<30000:
+                  raise RuntimeError(f'not a valid PDF response for {rid}: {len(data)} bytes')
+              reader=PdfReader(io.BytesIO(data),strict=False)
+              if reader.is_encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception:
+                      raise RuntimeError(f'encrypted PDF for {rid}')
+              pages=len(reader.pages)
+              text_prefix=''.join((reader.pages[i].extract_text() or '') for i in range(min(3,pages)))[:10000]
+              safe=re.sub(r'[\\/:*?"<>|]+','_',filename).strip()
+              out=Path('out/pdfs')/safe
+              out.write_bytes(data)
+              digest=hashlib.sha256(data).hexdigest()
+              # Render first, middle, and last page as an integrity check.
+              doc=pymupdf.open(stream=data,filetype='pdf')
+              sample=sorted(set([0,pages//2,pages-1]))
+              render_records=[]
+              for pno in sample:
+                  pix=doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.15,1.15),alpha=False)
+                  render_path=Path('out/renders')/f'{rid}_p{pno+1:03d}.png'
+                  pix.save(str(render_path))
+                  if render_path.stat().st_size<5000 or pix.width<500 or pix.height<600:
+                      raise RuntimeError(f'bad render {rid} page {pno+1}: {pix.width}x{pix.height}')
+                  render_records.append({'page':pno+1,'path':str(render_path),'width':pix.width,'height':pix.height,'bytes':render_path.stat().st_size})
+              doc.close()
+              rec={
+                  'report_id':rid,'page_url':page_url,'title':title,'filename':safe,
+                  'institution':info.get('机构'),'published':info.get('发表时间'),
+                  'type':info.get('类型'),'declared_view_page':declared_page,
+                  'actual_pages':pages,'bytes':len(data),'sha256':digest,
+                  'pdf_url':pdf_url,'decrypt_delta':delta,'key_used':key_text,
+                  'text_prefix':text_prefix,'render_checks':render_records,
+              }
+              records.append(rec)
+              print('VERIFIED',json.dumps({k:rec[k] for k in ['report_id','title','filename','institution','published','actual_pages','bytes','sha256']},ensure_ascii=False),flush=True)
+
+          Path('out/results.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('\nTOTAL_VERIFIED',len(records),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dalipal-verified-public-pdfs
+          path: out/
+          retention-days: 3
+          if-no-files-found: error
