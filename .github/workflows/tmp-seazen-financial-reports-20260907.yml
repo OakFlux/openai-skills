@@ -1,0 +1,401 @@
+name: Package Seazen annual and latest financial reports
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PDF tools
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+      - name: Discover, download, validate and package official HKEX PDFs
+        run: |
+          mkdir -p out/pdfs out/renders out/diagnostics
+          cat > /tmp/package_seazen.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from dataclasses import dataclass
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          BASE = "https://www1.hkexnews.hk"
+          SEARCH_URL = BASE + "/search/titlesearch.xhtml"
+          STOCK_ID = "80511"
+          STOCK_CODE = "01030"
+          OUT = Path("out")
+          PDF_DIR = OUT / "pdfs"
+          RENDER_DIR = OUT / "renders"
+          DIAG_DIR = OUT / "diagnostics"
+          UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": UA,
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          @dataclass(frozen=True)
+          class Wanted:
+              key: str
+              label: str
+              filename: str
+              date_from: str
+              date_to: str
+              year: int | None = None
+              kind: str = "annual"
+              optional: bool = False
+
+          wanted = [
+              Wanted("annual_2020", "2020年年度报告", "Seazen_2020_Annual_Report.pdf", "20210101", "20210630", 2020),
+              Wanted("annual_2021", "2021年年度报告", "Seazen_2021_Annual_Report.pdf", "20220101", "20220630", 2021),
+              Wanted("annual_2022", "2022年年度报告", "Seazen_2022_Annual_Report.pdf", "20230101", "20230630", 2022),
+              Wanted("annual_2023", "2023年年度报告", "Seazen_2023_Annual_Report.pdf", "20240101", "20240630", 2023),
+              Wanted("annual_2024", "2024年年度报告", "Seazen_2024_Annual_Report.pdf", "20250101", "20250630", 2024),
+              Wanted("annual_2025", "2025年年度报告", "Seazen_2025_Annual_Report.pdf", "20260101", "20260630", 2025),
+              Wanted(
+                  "q1_2026",
+                  "新城控股截至2026年3月31日止三个月主要财务数据及指标",
+                  "Seazen_Holdings_2026_Q1_Principal_Financial_Data.pdf",
+                  "20260420",
+                  "20260510",
+                  2026,
+                  "q1",
+              ),
+              Wanted(
+                  "h1_2026_subsidiary",
+                  "新城控股截至2026年6月30日止六个月主要财务数据及指标",
+                  "Seazen_Holdings_2026_H1_Principal_Financial_Data.pdf",
+                  "20260820",
+                  "20260907",
+                  2026,
+                  "h1_subsidiary",
+              ),
+              Wanted(
+                  "interim_results_2026",
+                  "新城发展截至2026年6月30日止六个月中期业绩公告",
+                  "Seazen_Group_2026_Interim_Results_Announcement.pdf",
+                  "20260820",
+                  "20260907",
+                  2026,
+                  "interim_results",
+              ),
+              Wanted(
+                  "interim_report_2026",
+                  "新城发展2026年中期报告（如截至打包日已刊发）",
+                  "Seazen_Group_2026_Interim_Report.pdf",
+                  "20260820",
+                  "20260907",
+                  2026,
+                  "interim_report",
+                  True,
+              ),
+          ]
+
+          def normalize(text: str) -> str:
+              return re.sub(r"\s+", " ", text or "").strip().lower()
+
+          def all_pdf_links(html: str, page_url: str) -> list[dict[str, str]]:
+              soup = BeautifulSoup(html, "html.parser")
+              links: list[dict[str, str]] = []
+              seen: set[str] = set()
+              for a in soup.find_all("a", href=True):
+                  href = urljoin(page_url, a["href"])
+                  text = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
+                  if "/listedco/listconews/" not in href.lower() or ".pdf" not in href.lower():
+                      continue
+                  if href in seen:
+                      continue
+                  seen.add(href)
+                  links.append({"text": text, "url": href})
+              return links
+
+          def is_match(item: Wanted, title: str) -> bool:
+              t = normalize(title)
+              year = str(item.year or "")
+              if item.kind == "annual":
+                  return (
+                      year in t
+                      and "annual report" in t
+                      and "results" not in t
+                      and "esg" not in t
+                      and "environmental" not in t
+                  ) or (
+                      year in title
+                      and ("年報" in title or "年度報告" in title)
+                      and "業績" not in title
+                      and "環境" not in title
+                  )
+              if item.kind == "q1":
+                  return (
+                      "principal financial data and indicators of seazen holdings" in t
+                      and "three months ended 31 march 2026" in t
+                  ) or (
+                      "新城控股" in title
+                      and "三個月" in title
+                      and "二零二六" in title
+                      and ("主要財務數據" in title or "主要財務資料" in title)
+                  )
+              if item.kind == "h1_subsidiary":
+                  return (
+                      "principal financial data and indicators of seazen holdings" in t
+                      and "six months ended 30 june 2026" in t
+                  ) or (
+                      "新城控股" in title
+                      and "六個月" in title
+                      and "二零二六" in title
+                      and ("主要財務數據" in title or "主要財務資料" in title)
+                  )
+              if item.kind == "interim_results":
+                  return (
+                      "interim results announcement" in t
+                      and "six months ended 30 june 2026" in t
+                  ) or (
+                      "中期業績公告" in title
+                      and "二零二六" in title
+                      and "六個月" in title
+                  )
+              if item.kind == "interim_report":
+                  return (
+                      "interim report 2026" in t
+                      or "2026 interim report" in t
+                      or ("二零二六年中期報告" in title)
+                  )
+              return False
+
+          def search_candidates(item: Wanted) -> list[dict[str, str]]:
+              found: list[dict[str, str]] = []
+              for lang in ("EN", "ZH"):
+                  params = {
+                      "category": "0",
+                      "documentType": "-1",
+                      "from": item.date_from,
+                      "lang": lang,
+                      "market": "SEHK",
+                      "searchType": "0",
+                      "stockId": STOCK_ID,
+                      "t1code": "-2",
+                      "t2Gcode": "-2",
+                      "t2code": "-2",
+                      "to": item.date_to,
+                  }
+                  response = session.get(SEARCH_URL, params=params, timeout=90)
+                  print("SEARCH", item.key, lang, response.status_code, len(response.content), response.url)
+                  response.raise_for_status()
+                  (DIAG_DIR / f"{item.key}_{lang}.html").write_bytes(response.content)
+                  for link in all_pdf_links(response.text, response.url):
+                      if is_match(item, link["text"]):
+                          row = dict(link)
+                          row["lang"] = lang
+                          found.append(row)
+                  time.sleep(0.4)
+              unique: list[dict[str, str]] = []
+              seen: set[str] = set()
+              for row in found:
+                  if row["url"] not in seen:
+                      seen.add(row["url"])
+                      unique.append(row)
+              # Prefer English reports for stable internal filenames and searchability.
+              unique.sort(key=lambda x: (0 if x.get("lang") == "EN" else 1, x["url"]))
+              return unique
+
+          def download_pdf(url: str, destination: Path) -> tuple[int, str]:
+              with session.get(
+                  url,
+                  headers={"Referer": SEARCH_URL, "User-Agent": UA},
+                  stream=True,
+                  timeout=180,
+              ) as response:
+                  print("DOWNLOAD", response.status_code, response.headers.get("content-type"), url)
+                  response.raise_for_status()
+                  with destination.open("wb") as fh:
+                      for chunk in response.iter_content(chunk_size=1024 * 1024):
+                          if chunk:
+                              fh.write(chunk)
+              data = destination.read_bytes()
+              if not data.lstrip().startswith(b"%PDF"):
+                  raise RuntimeError(f"Not a PDF: {url}; magic={data[:32]!r}")
+              if len(data) < 40_000:
+                  raise RuntimeError(f"PDF unexpectedly small ({len(data)} bytes): {url}")
+              return len(data), hashlib.sha256(data).hexdigest()
+
+          def validate_pdf(item: Wanted, path: Path) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if item.kind == "annual" and pages < 80:
+                  raise RuntimeError(f"Annual report {item.year} has only {pages} pages")
+              if item.kind in {"interim_results", "interim_report"} and pages < 5:
+                  raise RuntimeError(f"Interim document has only {pages} pages")
+              if item.kind in {"q1", "h1_subsidiary"} and pages < 1:
+                  raise RuntimeError(f"Financial data disclosure has no pages")
+
+              sample_parts: list[str] = []
+              for page in reader.pages[: min(10, pages)]:
+                  try:
+                      sample_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = normalize(" ".join(sample_parts))
+              company_tokens = (
+                  "seazen group limited",
+                  "future land development holdings limited",
+                  "seazen holdings",
+                  "新城发展控股",
+                  "新城發展控股",
+                  "新城控股",
+              )
+              if not any(token in sample for token in company_tokens):
+                  raise RuntimeError(f"Company identity not found in first pages of {path.name}")
+
+              render_prefix = RENDER_DIR / item.key
+              subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-r", "72", "-png", "-singlefile", str(path), str(render_prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+              )
+              render_path = Path(str(render_prefix) + ".png")
+              if not render_path.exists() or render_path.stat().st_size < 1000:
+                  raise RuntimeError(f"First-page render failed for {path.name}")
+              return pages, sample[:1600]
+
+          manifest: list[dict[str, object]] = []
+          missing_optional: list[str] = []
+
+          for item in wanted:
+              print("\n===", item.key, item.label, "===")
+              candidates = search_candidates(item)
+              if not candidates:
+                  if item.optional:
+                      missing_optional.append(item.label)
+                      print("OPTIONAL_NOT_FOUND", item.key)
+                      continue
+                  raise RuntimeError(f"No matching HKEX PDF found for {item.key}: {item.label}")
+
+              last_error: Exception | None = None
+              success = False
+              for candidate in candidates:
+                  tmp = PDF_DIR / f"{item.key}.download"
+                  try:
+                      size, sha = download_pdf(candidate["url"], tmp)
+                      final = PDF_DIR / item.filename
+                      tmp.replace(final)
+                      pages, sample = validate_pdf(item, final)
+                      manifest.append({
+                          "key": item.key,
+                          "label": item.label,
+                          "file": item.filename,
+                          "source_title": candidate["text"],
+                          "source_url": candidate["url"],
+                          "source_language": candidate.get("lang"),
+                          "pages": pages,
+                          "bytes": size,
+                          "sha256": sha,
+                          "validation_sample": sample,
+                      })
+                      print("VALIDATED", item.filename, pages, size, sha)
+                      success = True
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      print("CANDIDATE_FAILED", candidate, repr(exc))
+                      tmp.unlink(missing_ok=True)
+                      (PDF_DIR / item.filename).unlink(missing_ok=True)
+              if not success:
+                  if item.optional:
+                      missing_optional.append(item.label)
+                      continue
+                  raise RuntimeError(f"All candidates failed for {item.key}: {last_error!r}")
+
+          annual_count = sum(1 for x in manifest if str(x["key"]).startswith("annual_"))
+          if annual_count != 6:
+              raise RuntimeError(f"Expected 6 annual reports, got {annual_count}")
+          required_latest = {"q1_2026", "h1_2026_subsidiary", "interim_results_2026"}
+          actual_keys = {str(x["key"]) for x in manifest}
+          if not required_latest.issubset(actual_keys):
+              raise RuntimeError(f"Missing latest financial disclosures: {sorted(required_latest - actual_keys)}")
+
+          (OUT / "manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+
+          readme = [
+              "新城发展（01030.HK）2020-2025年报及最新财务披露资料包",
+              "",
+              "来源：香港交易所披露易（HKEXnews）官方文件。",
+              "",
+              "本资料包包含：",
+              "- 2020、2021、2022、2023、2024、2025年度报告；",
+              "- 新城控股截至2026年3月31日止三个月主要财务数据及指标；",
+              "- 新城控股截至2026年6月30日止六个月主要财务数据及指标；",
+              "- 新城发展截至2026年6月30日止六个月中期业绩公告。",
+              "",
+              "说明：新城发展为港股发行人，母公司并不按A股格式发布独立季度报告。",
+              "因此，本包将2026年第一季度子公司主要财务数据作为严格意义上的最新季度披露，",
+              "并同时收录更新至2026年上半年的母公司中期业绩公告及子公司半年期主要财务数据。",
+          ]
+          if missing_optional:
+              readme += [
+                  "",
+                  "截至打包日，港交所尚未检索到独立的《2026年中期报告》，故未收录；",
+                  "目前最新的母公司半年期财务文件为《2026年中期业绩公告》。",
+              ]
+          readme += ["", "文件清单："]
+          for row in manifest:
+              readme.append(
+                  f"- {row['file']} | {row['pages']}页 | {row['bytes']}字节 | SHA-256 {row['sha256']}"
+              )
+          readme += ["", "文件仅供个人研究使用，请遵守发行人、港交所及原文件的版权与使用条款。"]
+          (OUT / "README_文件说明.txt").write_text("\n".join(readme) + "\n", encoding="utf-8")
+          (OUT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{row['sha256']}  {row['file']}" for row in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = OUT / "seazen_2020_2025_annual_and_latest_reports.zip"
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for row in manifest:
+                  zf.write(PDF_DIR / str(row["file"]), arcname=str(row["file"]))
+              zf.write(OUT / "README_文件说明.txt", arcname="README_文件说明.txt")
+              zf.write(OUT / "manifest.json", arcname="manifest.json")
+              zf.write(OUT / "SHA256SUMS.txt", arcname="SHA256SUMS.txt")
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"Corrupt ZIP member: {bad}")
+              pdf_members = [name for name in zf.namelist() if name.lower().endswith(".pdf")]
+              if len(pdf_members) != len(manifest):
+                  raise RuntimeError(f"ZIP PDF count mismatch: {len(pdf_members)} vs {len(manifest)}")
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          (OUT / "PACKAGE_INFO.txt").write_text(
+              f"file={zip_path.name}\nbytes={zip_path.stat().st_size}\nsha256={zip_sha}\npdf_count={len(manifest)}\n",
+              encoding="utf-8",
+          )
+          print("PACKAGE_READY", zip_path, zip_path.stat().st_size, zip_sha, len(manifest))
+          PY
+          python /tmp/package_seazen.py
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seazen-financial-reports-package
+          path: |
+            out/seazen_2020_2025_annual_and_latest_reports.zip
+            out/PACKAGE_INFO.txt
+            out/manifest.json
+          retention-days: 1
+          compression-level: 0
