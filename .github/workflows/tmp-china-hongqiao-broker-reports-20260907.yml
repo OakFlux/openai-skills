@@ -1,0 +1,300 @@
+name: Package China Hongqiao broker deep reports
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          python -m pip install --quiet playwright pypdf requests
+          python -m playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+      - name: Download, validate and package public broker reports
+        run: |
+          mkdir -p out/pdfs out/diagnostics out/renders
+          cat > /tmp/package_reports.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import requests
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from pypdf import PdfReader
+
+          OUT = Path("out")
+          PDF_DIR = OUT / "pdfs"
+          DIAG_DIR = OUT / "diagnostics"
+          RENDER_DIR = OUT / "renders"
+          UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+
+          REPORTS = [
+              {
+                  "url": "https://www.hangyan.co/reports/3369212359292749530",
+                  "filename": "2024-05-16_Cinda_Securities_China_Hongqiao_Deep_Report.pdf",
+                  "broker": "Cinda Securities",
+                  "date": "2024-05-16",
+                  "title": "Aluminum industry chain integrated leader with high earnings elasticity",
+                  "min_pages": 15,
+              },
+              {
+                  "url": "https://www.hangyan.co/reports/3011596296847885511",
+                  "filename": "2023-01-06_Haitong_International_China_Hongqiao_Initiation.pdf",
+                  "broker": "Haitong International",
+                  "date": "2023-01-06",
+                  "title": "Initiation: integrated cost advantage and aluminum industry leader",
+                  "min_pages": 15,
+              },
+          ]
+
+          def is_pdf(data: bytes) -> bool:
+              return len(data) > 50_000 and data.lstrip().startswith(b"%PDF")
+
+          def safe_response_body(response):
+              try:
+                  return response.body()
+              except Exception:
+                  return b""
+
+          def extract_text(path: Path, max_pages: int = 10) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              parts = []
+              for page in reader.pages[: min(max_pages, pages)]:
+                  try:
+                      parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              return pages, re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+          def validate_pdf(path: Path, min_pages: int) -> tuple[int, str]:
+              pages, text = extract_text(path)
+              if pages < min_pages:
+                  raise RuntimeError(f"Report too short: {pages} pages, expected at least {min_pages}")
+              low = text.lower()
+              issuer_ok = any(token in low for token in [
+                  "china hongqiao",
+                  "中国宏桥",
+                  "中國宏橋",
+                  "01378",
+                  "1378.hk",
+                  "1378 hk",
+              ])
+              if not issuer_ok:
+                  raise RuntimeError("China Hongqiao identity not found in first pages")
+              render_prefix = RENDER_DIR / path.stem
+              subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-r", "90", "-png", "-singlefile", str(path), str(render_prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+              )
+              rendered = Path(str(render_prefix) + ".png")
+              if not rendered.exists() or rendered.stat().st_size < 1000:
+                  raise RuntimeError("First-page render validation failed")
+              return pages, text[:2200]
+
+          session = requests.Session()
+          session.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
+          manifest = []
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(
+                  accept_downloads=True,
+                  locale="zh-CN",
+                  user_agent=UA,
+              )
+
+              for index, report in enumerate(REPORTS, 1):
+                  page = context.new_page()
+                  captured: list[dict[str, object]] = []
+
+                  def on_response(response):
+                      try:
+                          ctype = (response.headers.get("content-type") or "").lower()
+                          url = response.url
+                          interesting = (
+                              "application/pdf" in ctype
+                              or ".pdf" in url.lower()
+                              or "qingstor" in url.lower()
+                              or "hangyan-prod" in url.lower()
+                              or "native-pdf" in url.lower()
+                          )
+                          if not interesting:
+                              return
+                          body = safe_response_body(response)
+                          if is_pdf(body):
+                              captured.append({"url": url, "data": body, "method": "network-response"})
+                      except Exception as exc:
+                          print("RESPONSE_HANDLER_ERROR", repr(exc))
+
+                  page.on("response", on_response)
+                  print("OPEN", report["url"])
+                  page.goto(report["url"], wait_until="domcontentloaded", timeout=120_000)
+                  page.wait_for_timeout(18_000)
+                  (DIAG_DIR / f"report_{index}.html").write_text(page.content(), encoding="utf-8")
+                  page.screenshot(path=str(DIAG_DIR / f"report_{index}.png"), full_page=False)
+
+                  # Try signed iframe URL first.
+                  iframe_src = ""
+                  iframe = page.locator('iframe[data-native-pdf-target="iframe"]')
+                  if iframe.count():
+                      for _ in range(15):
+                          iframe_src = iframe.first.get_attribute("src") or ""
+                          if iframe_src.startswith("http"):
+                              break
+                          page.wait_for_timeout(1_000)
+                  if iframe_src.startswith("http"):
+                      print("IFRAME", iframe_src)
+                      try:
+                          api_response = context.request.get(
+                              iframe_src,
+                              headers={"Referer": report["url"], "User-Agent": UA},
+                              timeout=120_000,
+                          )
+                          body = api_response.body()
+                          print("IFRAME_HTTP", api_response.status, len(body), api_response.headers.get("content-type"))
+                          if is_pdf(body):
+                              captured.insert(0, {"url": iframe_src, "data": body, "method": "iframe-request"})
+                      except Exception as exc:
+                          print("IFRAME_REQUEST_ERROR", repr(exc))
+
+                  # Try the site's public download button.
+                  button = page.locator('button[data-action*="native-pdf#download"]')
+                  if button.count() and button.first.is_visible():
+                      try:
+                          with page.expect_download(timeout=60_000) as download_info:
+                              button.first.click()
+                          download = download_info.value
+                          temp_path = DIAG_DIR / f"download_{index}.bin"
+                          download.save_as(str(temp_path))
+                          body = temp_path.read_bytes()
+                          print("BUTTON_DOWNLOAD", download.suggested_filename, len(body))
+                          if is_pdf(body):
+                              captured.insert(0, {"url": report["url"] + "#download", "data": body, "method": "download-button"})
+                      except PlaywrightTimeoutError:
+                          print("DOWNLOAD_BUTTON_TIMEOUT")
+                      except Exception as exc:
+                          print("DOWNLOAD_BUTTON_ERROR", repr(exc))
+
+                  page.wait_for_timeout(5_000)
+                  if not captured:
+                      page.close()
+                      raise RuntimeError(f"No public PDF captured for {report['url']}")
+
+                  # De-duplicate candidates by SHA-256 and validate each until one succeeds.
+                  candidates = []
+                  seen = set()
+                  for item in captured:
+                      data = item["data"]
+                      digest = hashlib.sha256(data).hexdigest()
+                      if digest not in seen:
+                          seen.add(digest)
+                          candidates.append((item, digest))
+
+                  selected = None
+                  last_error = None
+                  final_path = PDF_DIR / report["filename"]
+                  for item, digest in candidates:
+                      final_path.write_bytes(item["data"])
+                      try:
+                          pages, sample = validate_pdf(final_path, int(report["min_pages"]))
+                          selected = {
+                              "file": report["filename"],
+                              "broker": report["broker"],
+                              "date": report["date"],
+                              "title_en": report["title"],
+                              "source_page": report["url"],
+                              "pdf_source_url": item["url"],
+                              "capture_method": item["method"],
+                              "pages": pages,
+                              "bytes": len(item["data"]),
+                              "sha256": digest,
+                              "validation_sample": sample,
+                          }
+                          print("VALIDATED", json.dumps({k: v for k, v in selected.items() if k != "validation_sample"}, ensure_ascii=False))
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          print("CANDIDATE_VALIDATION_FAILED", digest, repr(exc))
+                          final_path.unlink(missing_ok=True)
+
+                  if selected is None:
+                      page.close()
+                      raise RuntimeError(f"No captured PDF validated for {report['url']}: {last_error!r}")
+                  manifest.append(selected)
+                  page.close()
+
+              browser.close()
+
+          if len(manifest) != 2:
+              raise RuntimeError(f"Expected 2 reports, got {len(manifest)}")
+          if len({row["sha256"] for row in manifest}) != len(manifest):
+              raise RuntimeError("Duplicate report content detected")
+
+          readme = [
+              "中国宏桥（01378.HK）券商深度报告资料包",
+              "",
+              "本资料包收录2份在公开网页可直接读取的原始券商PDF，未绕过登录、付费或权限限制。",
+              "",
+              "文件清单：",
+              "1. 信达证券｜2024-05-16｜《铝产业链一体化龙头，有望享高盈利弹性》",
+              "2. 海通国际｜2023-01-06｜《首次覆盖：一体化成本优势，电解铝行业的领军者》",
+              "",
+              "文件仅供个人研究使用，版权归原券商及作者所有，请遵守原报告使用条款。",
+          ]
+          (OUT / "README_CN.txt").write_text("\n".join(readme) + "\n", encoding="utf-8")
+          (OUT / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          (OUT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{row['sha256']}  {row['file']}" for row in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = OUT / "china_hongqiao_broker_deep_reports.zip"
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for row in manifest:
+                  zf.write(PDF_DIR / row["file"], arcname=row["file"])
+              zf.write(OUT / "README_CN.txt", arcname="README_CN.txt")
+              zf.write(OUT / "manifest.json", arcname="manifest.json")
+              zf.write(OUT / "SHA256SUMS.txt", arcname="SHA256SUMS.txt")
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f"Corrupt ZIP member: {bad}")
+              pdfs = [name for name in zf.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 2:
+                  raise RuntimeError(f"Expected 2 PDFs in ZIP, got {len(pdfs)}")
+
+          package_info = {
+              "file": zip_path.name,
+              "bytes": zip_path.stat().st_size,
+              "sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "pdf_count": 2,
+          }
+          (OUT / "PACKAGE_INFO.json").write_text(json.dumps(package_info, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_READY", json.dumps(package_info, ensure_ascii=False))
+          PY
+          python /tmp/package_reports.py
+      - name: Upload final package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-hongqiao-broker-reports-package
+          path: |
+            out/china_hongqiao_broker_deep_reports.zip
+            out/PACKAGE_INFO.json
+            out/manifest.json
+            out/diagnostics
+          retention-days: 1
+          compression-level: 0
