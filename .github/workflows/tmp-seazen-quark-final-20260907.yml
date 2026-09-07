@@ -1,0 +1,338 @@
+name: Build verified Seazen broker report package
+on:
+  push:
+    branches:
+      - tmp-seazen-quark-final-20260907
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests pypdf pymupdf pillow
+      - name: Download, validate, render, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pdfs work/renders
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from PIL import Image, ImageOps, ImageDraw
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          WORK = Path('work')
+          PDF_DIR = WORK / 'pdfs'
+          RENDER_DIR = WORK / 'renders'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36'
+
+          SOURCES = [
+              {
+                  'share_id': 'ad367a3102aa',
+                  'broker': '国泰海通证券',
+                  'date': '2026-02-03',
+                  'title': '公司首次覆盖：不止于开发，从平衡到引领',
+                  'source_page': 'https://www.ziliaoting.com/65594.html',
+              },
+              {
+                  'share_id': 'e0fa87d5353f',
+                  'broker': '东北证券',
+                  'date': '2025-12-21',
+                  'title': '深度研究报告：商业精耕红利凸显，开发减损债患渐消',
+                  'source_page': 'https://www.ziliaoting.com/49883.html',
+              },
+          ]
+
+          def safe_name(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', ' ', value).strip(' ._')
+              return value[:180]
+
+          def new_session(share_url: str) -> requests.Session:
+              session = requests.Session()
+              session.headers.update({
+                  'User-Agent': UA,
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                  'Origin': 'https://pan.quark.cn',
+                  'Referer': share_url,
+                  'Accept': 'application/json, text/plain, */*',
+              })
+              return session
+
+          def api_params() -> dict[str, str]:
+              return {
+                  'pr': 'ucpro',
+                  'fr': 'pc',
+                  'uc_param_str': '',
+                  '__dt': '1000',
+                  '__t': str(int(time.time() * 1000)),
+              }
+
+          def get_public_file(source: dict[str, str]) -> dict[str, object]:
+              share_id = source['share_id']
+              share_url = f'https://pan.quark.cn/s/{share_id}'
+              session = new_session(share_url)
+              host = 'https://drive-h.quark.cn/1/clouddrive'
+
+              token_response = session.post(
+                  host + '/share/sharepage/token',
+                  params=api_params(),
+                  json={
+                      'pwd_id': share_id,
+                      'passcode': '',
+                      'support_visit_limit_private_share': True,
+                  },
+                  timeout=90,
+              )
+              token_response.raise_for_status()
+              token_json = token_response.json()
+              if token_json.get('code') != 0:
+                  raise RuntimeError(f'Token API failed for {share_id}: {token_json}')
+              stoken = (token_json.get('data') or {}).get('stoken')
+              if not stoken:
+                  raise RuntimeError(f'Missing stoken for {share_id}')
+
+              detail_params = {
+                  **api_params(),
+                  'ver': '2',
+                  'pwd_id': share_id,
+                  'stoken': stoken,
+                  'pdir_fid': '0',
+                  'force': '0',
+                  '_page': '1',
+                  '_size': '50',
+                  '_fetch_banner': '1',
+                  '_fetch_share': '1',
+                  'fetch_relate_conversation': '1',
+                  '_fetch_total': '1',
+                  '_sort': 'file_type:asc,file_name:asc',
+              }
+              detail_response = session.get(
+                  host + '/share/sharepage/detail',
+                  params=detail_params,
+                  timeout=90,
+              )
+              detail_response.raise_for_status()
+              detail_json = detail_response.json()
+              if detail_json.get('code') != 0:
+                  raise RuntimeError(f'Detail API failed for {share_id}: {detail_json}')
+              items = (detail_json.get('data') or {}).get('list') or []
+              files = [item for item in items if item.get('file') is True or item.get('dir') is False]
+              pdf_files = [item for item in files if str(item.get('file_name') or '').lower().endswith('.pdf')]
+              if not pdf_files:
+                  raise RuntimeError(f'No PDF in share {share_id}; items={items}')
+              item = pdf_files[0]
+              fid = item.get('fid')
+              fid_token = item.get('share_fid_token')
+              if not fid or not fid_token:
+                  raise RuntimeError(f'Missing file identifiers in share {share_id}: {item}')
+
+              download_response = session.post(
+                  host + '/file/download',
+                  params=api_params(),
+                  json={
+                      'fids': [fid],
+                      'fid_tokens': [fid_token],
+                      'pwd_id': share_id,
+                      'stoken': stoken,
+                  },
+                  timeout=90,
+              )
+              download_response.raise_for_status()
+              download_json = download_response.json()
+              if download_json.get('code') != 0:
+                  raise RuntimeError(f'Download API failed for {share_id}: {download_json}')
+              metadata = (download_json.get('data') or [None])[0]
+              if not metadata or not metadata.get('download_url'):
+                  raise RuntimeError(f'Missing direct URL for {share_id}: {download_json}')
+
+              direct_url = metadata['download_url']
+              binary_response = session.get(
+                  direct_url,
+                  headers={
+                      'User-Agent': UA,
+                      'Referer': share_url,
+                      'Accept': 'application/pdf,application/octet-stream,*/*',
+                  },
+                  stream=True,
+                  timeout=(30, 180),
+                  allow_redirects=True,
+              )
+              binary_response.raise_for_status()
+              data = b''.join(binary_response.iter_content(chunk_size=1024 * 1024))
+              if not data.lstrip().startswith(b'%PDF'):
+                  raise RuntimeError(f'Not a PDF for {share_id}; content-type={binary_response.headers.get("content-type")}, head={data[:32]!r}')
+              if len(data) < 100_000:
+                  raise RuntimeError(f'PDF too small for {share_id}: {len(data)}')
+
+              original_name = str(metadata.get('file_name') or item.get('file_name') or f'{share_id}.pdf')
+              output_name = safe_name(f"{source['date']}_{source['broker']}_{source['title']}") + '.pdf'
+              output_path = PDF_DIR / output_name
+              output_path.write_bytes(data)
+
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              pages = len(reader.pages)
+              if pages < 10:
+                  raise RuntimeError(f'Expected long-form research report, got {pages} pages for {share_id}')
+
+              text_parts = []
+              for page in reader.pages[: min(5, pages)]:
+                  try:
+                      text_parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              sample_text = '\n'.join(text_parts)
+              identity = sample_text + ' ' + original_name
+              if '新城发展' not in identity and 'SEAZEN' not in identity.upper():
+                  raise RuntimeError(f'Company identity not found in {share_id}')
+
+              doc = fitz.open(stream=data, filetype='pdf')
+              page = doc.load_page(0)
+              pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+              render_path = RENDER_DIR / (output_path.stem + '.png')
+              pix.save(str(render_path))
+              doc.close()
+              with Image.open(render_path) as image:
+                  if image.width < 500 or image.height < 500:
+                      raise RuntimeError(f'First-page render unexpectedly small for {share_id}')
+
+              return {
+                  **source,
+                  'share_url': share_url,
+                  'original_name': original_name,
+                  'file_name': output_name,
+                  'file_path': str(output_path),
+                  'render_path': str(render_path),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'md5': hashlib.md5(data).hexdigest(),
+                  'source_size': metadata.get('size'),
+                  'source_md5': metadata.get('md5'),
+                  'text_sample': sample_text[:2000],
+              }
+
+          records = []
+          diagnostics = []
+          for source in SOURCES:
+              try:
+                  record = get_public_file(source)
+                  records.append(record)
+                  print('REPORT_OK', record['broker'], record['pages'], record['bytes'], record['sha256'], flush=True)
+              except Exception as exc:
+                  diagnostics.append({'source': source, 'error': repr(exc)})
+                  print('REPORT_FAILED', source['share_id'], repr(exc), flush=True)
+
+          (OUT / 'diagnostics.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+          if len(records) != 2:
+              raise RuntimeError(f'Expected both reports, got {len(records)}; diagnostics={diagnostics}')
+          if records[0]['sha256'] == records[1]['sha256']:
+              raise RuntimeError('The two PDFs are duplicates')
+
+          # Contact sheet for visual QA.
+          rendered = []
+          for record in records:
+              image = Image.open(record['render_path']).convert('RGB')
+              image.thumbnail((650, 900))
+              canvas = Image.new('RGB', (700, 1000), 'white')
+              x = (700 - image.width) // 2
+              canvas.paste(image, (x, 20))
+              draw = ImageDraw.Draw(canvas)
+              draw.text((20, 940), f"{record['broker']} | {record['date']} | {record['pages']} pages", fill='black')
+              rendered.append(canvas)
+              image.close()
+          sheet = Image.new('RGB', (1400, 1000), 'white')
+          sheet.paste(rendered[0], (0, 0))
+          sheet.paste(rendered[1], (700, 0))
+          sheet.save(OUT / 'first_page_contact_sheet.jpg', quality=90)
+          for image in rendered:
+              image.close()
+
+          manifest = WORK / '文件清单与校验值.csv'
+          with manifest.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=[
+                  '序号', '券商', '发布日期', '报告标题', '实际PDF页数', '文件大小_字节',
+                  'SHA256', 'MD5', '公开分享页', '资料索引页', '原始文件名', '打包文件名'
+              ])
+              writer.writeheader()
+              for index, record in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': index,
+                      '券商': record['broker'],
+                      '发布日期': record['date'],
+                      '报告标题': record['title'],
+                      '实际PDF页数': record['pages'],
+                      '文件大小_字节': record['bytes'],
+                      'SHA256': record['sha256'],
+                      'MD5': record['md5'],
+                      '公开分享页': record['share_url'],
+                      '资料索引页': record['source_page'],
+                      '原始文件名': record['original_name'],
+                      '打包文件名': record['file_name'],
+                  })
+
+          readme = WORK / 'README.txt'
+          lines = [
+              '新城发展（01030.HK）券商深度报告资料包',
+              '重新打包日期：2026-09-07',
+              '',
+              '本压缩包包含2份公开分享的完整券商原始PDF。',
+              'PDF已检查文件头、可解析性、实际页数、公司名称与首页渲染；ZIP已完成CRC校验。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {record['broker']}｜{record['date']}｜{record['title']}｜实际{record['pages']}页",
+                  f"   原始文件名：{record['original_name']}",
+                  f"   资料索引页：{record['source_page']}",
+              ])
+          readme.write_text('\n'.join(lines), encoding='utf-8')
+
+          archive = OUT / '新城发展_01030_券商深度报告_2份_重新打包.zip'
+          with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for record in records:
+                  zf.write(record['file_path'], arcname=record['file_name'])
+              zf.write(manifest, arcname=manifest.name)
+              zf.write(readme, arcname=readme.name)
+          with zipfile.ZipFile(archive, 'r') as zf:
+              bad = zf.testzip()
+              names = zf.namelist()
+              pdfs = [name for name in names if name.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != 2:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, names={names}')
+
+          shutil.copy2(archive, OUT / 'Seazen_Group_01030_Broker_Deep_Reports_2_Repacked.zip')
+          result = {
+              'ok': True,
+              'archive': archive.name,
+              'backup_archive': 'Seazen_Group_01030_Broker_Deep_Reports_2_Repacked.zip',
+              'archive_bytes': archive.stat().st_size,
+              'zip_crc_ok': True,
+              'records': records,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: seazen-broker-deep-reports-final
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
