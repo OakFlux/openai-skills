@@ -1,0 +1,153 @@
+name: Temporary Seazen public source probe
+on:
+  push:
+    branches:
+      - tmp-seazen-broker-reports-20260907
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml playwright pypdf pillow
+          python -m playwright install --with-deps chromium
+      - name: Probe sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import json,re
+          from pathlib import Path
+          from urllib.parse import quote,urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          out=Path('output')
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Accept':'text/html,application/xhtml+xml,application/pdf,image/avif,image/webp,image/apng,*/*;q=0.8'})
+          result={'fx_search':[],'fx_first':{},'valuelist':{},'sgpjbg_js':{}}
+
+          # Inspect fxbaogao search variants.
+          variants=[
+            'https://www.fxbaogao.com/search?keyword='+quote('新城发展'),
+            'https://www.fxbaogao.com/search?keywords='+quote('新城发展'),
+            'https://www.fxbaogao.com/search?q='+quote('新城发展'),
+            'https://www.fxbaogao.com/search?query='+quote('新城发展'),
+            'https://www.fxbaogao.com/search/'+quote('新城发展'),
+            'https://www.fxbaogao.com/?keyword='+quote('新城发展'),
+          ]
+          for i,u in enumerate(variants,1):
+            row={'url':u}
+            try:
+              r=s.get(u,timeout=90,allow_redirects=True)
+              row.update({'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'title':BeautifulSoup(r.text,'lxml').title.get_text(' ',strip=True) if BeautifulSoup(r.text,'lxml').title else None})
+              (out/f'fx_search_{i}.html').write_bytes(r.content)
+              soup=BeautifulSoup(r.text,'lxml')
+              links=[]
+              for a in soup.find_all('a',href=True):
+                href=urljoin(r.url,a.get('href')); txt=' '.join(a.get_text(' ',strip=True).split())
+                parent=a.find_parent(['article','li','section','div'])
+                context=' '.join((parent.get_text(' ',strip=True) if parent else txt).split())[:3000]
+                if re.search(r'/detail/\d+',href) or '新城发展' in txt or '新城发展' in context:
+                  links.append({'href':href,'text':txt,'context':context})
+              row['links']=links[:500]
+              print('FX_SEARCH',i,r.status_code,len(r.content),r.url,'LINKS',len(links),flush=True)
+              for x in links[:50]: print('FX_LINK',json.dumps(x,ensure_ascii=False),flush=True)
+            except Exception as e: row['error']=repr(e); print('FX_SEARCH_ERR',i,repr(e),flush=True)
+            result['fx_search'].append(row)
+
+          # Inspect first known report and scripts/data.
+          u='https://www.fxbaogao.com/detail/5253520'
+          r=s.get(u,timeout=90,allow_redirects=True)
+          (out/'fx_first.html').write_bytes(r.content)
+          sp=BeautifulSoup(r.text,'lxml')
+          cand=[]
+          for tag in sp.find_all(True):
+            for attr in ['href','src','data-src','data-original','data-url','data-file','data-pdf','content','value']:
+              v=tag.get(attr)
+              if not isinstance(v,str): continue
+              a=urljoin(r.url,v)
+              if any(k in a.lower() for k in ['report-image','.pdf','download','api','search']): cand.append({'tag':tag.name,'attr':attr,'value':v,'url':a,'text':' '.join(tag.get_text(' ',strip=True).split())[:500]})
+          decoded=r.text.replace('\\/','/')
+          for x in re.findall(r'https?://[^"\'<>\s\\]+',decoded,re.I):
+            if any(k in x.lower() for k in ['report-image','.pdf','download','api','search']): cand.append({'tag':'regex','attr':'text','value':x,'url':x,'text':''})
+          uniq=[]; seen=set()
+          for x in cand:
+            if x['url'] in seen: continue
+            seen.add(x['url']); uniq.append(x)
+          result['fx_first']={'status':r.status_code,'url':r.url,'title':sp.title.get_text(' ',strip=True) if sp.title else None,'candidates':uniq[:1000],'scripts':[urljoin(r.url,x.get('src')) for x in sp.find_all('script',src=True)]}
+          print('FX_FIRST',r.status_code,len(r.content),'CANDS',len(uniq),flush=True)
+          for x in uniq[:100]: print('FX_CAND',json.dumps(x,ensure_ascii=False),flush=True)
+
+          # Inspect valuelist page using both requests and a browser.
+          vu='https://www.valuelist.cn/814543.html'
+          vr=s.get(vu,timeout=90,allow_redirects=True)
+          (out/'valuelist_requests.html').write_bytes(vr.content)
+          result['valuelist']['requests']={'status':vr.status_code,'url':vr.url,'bytes':len(vr.content),'headers':dict(vr.headers),'head':vr.text[:10000]}
+          print('VALUE_REQUESTS',vr.status_code,len(vr.content),vr.url,flush=True)
+          with sync_playwright() as p:
+            browser=p.chromium.launch(headless=True,args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'])
+            ctx=browser.new_context(viewport={'width':1440,'height':1200},locale='zh-CN',accept_downloads=True,user_agent=ua,extra_http_headers={'Accept-Language':'zh-CN,zh;q=0.9'})
+            ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            page=ctx.new_page(); reqs=[]; resps=[]
+            page.on('request',lambda q:reqs.append({'url':q.url,'method':q.method,'type':q.resource_type}) if any(k in q.url.lower() for k in ['download','.pdf','file','ajax','api']) else None)
+            page.on('response',lambda q:resps.append({'url':q.url,'status':q.status,'headers':dict(q.headers)}) if any(k in q.url.lower() for k in ['download','.pdf','file','ajax','api']) else None)
+            row={}
+            try:
+              pr=page.goto(vu,wait_until='domcontentloaded',timeout=120000); page.wait_for_timeout(5000)
+              row.update({'status':pr.status if pr else None,'url':page.url,'title':page.title(),'body':' '.join(page.locator('body').inner_text().split())[:30000]})
+              anchors=page.eval_on_selector_all('a','els=>els.map(e=>({href:e.href,text:(e.innerText||e.textContent||"").trim(),html:e.outerHTML}))')
+              row['anchors']=[a for a in anchors if any(k in ((a.get('href') or '')+' '+(a.get('text') or '')).lower() for k in ['下载','download','.pdf','file'])][:500]
+              (out/'valuelist_browser.html').write_text(page.content(),encoding='utf-8')
+              page.screenshot(path=str(out/'valuelist.png'),full_page=True)
+              for selector in ['a:has-text("立即下载")','button:has-text("立即下载")','a:has-text("免费下载")','a[href*="download"]']:
+                loc=page.locator(selector)
+                for j in range(min(loc.count(),5)):
+                  try:
+                    item=loc.nth(j)
+                    if not item.is_visible(): continue
+                    row.setdefault('clicks',[]).append({'selector':selector,'index':j,'href':item.get_attribute('href'),'html':item.evaluate('e=>e.outerHTML')})
+                    try:
+                      with page.expect_download(timeout=12000) as pending: item.click(timeout=8000)
+                      dl=pending.value; path=out/('value_'+re.sub(r'[^A-Za-z0-9._-]+','_',dl.suggested_filename)); dl.save_as(str(path)); row['clicks'][-1]['download']={'name':dl.suggested_filename,'path':str(path),'bytes':path.stat().st_size}
+                    except Exception as de:
+                      row['clicks'][-1]['click_error']=repr(de); page.wait_for_timeout(3000); row['clicks'][-1]['after_url']=page.url
+                  except Exception as ce: row.setdefault('selector_errors',[]).append({'selector':selector,'error':repr(ce)})
+              row['requests']=reqs; row['responses']=resps
+              print('VALUE_BROWSER',row.get('status'),row.get('url'),row.get('title'),'ANCHORS',len(row.get('anchors',[])),flush=True)
+              for x in row.get('anchors',[])[:100]: print('VALUE_ANCHOR',json.dumps(x,ensure_ascii=False),flush=True)
+              for x in row.get('clicks',[])[:20]: print('VALUE_CLICK',json.dumps(x,ensure_ascii=False),flush=True)
+            except Exception as e: row['error']=repr(e); print('VALUE_BROWSER_ERR',repr(e),flush=True)
+            result['valuelist']['browser']=row
+            browser.close()
+
+          # Fetch SGPJBG viewer scripts and print relevant snippets.
+          jsurls=['https://cache.sgpjbg.com/master/view/view2.js','https://cache.sgpjbg.com/Master/view/view-mini-fz.js']
+          for i,ju in enumerate(jsurls,1):
+            row={'url':ju}
+            try:
+              jr=s.get(ju,timeout=90); text=jr.text
+              (out/f'sgpjbg_view_{i}.js').write_bytes(jr.content)
+              snippets=[]
+              for key in ['_Addpage','_GotoPage','dp','product_id','inner_page','file.sgpjbg','mhi','mfvs','nodecode']:
+                for m in list(re.finditer(re.escape(key),text,re.I))[:20]: snippets.append({'key':key,'start':m.start(),'snippet':text[max(0,m.start()-800):min(len(text),m.end()+1800)]})
+              row.update({'status':jr.status_code,'bytes':len(jr.content),'content_type':jr.headers.get('content-type'),'snippets':snippets})
+              print('JS',i,jr.status_code,len(jr.content),ju,'SNIPS',len(snippets),flush=True)
+              for x in snippets[:50]: print('JS_SNIP',json.dumps(x,ensure_ascii=False),flush=True)
+            except Exception as e: row['error']=repr(e); print('JS_ERR',ju,repr(e),flush=True)
+            result['sgpjbg_js'][ju]=row
+          (out/'probe.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: seazen-source-probe
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
