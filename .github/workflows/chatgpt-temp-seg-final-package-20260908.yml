@@ -1,0 +1,190 @@
+name: chatgpt-temp-seg-final-package-20260908
+on:
+  push:
+    branches: [chatgpt-temp-china-lesso-reports-20260908]
+    paths: ['.github/workflows/chatgpt-temp-seg-final-package-20260908.yml']
+  workflow_dispatch:
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+          python <<'PY'
+          import hashlib, json, re, shutil, sys, time, urllib.parse, zipfile
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          ROOT=Path('seg_final')
+          PDFDIR=ROOT/'PDF'
+          PDFDIR.mkdir(parents=True,exist_ok=True)
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          targets=[
+            {'kind':'annual','period':2020,'archive_year':2021,'title':'2020 ANNUAL REPORT'},
+            {'kind':'annual','period':2021,'archive_year':2022,'title':'2021 ANNUAL REPORT'},
+            {'kind':'annual','period':2022,'archive_year':2023,'title':'2022 ANNUAL REPORT'},
+            {'kind':'annual','period':2023,'archive_year':2024,'title':'2023 ANNUAL REPORT'},
+            {'kind':'annual','period':2024,'archive_year':2025,'title':'2024 ANNUAL REPORT'},
+            {'kind':'annual','period':2025,'archive_year':2026,'title':'2025 ANNUAL REPORT'},
+            {'kind':'interim','period':2026,'archive_year':2026,'title':'2026 INTERIM REPORT'},
+          ]
+          known={
+            ('annual',2024):'https://financialfilings.com/filings/sinopec-engineering-group-co-ltd/annual-report/2025/32350320/',
+            ('annual',2025):'https://financialfilings.com/filings/sinopec-engineering-group-co-ltd/annual-report/2026/32950454/',
+            ('interim',2026):'https://financialfilings.com/filings/sinopec-engineering-group-co-ltd/interim-quarterly-report/2026/56354364/',
+          }
+
+          def get(url,timeout=60):
+            for attempt in range(4):
+              try:
+                r=s.get(url,timeout=timeout,allow_redirects=True)
+                if r.status_code==200: return r
+                print('GET',r.status_code,url,flush=True)
+              except Exception as e:
+                print('GET_ERROR',attempt,url,repr(e),flush=True)
+              time.sleep(2+attempt*2)
+            raise RuntimeError(f'failed to fetch {url}')
+
+          def normtext(x):
+            return ' '.join((x or '').replace('\xa0',' ').split()).upper()
+
+          def find_filing_page(t):
+            k=(t['kind'],t['period'])
+            if k in known: return known[k]
+            archive=f"https://financialfilings.com/companies/sinopec-engineering-group-co-ltd/{t['archive_year']}/"
+            r=get(archive)
+            soup=BeautifulSoup(r.text,'lxml')
+            wanted=normtext(t['title'])
+            candidates=[]
+            for a in soup.find_all('a',href=True):
+              text=normtext(a.get_text(' ',strip=True))
+              href=urllib.parse.urljoin(r.url,a['href'])
+              if '/filings/sinopec-engineering-group-co-ltd/' not in href: continue
+              if text==wanted or wanted in text:
+                candidates.append((0 if text==wanted else 1,href,text))
+            # Fallback: any annual/interim report path with the period in the nearby text.
+            if not candidates:
+              for a in soup.find_all('a',href=True):
+                text=normtext(a.get_text(' ',strip=True))
+                href=urllib.parse.urljoin(r.url,a['href'])
+                if '/filings/sinopec-engineering-group-co-ltd/' not in href: continue
+                if str(t['period']) in text and ('ANNUAL REPORT' in text if t['kind']=='annual' else 'INTERIM' in text):
+                  candidates.append((2,href,text))
+            if not candidates:
+              (ROOT/f"archive_{t['archive_year']}.html").write_text(r.text,encoding='utf-8')
+              raise RuntimeError(f"filing page not found for {t['title']} in {archive}")
+            candidates.sort()
+            print('FILING_CANDIDATES',t['title'],candidates[:10],flush=True)
+            return candidates[0][1]
+
+          def find_pdf_url(page_url):
+            r=get(page_url)
+            soup=BeautifulSoup(r.text,'lxml')
+            text=normtext(soup.get_text(' ',strip=True))
+            if 'SINOPEC ENGINEERING' not in text or '2386' not in text:
+              raise RuntimeError(f'filing page identity mismatch: {page_url}')
+            cand=[]
+            for a in soup.find_all('a',href=True):
+              href=urllib.parse.urljoin(r.url,a['href'])
+              label=normtext(a.get_text(' ',strip=True))
+              if href.lower().split('?')[0].endswith('.pdf'):
+                score=0
+                if 'cdn.financialreports.eu' in href: score-=5
+                if 'ORIGINAL' in label or 'VIEWER' in label: score-=3
+                cand.append((score,href,label))
+            # Also extract naked PDF URLs from page source/JSON.
+            for m in re.finditer(r'https?://[^\"\'<>\s]+\.pdf(?:\?[^\"\'<>\s]*)?',r.text,re.I):
+              href=m.group(0).replace('\\u0026','&').replace('\\/','/')
+              cand.append((-1,href,'REGEX'))
+            if not cand:
+              (ROOT/f"filing_{hashlib.md5(page_url.encode()).hexdigest()}.html").write_text(r.text,encoding='utf-8')
+              raise RuntimeError(f'PDF URL not found: {page_url}')
+            cand=sorted(set(cand))
+            print('PDF_CANDIDATES',page_url,cand[:20],flush=True)
+            return cand[0][1]
+
+          def download_pdf(url,out):
+            rr=get(url,timeout=120)
+            data=rr.content
+            if not data.startswith(b'%PDF-') or len(data)<100000:
+              raise RuntimeError(f'not a valid PDF: {url} status={rr.status_code} ct={rr.headers.get("content-type")} bytes={len(data)}')
+            out.write_bytes(data)
+            return rr.url
+
+          def validate(out,t):
+            reader=PdfReader(str(out))
+            pages=len(reader.pages)
+            if pages<40:
+              raise RuntimeError(f'PDF too short for full report: {out} pages={pages}')
+            chunks=[]
+            for p in reader.pages[:min(16,pages)]:
+              try: chunks.append(p.extract_text() or '')
+              except Exception: pass
+            txt=normtext('\n'.join(chunks))
+            if 'SINOPEC ENGINEERING' not in txt and '中石化' not in txt:
+              raise RuntimeError(f'company identity not found in first pages: {out}')
+            if str(t['period']) not in txt:
+              raise RuntimeError(f'period {t["period"]} not found in first pages: {out}')
+            if t['kind']=='annual' and 'ANNUAL REPORT' not in txt and '年度报告' not in txt and '年度報告' not in txt:
+              raise RuntimeError(f'annual report marker missing: {out}')
+            if t['kind']=='interim' and 'INTERIM REPORT' not in txt and '中期报告' not in txt and '中期報告' not in txt:
+              raise RuntimeError(f'interim report marker missing: {out}')
+            return pages
+
+          manifest=[]
+          for t in targets:
+            page=find_filing_page(t)
+            pdf_url=find_pdf_url(page)
+            if t['kind']=='annual':
+              filename=f"中石化炼化工程_02386_{t['period']}年年度报告.pdf"
+            else:
+              filename=f"中石化炼化工程_02386_{t['period']}年中期报告_截至06月30日.pdf"
+            out=PDFDIR/filename
+            final_url=download_pdf(pdf_url,out)
+            pages=validate(out,t)
+            sha=hashlib.sha256(out.read_bytes()).hexdigest()
+            item={**t,'filename':filename,'pages':pages,'bytes':out.stat().st_size,'sha256':sha,'filing_page':page,'download_url':final_url}
+            manifest.append(item)
+            print('VERIFIED',filename,pages,out.stat().st_size,sha,flush=True)
+
+          readme_lines=[
+            '# 中石化炼化工程（02386.HK）财务报告资料包',
+            '',
+            '本资料包包含 2020—2025 年完整年度报告，以及截至 2026 年 6 月 30 日止六个月的最新中期报告。',
+            '',
+            '说明：该公司为香港上市公司，通常披露年度报告及中期报告，不按 A 股规则定期披露一季报和三季报。因此用户所称“最新季报”以最新已发布的 2026 年中期报告替代。',
+            '',
+            '| 报告期 | 类型 | 页数 | 文件名 |',
+            '|---|---:|---:|---|',
+          ]
+          for x in manifest:
+            typ='年度报告' if x['kind']=='annual' else '中期报告'
+            readme_lines.append(f"| {x['period']} | {typ} | {x['pages']} | {x['filename']} |")
+          readme_lines += ['', '所有 PDF 均已校验文件头、公司名称、报告期、报告类型和页数。详细来源及 SHA-256 校验值见 manifest.json。']
+          (ROOT/'README.md').write_text('\n'.join(readme_lines)+'\n',encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  PDF/{x['filename']}" for x in manifest)+'\n',encoding='utf-8')
+
+          zip_path=Path('中石化炼化工程_02386_2020-2025年报及2026中期报告.zip')
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file(): z.write(p,p.relative_to(ROOT.parent))
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SEG-02386-2020-2025-Annual-and-2026-Interim
+          path: 中石化炼化工程_02386_2020-2025年报及2026中期报告.zip
+          retention-days: 1
+          compression-level: 0
