@@ -1,0 +1,146 @@
+name: Inspect China Hongqiao report PDF links
+on:
+  push:
+    branches:
+      - tmp-chinahongqiao-pdf-discovery-20260908
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install browser bindings
+        run: |
+          python -m pip install --quiet playwright beautifulsoup4 lxml requests
+      - name: Inspect report pages and network
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import json, os, re, shutil
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          reports = {
+              '4307103': {'date': '2024-05-16', 'broker': '信达证券'},
+              '4802165': {'date': '2025-04-21', 'broker': '西部证券'},
+              '4864892': {'date': '2025-05-27', 'broker': '华创证券'},
+          }
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          all_results = {}
+          url_pat = re.compile(r'(\.pdf(?:$|\?)|download|report|file|oss|api|document|attachment)', re.I)
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True,
+                  executable_path=chrome,
+                  args=['--no-sandbox', '--disable-dev-shm-usage']
+              )
+              context = browser.new_context(
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+                  locale='zh-CN',
+                  viewport={'width': 1440, 'height': 1100},
+                  accept_downloads=True,
+              )
+
+              for rid, meta in reports.items():
+                  page = context.new_page()
+                  requests_seen = []
+                  responses_seen = []
+                  downloads = []
+
+                  def on_request(req):
+                      if url_pat.search(req.url):
+                          requests_seen.append({'url': req.url, 'method': req.method, 'resource_type': req.resource_type})
+
+                  def on_response(resp):
+                      try:
+                          ct = resp.headers.get('content-type', '')
+                      except Exception:
+                          ct = ''
+                      if url_pat.search(resp.url) or 'pdf' in ct.lower():
+                          responses_seen.append({'url': resp.url, 'status': resp.status, 'content_type': ct})
+
+                  page.on('request', on_request)
+                  page.on('response', on_response)
+
+                  rec = {'meta': meta, 'pages': {}, 'requests': requests_seen, 'responses': responses_seen, 'downloads': downloads}
+                  for label, url in [
+                      ('detail', f'https://www.fxbaogao.com/detail/{rid}'),
+                      ('view', f'https://www.fxbaogao.com/view?id={rid}'),
+                  ]:
+                      item = {'url': url}
+                      try:
+                          resp = page.goto(url, wait_until='domcontentloaded', timeout=120000)
+                          try:
+                              page.wait_for_load_state('networkidle', timeout=25000)
+                          except PWTimeout:
+                              pass
+                          page.wait_for_timeout(3000)
+                          item['status'] = resp.status if resp else None
+                          item['final_url'] = page.url
+                          item['title'] = page.title()
+                          item['body'] = ' '.join(page.locator('body').inner_text(timeout=15000).split())[:100000]
+                          item['links'] = page.eval_on_selector_all('a', "els => els.map(e => ({text:(e.innerText||e.textContent||'').trim(), href:e.href, title:e.title||'', download:e.download||''}))")
+                          item['scripts'] = page.eval_on_selector_all('script', "els => els.map(e => ({src:e.src||'', text:(e.textContent||'').slice(0,50000)}))")
+                          item['globals'] = page.evaluate("""() => {
+                              const out = {};
+                              for (const k of ['__NEXT_DATA__','__NUXT__','__INITIAL_STATE__','__APOLLO_STATE__']) {
+                                  try { if (window[k] !== undefined) out[k] = window[k]; } catch(e) {}
+                              }
+                              try { out.localStorage = {...localStorage}; } catch(e) {}
+                              try { out.sessionStorage = {...sessionStorage}; } catch(e) {}
+                              return out;
+                          }""")
+                          Path(f'output/{rid}_{label}.html').write_text(page.content(), encoding='utf-8')
+                          page.screenshot(path=f'output/{rid}_{label}.png', full_page=True)
+
+                          # Click public report/view/download controls when present; do not log in or bypass gates.
+                          for text in ['点击免费查看完整报告', '免费查看完整报告', '打开报告原文', '下载报告', '下载']:
+                              loc = page.get_by_text(text, exact=False)
+                              count = loc.count()
+                              if count:
+                                  try:
+                                      with page.expect_download(timeout=5000) as dinfo:
+                                          loc.first.click(timeout=5000)
+                                      d = dinfo.value
+                                      suggested = d.suggested_filename
+                                      target = f'output/{rid}_{label}_{suggested}'
+                                      d.save_as(target)
+                                      downloads.append({'label': label, 'text': text, 'file': target, 'url': d.url})
+                                  except Exception as exc:
+                                      item.setdefault('click_results', []).append({'text': text, 'error': repr(exc), 'after_url': page.url})
+                                      try:
+                                          page.wait_for_timeout(1500)
+                                      except Exception:
+                                          pass
+                          item['after_click_url'] = page.url
+                      except Exception as exc:
+                          item['error'] = repr(exc)
+                      rec['pages'][label] = item
+                  page.close()
+                  all_results[rid] = rec
+
+              browser.close()
+
+          # Extract every URL-like token for easier review.
+          url_re = re.compile(r'https?://[^\"\'<>\\s]+')
+          for rid, rec in all_results.items():
+              blob = json.dumps(rec, ensure_ascii=False)
+              urls = sorted(set(url_re.findall(blob)))
+              rec['all_urls'] = urls
+              rec['pdf_candidates'] = [u for u in urls if '.pdf' in u.lower() or 'download' in u.lower()]
+              print('REPORT', rid, 'PDF_CANDIDATES', json.dumps(rec['pdf_candidates'], ensure_ascii=False), flush=True)
+
+          Path('output/result.json').write_text(json.dumps(all_results, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+      - name: Upload inspection artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinahongqiao-pdf-discovery
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
