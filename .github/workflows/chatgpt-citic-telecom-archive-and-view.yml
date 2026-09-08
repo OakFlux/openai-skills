@@ -1,0 +1,183 @@
+name: Recover archived CITIC Telecom reports and inspect public report viewer
+
+on:
+  push:
+    branches:
+      - chatgpt-citic-telecom-dbs-download-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml playwright pypdf pymupdf
+      - name: Recover archived reports and inspect viewers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > /tmp/recover.py <<'PY'
+          from __future__ import annotations
+          import io, json, re, shutil, time, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+          from pypdf import PdfReader
+
+          OUT=Path('out')
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          hibor_variants=[
+            'http://www.microbell.com/repdetail_2571700.html',
+            'https://www.microbell.com/repdetail_2571700.html',
+            'http://microbell.com/repdetail_2571700.html',
+            'https://microbell.com/repdetail_2571700.html',
+            'http://www.hibor.com.cn/repdetail_2571700.html',
+            'https://www.hibor.com.cn/repdetail_2571700.html',
+            'http://hibor.com.cn/repdetail_2571700.html',
+            'https://hibor.com.cn/repdetail_2571700.html',
+            'http://www.hibor.com.cn/repdetail_2571700.html?from=search',
+            'http://www.microbell.com/repdetail_2571700.html?from=search',
+          ]
+          results={'hibor':[],'cdx':[],'archive_pages':[],'fx':[]}
+          for i,u in enumerate(hibor_variants):
+            try:
+              r=s.get(u,timeout=(15,90),allow_redirects=False)
+              rec={'url':u,'status':r.status_code,'location':r.headers.get('location'),'ctype':r.headers.get('content-type'),'bytes':len(r.content),'text':r.text[:2000]}
+              results['hibor'].append(rec)
+              print('HIBOR',json.dumps(rec,ensure_ascii=False),flush=True)
+              Path(f'out/hibor_{i:02d}.html').write_bytes(r.content)
+            except Exception as e:
+              results['hibor'].append({'url':u,'error':repr(e)}); print('HIBOR_FAIL',u,repr(e),flush=True)
+
+          cdx_queries=[
+            'http://web.archive.org/cdx/search/cdx?url=www.microbell.com/repdetail_2571700.html&output=json&filter=statuscode:200&filter=mimetype:text/html&fl=timestamp,original,statuscode,mimetype,digest,length&collapse=digest',
+            'https://web.archive.org/cdx/search/cdx?url=www.microbell.com/repdetail_2571700.html&output=json&filter=statuscode:200&fl=timestamp,original,statuscode,mimetype,digest,length&collapse=digest',
+            'https://web.archive.org/cdx/search/cdx?url=www.hibor.com.cn/repdetail_2571700.html&output=json&filter=statuscode:200&fl=timestamp,original,statuscode,mimetype,digest,length&collapse=digest',
+            'https://web.archive.org/cdx/search/cdx?url=*2571700*&output=json&filter=statuscode:200&fl=timestamp,original,statuscode,mimetype,digest,length&collapse=digest&limit=500',
+            'https://web.archive.org/cdx/search/cdx?url=img.hibor.com.cn/*&output=json&filter=statuscode:200&filter=urlkey:.*2571700.*&fl=timestamp,original,statuscode,mimetype,digest,length&collapse=digest&limit=500',
+          ]
+          snapshots=[]
+          for u in cdx_queries:
+            try:
+              r=s.get(u,timeout=(20,180)); rec={'url':u,'status':r.status_code,'bytes':len(r.content),'ctype':r.headers.get('content-type'),'text':r.text[:10000]}
+              results['cdx'].append(rec); print('CDX',json.dumps(rec,ensure_ascii=False)[:12000],flush=True)
+              if r.status_code==200:
+                try:
+                  data=r.json()
+                  if isinstance(data,list) and len(data)>1:
+                    hdr=data[0]
+                    for row in data[1:]: snapshots.append(dict(zip(hdr,row)))
+                except Exception: pass
+            except Exception as e:
+              results['cdx'].append({'url':u,'error':repr(e)}); print('CDX_FAIL',u,repr(e),flush=True)
+          uniq=[]; seen=set()
+          for x in snapshots:
+            key=(x.get('timestamp'),x.get('original'))
+            if key not in seen: seen.add(key); uniq.append(x)
+          snapshots=uniq
+          print('SNAPSHOTS',json.dumps(snapshots,ensure_ascii=False),flush=True)
+          for i,x in enumerate(snapshots[:100]):
+            ts=x.get('timestamp'); orig=x.get('original')
+            if not ts or not orig: continue
+            au=f'https://web.archive.org/web/{ts}id_/{orig}'
+            try:
+              r=s.get(au,timeout=(20,180),allow_redirects=True)
+              rec={'archive_url':au,'status':r.status_code,'final_url':r.url,'ctype':r.headers.get('content-type'),'bytes':len(r.content),'timestamp':ts,'original':orig}
+              if b'%PDF' in r.content[:4096]:
+                rec['is_pdf']=True
+                try: rec['pages']=len(PdfReader(io.BytesIO(r.content),strict=False).pages)
+                except Exception as e: rec['pdf_error']=repr(e)
+                Path(f'out/archive_{i:03d}.pdf').write_bytes(r.content)
+              else:
+                text=r.text; rec['title']=BeautifulSoup(text,'lxml').title.get_text(' ',strip=True) if BeautifulSoup(text,'lxml').title else None
+                rec['snippets']=[]; rec['links']=[]
+                for term in ['Catching the Express','中信国际电讯','CITIC Telecom','2571700','pdf','download']:
+                  for m in list(re.finditer(re.escape(term),text,re.I))[:10]: rec['snippets'].append(re.sub(r'\s+',' ',text[max(0,m.start()-400):m.start()+1000])[:1400])
+                soup=BeautifulSoup(text,'lxml')
+                for tag in soup.find_all(['a','iframe','embed','object','script','img']):
+                  for attr in ('href','src','data','onclick','value'):
+                    v=tag.get(attr)
+                    if v and any(k in str(v).lower() for k in ['pdf','download','report','2571700','file','attach']): rec['links'].append({'tag':tag.name,'attr':attr,'value':str(v)[:2000],'text':tag.get_text(' ',strip=True)[:200]})
+                Path(f'out/archive_{i:03d}.html').write_text(text,encoding='utf-8',errors='replace')
+              results['archive_pages'].append(rec); print('ARCHIVE',json.dumps(rec,ensure_ascii=False)[:20000],flush=True)
+            except Exception as e:
+              results['archive_pages'].append({'archive_url':au,'error':repr(e)}); print('ARCHIVE_FAIL',au,repr(e),flush=True)
+
+          # Use public FX report viewer and capture all report-image/API traffic after clicking view.
+          fx_ids=['1105584','1042738','1208265']
+          chrome=shutil.which('google-chrome') or shutil.which('chromium') or shutil.which('chromium-browser')
+          with sync_playwright() as p:
+            browser=p.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage']) if chrome else p.chromium.launch(headless=True)
+            context=browser.new_context(user_agent=UA,locale='zh-CN',ignore_https_errors=True,viewport={'width':1440,'height':1000})
+            for docid in fx_ids:
+              page=context.new_page(); requests_seen=[]; responses_seen=[]
+              page.on('request',lambda req,arr=requests_seen: arr.append({'url':req.url,'method':req.method,'post_data':req.post_data}) if any(k in req.url.lower() for k in ['report','pdf','image','view','detail','api','doc']) else None)
+              page.on('response',lambda resp,arr=responses_seen: arr.append({'status':resp.status,'url':resp.url,'ctype':resp.headers.get('content-type')}) if any(k in resp.url.lower() for k in ['report','pdf','image','view','detail','api','doc']) else None)
+              rec={'docid':docid}
+              try:
+                url=f'https://www.fxbaogao.com/detail/{docid}'
+                page.goto(url,wait_until='networkidle',timeout=120000)
+                rec['detail_url']=page.url; rec['detail_title']=page.title()
+                hrefs=page.locator('a').evaluate_all("els => els.map(e => ({text:(e.innerText||'').trim(),href:e.href,title:e.title,className:e.className}))")
+                rec['hrefs']=hrefs
+                # Open /view directly and wait.
+                page.goto(f'https://www.fxbaogao.com/view?id={docid}',wait_until='domcontentloaded',timeout=120000)
+                page.wait_for_timeout(10000)
+                rec['view_url']=page.url; rec['view_title']=page.title(); rec['html_bytes']=len(page.content().encode())
+                htmltxt=page.content(); Path(f'out/fx_{docid}_view.html').write_text(htmltxt,encoding='utf-8',errors='replace')
+                rec['view_links']=[]
+                soup=BeautifulSoup(htmltxt,'lxml')
+                for tag in soup.find_all(['a','img','iframe','embed','object','script']):
+                  for attr in ('href','src','data','data-src','data-url'):
+                    v=tag.get(attr)
+                    if v and any(k in str(v).lower() for k in ['report','pdf','image','view','api','doc']): rec['view_links'].append({'tag':tag.name,'attr':attr,'value':str(v)[:3000]})
+                rec['requests']=requests_seen; rec['responses']=responses_seen
+                print('FX',json.dumps(rec,ensure_ascii=False)[:50000],flush=True)
+              except Exception as e:
+                rec['error']=repr(e); rec['requests']=requests_seen; rec['responses']=responses_seen; print('FX_FAIL',docid,repr(e),flush=True)
+              results['fx'].append(rec); page.close()
+            browser.close()
+
+          # Probe unique FX image endpoints with browser-like referer; enumerate sequential pages if pattern found.
+          urls=[]
+          for rec in results['fx']:
+            for x in rec.get('requests',[]):
+              u=x.get('url','')
+              if u and u not in urls: urls.append(u)
+            for x in rec.get('view_links',[]):
+              u=urllib.parse.urljoin(rec.get('view_url') or 'https://www.fxbaogao.com/',x.get('value',''))
+              if u and u not in urls: urls.append(u)
+          probed=[]
+          for u in urls[:1000]:
+            if not u.startswith('http'): continue
+            try:
+              r=s.get(u,headers={'User-Agent':UA,'Referer':'https://www.fxbaogao.com/'},timeout=(15,120),allow_redirects=True)
+              obj={'url':u,'status':r.status_code,'final_url':r.url,'ctype':r.headers.get('content-type'),'bytes':len(r.content),'head':r.content[:20].hex()}
+              probed.append(obj)
+              if ('image' in (obj['ctype'] or '').lower() or b'%PDF' in r.content[:4096]) and len(r.content)>10000:
+                ext='.pdf' if b'%PDF' in r.content[:4096] else ('.png' if b'PNG' in r.content[:16] else '.jpg')
+                Path(f'out/fx_asset_{len(probed):04d}{ext}').write_bytes(r.content)
+              print('FX_PROBE',json.dumps(obj,ensure_ascii=False),flush=True)
+            except Exception as e: print('FX_PROBE_FAIL',u,repr(e),flush=True)
+          results['fx_probed']=probed
+          Path('out/results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/recover.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: citic-telecom-archive-and-view
+          path: out/
+          retention-days: 3
+          if-no-files-found: error
