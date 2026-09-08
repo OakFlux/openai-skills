@@ -1,0 +1,116 @@
+name: Inspect public Doc88 China Hongqiao full reading
+on:
+  push:
+    branches:
+      - tmp-doc88-hongqiao-public-read-20260908
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet playwright pillow pypdf requests
+      - name: Capture only publicly rendered report pages
+        run: |
+          set -euo pipefail
+          mkdir -p output/images
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib,io,json,re,shutil
+          from pathlib import Path
+          from urllib.parse import urlparse
+          from PIL import Image
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          url='https://www.doc88.com/p-89219780035956.html'
+          expected=28
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          chrome=shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          rec={'url':url,'requests':[],'responses':[],'page_urls':[],'downloaded':[]}
+          candidates=[]
+          def looks_page(u,ct=''):
+              return bool(re.search(r'(page|view|image|img|source|document|pdf)',u,re.I) or 'image/' in ct.lower() or 'pdf' in ct.lower())
+          with sync_playwright() as p:
+            browser=p.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage'])
+            ctx=browser.new_context(user_agent=ua,locale='zh-CN',viewport={'width':1500,'height':1200},accept_downloads=True)
+            pg=ctx.new_page()
+            def on_req(r):
+              if looks_page(r.url):rec['requests'].append({'url':r.url,'method':r.method,'type':r.resource_type,'post':r.post_data})
+            def on_resp(r):
+              try:ct=r.headers.get('content-type','')
+              except:ct=''
+              if looks_page(r.url,ct):
+                item={'url':r.url,'status':r.status,'ct':ct};rec['responses'].append(item)
+                if r.status==200 and ('image/' in ct.lower() or 'pdf' in ct.lower()):candidates.append((r.url,ct))
+            pg.on('request',on_req);pg.on('response',on_resp)
+            try:
+              r=pg.goto(url,wait_until='domcontentloaded',timeout=120000)
+              try:pg.wait_for_load_state('networkidle',timeout=30000)
+              except PWTimeout:pass
+              pg.wait_for_timeout(2500)
+              rec['initial']={'status':r.status if r else None,'url':pg.url,'title':pg.title(),'body':' '.join(pg.locator('body').inner_text(timeout=15000).split())[:120000]}
+              # Publicly scroll through the viewer. Click only controls explicitly labelled as continuing free reading.
+              for _ in range(100):
+                for text in ['继续阅读','继续预览','展开阅读全文','下一页']:
+                  loc=pg.get_by_text(text,exact=False)
+                  for i in range(min(loc.count(),2)):
+                    try:
+                      if loc.nth(i).is_visible(): loc.nth(i).click(timeout=1500)
+                    except: pass
+                pg.evaluate('window.scrollBy(0, Math.max(900, window.innerHeight*0.85))')
+                pg.wait_for_timeout(250)
+                if pg.evaluate('window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 20'):
+                  pg.wait_for_timeout(800)
+              pg.wait_for_timeout(2000)
+              body=' '.join(pg.locator('body').inner_text(timeout=15000).split())
+              imgs=pg.eval_on_selector_all('img','els=>els.map(e=>({src:e.currentSrc||e.src||"",alt:e.alt||"",w:e.naturalWidth||0,h:e.naturalHeight||0,className:e.className||""}))')
+              frames=pg.eval_on_selector_all('iframe,embed,object','els=>els.map(e=>({tag:e.tagName,src:e.src||e.data||"",outer:e.outerHTML.slice(0,3000)}))')
+              canvases=pg.eval_on_selector_all('canvas','els=>els.map(e=>({w:e.width,h:e.height,className:e.className||"",id:e.id||""}))')
+              rec['final']={'url':pg.url,'body':body[:150000],'imgs':imgs,'frames':frames,'canvases':canvases}
+              Path('output/page.html').write_text(pg.content(),encoding='utf-8')
+              pg.screenshot(path='output/full.png',full_page=True)
+              for x in imgs:
+                if x.get('src') and x.get('w',0)>500 and x.get('h',0)>500:candidates.append((x['src'],'image/unknown'))
+            except Exception as exc:rec['error']=repr(exc)
+
+            # Download only URLs observed in the public page/network. Dedupe by bytes.
+            seen_url=set();seen_sha=set();images=[]
+            for u,ct in candidates:
+              if not u.startswith('http') or u in seen_url:continue
+              seen_url.add(u)
+              try:
+                rr=ctx.request.get(u,headers={'Referer':url},timeout=60000);data=rr.body()
+                item={'url':u,'status':rr.status,'ct':rr.headers.get('content-type',''),'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()}
+                if item['sha256'] in seen_sha:continue
+                seen_sha.add(item['sha256'])
+                if data.startswith(b'%PDF'):
+                  pth=Path('output/public_source.pdf');pth.write_bytes(data)
+                  rd=PdfReader(str(pth));item['pdf_pages']=len(rd.pages);item['saved_as']=str(pth)
+                else:
+                  try:
+                    im=Image.open(io.BytesIO(data)).convert('RGB')
+                    item.update(width=im.width,height=im.height)
+                    if im.width>700 and im.height>800:
+                      ip=Path('output/images')/f'{len(images)+1:03d}_{item["sha256"][:10]}.jpg';im.save(ip,quality=95);images.append((u,im.copy()));item['saved_as']=str(ip)
+                  except Exception as exc:item['image_error']=repr(exc)
+                rec['downloaded'].append(item)
+              except Exception as exc:rec['downloaded'].append({'url':u,'error':repr(exc)})
+            # Save public page screenshots as PDF only if exactly expected unique report-page images were displayed.
+            rec['unique_large_images']=len(images)
+            if len(images)==expected:
+              out=Path('output/2025-05-27_华创证券_中国宏桥_全球电解铝龙头_公开阅读版.pdf')
+              images[0][1].save(out,save_all=True,append_images=[x[1] for x in images[1:]],resolution=150)
+              rd=PdfReader(str(out));rec['assembled']={'file':str(out),'pages':len(rd.pages),'bytes':out.stat().st_size,'sha256':hashlib.sha256(out.read_bytes()).hexdigest()}
+            browser.close()
+          Path('output/result.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('RESULT',json.dumps(rec,ensure_ascii=False)[:80000],flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doc88-hongqiao-public-read
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
