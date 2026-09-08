@@ -1,0 +1,187 @@
+name: Download official CMBI China Hongqiao research PDFs
+on:
+  push:
+    branches:
+      - tmp-chinahongqiao-cmbi-official-20260908
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet playwright requests beautifulsoup4 lxml pypdf pymupdf
+      - name: Fetch articles and official PDFs
+        run: |
+          set -euo pipefail
+          mkdir -p output/pdfs output/html output/screens
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil, time
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          article_ids = [6833, 10002, 10267, 11073, 12626, 12805, 13479]
+          langs = ['en', 'cn', 'tc']
+          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({'User-Agent': ua, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
+          result = {'articles': {}, 'pdfs': {}}
+
+          def save_pdf(data: bytes, source_url: str, article_id: int, lang: str, method: str):
+              if not data.startswith(b'%PDF'):
+                  return None
+              sha = hashlib.sha256(data).hexdigest()
+              fn = Path('output/pdfs') / f'{article_id}_{lang}_{sha[:12]}.pdf'
+              if not fn.exists(): fn.write_bytes(data)
+              try:
+                  reader = PdfReader(str(fn))
+                  pages = len(reader.pages)
+                  text_parts = []
+                  for idx in range(min(pages, 5)):
+                      try: text_parts.append(reader.pages[idx].extract_text() or '')
+                      except Exception: pass
+                  preview = ' '.join(' '.join(text_parts).split())[:12000]
+                  meta = {str(k): str(v) for k, v in (reader.metadata or {}).items()}
+              except Exception as exc:
+                  pages = None; preview = ''; meta = {'parse_error': repr(exc)}
+              rec = {
+                  'file': str(fn), 'source_url': source_url, 'article_id': article_id,
+                  'lang': lang, 'method': method, 'bytes': len(data), 'sha256': sha,
+                  'pages': pages, 'text_preview': preview, 'metadata': meta,
+              }
+              result['pdfs'][sha] = rec
+              print('PDF', json.dumps(rec, ensure_ascii=False), flush=True)
+              return rec
+
+          # First inspect static article HTML and try direct HTTP download with official referer.
+          pdf_candidates = []
+          for aid in article_ids:
+              for lang in langs:
+                  article_url = f'https://www.cmbi.com.hk/article/{aid}.html?lang={lang}'
+                  key = f'{aid}_{lang}'
+                  rec = {'article_url': article_url}
+                  try:
+                      r = session.get(article_url, timeout=60, allow_redirects=True)
+                      rec.update({'status': r.status_code, 'final_url': r.url, 'bytes': len(r.content)})
+                      text = r.text
+                      Path(f'output/html/{key}.html').write_text(text, encoding='utf-8')
+                      soup = BeautifulSoup(text, 'lxml')
+                      rec['title'] = soup.title.get_text(' ', strip=True) if soup.title else ''
+                      rec['body'] = ' '.join(soup.get_text(' ', strip=True).split())[:30000]
+                      rec['meta'] = {m.get('name') or m.get('property') or m.get('itemprop'): m.get('content') for m in soup.find_all('meta') if (m.get('name') or m.get('property') or m.get('itemprop')) and m.get('content')}
+                      links = []
+                      for tag in soup.find_all(['iframe','a','embed','object']):
+                          raw = tag.get('src') or tag.get('href') or tag.get('data')
+                          if raw:
+                              u = urljoin(r.url, raw)
+                              links.append({'tag': tag.name, 'url': u, 'text': tag.get_text(' ', strip=True)[:300]})
+                              if '.pdf' in u.lower(): pdf_candidates.append((aid, lang, article_url, u))
+                      rec['links'] = links
+                      # Also recover URLs embedded in scripts or escaped JSON.
+                      normalized = text.replace('\\/','/')
+                      for u in re.findall(r'https?://[^\"\'<>\\s]+?\.pdf(?:\?[^\"\'<>\\s]*)?', normalized, re.I):
+                          pdf_candidates.append((aid, lang, article_url, u))
+                      for rel in re.findall(r'(?:(?:src|href)=[\"\']|[\"\'])(/[^\"\']+?\.pdf(?:\?[^\"\']*)?)', normalized, re.I):
+                          pdf_candidates.append((aid, lang, article_url, urljoin(r.url, rel)))
+                  except Exception as exc:
+                      rec['error'] = repr(exc)
+                  result['articles'][key] = rec
+                  print('ARTICLE', key, json.dumps({k:rec.get(k) for k in ['status','final_url','title','body','links','error']}, ensure_ascii=False)[:20000], flush=True)
+
+          # De-duplicate candidate tuples.
+          seen = set(); unique = []
+          for row in pdf_candidates:
+              sig = row[3]
+              if sig in seen: continue
+              seen.add(sig); unique.append(row)
+          pdf_candidates = unique
+          print('CANDIDATES', json.dumps(pdf_candidates, ensure_ascii=False), flush=True)
+
+          for aid, lang, article_url, pdf_url in pdf_candidates:
+              headers_variants = [
+                  {'Referer': article_url, 'Accept': 'application/pdf,*/*;q=0.8'},
+                  {'Referer': 'https://www.cmbi.com.hk/', 'Origin': 'https://www.cmbi.com.hk', 'Accept': 'application/pdf,*/*;q=0.8'},
+                  {'Accept': 'application/pdf,*/*;q=0.8'},
+              ]
+              for j, hdrs in enumerate(headers_variants):
+                  try:
+                      rr = session.get(pdf_url, headers=hdrs, timeout=90, allow_redirects=True)
+                      print('DIRECT', aid, lang, j, rr.status_code, rr.url, rr.headers.get('content-type'), len(rr.content), flush=True)
+                      if save_pdf(rr.content, rr.url, aid, lang, f'requests_{j}'):
+                          break
+                  except Exception as exc:
+                      print('DIRECT_ERR', aid, lang, j, repr(exc), flush=True)
+
+          # Browser path: load official article, allow iframe request, capture any PDF response body.
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, executable_path=chrome, args=['--no-sandbox','--disable-dev-shm-usage'])
+              context = browser.new_context(user_agent=ua, locale='zh-CN', viewport={'width':1440,'height':1000}, accept_downloads=True)
+              for aid in article_ids:
+                  for lang in langs:
+                      article_url = f'https://www.cmbi.com.hk/article/{aid}.html?lang={lang}'
+                      page = context.new_page()
+                      captured = []
+                      def on_response(resp, aid=aid, lang=lang, captured=captured):
+                          try: ct = resp.headers.get('content-type','')
+                          except Exception: ct = ''
+                          if '.pdf' in resp.url.lower() or 'application/pdf' in ct.lower():
+                              item = {'url': resp.url, 'status': resp.status, 'content_type': ct}
+                              try:
+                                  data = resp.body()
+                                  item['bytes'] = len(data)
+                                  save_pdf(data, resp.url, aid, lang, 'browser_response')
+                              except Exception as exc:
+                                  item['body_error'] = repr(exc)
+                              captured.append(item)
+                      page.on('response', on_response)
+                      try:
+                          rr = page.goto(article_url, wait_until='domcontentloaded', timeout=90000)
+                          try: page.wait_for_load_state('networkidle', timeout=30000)
+                          except PWTimeout: pass
+                          page.wait_for_timeout(2500)
+                          key=f'{aid}_{lang}'
+                          result['articles'].setdefault(key,{})['browser_status'] = rr.status if rr else None
+                          result['articles'][key]['browser_url'] = page.url
+                          result['articles'][key]['browser_title'] = page.title()
+                          result['articles'][key]['browser_links'] = page.eval_on_selector_all('iframe,a,embed,object', "els=>els.map(e=>({tag:e.tagName,url:e.src||e.href||e.data||'',text:(e.innerText||e.textContent||'').trim()}))")
+                          result['articles'][key]['captured'] = captured
+                          Path(f'output/html/{key}_browser.html').write_text(page.content(), encoding='utf-8')
+                          page.screenshot(path=f'output/screens/{key}.png', full_page=True)
+
+                          # Navigate through the official report link in a new page to preserve referer/cookies.
+                          candidates = page.locator('iframe[src*=".pdf"], a[href*=".pdf"]')
+                          if candidates.count():
+                              src = candidates.first.get_attribute('src') or candidates.first.get_attribute('href')
+                              if src:
+                                  abs_url = urljoin(page.url, src)
+                                  try:
+                                      pdf_page = context.new_page()
+                                      pdf_page.set_extra_http_headers({'Referer': article_url, 'Accept': 'application/pdf,*/*;q=0.8'})
+                                      pr = pdf_page.goto(abs_url, wait_until='commit', timeout=90000)
+                                      pdf_page.wait_for_timeout(2500)
+                                      result['articles'][key]['pdf_navigation'] = {'url': pdf_page.url, 'status': pr.status if pr else None}
+                                      pdf_page.close()
+                                  except Exception as exc:
+                                      result['articles'][key]['pdf_navigation_error'] = repr(exc)
+                      except Exception as exc:
+                          result['articles'].setdefault(f'{aid}_{lang}',{})['browser_error'] = repr(exc)
+                      page.close()
+              browser.close()
+
+          Path('output/result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('TOTAL_PDFS', len(result['pdfs']), flush=True)
+          PY
+      - name: Upload official files
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinahongqiao-cmbi-official-pdfs
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
