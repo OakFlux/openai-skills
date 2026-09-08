@@ -1,0 +1,217 @@
+name: Inspect public China Hongqiao report viewers
+on:
+  push:
+    branches:
+      - tmp-chinahongqiao-fxbaogao-20260908
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet playwright requests beautifulsoup4 lxml pypdf
+      - name: Inspect public viewers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/pdfs output/html output/json output/screens
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          targets = {
+              'west_20250421': {'id': '4802165', 'broker': '西部证券', 'date': '2025-04-21', 'title': '高景气+一体化+高分红，电解铝龙头静待价值重估'},
+              'huachuang_20250527': {'id': '4864892', 'broker': '华创证券', 'date': '2025-05-27', 'title': '全球电解铝龙头，一体化打造盈利护城河，高分红属性明显'},
+              'kaiyuan_20240612': {'id': '4343421', 'broker': '开源证券', 'date': '2024-06-12', 'title': '成本企稳+铝行业高景气，电解铝龙头扬帆起航'},
+          }
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+          session = requests.Session(); session.headers.update(headers)
+          results = {}
+          pdf_records = []
+
+          def safe_name(s: str) -> str:
+              return re.sub(r'[^0-9A-Za-z._\-]+', '_', s)[:140]
+
+          def save_pdf(data: bytes, key: str, source_url: str, label: str) -> dict | None:
+              if not data.startswith(b'%PDF') or len(data) < 20000:
+                  return None
+              sha = hashlib.sha256(data).hexdigest()
+              path = Path('output/pdfs') / f'{safe_name(key)}_{sha[:12]}.pdf'
+              if not path.exists(): path.write_bytes(data)
+              rec = {'key': key, 'file': str(path), 'bytes': len(data), 'sha256': sha, 'source_url': source_url, 'label': label}
+              try:
+                  reader = PdfReader(str(path)); pages = len(reader.pages)
+                  idxs = sorted(set([0, min(1,pages-1), min(4,pages-1), max(0,pages//2), max(0,pages-2), pages-1]))
+                  text = ''.join((reader.pages[i].extract_text() or '') for i in idxs)
+                  rec.update({'pages': pages, 'sample_text': ' '.join(text.split())[:8000], 'mentions_company': bool(re.search(r'中国宏桥|中國宏橋|China\s+Hongqiao|01378', text, re.I))})
+              except Exception as exc:
+                  rec['parse_error'] = repr(exc)
+              pdf_records.append(rec)
+              print('SAVED_PDF', json.dumps(rec, ensure_ascii=False), flush=True)
+              return rec
+
+          # Static inspection of detail and view pages.
+          for key, meta in targets.items():
+              rec = {'meta': meta, 'static': {}}
+              for kind, url in [('detail', f'https://www.fxbaogao.com/detail/{meta["id"]}'), ('view', f'https://www.fxbaogao.com/view?id={meta["id"]}')]:
+                  item = {'url': url}
+                  try:
+                      r = session.get(url, timeout=60, allow_redirects=True)
+                      item.update({'status': r.status_code, 'final_url': r.url, 'content_type': r.headers.get('content-type',''), 'bytes': len(r.content)})
+                      Path(f'output/html/{key}_{kind}.html').write_bytes(r.content)
+                      save_pdf(r.content, key, r.url, f'static-{kind}')
+                      text = r.text.replace('\\/','/')
+                      soup = BeautifulSoup(text, 'lxml')
+                      links = []
+                      for tag in soup.find_all(['a','iframe','embed','object','source','script']):
+                          for attr in ['href','src','data','data-src','data-url','data-file','file','url']:
+                              val = tag.get(attr)
+                              if isinstance(val, str) and val:
+                                  absu = urljoin(r.url, val)
+                                  if re.search(r'(\.pdf(?:$|[?&#])|download|view|report|file|document|attachment|oss|cdn|api)', absu, re.I):
+                                      links.append({'tag': tag.name, 'attr': attr, 'url': absu, 'text': ' '.join(tag.get_text(' ', strip=True).split())[:500]})
+                      item['interesting_links'] = links[:500]
+                      urls = sorted(set(re.findall(r'https?://[^\"\'<>\s\\]+', text)))
+                      item['url_tokens'] = [u for u in urls if re.search(r'(\.pdf(?:$|[?&#])|download|report|file|document|attachment|oss|cdn|api)', u, re.I)][:1000]
+                      snippets = []
+                      for m in re.finditer(r'.{0,500}(?:\.pdf|download|点击免费查看完整报告|免费查看完整报告|fileUrl|pdfUrl|reportUrl|attachment).{0,1600}', text, re.I|re.S):
+                          snippets.append(' '.join(m.group(0).split())[:2200])
+                      item['snippets'] = snippets[:100]
+                  except Exception as exc:
+                      item['error'] = repr(exc)
+                  rec['static'][kind] = item
+              results[key] = rec
+
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, executable_path=chrome, args=['--no-sandbox','--disable-dev-shm-usage'])
+              context = browser.new_context(user_agent=headers['User-Agent'], locale='zh-CN', viewport={'width': 1440, 'height': 1200}, accept_downloads=True)
+
+              for key, meta in targets.items():
+                  page = context.new_page()
+                  reqs, resps, downloads, popups = [], [], [], []
+
+                  def on_request(req):
+                      if re.search(r'(fxbaogao|\.pdf|download|report|file|view|document|attachment|oss|cdn|api)', req.url, re.I):
+                          reqs.append({'url': req.url, 'method': req.method, 'resource_type': req.resource_type, 'post_data': req.post_data})
+
+                  def on_response(resp):
+                      try: ct = resp.headers.get('content-type','')
+                      except Exception: ct = ''
+                      if re.search(r'(fxbaogao|\.pdf|download|report|file|view|document|attachment|oss|cdn|api)', resp.url, re.I) or 'pdf' in ct.lower() or 'octet-stream' in ct.lower():
+                          item = {'url': resp.url, 'status': resp.status, 'content_type': ct}
+                          resps.append(item)
+                          try:
+                              if resp.status == 200:
+                                  body = resp.body()
+                                  item['bytes'] = len(body)
+                                  saved = save_pdf(body, key, resp.url, 'network-response')
+                                  if saved: item['saved_as'] = saved['file']
+                                  elif 'json' in ct.lower() and len(body) < 5_000_000:
+                                      fn = Path('output/json') / f'{safe_name(key)}_resp_{len(resps):03d}.json'
+                                      fn.write_bytes(body); item['saved_json'] = str(fn)
+                          except Exception as exc:
+                              item['body_error'] = repr(exc)
+
+                  page.on('request', on_request); page.on('response', on_response)
+                  brec = {'requests': reqs, 'responses': resps, 'downloads': downloads, 'popups': popups}
+                  detail_url = f'https://www.fxbaogao.com/detail/{meta["id"]}'
+                  try:
+                      resp = page.goto(detail_url, wait_until='domcontentloaded', timeout=120000)
+                      try: page.wait_for_load_state('networkidle', timeout=30000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(2500)
+                      brec['detail_initial'] = {'status': resp.status if resp else None, 'url': page.url, 'title': page.title(), 'body': ' '.join(page.locator('body').inner_text(timeout=15000).split())[:120000]}
+                      Path(f'output/html/{key}_detail_browser.html').write_text(page.content(), encoding='utf-8')
+                      page.screenshot(path=f'output/screens/{key}_detail.png', full_page=True)
+
+                      # Public complete-view control.
+                      for txt in ['点击免费查看完整报告','免费查看完整报告','查看完整报告','报告原文']:
+                          loc = page.get_by_text(txt, exact=False)
+                          if loc.count():
+                              try:
+                                  loc.first.click(force=True, timeout=10000)
+                                  page.wait_for_timeout(3000)
+                                  break
+                              except Exception as exc:
+                                  brec.setdefault('click_errors', []).append({'text': txt, 'error': repr(exc)})
+                      # Directly load documented public viewer if click did not navigate.
+                      if '/view' not in page.url:
+                          try:
+                              page.goto(f'https://www.fxbaogao.com/view?id={meta["id"]}', wait_until='domcontentloaded', timeout=120000)
+                          except Exception as exc:
+                              brec.setdefault('view_errors', []).append(repr(exc))
+                      try: page.wait_for_load_state('networkidle', timeout=35000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(5000)
+                      brec['view'] = {'url': page.url, 'title': page.title(), 'body': ' '.join(page.locator('body').inner_text(timeout=15000).split())[:150000]}
+                      brec['view_elements'] = page.eval_on_selector_all('a,button,iframe,embed,object,source', "els => els.map(e => ({tag:e.tagName,text:(e.innerText||e.textContent||'').trim(),href:e.href||'',src:e.src||'',data:e.data||'',download:e.download||'',onclick:e.getAttribute('onclick')||'',outer:e.outerHTML.slice(0,4000)}))")
+                      brec['performance_urls'] = page.evaluate("() => performance.getEntriesByType('resource').map(x=>x.name)")
+                      brec['globals'] = page.evaluate("""() => { const out={}; for(const k of ['__NEXT_DATA__','__NUXT__','__INITIAL_STATE__','__APOLLO_STATE__']){try{if(window[k]!==undefined)out[k]=window[k]}catch(e){}}; try{out.localStorage={...localStorage}}catch(e){}; try{out.sessionStorage={...sessionStorage}}catch(e){}; return out; }""")
+                      Path(f'output/html/{key}_view_browser.html').write_text(page.content(), encoding='utf-8')
+                      page.screenshot(path=f'output/screens/{key}_view.png', full_page=True)
+
+                      # Click a download control only if the page is not presenting a login/payment gate.
+                      body_now = brec['view']['body']
+                      gated = bool(re.search(r'(登录后|请登录|会员|付费|购买|充值|报告豆|支付)', body_now))
+                      brec['gate_detected_before_download'] = gated
+                      if not gated:
+                          for txt in ['下载报告','免费下载','立即下载','下载']:
+                              loc = page.get_by_text(txt, exact=False)
+                              if loc.count():
+                                  try:
+                                      with page.expect_download(timeout=10000) as dinfo:
+                                          loc.first.click(force=True, timeout=8000)
+                                      d = dinfo.value
+                                      fn = Path('output/pdfs') / f'{safe_name(key)}_{safe_name(d.suggested_filename)}'
+                                      d.save_as(str(fn))
+                                      dl = {'url': d.url, 'suggested_filename': d.suggested_filename, 'file': str(fn), 'bytes': fn.stat().st_size}
+                                      downloads.append(dl)
+                                      save_pdf(fn.read_bytes(), key, d.url, 'browser-download')
+                                      break
+                                  except Exception as exc:
+                                      brec.setdefault('download_click_errors', []).append({'text': txt, 'error': repr(exc)})
+                                      try: page.wait_for_timeout(1500)
+                                      except Exception: pass
+
+                      for j, pg in enumerate(context.pages):
+                          if pg is page: continue
+                          try:
+                              pop = {'url': pg.url, 'title': pg.title(), 'body': ' '.join(pg.locator('body').inner_text(timeout=5000).split())[:50000]}
+                              popups.append(pop)
+                          except Exception as exc:
+                              popups.append({'url': pg.url, 'error': repr(exc)})
+                  except Exception as exc:
+                      brec['error'] = repr(exc)
+                  results[key]['browser'] = brec
+                  page.close()
+              browser.close()
+
+          # Validate and deduplicate captured PDFs.
+          uniq = {}
+          for rec in pdf_records:
+              uniq.setdefault(rec['sha256'], rec)
+          validated = list(uniq.values())
+          Path('output/result.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          Path('output/pdf_validations.json').write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('VALID_PDFS', json.dumps(validated, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinahongqiao-fxbaogao-inspection
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
