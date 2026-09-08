@@ -1,0 +1,229 @@
+name: Inspect Vzkoo China Hongqiao original PDFs
+on:
+  push:
+    branches:
+      - tmp-vzkoo-chinahongqiao-pdf-20260908
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet playwright requests beautifulsoup4 lxml pypdf
+      - name: Discover and download public original PDFs
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          read_pages = {
+              'huachuang_2025': {
+                  'url': 'https://www.vzkoo.com/read/20250528cadc25e0bf397f71233f77c6.html',
+                  'broker': '华创证券',
+                  'date': '2025-05-27',
+                  'title': '全球电解铝龙头，一体化打造盈利护城河，高分红属性明显',
+                  'known_document': 'https://www.vzkoo.com/document/202505284d706ccf964f075580f58225.html?from=report',
+              },
+              'kaiyuan_2024': {
+                  'url': 'https://www.vzkoo.com/read/202406132f337967da1467c08bce7800.html',
+                  'broker': '开源证券',
+                  'date': '2024-06-13',
+                  'title': '成本企稳+铝行业高景气，电解铝龙头扬帆起航',
+                  'known_document': 'https://www.vzkoo.com/document/20240613685119ace79295e90edc0069.html?from=report',
+              },
+              'zheshang_2024': {
+                  'url': 'https://www.vzkoo.com/read/2024081907b24b74412495f5108f985a.html',
+                  'broker': '浙商证券',
+                  'date': '2024-08-19',
+                  'title': '电解铝龙头弹性显著',
+              },
+              'huayuan_2026': {
+                  'url': 'https://www.vzkoo.com/read/4662679491238170624.html',
+                  'broker': '华源证券',
+                  'date': '2026-04-25',
+                  'title': '全球电解铝龙头，兼具一体化优势与高分红属性',
+              },
+              'dongwu_2026': {
+                  'url': 'https://www.vzkoo.com/read/1136811353590001f892134f7e1e.html',
+                  'broker': '东吴证券',
+                  'date': '2026-08-08',
+                  'title': '全产业链铸就成本护城河，高股息引领价值重估',
+              },
+          }
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+          s = requests.Session(); s.headers.update(headers)
+          url_pat = re.compile(r'(\.pdf(?:$|[?&#])|download|fileUrl|file_url|document|attachment|cdnfiles|api)', re.I)
+          results = {}
+
+          def urls_from_html(html: str, base: str):
+              soup = BeautifulSoup(html, 'lxml')
+              out = []
+              for tag in soup.find_all(True):
+                  for k, v in tag.attrs.items():
+                      vals = v if isinstance(v, list) else [v]
+                      for val in vals:
+                          if not isinstance(val, str):
+                              continue
+                          if k in {'href','src','action','data-url','data-href','data-file','data-src','data-pdf'} or 'url' in k.lower() or 'file' in k.lower():
+                              out.append({'tag': tag.name, 'attr': k, 'value': val, 'absolute': urljoin(base, val), 'text': ' '.join(tag.get_text(' ', strip=True).split())[:500]})
+              return out
+
+          # Static discovery of document URLs.
+          document_targets = []
+          for key, meta in read_pages.items():
+              rec = {'meta': meta, 'static': {}}
+              try:
+                  r = s.get(meta['url'], timeout=60, allow_redirects=True)
+                  Path(f'output/{key}_read_static.html').write_bytes(r.content)
+                  rec['static'] = {'status': r.status_code, 'final_url': r.url, 'bytes': len(r.content), 'content_type': r.headers.get('content-type','')}
+                  elems = urls_from_html(r.text.replace('\\/','/'), r.url)
+                  rec['static']['interesting_elements'] = [e for e in elems if url_pat.search(json.dumps(e, ensure_ascii=False))][:500]
+                  docs = sorted(set(e['absolute'] for e in elems if '/document/' in e['absolute']))
+                  rec['static']['document_urls'] = docs
+                  for u in docs:
+                      document_targets.append((key, u))
+                  print('READ_STATIC', key, json.dumps(rec['static'], ensure_ascii=False)[:30000], flush=True)
+              except Exception as exc:
+                  rec['static']['error'] = repr(exc)
+              if meta.get('known_document'):
+                  document_targets.append((key, meta['known_document']))
+              results[key] = rec
+
+          # Browser discovery from read pages, then inspect document pages.
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, executable_path=chrome, args=['--no-sandbox','--disable-dev-shm-usage'])
+              context = browser.new_context(user_agent=headers['User-Agent'], locale='zh-CN', viewport={'width':1440,'height':1150}, accept_downloads=True)
+
+              for key, meta in read_pages.items():
+                  page = context.new_page()
+                  try:
+                      resp = page.goto(meta['url'], wait_until='domcontentloaded', timeout=120000)
+                      try: page.wait_for_load_state('networkidle', timeout=25000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(2000)
+                      links = page.eval_on_selector_all('a', "els => els.map(e=>({text:(e.innerText||e.textContent||'').trim(),href:e.href||'',download:e.download||'',outer:e.outerHTML.slice(0,2000)}))")
+                      docs = sorted(set(x['href'] for x in links if '/document/' in x.get('href','')))
+                      results[key]['browser_read'] = {'status': resp.status if resp else None, 'url': page.url, 'title': page.title(), 'document_urls': docs, 'links': [x for x in links if re.search(r'(document|\.pdf|下载|报告)', json.dumps(x, ensure_ascii=False), re.I)][:300], 'body': ' '.join(page.locator('body').inner_text(timeout=10000).split())[:100000]}
+                      for u in docs: document_targets.append((key,u))
+                      Path(f'output/{key}_read_browser.html').write_text(page.content(), encoding='utf-8')
+                  except Exception as exc:
+                      results[key]['browser_read'] = {'error': repr(exc)}
+                  page.close()
+
+              # Deduplicate discovered document pages.
+              seen = set(); targets = []
+              for key, u in document_targets:
+                  norm = u.split('#')[0]
+                  if norm not in seen:
+                      seen.add(norm); targets.append((key,norm))
+              print('DOCUMENT_TARGETS', json.dumps(targets, ensure_ascii=False), flush=True)
+
+              for idx, (key, doc_url) in enumerate(targets):
+                  page = context.new_page()
+                  reqs, resps, downloads, popups = [], [], [], []
+
+                  def on_request(req):
+                      if url_pat.search(req.url) or 'vzkoo' in req.url:
+                          reqs.append({'url':req.url,'method':req.method,'resource_type':req.resource_type,'post_data':req.post_data})
+
+                  def on_response(resp):
+                      try: ct = resp.headers.get('content-type','')
+                      except Exception: ct = ''
+                      if url_pat.search(resp.url) or 'pdf' in ct.lower() or 'vzkoo' in resp.url:
+                          item={'url':resp.url,'status':resp.status,'content_type':ct}
+                          resps.append(item)
+                          if 'pdf' in ct.lower() or resp.url.lower().split('?')[0].endswith('.pdf'):
+                              try:
+                                  body=resp.body()
+                                  if body.startswith(b'%PDF') and len(body)>20000:
+                                      fn=Path(f'output/{key}_network_{idx}_{len(resps)}.pdf')
+                                      fn.write_bytes(body)
+                                      item['saved_as']=str(fn); item['bytes']=len(body)
+                              except Exception as exc:
+                                  item['save_error']=repr(exc)
+
+                  page.on('request', on_request); page.on('response', on_response)
+                  drec={'url':doc_url,'requests':reqs,'responses':resps,'downloads':downloads,'popups':popups}
+                  try:
+                      resp=page.goto(doc_url,wait_until='domcontentloaded',timeout=120000)
+                      try: page.wait_for_load_state('networkidle',timeout=30000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(2500)
+                      drec['initial']={'status':resp.status if resp else None,'url':page.url,'title':page.title(),'body':' '.join(page.locator('body').inner_text(timeout=15000).split())[:120000]}
+                      drec['elements']=page.eval_on_selector_all('a,button,input,iframe,embed,object',"els=>els.map(e=>({tag:e.tagName,text:(e.innerText||e.textContent||'').trim(),href:e.href||'',src:e.src||'',onclick:e.getAttribute('onclick')||'',download:e.download||'',id:e.id||'',className:e.className||'',outer:e.outerHTML.slice(0,4000)}))")
+                      drec['globals']=page.evaluate("""() => { const out={}; for(const k of ['__NEXT_DATA__','__NUXT__','__INITIAL_STATE__']){try{if(window[k]!==undefined)out[k]=window[k]}catch(e){}}; try{out.localStorage={...localStorage}}catch(e){}; return out; }""")
+                      Path(f'output/{key}_document_{idx}_initial.html').write_text(page.content(),encoding='utf-8')
+                      page.screenshot(path=f'output/{key}_document_{idx}_initial.png',full_page=True)
+                      print('DOC_ELEMENTS',key,doc_url,json.dumps([x for x in drec['elements'] if re.search(r'(下载|pdf|file|document|查看原文)',json.dumps(x,ensure_ascii=False),re.I)],ensure_ascii=False)[:30000],flush=True)
+
+                      # Publicly click download/original controls once. Do not attempt account or payment bypass.
+                      candidates=[]
+                      for text in ['免费下载','下载文档','下载报告','立即下载','下载','查看原文']:
+                          loc=page.get_by_text(text,exact=False)
+                          for i in range(min(loc.count(),3)):
+                              candidates.append((text,i))
+                      for cidx,(text,i) in enumerate(candidates[:8]):
+                          item={'text':text,'index':i,'before_url':page.url}
+                          try:
+                              try:
+                                  with page.expect_download(timeout=9000) as dinfo:
+                                      page.get_by_text(text,exact=False).nth(i).click(force=True,timeout=8000)
+                                  d=dinfo.value
+                                  fn=Path('output')/f'{key}_download_{idx}_{cidx}_{d.suggested_filename}'
+                                  d.save_as(str(fn))
+                                  dl={'url':d.url,'suggested_filename':d.suggested_filename,'saved_as':str(fn),'bytes':fn.stat().st_size}
+                                  downloads.append(dl); item['download']=dl
+                              except Exception as exc:
+                                  item['download_wait_error']=repr(exc)
+                                  try: page.get_by_text(text,exact=False).nth(i).click(force=True,timeout=6000)
+                                  except Exception as exc2: item['click_error']=repr(exc2)
+                              page.wait_for_timeout(2500)
+                          except Exception as exc: item['error']=repr(exc)
+                          item['after_url']=page.url
+                          try: item['after_body']=' '.join(page.locator('body').inner_text(timeout=5000).split())[:40000]
+                          except Exception: pass
+                          drec.setdefault('clicks',[]).append(item)
+                          if re.search(r'(登录|注册|购买|付费|会员|扫码)',item.get('after_body','')):
+                              break
+                      Path(f'output/{key}_document_{idx}_after.html').write_text(page.content(),encoding='utf-8')
+                  except Exception as exc:
+                      drec['error']=repr(exc)
+                  results.setdefault(key,{}).setdefault('documents',[]).append(drec)
+                  page.close()
+              browser.close()
+
+          validations=[]
+          for pdf in sorted(Path('output').glob('*.pdf')):
+              rec={'file':str(pdf),'bytes':pdf.stat().st_size,'sha256':hashlib.sha256(pdf.read_bytes()).hexdigest(),'header':pdf.read_bytes()[:8].decode('latin1','replace')}
+              try:
+                  reader=PdfReader(str(pdf)); pages=len(reader.pages)
+                  idxs=sorted(set([0,min(1,pages-1),min(4,pages-1),max(0,pages//2),max(0,pages-2),pages-1]))
+                  text=''.join((reader.pages[i].extract_text() or '') for i in idxs)
+                  rec.update({'pages':pages,'searchable_chars_sample':len(re.sub(r'\s+','',text)),'sample_text':' '.join(text.split())[:6000]})
+              except Exception as exc: rec['error']=repr(exc)
+              validations.append(rec); print('PDF_VALIDATION',json.dumps(rec,ensure_ascii=False),flush=True)
+          results['validations']=validations
+          Path('output/result.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps(results,ensure_ascii=False)[:100000],flush=True)
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vzkoo-chinahongqiao-pdf-inspection
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
