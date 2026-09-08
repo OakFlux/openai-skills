@@ -1,0 +1,226 @@
+name: Download official CMBI China Hongqiao research PDFs
+on:
+  push:
+    branches:
+      - tmp-cmbi-chinahongqiao-pdfs-20260908
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml pypdf playwright
+      - name: Discover and validate official PDFs
+        run: |
+          set -euo pipefail
+          mkdir -p output/html output/pdfs
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil, time
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, unquote
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          articles = {
+              '6833': 'China Hongqiao (1378 HK) - Market leader in the aluminum industry',
+              '10002': 'China Hongqiao (1378 HK) - A key beneficiary of tight aluminum supply trading at attractive valuation',
+              '10267': 'China Hongqiao (1378 HK) - Net profit 1H24 +2.7x YoY, beat expectations',
+              '11073': 'China Hongqiao (1378 HK) - Net profit in 2024 +95% in line; 63% payout ratio implies 11% yield at the current price',
+              '12626': 'China Hongqiao (1378 HK) - Raising earnings and TP on higher aluminium price',
+              '12805': 'China Hongqiao (1378 HK) - 2025 core profit in-line; Supply disruption to drive ASP in 2026E',
+              '13479': 'China Hongqiao (1378 HK) - Core net profit +10% YoY in 1H26',
+          }
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+              'Referer': 'https://www.cmbi.com.hk/',
+          }
+          s = requests.Session(); s.headers.update(headers)
+          result = {'articles': {}, 'validations': []}
+          pdf_candidates = []
+          url_re = re.compile(r'https?://[^\"\'<>\s\\]+', re.I)
+          pdf_pat = re.compile(r'(\.pdf(?:$|[?&#])|pdfviewer|viewer\.html|download|file=|url=)', re.I)
+
+          def clean_url(u: str, base: str) -> str:
+              u = (u or '').strip().replace('&amp;', '&')
+              return urljoin(base, u)
+
+          def safe(s_: str) -> str:
+              s_ = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', s_)
+              return re.sub(r'\s+', ' ', s_).strip(' ._')[:150]
+
+          def save_pdf(body: bytes, name: str, source: str, bucket: list):
+              if not body.startswith(b'%PDF') or len(body) < 20000:
+                  return None
+              h = hashlib.sha256(body).hexdigest()
+              existing = next((x for x in bucket if x.get('sha256') == h), None)
+              if existing:
+                  existing.setdefault('alternate_sources', []).append(source)
+                  return existing['file']
+              path = Path('output/pdfs') / f'{safe(name)}_{h[:10]}.pdf'
+              path.write_bytes(body)
+              bucket.append({'file': str(path), 'source_url': source, 'sha256': h, 'bytes': len(body)})
+              print('SAVED_PDF', path, len(body), source, flush=True)
+              return str(path)
+
+          saved = []
+
+          def fetch_resource(url: str, label: str, depth: int = 0, seen=None):
+              if seen is None: seen = set()
+              if not url or url in seen or depth > 3: return {'url': url, 'skipped': True}
+              seen.add(url)
+              rec = {'url': url, 'depth': depth}
+              try:
+                  r = s.get(url, timeout=75, allow_redirects=True)
+                  ct = r.headers.get('content-type','')
+                  rec.update({'status': r.status_code, 'final_url': r.url, 'content_type': ct, 'bytes': len(r.content), 'history': [{'status':x.status_code,'url':x.url,'location':x.headers.get('location')} for x in r.history]})
+                  if r.content.startswith(b'%PDF') or 'application/pdf' in ct.lower():
+                      rec['saved_as'] = save_pdf(r.content, label, r.url, saved)
+                      return rec
+                  text = r.text.replace('\\/','/')
+                  Path(f'output/html/{safe(label)}_d{depth}_{len(seen)}.html').write_text(text, encoding='utf-8')
+                  soup = BeautifulSoup(text, 'lxml')
+                  refs = []
+                  for tag in soup.find_all(['iframe','embed','object','a','script','link']):
+                      for attr in ['src','href','data','data-src','data-url','data-file','file','url']:
+                          val = tag.get(attr)
+                          if isinstance(val, str) and val.strip():
+                              refs.append({'tag':tag.name,'attr':attr,'raw':val,'url':clean_url(val,r.url),'text':' '.join(tag.get_text(' ',strip=True).split())[:300]})
+                  # URL tokens embedded in JSON and inline scripts.
+                  for token in url_re.findall(text):
+                      refs.append({'tag':'token','attr':'text','raw':token,'url':clean_url(token,r.url),'text':''})
+                  uniq=[]; seen_ref=set()
+                  for x in refs:
+                      u=x['url']
+                      if u not in seen_ref:
+                          seen_ref.add(u); uniq.append(x)
+                  rec['interesting_refs']=[x for x in uniq if pdf_pat.search(x['url']) or x['tag'] in {'iframe','embed','object'}][:500]
+                  children=[]
+                  for x in rec['interesting_refs'][:100]:
+                      u=x['url']
+                      host=urlparse(u).netloc.lower()
+                      if host.endswith(('cmbi.com.hk','cmbi.info','cmbi.com','amazonaws.com','aliyuncs.com','oss-cn-hongkong.aliyuncs.com')) or '.pdf' in u.lower() or x['tag'] in {'iframe','embed','object'}:
+                          children.append(fetch_resource(u, f'{label}_{x["tag"]}', depth+1, seen))
+                  rec['children']=children
+              except Exception as exc:
+                  rec['error']=repr(exc)
+              return rec
+
+          # Static pass over all official article pages.
+          for aid,title in articles.items():
+              urls=[f'https://www.cmbi.com.hk/article/{aid}.html?lang=en',f'https://www.cmbi.com.hk/article/{aid}.html?lang=cn']
+              arec={'title':title,'static':[],'browser':{}}
+              for idx,u in enumerate(urls):
+                  arec['static'].append(fetch_resource(u, f'{aid}_{idx}_{title}', 0, set()))
+              result['articles'][aid]=arec
+
+          # Browser pass: captures iframe/network PDFs and public “read report” links.
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage'])
+              context=browser.new_context(user_agent=headers['User-Agent'],locale='en-US',viewport={'width':1440,'height':1100},accept_downloads=True)
+              for aid,title in articles.items():
+                  page=context.new_page(); reqs=[]; resps=[]; downloads=[]
+                  def on_request(req):
+                      if pdf_pat.search(req.url) or req.resource_type in {'document','xhr','fetch'}:
+                          reqs.append({'url':req.url,'method':req.method,'resource_type':req.resource_type,'post_data':req.post_data})
+                  def on_response(resp):
+                      try: ct=resp.headers.get('content-type','')
+                      except Exception: ct=''
+                      if pdf_pat.search(resp.url) or 'pdf' in ct.lower() or resp.request.resource_type in {'document','xhr','fetch'}:
+                          item={'url':resp.url,'status':resp.status,'content_type':ct,'resource_type':resp.request.resource_type}
+                          resps.append(item)
+                          if 'pdf' in ct.lower() or resp.url.lower().split('?')[0].endswith('.pdf'):
+                              try:
+                                  body=resp.body()
+                                  saved_as=save_pdf(body,f'{aid}_{title}_network',resp.url,saved)
+                                  if saved_as: item['saved_as']=saved_as; item['bytes']=len(body)
+                              except Exception as exc: item['save_error']=repr(exc)
+                  page.on('request',on_request); page.on('response',on_response)
+                  brec={'requests':reqs,'responses':resps,'downloads':downloads}
+                  try:
+                      u=f'https://www.cmbi.com.hk/article/{aid}.html?lang=en'
+                      resp=page.goto(u,wait_until='domcontentloaded',timeout=120000)
+                      try: page.wait_for_load_state('networkidle',timeout=30000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(2500)
+                      brec['initial']={'status':resp.status if resp else None,'url':page.url,'title':page.title(),'body':' '.join(page.locator('body').inner_text(timeout=15000).split())[:50000]}
+                      brec['frames']=[{'url':f.url,'name':f.name} for f in page.frames]
+                      brec['elements']=page.eval_on_selector_all('a,iframe,embed,object,button',"els=>els.map(e=>({tag:e.tagName,text:(e.innerText||e.textContent||'').trim(),href:e.href||'',src:e.src||'',data:e.data||'',download:e.download||'',outer:e.outerHTML.slice(0,3000)}))")
+                      Path(f'output/html/{aid}_browser.html').write_text(page.content(),encoding='utf-8')
+                      page.screenshot(path=f'output/html/{aid}_browser.png',full_page=True)
+                      print('ARTICLE',aid,'FRAMES',json.dumps(brec['frames'],ensure_ascii=False),'ELEMENTS',json.dumps(brec['elements'],ensure_ascii=False)[:20000],flush=True)
+                      # Follow every frame and explicit report link with static requests.
+                      for f in brec['frames']:
+                          if f['url'] and f['url'] != page.url and f['url'] != 'about:blank':
+                              fetch_resource(f['url'],f'{aid}_{title}_frame',1,set())
+                      for e in brec['elements']:
+                          for k in ['href','src','data']:
+                              u=e.get(k) or ''
+                              if u and (pdf_pat.search(u) or e.get('tag') in {'IFRAME','EMBED','OBJECT'}):
+                                  fetch_resource(u,f'{aid}_{title}_{e.get("tag")}',1,set())
+                      # Try public click once; no login/payment flows are attempted.
+                      for text in ['Click to read the report','点击阅读原文','read the report']:
+                          loc=page.get_by_text(text,exact=False)
+                          for i in range(min(loc.count(),2)):
+                              item={'text':text,'index':i,'before_url':page.url}
+                              try:
+                                  try:
+                                      with page.expect_download(timeout=7000) as dinfo:
+                                          loc.nth(i).click(force=True,timeout=6000)
+                                      d=dinfo.value
+                                      fn=Path('output/pdfs')/f'{aid}_{safe(d.suggested_filename)}'
+                                      d.save_as(str(fn))
+                                      downloads.append({'url':d.url,'file':str(fn),'bytes':fn.stat().st_size})
+                                  except Exception as exc:
+                                      item['download_wait_error']=repr(exc)
+                                      try: loc.nth(i).click(force=True,timeout=5000)
+                                      except Exception as exc2: item['click_error']=repr(exc2)
+                                  page.wait_for_timeout(2000)
+                              except Exception as exc: item['error']=repr(exc)
+                              item['after_url']=page.url
+                              brec.setdefault('clicks',[]).append(item)
+                  except Exception as exc: brec['error']=repr(exc)
+                  result['articles'][aid]['browser']=brec
+                  page.close()
+              browser.close()
+
+          # Include any browser download files not already captured.
+          for pth in Path('output/pdfs').glob('*'):
+              if pth.is_file() and pth.read_bytes()[:4]==b'%PDF':
+                  h=hashlib.sha256(pth.read_bytes()).hexdigest()
+                  if not any(x.get('sha256')==h for x in saved):
+                      saved.append({'file':str(pth),'source_url':'browser-download','sha256':h,'bytes':pth.stat().st_size})
+
+          # Validate identity, length and searchable text.
+          validations=[]
+          for item in saved:
+              rec=dict(item)
+              pth=Path(rec['file'])
+              try:
+                  reader=PdfReader(str(pth)); pages=len(reader.pages)
+                  idxs=sorted(set([0,min(1,pages-1),min(4,pages-1),max(0,pages//2),max(0,pages-2),pages-1]))
+                  text=''.join((reader.pages[i].extract_text() or '') for i in idxs)
+                  first=''.join((reader.pages[i].extract_text() or '') for i in range(min(5,pages)))
+                  blob=(text+' '+first).lower()
+                  rec.update({'pages':pages,'searchable_chars_sample':len(re.sub(r'\s+','',text)),'first_text':' '.join(first.split())[:8000],'target_identity':('china hongqiao' in blob or '中国宏桥' in blob or '1378 hk' in blob or '1378.hk' in blob)})
+                  rec['valid']=bool(pages>=3 and rec['searchable_chars_sample']>=200 and rec['target_identity'])
+              except Exception as exc:
+                  rec['valid']=False; rec['error']=repr(exc)
+              validations.append(rec)
+              print('VALIDATION',json.dumps(rec,ensure_ascii=False),flush=True)
+          result['validations']=validations
+          Path('output/result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload official PDF candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmbi-chinahongqiao-official-pdfs
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
