@@ -1,0 +1,315 @@
+name: chatgpt-temp-china-hongqiao-eastmoney
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-china-hongqiao-eastmoney.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query public broker-report API and build archive
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pypdf pymupdf pillow
+          python <<'PY'
+          import hashlib, json, re, time, zipfile
+          from pathlib import Path
+          import requests
+          import fitz
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+
+          ROOT = Path('china_hongqiao_reports')
+          PDF_DIR = ROOT / 'PDF'
+          QA_DIR = ROOT / 'qa'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          QA_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept': 'application/json,text/javascript,*/*;q=0.01',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def parse_jsonp(text):
+              try:
+                  return json.loads(text)
+              except Exception:
+                  a, b = text.find('{'), text.rfind('}')
+                  if a >= 0 and b > a:
+                      return json.loads(text[a:b+1])
+                  raise
+
+          all_records = []
+          seen = set()
+          queries = [
+              {'keyword': '中国宏桥'},
+              {'code': '01378'},
+              {'code': '1378'},
+              {'code': '1378.HK'},
+              {'code': 'HK1378'},
+          ]
+          for query in queries:
+              for page in range(1, 31):
+                  params = {
+                      'cb': 'datatable123456',
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2015-01-01', 'endTime': '2026-09-08',
+                      'pageNo': str(page), 'fields': '', 'qType': '0',
+                      'orgCode': '', 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                      '_': str(int(time.time() * 1000)),
+                      **query,
+                  }
+                  response = session.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=60)
+                  obj = parse_jsonp(response.text)
+                  rows = obj.get('data') or []
+                  if isinstance(rows, dict):
+                      rows = rows.get('data') or rows.get('list') or []
+                  if not isinstance(rows, list):
+                      rows = []
+                  print('QUERY', query, 'PAGE', page, 'HTTP', response.status_code,
+                        'ROWS', len(rows), 'HITS', obj.get('hits'), 'TOTAL', obj.get('TotalPage'), flush=True)
+                  for row in rows:
+                      blob = json.dumps(row, ensure_ascii=False)
+                      title = str(row.get('title') or row.get('TITLE') or '')
+                      company = str(row.get('stockName') or row.get('secuName') or row.get('stockNameEn') or '')
+                      code = str(row.get('stockCode') or row.get('secuCode') or row.get('code') or '')
+                      if not ('中国宏桥' in blob or 'CHINA HONGQIAO' in blob.upper() or '01378' in blob or '1378.HK' in blob.upper()):
+                          continue
+                      info = row.get('infoCode') or row.get('INFO_CODE')
+                      if not info or info in seen:
+                          continue
+                      seen.add(info)
+                      all_records.append(row)
+                      print('RECORD', json.dumps(row, ensure_ascii=False), flush=True)
+                  total = int(obj.get('TotalPage') or 1)
+                  if not rows or page >= total:
+                      break
+                  time.sleep(0.15)
+
+          (ROOT / 'all_records.json').write_text(json.dumps(all_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('UNIQUE_RECORDS', len(all_records), flush=True)
+
+          deep_terms = [
+              '首次覆盖', '深度', '公司深度', '再出发', '价值重估', '全产业链',
+              '产业布局', '投资价值', '龙头', '高景气', '护城河', '长期价值',
+              '盈利和成长性', '一体化优势', '红利吸引力', '优质电解铝',
+          ]
+          shallow_terms = ['点评', '快报', '业绩预告', '中报', '年报点评', '季报', '跟踪点评', '事件点评']
+
+          def field(row, *names):
+              for name in names:
+                  value = row.get(name)
+                  if value not in (None, ''):
+                      return value
+              return ''
+
+          def score(row):
+              title = str(field(row, 'title', 'TITLE'))
+              org = str(field(row, 'orgSName', 'orgName', 'ORG_SNAME'))
+              date = str(field(row, 'publishDate', 'PUBLISH_DATE'))[:10]
+              attach_pages = field(row, 'attachPages', 'ATTACH_PAGES')
+              try: attach_pages = int(float(attach_pages))
+              except Exception: attach_pages = 0
+              s = 0
+              s += sum(30 for term in deep_terms if term in title)
+              s -= sum(20 for term in shallow_terms if term in title)
+              if '首次覆盖' in title: s += 120
+              if '深度' in title or '再出发' in title: s += 90
+              if attach_pages >= 25: s += 80
+              elif attach_pages >= 18: s += 55
+              elif attach_pages >= 12: s += 30
+              elif 0 < attach_pages < 8: s -= 80
+              if date >= '2025-01-01': s += 35
+              elif date >= '2023-01-01': s += 20
+              if org in ['西部证券','中泰证券','华创证券','东北证券','华源证券','国信证券','国盛证券','华泰证券','中金公司','中信证券','广发证券']:
+                  s += 15
+              return (s, date)
+
+          all_records.sort(key=score, reverse=True)
+          downloaded = []
+          used_orgs = set()
+          used_hashes = set()
+
+          def safe_name(text):
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', text)
+              text = re.sub(r'\s+', ' ', text).strip()
+              return text[:180]
+
+          def download_pdf(info):
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/{info}.pdf',
+              ]
+              for url in urls:
+                  try:
+                      r = session.get(url, timeout=180, allow_redirects=True,
+                                      headers={'Referer': 'https://data.eastmoney.com/'})
+                      print('PDF_PROBE', info, r.status_code, len(r.content), r.url, flush=True)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 100000:
+                          return r.content, r.url
+                  except Exception as exc:
+                      print('PDF_ERROR', info, url, repr(exc), flush=True)
+              return None, None
+
+          for row in all_records:
+              if len(downloaded) >= 3:
+                  break
+              title = str(field(row, 'title', 'TITLE'))
+              org = str(field(row, 'orgSName', 'orgName', 'ORG_SNAME') or '券商')
+              date = str(field(row, 'publishDate', 'PUBLISH_DATE'))[:10]
+              info = str(field(row, 'infoCode', 'INFO_CODE'))
+              reported_pages = field(row, 'attachPages', 'ATTACH_PAGES')
+              # Require clear depth signals; retain a fallback only for long reports.
+              clear_deep = any(term in title for term in deep_terms)
+              try: rp = int(float(reported_pages))
+              except Exception: rp = 0
+              if not clear_deep and rp < 15:
+                  continue
+              if org in used_orgs and len(all_records) > 3:
+                  continue
+              data, source_url = download_pdf(info)
+              if not data:
+                  continue
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in used_hashes:
+                  continue
+              tmp = ROOT / f'tmp_{info}.pdf'
+              tmp.write_bytes(data)
+              try:
+                  reader = PdfReader(str(tmp), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 10:
+                      print('REJECT_SHORT', title, pages, flush=True)
+                      tmp.unlink(missing_ok=True)
+                      continue
+                  sample_indices = list(range(min(12, pages)))
+                  if pages > 20:
+                      sample_indices += [pages // 2, pages - 2]
+                  chunks = []
+                  for idx in sample_indices:
+                      try: chunks.append(reader.pages[idx].extract_text() or '')
+                      except Exception: pass
+                  text = re.sub(r'\s+', ' ', '\n'.join(chunks)).upper()
+                  if not any(mark in text for mark in ['中国宏桥', 'CHINA HONGQIAO', '01378', '1378.HK']):
+                      print('REJECT_IDENTITY', title, text[:500], flush=True)
+                      tmp.unlink(missing_ok=True)
+                      continue
+                  # Visual sanity check on first/middle/last pages.
+                  doc = fitz.open(str(tmp))
+                  checks = []
+                  for idx, tag in [(0, 'first'), (pages // 2, 'middle'), (pages - 1, 'last')]:
+                      pix = doc[idx].get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+                      png = QA_DIR / f'{info}_{tag}.png'
+                      pix.save(str(png))
+                      img = Image.open(png).convert('L').resize((64, 64))
+                      std = float(ImageStat.Stat(img).stddev[0])
+                      checks.append({'page': idx + 1, 'stddev': round(std, 4)})
+                      if std < 2.0:
+                          raise RuntimeError(f'near-blank render page {idx+1}')
+                  doc.close()
+                  filename = safe_name(f'{date}_{org}_中国宏桥_{title}') + '.pdf'
+                  out = PDF_DIR / filename
+                  tmp.replace(out)
+                  item = {
+                      'date': date, 'institution': org, 'title': title,
+                      'pages': pages, 'reported_pages': rp, 'filename': filename,
+                      'info_code': info, 'source_url': source_url,
+                      'sha256': digest, 'size_bytes': len(data),
+                      'render_checks': checks,
+                      'api_record': row,
+                  }
+                  downloaded.append(item)
+                  used_orgs.add(org)
+                  used_hashes.add(digest)
+                  print('ACCEPT', json.dumps(item, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('VALIDATION_ERROR', title, repr(exc), flush=True)
+                  tmp.unlink(missing_ok=True)
+
+          # Second pass allows duplicate institutions if needed.
+          if len(downloaded) < 2:
+              for row in all_records:
+                  if len(downloaded) >= 3:
+                      break
+                  info = str(field(row, 'infoCode', 'INFO_CODE'))
+                  if any(x['info_code'] == info for x in downloaded):
+                      continue
+                  title = str(field(row, 'title', 'TITLE'))
+                  org = str(field(row, 'orgSName', 'orgName', 'ORG_SNAME') or '券商')
+                  date = str(field(row, 'publishDate', 'PUBLISH_DATE'))[:10]
+                  try: rp = int(float(field(row, 'attachPages', 'ATTACH_PAGES') or 0))
+                  except Exception: rp = 0
+                  if not any(term in title for term in deep_terms) and rp < 12:
+                      continue
+                  data, source_url = download_pdf(info)
+                  if not data: continue
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in used_hashes: continue
+                  tmp = ROOT / f'tmp2_{info}.pdf'; tmp.write_bytes(data)
+                  try:
+                      reader = PdfReader(str(tmp), strict=False); pages = len(reader.pages)
+                      if pages < 10: tmp.unlink(missing_ok=True); continue
+                      txt = ' '.join((reader.pages[i].extract_text() or '') for i in range(min(10,pages))).upper()
+                      if not any(mark in txt for mark in ['中国宏桥','CHINA HONGQIAO','01378','1378.HK']):
+                          tmp.unlink(missing_ok=True); continue
+                      filename = safe_name(f'{date}_{org}_中国宏桥_{title}') + '.pdf'
+                      out = PDF_DIR / filename; tmp.replace(out)
+                      item = {'date':date,'institution':org,'title':title,'pages':pages,'reported_pages':rp,
+                              'filename':filename,'info_code':info,'source_url':source_url,'sha256':digest,
+                              'size_bytes':len(data),'render_checks':[],'api_record':row}
+                      downloaded.append(item); used_hashes.add(digest)
+                      print('ACCEPT_FALLBACK', json.dumps(item,ensure_ascii=False),flush=True)
+                  except Exception as exc:
+                      print('FALLBACK_ERROR',repr(exc),flush=True); tmp.unlink(missing_ok=True)
+
+          if len(downloaded) < 2:
+              raise RuntimeError(f'Only {len(downloaded)} valid deep reports obtained from {len(all_records)} records')
+
+          downloaded = downloaded[:3]
+          readme = [
+              '# 中国宏桥（01378.HK）券商深度报告资料包', '',
+              f'本资料包收录 {len(downloaded)} 份公开可完整取得的券商公司研究/深度报告。', '',
+              '| 日期 | 券商 | 报告题目 | 页数 |', '|---|---|---|---:|',
+          ]
+          for item in downloaded:
+              readme.append(f"| {item['date']} | {item['institution']} | {item['title']} | {item['pages']} |")
+          readme.extend(['', 'PDF 已核验文件头、公司名称或股票代码、实际页数及抽样页面渲染。',
+                         '来源地址、文件大小和 SHA-256 校验值见 manifest.json 与 SHA256SUMS.txt。'])
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(downloaded, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  PDF/{x['filename']}" for x in downloaded) + '\n', encoding='utf-8')
+
+          zip_path = Path(f'China_Hongqiao_01378_Broker_Deep_Reports_{len(downloaded)}.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file() and QA_DIR not in path.parents and path.name != 'all_records.json':
+                      archive.write(path, path.relative_to(ROOT.parent))
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad: raise RuntimeError(f'ZIP corruption at {bad}')
+          meta = {'archive': zip_path.name, 'archive_bytes': zip_path.stat().st_size,
+                  'archive_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+                  'reports': downloaded}
+          Path('final_meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL', json.dumps(meta, ensure_ascii=False), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: China-Hongqiao-01378-Broker-Deep-Reports
+          path: |
+            China_Hongqiao_01378_Broker_Deep_Reports_*.zip
+            final_meta.json
+            china_hongqiao_reports/all_records.json
+          retention-days: 1
+          compression-level: 0
