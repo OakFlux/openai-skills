@@ -1,0 +1,280 @@
+name: Build verified Pacific Basin broker research package 20260908
+
+on:
+  push:
+    paths:
+      - '.github/workflows/pacific-basin-final-package-20260908.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pillow pypdf pymupdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          package = '太平洋航运_券商研究报告_公开完整版_2份'
+          out = Path(package)
+          work = Path('_pacific_basin_work')
+          renders = work / 'renders'
+          out.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+          renders.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def request_bytes(url, *, referer=None, accept='application/pdf,*/*;q=0.8', min_bytes=1000, attempts=5):
+              errors = []
+              for attempt in range(1, attempts + 1):
+                  try:
+                      headers = {'Accept': accept}
+                      if referer:
+                          headers['Referer'] = referer
+                      r = session.get(url, headers=headers, timeout=(25, 240), allow_redirects=True)
+                      data = r.content
+                      print('GET', attempt, r.status_code, len(data), r.url, flush=True)
+                      if r.status_code == 200 and len(data) >= min_bytes:
+                          return data, r.url, dict(r.headers)
+                      errors.append(f'HTTP {r.status_code}/{len(data)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {url}: {errors[-5:]}')
+
+          def validate_pdf(path, expected_pages, identity_terms):
+              data = path.read_bytes()
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'bad PDF signature: {path}')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages != expected_pages:
+                  raise RuntimeError(f'page mismatch {path}: {pages} != {expected_pages}')
+              sample_text = ''
+              for pno in sorted(set([0, pages // 2, pages - 1])):
+                  try:
+                      sample_text += '\n' + (reader.pages[pno].extract_text() or '')
+                  except Exception:
+                      pass
+              if sample_text.strip() and not any(term.lower() in sample_text.lower() for term in identity_terms):
+                  raise RuntimeError(f'company identity not found in sampled text: {path}')
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {path}: {q.stderr[-1500:]}')
+              doc = pymupdf.open(str(path))
+              rendered = []
+              for pno in sorted(set([0, pages // 2, pages - 1])):
+                  pix = doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  rp = renders / f'{path.stem}_{pno + 1:03d}.png'
+                  pix.save(str(rp))
+                  if rp.stat().st_size < 5000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'render validation failed: {path} page {pno + 1}')
+                  rendered.append(pno + 1)
+              doc.close()
+              return {
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'rendered_pages': rendered,
+              }
+
+          records = []
+
+          # 1) Zheshang Securities 2024 company deep report.
+          zheshang = {
+              'broker': '浙商证券',
+              'title': '太平洋航运深度报告：小宗散货航运龙头，静待风起时',
+              'report_date': '2024-01-18',
+              'platform_date': '2024-01-20',
+              'authors': '李丹；研究助理：卢骁尧',
+              'rating': '增持（首次）',
+              'pages': 28,
+              'detail_url': 'https://www.sdyanbao.com/detail/697752',
+              'page_base': 'https://oss.sdyanbao.com/page/2024/1/20/922658',
+          }
+          image_dir = work / 'zheshang_pages'
+          image_dir.mkdir(exist_ok=True)
+          image_paths = []
+          page_manifest = []
+          seen_hashes = set()
+          for index in range(zheshang['pages']):
+              page_url = f"{zheshang['page_base']}/{index}.png"
+              data, final_url, headers = request_bytes(
+                  page_url,
+                  referer=zheshang['detail_url'],
+                  accept='image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                  min_bytes=12000,
+              )
+              if not (data.startswith(b'\x89PNG') or data.startswith(b'\xff\xd8\xff') or data.startswith(b'RIFF')):
+                  raise RuntimeError(f'page {index + 1} has non-image signature')
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in seen_hashes:
+                  raise RuntimeError(f'duplicate page image detected at page {index + 1}')
+              seen_hashes.add(digest)
+              p = image_dir / f'{index:03d}.img'
+              p.write_bytes(data)
+              with Image.open(p) as image:
+                  image.verify()
+              with Image.open(p) as image:
+                  width, height = image.size
+              if width < 600 or height < 800:
+                  raise RuntimeError(f'page {index + 1} image too small: {width}x{height}')
+              image_paths.append(p)
+              page_manifest.append({
+                  'page': index + 1,
+                  'url': final_url,
+                  'bytes': len(data),
+                  'width': width,
+                  'height': height,
+                  'sha256': digest,
+              })
+
+          zheshang_pdf_work = work / 'zheshang_20240118.pdf'
+          doc = pymupdf.open()
+          for p in image_paths:
+              with Image.open(p) as image:
+                  width, height = image.size
+              page = doc.new_page(width=width, height=height)
+              page.insert_image(page.rect, filename=str(p), keep_proportion=False)
+          doc.set_metadata({
+              'title': zheshang['title'],
+              'author': zheshang['broker'],
+              'subject': '太平洋航运（02343.HK）券商公司深度报告',
+          })
+          doc.save(str(zheshang_pdf_work), garbage=4, deflate=True, clean=True)
+          doc.close()
+          zheshang_filename = '01_浙商证券_小宗散货航运龙头静待风起时_20240118_28页.pdf'
+          (out / zheshang_filename).write_bytes(zheshang_pdf_work.read_bytes())
+          zheshang_validation = validate_pdf(out / zheshang_filename, 28, ['太平洋航运', 'Pacific Basin'])
+          records.append({
+              **{k: v for k, v in zheshang.items() if k != 'page_base'},
+              'filename': zheshang_filename,
+              **zheshang_validation,
+              'source_type': '公开原版逐页图像按原页序合成PDF（未裁切、未重排）',
+          })
+          (work / 'zheshang_page_manifest.json').write_text(
+              json.dumps(page_manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          # 2) Deutsche Bank 2018 company report, original public PDF.
+          deutsche = {
+              'broker': '德意志银行',
+              'title': 'Pacific Basin Shipping Ltd: 1H 2018 results - a solid return to the black',
+              'report_date': '2018-07-27',
+              'authors': 'Deutsche Bank Research',
+              'rating': 'Buy',
+              'pages': 10,
+              'source_url': 'https://img3.gelonghui.com/pdf201807/pdf20180731140034904.pdf',
+          }
+          deutsche_data, deutsche_final_url, _ = request_bytes(
+              deutsche['source_url'],
+              referer='https://www.gelonghui.com/',
+              accept='application/pdf,application/octet-stream,*/*;q=0.8',
+              min_bytes=100000,
+          )
+          if not deutsche_data.startswith(b'%PDF-'):
+              raise RuntimeError('Deutsche Bank source did not return a PDF')
+          deutsche_filename = '02_德意志银行_1H2018业绩重回盈利_20180727_10页_EN.pdf'
+          (out / deutsche_filename).write_bytes(deutsche_data)
+          deutsche_validation = validate_pdf(out / deutsche_filename, 10, ['Pacific Basin', '2343.HK'])
+          records.append({
+              **deutsche,
+              'source_url': deutsche_final_url,
+              'filename': deutsche_filename,
+              **deutsche_validation,
+              'source_type': '公开原始PDF',
+          })
+
+          # Human-readable manifest.
+          total_pages = sum(r['pages'] for r in records)
+          lines = [
+              '太平洋航运（02343.HK）券商研究报告',
+              '',
+              f'本包包含2份可离线打开的完整PDF，共{total_pages}页。',
+              '筛选标准：公司身份可确认、正文完整、无需登录或付费即可取得、PDF结构与页面渲染正常。',
+              '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines.extend([
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   报告日期：{r['report_date']}；作者：{r['authors']}；评级：{r['rating']}",
+                  f"   实际页数：{r['pages']}页；文件大小：{r['bytes'] / 1048576:.2f} MB",
+                  f"   文件：{r['filename']}",
+                  f"   来源：{r.get('detail_url') or r.get('source_url')}",
+                  f"   文件形式：{r['source_type']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：页面文件签名与尺寸、页面去重、PDF文件头、实际页数、qpdf结构检查、首页/中间页/末页渲染、SHA-256以及ZIP CRC。',
+              '浙商证券报告的公开来源提供逐页原版图像，本包严格按原页顺序合成为PDF；可正常阅读和打印，但全文检索能力可能弱于原生矢量PDF。',
+              '历史评级、目标价和预测不构成当前投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8'
+          )
+
+          zip_path = Path(package + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for p in sorted(out.iterdir()):
+                  zf.write(p, arcname=f'{package}/{p.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed at {bad}')
+              pdf_names = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != 2:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_names)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', total_pages, flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pacific-basin-broker-reports-final
+          path: 太平洋航运_券商研究报告_公开完整版_2份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload validation renders
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pacific-basin-validation-renders
+          path: _pacific_basin_work/renders/
+          if-no-files-found: ignore
+          retention-days: 7
