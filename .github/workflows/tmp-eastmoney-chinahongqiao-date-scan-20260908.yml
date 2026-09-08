@@ -1,0 +1,101 @@
+name: Scan Eastmoney daily reports for China Hongqiao
+on:
+  push:
+    branches:
+      - tmp-eastmoney-chinahongqiao-date-scan-20260908
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+      - name: Scan known publication windows and download originals
+        run: |
+          set -euo pipefail
+          mkdir -p output/pdfs output/raw
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          API='https://reportapi.eastmoney.com/report/list'
+          headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Referer':'https://data.eastmoney.com/'}
+          s=requests.Session(); s.headers.update(headers)
+          anchors=['2024-05-16','2024-06-12','2024-06-13','2024-08-19','2025-04-21','2025-05-27','2025-05-28','2026-04-25','2026-08-08']
+          # Scan +/- 1 day because mirror publication dates may differ from broker dates.
+          days=[]
+          for a in anchors:
+              d=datetime.strptime(a,'%Y-%m-%d').date()
+              for off in [-1,0,1]: days.append((d+timedelta(days=off)).isoformat())
+          days=sorted(set(days))
+          hits={}
+          scan=[]
+          for day in days:
+              for qtype in ['0','1']:
+                  page=1
+                  while page<=20:
+                      params={
+                          'cb':'','industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                          'beginTime':day,'endTime':day,'pageNo':str(page),'fields':'','qType':qtype,
+                          'orgCode':'*','code':'*','rcode':'*','p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                          '_':str(int(time.time()*1000)),
+                      }
+                      try:
+                          r=s.get(API,params=params,timeout=40)
+                          d=r.json()
+                          rows=d.get('data') or []
+                          total=int(d.get('TotalPage') or 1)
+                          scan.append({'day':day,'qType':qtype,'page':page,'status':r.status_code,'rows':len(rows),'total':total,'hits':d.get('hits')})
+                          Path(f'output/raw/{day}_q{qtype}_p{page}.json').write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding='utf-8')
+                          print('PAGE',day,qtype,page,len(rows),total,d.get('hits'),flush=True)
+                          for row in rows:
+                              blob=' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode','secuName','secuCode','orgSName','orgName','researcher']).lower()
+                              if '中国宏桥' in blob or 'china hongqiao' in blob or re.search(r'(^|\D)0?1378(?:\.hk)?($|\D)',blob):
+                                  info=str(row.get('infoCode') or '')
+                                  if info: hits[info]=row
+                                  print('HIT',json.dumps(row,ensure_ascii=False),flush=True)
+                          if not rows or page>=total: break
+                          page+=1
+                          time.sleep(0.15)
+                      except Exception as exc:
+                          scan.append({'day':day,'qType':qtype,'page':page,'error':repr(exc)})
+                          print('ERROR',day,qtype,page,repr(exc),flush=True)
+                          break
+          Path('output/scan_summary.json').write_text(json.dumps(scan,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('output/hits.json').write_text(json.dumps(list(hits.values()),ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL_HITS',len(hits),flush=True)
+
+          vals=[]
+          for info,row in hits.items():
+              rec={k:row.get(k) for k in row.keys()}
+              urls=[f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?{int(time.time()*1000)}.pdf']
+              for url in urls:
+                  try:
+                      r=s.get(url,timeout=90,allow_redirects=True)
+                      rec.setdefault('attempts',[]).append({'url':url,'status':r.status_code,'content_type':r.headers.get('content-type',''),'bytes':len(r.content),'header':r.content[:8].decode('latin1','replace')})
+                      if r.status_code==200 and r.content.startswith(b'%PDF') and len(r.content)>20000:
+                          p=Path('output/pdfs')/f'{info}.pdf'; p.write_bytes(r.content)
+                          reader=PdfReader(str(p)); pages=len(reader.pages)
+                          idxs=sorted(set([0,min(1,pages-1),min(4,pages-1),max(0,pages//2),max(0,pages-2),pages-1]))
+                          text=''.join((reader.pages[i].extract_text() or '') for i in idxs)
+                          rec.update({'file':str(p),'source_url':r.url,'pages':pages,'searchable_chars_sample':len(re.sub(r'\s+','',text)),'sample_text':' '.join(text.split())[:6000],'sha256':hashlib.sha256(r.content).hexdigest()})
+                          break
+                  except Exception as exc:
+                      rec.setdefault('attempts',[]).append({'url':url,'error':repr(exc)})
+              vals.append(rec)
+              print('VALIDATION',json.dumps({k:rec.get(k) for k in ['infoCode','publishDate','orgSName','title','stockName','stockCode','pages','searchable_chars_sample','source_url']},ensure_ascii=False),flush=True)
+          Path('output/validations.json').write_text(json.dumps(vals,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload scan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eastmoney-chinahongqiao-date-scan
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
