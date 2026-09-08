@@ -1,0 +1,151 @@
+name: Download full China Hongqiao report page images
+on:
+  push:
+    branches:
+      - tmp-fxbaogao-full-image-chq-20260908
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pillow pypdf
+      - name: Probe all public report images and build full PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/package output/pages
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, io, json, re, zipfile
+          from pathlib import Path
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          reports = [
+              {
+                  'id':'4864892','broker':'华创证券','date':'2025-05-27','date_path':'2025/05/27',
+                  'title':'全球电解铝龙头，一体化打造盈利护城河，高分红属性明显',
+                  'source':'https://www.fxbaogao.com/detail/4864892','minimum_pages':24,
+              },
+              {
+                  'id':'4802165','broker':'西部证券','date':'2025-04-21','date_path':'2025/04/21',
+                  'title':'高景气+一体化+高分红，电解铝龙头静待价值重估',
+                  'source':'https://www.fxbaogao.com/detail/4802165','minimum_pages':25,
+              },
+              {
+                  'id':'4307103','broker':'信达证券','date':'2024-05-16','date_path':'2024/05/16',
+                  'title':'铝产业链一体化龙头，有望享高盈利弹性',
+                  'source':'https://www.fxbaogao.com/detail/4307103','minimum_pages':27,
+              },
+          ]
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Referer':'https://www.fxbaogao.com/','Accept':'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'})
+          out=Path('output/package'); root=Path('output/pages')
+          manifest=[]; probe=[]
+
+          def fetch_image(report, n):
+              base=f"https://public.fxbaogao.com/report-image/{report['date_path']}/"
+              variants=[
+                  f"{base}{report['id']}-{n}.png",
+                  f"{base}{report['id']}-{n}.png?x-oss-process=image/format,png",
+                  f"{base}{report['id']}-{n}.png?x-oss-process=image/format,webp",
+                  f"{base}{report['id']}_{n}.png",
+                  f"{base}{report['id']}-{n}.jpg",
+              ]
+              attempts=[]
+              for url in variants:
+                  try:
+                      r=s.get(url,timeout=35,allow_redirects=True)
+                      data=r.content
+                      rec={'url':url,'final_url':r.url,'status':r.status_code,'content_type':r.headers.get('content-type',''),'bytes':len(data)}
+                      attempts.append(rec)
+                      if r.status_code!=200 or len(data)<10000:
+                          continue
+                      try:
+                          im=Image.open(io.BytesIO(data)); im.load()
+                      except Exception as exc:
+                          rec['image_error']=repr(exc); continue
+                      rec.update({'width':im.width,'height':im.height,'format':im.format})
+                      if im.width<500 or im.height<650:
+                          rec['rejected']='dimensions'; im.close(); continue
+                      rec['sha256']=hashlib.sha256(data).hexdigest()
+                      return data, im.copy(), rec, attempts
+                  except Exception as exc:
+                      attempts.append({'url':url,'error':repr(exc)})
+              return None,None,None,attempts
+
+          for idx,r in enumerate(reports,1):
+              rdir=root/r['id']; rdir.mkdir(parents=True,exist_ok=True)
+              imgs=[]; pages=[]; misses=0
+              for n in range(1,61):
+                  data,im,rec,attempts=fetch_image(r,n)
+                  probe.append({'report_id':r['id'],'page':n,'accepted':rec,'attempts':attempts})
+                  if data is None:
+                      misses += 1
+                      # Once page 1 exists, two consecutive misses signal the end.
+                      if imgs and misses>=2: break
+                      if not imgs and misses>=1: break
+                      continue
+                  misses=0
+                  p=rdir/f'{n:02d}.img'; p.write_bytes(data)
+                  imgs.append(im.convert('RGB'))
+                  pages.append({'page':n,**rec})
+              count=len(imgs)
+              print('REPORT_IMAGE_COUNT',r['id'],count,json.dumps(pages[-2:] if pages else [],ensure_ascii=False),flush=True)
+              if count < r['minimum_pages']:
+                  for im in imgs: im.close()
+                  manifest.append({'券商':r['broker'],'报告日期':r['date'],'报告标题':r['title'],'公开来源':r['source'],'状态':'未达到完整页数','获取页数':count,'最低预期页数':r['minimum_pages']})
+                  continue
+              safe=re.sub(r'[\\/:*?"<>|]+','_',r['title'])[:70]
+              pdf=out/f"{idx:02d}_{r['date']}_{r['broker']}_{safe}_完整公开图像版.pdf"
+              imgs[0].save(pdf,save_all=True,append_images=imgs[1:],resolution=150.0,quality=94,optimize=True)
+              for im in imgs: im.close()
+              reader=PdfReader(str(pdf)); pdf_pages=len(reader.pages)
+              if pdf_pages!=count or pdf.stat().st_size<500000:
+                  raise RuntimeError(f'PDF validation failed: {pdf}, pages={pdf_pages}, expected={count}, bytes={pdf.stat().st_size}')
+              manifest.append({
+                  '券商':r['broker'],'报告日期':r['date'],'报告标题':r['title'],'公开来源':r['source'],
+                  '状态':'已生成完整公开图像版','PDF页数':pdf_pages,'最低预期页数':r['minimum_pages'],
+                  '文件大小_字节':pdf.stat().st_size,'SHA256':hashlib.sha256(pdf.read_bytes()).hexdigest(),'文件名':pdf.name,
+                  '首图URL':pages[0]['url'],'末图URL':pages[-1]['url'],
+              })
+
+          Path('output/probe.json').write_text(json.dumps(probe,ensure_ascii=False,indent=2),encoding='utf-8')
+          good=[m for m in manifest if m.get('状态')=='已生成完整公开图像版']
+          if len(good)<2:
+              Path('output/manifest_all.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+              raise RuntimeError(f'Only {len(good)} complete reports: {manifest}')
+          with (out/'报告清单.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              fields=list(good[0].keys()); w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(good)
+          readme=[
+              '中国宏桥（01378.HK）券商深度报告包','',
+              f'共收录 {len(good)} 份报告。PDF由报告平台公开展示的逐页高清图像合成为离线阅读版；页数已核验。',
+              '仅供个人研究与学习，请保留券商署名及版权信息。',''
+          ]
+          readme += [f"{i}. {x['券商']}｜{x['报告日期']}｜{x['报告标题']}｜{x['PDF页数']}页" for i,x in enumerate(good,1)]
+          (out/'README.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(good,ensure_ascii=False,indent=2),encoding='utf-8')
+          z=Path('output/China_Hongqiao_01378_Broker_Deep_Reports_Full_Public_Image_2-3.zip')
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as zz:
+              for p in sorted(out.iterdir()): zz.write(p,p.name)
+          with zipfile.ZipFile(z) as zz:
+              assert zz.testzip() is None
+              assert len([n for n in zz.namelist() if n.lower().endswith('.pdf')])>=2
+          status={'ok':True,'count':len(good),'zip':str(z),'zip_bytes':z.stat().st_size,'zip_sha256':hashlib.sha256(z.read_bytes()).hexdigest(),'reports':good,'incomplete':[m for m in manifest if m.get('状态')!='已生成完整公开图像版']}
+          Path('output/status.json').write_text(json.dumps(status,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_STATUS',json.dumps(status,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-hongqiao-full-public-image-reports
+          path: |
+            output/China_Hongqiao_01378_Broker_Deep_Reports_Full_Public_Image_2-3.zip
+            output/status.json
+            output/package/*
+          retention-days: 1
+          if-no-files-found: error
