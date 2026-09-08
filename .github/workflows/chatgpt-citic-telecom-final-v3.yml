@@ -1,0 +1,378 @@
+name: Build corrected verified CITIC Telecom broker research package
+
+on:
+  push:
+    branches:
+      - chatgpt-citic-telecom-final-v3-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml ftfy reportlab pypdf pymupdf
+      - name: Fetch official research, create clean PDFs, validate, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders
+          cat > /tmp/build.py <<'PY'
+          from __future__ import annotations
+          import csv, difflib, hashlib, html, io, json, re, urllib.parse, zipfile
+          from pathlib import Path
+
+          import ftfy
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_JUSTIFY
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.ttfonts import TTFont
+          from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+          OUT = Path('output')
+          PDF_DIR = OUT / 'reports'
+          RENDER_DIR = OUT / 'renders'
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9'})
+
+          reports = [
+              {
+                  'order': 1,
+                  'title': 'CITIC Telecom - Company Guide',
+                  'declared_date': None,
+                  'kind': 'Company guide / company-deep research',
+                  'url': 'https://www.dbs.com.sg/treasures/aics/templatedata/article/equity/data/en/DBSV/012014/1883_HK.xml',
+                  'filename': '01_DBS_CITIC_Telecom_Company_Guide_Current.pdf',
+                  'mode': 'guide',
+              },
+              {
+                  'order': 2,
+                  'title': 'CITIC Telecom - FY25 earnings stabilise; appealing dividend yield',
+                  'declared_date': '2026-03-17',
+                  'kind': 'Full-year results company research update',
+                  'url': 'https://www.dbs.com.sg/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/032026/1883_HK_03172026.xml',
+                  'filename': '02_DBS_CITIC_Telecom_FY25_Research_2026-03-17.pdf',
+                  'mode': 'update',
+              },
+              {
+                  'order': 3,
+                  'title': 'CITIC Telecom - Stable outlook supported by resilient Macau businesses, after mixed 1H25 results',
+                  'declared_date': '2025-08-19',
+                  'kind': 'Interim-results company research update',
+                  'url': 'https://www.dbs.com.sg/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/082025/1883_HK_08192025.xml',
+                  'filename': '03_DBS_CITIC_Telecom_1H25_Research_2025-08-19.pdf',
+                  'mode': 'update',
+              },
+          ]
+
+          pdfmetrics.registerFont(TTFont('DV', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+          FONT = 'DV'
+          styles = getSampleStyleSheet()
+          styles.add(ParagraphStyle(name='TitleX', fontName=FONT, fontSize=18.5, leading=22, spaceAfter=9, textColor=colors.HexColor('#111111')))
+          styles.add(ParagraphStyle(name='H2X', fontName=FONT, fontSize=12.2, leading=15, spaceBefore=10, spaceAfter=5, keepWithNext=True))
+          styles.add(ParagraphStyle(name='BodyX', fontName=FONT, fontSize=9.25, leading=13.1, alignment=TA_JUSTIFY, spaceAfter=5.2, splitLongWords=True))
+          styles.add(ParagraphStyle(name='MetaX', fontName=FONT, fontSize=8.4, leading=11.2, textColor=colors.HexColor('#444444'), spaceAfter=3))
+          styles.add(ParagraphStyle(name='SmallX', fontName=FONT, fontSize=7.5, leading=10, textColor=colors.HexColor('#555555')))
+
+          headings = {
+              'Quick View', 'Profile', 'Previous Close Price', 'Key Statistics', 'Recent Developments', 'Our Views', 'Risks', 'Valuation',
+              'Related Stories', '1H26 Results Highlights', 'FY25 Results Highlights', '1H25 Results Highlights', 'FY24 Results Highlights',
+              'Outlook', 'Investment Summary', 'Key summary points', 'Results Highlights', 'Our View',
+          }
+          noise = {
+              'Created with Sketch.', 'Print', 'Download PDF', 'Have a question?', 'Yes, contact me', 'Start Now', 'Read More',
+              'Manage your portfolio from your iWealth account', 'Get more in-depth analysis from DBS Research', 'Show me more',
+              'You need to enable JavaScript to run this app.', 'Image',
+          }
+          legal_markers = {
+              'ANALYST CERTIFICATION', 'COMPANY-SPECIFIC / REGULATORY DISCLOSURES', 'GENERAL DISCLOSURE/DISCLAIMER',
+              'RESTRICTIONS ON DISTRIBUTION',
+          }
+
+          def digest(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def decode_html(response: requests.Response) -> str:
+              # The pages are UTF-8 but may be served without an explicit charset; force UTF-8 to prevent mojibake.
+              text = response.content.decode('utf-8', errors='replace')
+              return ftfy.fix_text(text)
+
+          def normalise_line(value: str) -> str:
+              value = ftfy.fix_text(html.unescape(value))
+              value = value.replace('\u00a0', ' ').replace('\u200b', '').replace('\ufeff', '')
+              value = re.sub(r'[ \t]+', ' ', value).strip()
+              if value in {'Â', 'Ã', '�', 'A'}:
+                  return ''
+              return value
+
+          def fetch_and_extract(item: dict) -> tuple[list[str], str, str, list[str]]:
+              response = session.get(item['url'], timeout=(15, 75), allow_redirects=True)
+              response.raise_for_status()
+              page_html = decode_html(response)
+              soup = BeautifulSoup(page_html, 'lxml')
+              for tag in soup(['script', 'style', 'noscript', 'svg', 'header', 'footer', 'nav']):
+                  tag.decompose()
+              lines = [normalise_line(x) for x in (soup.body or soup).get_text('\n', strip=True).splitlines()]
+              lines = [x for x in lines if x and x not in noise and not x.startswith('Image ')]
+
+              if item['mode'] == 'guide':
+                  candidates = []
+                  for idx, line in enumerate(lines):
+                      if line == 'CITIC Telecom' and 'Quick View' in lines[idx + 1:idx + 18]:
+                          candidates.append(idx)
+                  if not candidates:
+                      raise RuntimeError('company-guide body start not found')
+                  start = candidates[-1]
+              else:
+                  candidates = [idx for idx, line in enumerate(lines) if line == item['title']]
+                  if not candidates:
+                      candidates = [idx for idx, line in enumerate(lines) if line.startswith(item['title'][:45])]
+                  if not candidates:
+                      raise RuntimeError(f'update body start not found: {item["title"]}')
+                  start = candidates[-1]
+
+              body = lines[start:]
+              # Keep all analytical content and stop when the standard legal boilerplate begins.
+              legal_start = None
+              for idx, line in enumerate(body):
+                  if idx > 15 and line in legal_markers:
+                      legal_start = idx
+                      break
+              if legal_start is not None:
+                  body = body[:legal_start]
+
+              # Remove repeated website widgets/related-story blocks at the tail.
+              if item['mode'] == 'update':
+                  title_seen = 0
+                  trimmed = []
+                  for line in body:
+                      if line == item['title']:
+                          title_seen += 1
+                          if title_seen > 1:
+                              break
+                      trimmed.append(line)
+                  body = trimmed
+
+              cleaned = []
+              for line in body:
+                  if line in noise:
+                      continue
+                  if cleaned and cleaned[-1] == line:
+                      continue
+                  cleaned.append(line)
+
+              text = '\n'.join(cleaned)
+              compact = re.sub(r'\s+', '', text).lower()
+              if len(text) < 1800 or 'citictelecom' not in compact or not any(key in compact for key in ['1883', 'macau', 'ctm']):
+                  raise RuntimeError(f'content validation failed: {item["title"]}, chars={len(text)}')
+              if any(bad in text for bad in ['â€', 'Ã', '\ufffd']):
+                  raise RuntimeError(f'mojibake remained in extracted text: {item["title"]}')
+
+              actual_date = item['declared_date']
+              if item['mode'] == 'guide':
+                  actual_date = None
+                  for idx, line in enumerate(cleaned):
+                      if line == 'Publication Date' and idx + 1 < len(cleaned):
+                          candidate = cleaned[idx + 1]
+                          if re.fullmatch(r'20\d{2}-\d{2}-\d{2}', candidate):
+                              actual_date = candidate
+                              break
+                  if not actual_date:
+                      raise RuntimeError('could not parse current company-guide publication date')
+
+              # Capture any official PDF path for the manifest, while keeping the public webpage export as the deliverable.
+              pdf_paths = []
+              for pattern in [
+                  r'(?:ArticlePDFPath|ArticlePdfPath|ReportPDFPath|ReportPdfPath)[^/]{0,150}(/content/article/pdf/[^"\'<>\\\s]+\.pdf)',
+                  r'(/content/article/pdf/(?:1883_HK_EQUITY|000000_HK)/[^"\'<>\\\s]+\.pdf)',
+              ]:
+                  for match in re.finditer(pattern, page_html, re.I):
+                      pdf_paths.append(match.group(1))
+              return cleaned, response.url, actual_date, list(dict.fromkeys(pdf_paths))
+
+          def make_pdf(lines: list[str], item: dict, source: str, actual_date: str, pdf_paths: list[str], path: Path) -> None:
+              def footer(canvas, doc):
+                  canvas.saveState()
+                  canvas.setFont(FONT, 7)
+                  canvas.setFillColor(colors.HexColor('#666666'))
+                  canvas.drawCentredString(A4[0] / 2, 8 * mm, str(doc.page))
+                  canvas.restoreState()
+
+              doc = SimpleDocTemplate(
+                  str(path), pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm, topMargin=14 * mm, bottomMargin=15 * mm,
+                  title=item['title'], author='DBS Bank (Hong Kong) Limited',
+              )
+              story = [Paragraph(html.escape(item['title']), styles['TitleX'])]
+              meta = [
+                  ['Broker', 'DBS Bank (Hong Kong) Limited'],
+                  ['Publication date', actual_date],
+                  ['Report type', item['kind']],
+                  ['Official public research page', source],
+                  ['Edition', 'Searchable offline PDF prepared from the complete public analytical text. Website navigation and standard legal boilerplate are omitted.'],
+              ]
+              if pdf_paths:
+                  meta.append(['Original-layout PDF path shown by DBS', pdf_paths[0] + ' (DBS login may be required)'])
+              table = Table(
+                  [[Paragraph('<b>' + html.escape(k) + '</b>', styles['SmallX']), Paragraph(html.escape(v), styles['SmallX'])] for k, v in meta],
+                  colWidths=[39 * mm, 137 * mm],
+              )
+              table.setStyle(TableStyle([
+                  ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F4F4F4')),
+                  ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#BBBBBB')),
+                  ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.HexColor('#DDDDDD')),
+                  ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                  ('LEFTPADDING', (0, 0), (-1, -1), 5), ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+                  ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+              ]))
+              story.extend([table, Spacer(1, 8)])
+
+              title_skipped = False
+              for line in lines:
+                  if not title_skipped and (line == item['title'] or (item['mode'] == 'guide' and line == 'CITIC Telecom')):
+                      title_skipped = True
+                      continue
+                  escaped = html.escape(line)
+                  if line in headings or (line.isupper() and 5 <= len(line) <= 70):
+                      story.append(Paragraph(escaped, styles['H2X']))
+                  elif re.match(r'^(Tsz Wang Tam|\d{1,2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) 20\d{2}|Publication Date)', line):
+                      story.append(Paragraph(escaped, styles['MetaX']))
+                  elif line.startswith(('•', '- ')):
+                      story.append(Paragraph('• ' + html.escape(line.lstrip('•- ')), styles['BodyX']))
+                  else:
+                      story.append(Paragraph(escaped, styles['BodyX']))
+              story.extend([
+                  Spacer(1, 10),
+                  Paragraph('Research copyright and views belong to DBS and the named analyst(s). This offline research-text export is for reference only and is not investment advice.', styles['SmallX']),
+              ])
+              doc.build(story, onFirstPage=footer, onLaterPages=footer)
+
+          def verify_pdf(path: Path, expected_title: str) -> dict:
+              data = path.read_bytes()
+              if b'%PDF' not in data[:4096] or len(data) < 20_000:
+                  raise RuntimeError(f'invalid PDF: {path.name}')
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'PDF too short: {path.name}, pages={pages}')
+              text = '\n'.join((page.extract_text() or '') for page in reader.pages)
+              compact = re.sub(r'\s+', '', text).lower()
+              if 'citictelecom' not in compact or not any(key in compact for key in ['1883', 'macau', 'ctm']):
+                  raise RuntimeError(f'PDF relevance validation failed: {path.name}')
+              if any(bad in text for bad in ['â€', 'Ã', '\ufffd']):
+                  raise RuntimeError(f'PDF text contains mojibake: {path.name}')
+              doc = pymupdf.open(str(path))
+              checks = []
+              for page_no in sorted(set([0, pages // 2, pages - 1])):
+                  pix = doc.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(1.35, 1.35), alpha=False)
+                  render_path = RENDER_DIR / f'{path.stem}_p{page_no + 1:03d}.png'
+                  pix.save(str(render_path))
+                  if pix.width < 500 or pix.height < 650 or render_path.stat().st_size < 5_000:
+                      raise RuntimeError(f'render validation failed: {path.name}, page={page_no + 1}')
+                  checks.append({'page': page_no + 1, 'file': render_path.name, 'width': pix.width, 'height': pix.height, 'bytes': render_path.stat().st_size})
+              doc.close()
+              return {'pages': pages, 'bytes': len(data), 'sha256': digest(data), 'text': text, 'checks': checks}
+
+          records = []
+          fingerprints = []
+          for item in reports:
+              lines, source, actual_date, pdf_paths = fetch_and_extract(item)
+              output_path = PDF_DIR / item['filename']
+              make_pdf(lines, item, source, actual_date, pdf_paths, output_path)
+              validation = verify_pdf(output_path, item['title'])
+              fingerprints.append(re.sub(r'\W+', '', validation['text']).lower())
+              record = {
+                  '序号': item['order'],
+                  '文件名': output_path.name,
+                  '券商': 'DBS Bank (Hong Kong) Limited / 星展银行（香港）',
+                  '发布日期': actual_date,
+                  '报告标题': item['title'],
+                  '报告类型': item['kind'],
+                  '页数': validation['pages'],
+                  '文件大小（字节）': validation['bytes'],
+                  '来源类型': 'DBS官方公开研究正文转存为可搜索PDF',
+                  '官方公开研究页面': source,
+                  '官网显示的原始PDF路径': pdf_paths[0] if pdf_paths else '',
+                  'SHA-256': validation['sha256'],
+                  '渲染核验': validation['checks'],
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 3 or len({r['SHA-256'] for r in records}) != 3:
+              raise RuntimeError('expected three distinct verified PDFs')
+          for i in range(len(fingerprints)):
+              for j in range(i + 1, len(fingerprints)):
+                  ratio = difflib.SequenceMatcher(None, fingerprints[i], fingerprints[j], autojunk=False).ratio()
+                  print('TEXT_SIMILARITY', i + 1, j + 1, ratio, flush=True)
+                  if ratio >= 0.93:
+                      raise RuntimeError(f'reports {i + 1} and {j + 1} appear substantially duplicated: ratio={ratio}')
+
+          manifest_path = OUT / '报告清单与校验值.csv'
+          fields = ['序号', '文件名', '券商', '发布日期', '报告标题', '报告类型', '页数', '文件大小（字节）', '来源类型', '官方公开研究页面', '官网显示的原始PDF路径', 'SHA-256']
+          with manifest_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
+              writer.writeheader()
+              writer.writerows(records)
+
+          readme_path = OUT / '说明.txt'
+          readme_path.write_text(
+              '中信国际电讯（01883.HK）券商公司研究资料包\n\n'
+              '本包收录3份星展银行（香港）公开公司研究资料：当前公司指南、FY25年度业绩研究、1H25中期业绩研究。\n\n'
+              '公开研究页面提供完整分析正文，但原始版式PDF下载要求通过DBS/iWealth权限验证。'
+              '因此，本包将官方公开分析正文整理为可搜索、可离线阅读的PDF；不是一两页预览，不是下载脚本，也不冒充券商原始版式PDF。'
+              '为提高可读性，PDF省略网站导航、重复组件及标准通用法律条款，保留公司分析、业绩数据、观点、估值与风险内容。\n\n'
+              '各文件已核验PDF文件头、页数、公司名称、文本编码及首/中/末页渲染；ZIP已完成CRC完整性测试。\n'
+              '报告版权及观点归星展银行和相关分析师所有，仅供研究参考，不构成投资建议。\n',
+              encoding='utf-8',
+          )
+
+          zip_path = OUT / 'CITIC_Telecom_01883_Broker_Research_3_Searchable_PDFs.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for pdf in sorted(PDF_DIR.glob('*.pdf')):
+                  archive.write(pdf, arcname=pdf.name)
+              archive.write(manifest_path, arcname=manifest_path.name)
+              archive.write(readme_path, arcname=readme_path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              names = archive.namelist()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP CRC failure at {bad}')
+              if len([name for name in names if name.lower().endswith('.pdf')]) != 3:
+                  raise RuntimeError(f'wrong PDF count: {names}')
+
+          summary = {
+              'zip_file': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': digest(zip_path.read_bytes()),
+              'reports': records,
+          }
+          (OUT / 'package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_READY', json.dumps(summary, ensure_ascii=False), flush=True)
+          PY
+          python /tmp/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: citic-telecom-final-v3
+          path: |
+            output/CITIC_Telecom_01883_Broker_Research_3_Searchable_PDFs.zip
+            output/package_summary.json
+            output/renders/
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
