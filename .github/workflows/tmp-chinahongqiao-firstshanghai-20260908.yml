@@ -1,0 +1,154 @@
+name: Discover official First Shanghai China Hongqiao reports
+on:
+  push:
+    branches:
+      - tmp-chinahongqiao-firstshanghai-20260908
+permissions:
+  contents: read
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml playwright pypdf
+      - name: Search and fetch official reports
+        run: |
+          set -euo pipefail
+          mkdir -p output/html output/pdfs output/screens
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          base='https://www.mystockhk.com/'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-HK,zh;q=0.9,en;q=0.8'})
+          out={'search_pages':[],'details':{},'pdfs':{}}
+          detail_urls=[]
+
+          def save_pdf(data,url,source):
+              if not data.startswith(b'%PDF'): return None
+              sha=hashlib.sha256(data).hexdigest(); fn=Path('output/pdfs')/f'{sha[:16]}.pdf'
+              if not fn.exists(): fn.write_bytes(data)
+              try:
+                  r=PdfReader(str(fn)); pages=len(r.pages)
+                  text=' '.join(' '.join((r.pages[i].extract_text() or '') for i in range(min(pages,5))).split())[:15000]
+                  meta={str(k):str(v) for k,v in (r.metadata or {}).items()}
+              except Exception as e: pages=None; text=''; meta={'error':repr(e)}
+              rec={'file':str(fn),'url':url,'source':source,'bytes':len(data),'sha256':sha,'pages':pages,'text_preview':text,'metadata':meta}
+              out['pdfs'][sha]=rec; print('PDF',json.dumps(rec,ensure_ascii=False),flush=True); return rec
+
+          # Search filtered result pages plus known archive pages around matching dates.
+          urls=[]
+          for page in range(1,12):
+              urls.append(f'https://www.mystockhk.com/searchInfo.aspx?EndDate=&NodeId=85&StartDate=&page={page}&stockCode=1378&strIndustry=0')
+          urls += ['https://www.mystockhk.com/searchInfo.aspx?EndDate=&NodeId=85&StartDate=&page=28&stockCode=&strIndustry=0','https://www.mystockhk.com/category.aspx?NodeID=85&page=10']
+          for idx,url in enumerate(urls):
+              rec={'url':url}
+              try:
+                  r=s.get(url,timeout=60,allow_redirects=True); rec.update({'status':r.status_code,'final_url':r.url,'bytes':len(r.content)})
+                  Path(f'output/html/search_{idx}.html').write_text(r.text,encoding='utf-8')
+                  soup=BeautifulSoup(r.text,'lxml'); body=' '.join(soup.get_text(' ',strip=True).split())
+                  rec['body']=body[:50000]
+                  rec['contains_hongqiao']=('中國宏橋' in body or '中国宏桥' in body or '1378' in body)
+                  links=[]
+                  for a in soup.find_all('a',href=True):
+                      href=urljoin(r.url,a['href']); txt=' '.join(a.get_text(' ',strip=True).split())
+                      if 'detail.aspx' in href.lower() and ('宏橋' in txt or '宏桥' in txt or '1378' in txt or rec['contains_hongqiao']):
+                          links.append({'text':txt,'url':href})
+                          if ('宏橋' in txt or '宏桥' in txt or '1378' in txt): detail_urls.append(href)
+                  rec['links']=links
+                  print('SEARCH',idx,r.status_code,rec['contains_hongqiao'],json.dumps(links,ensure_ascii=False),flush=True)
+              except Exception as e: rec['error']=repr(e)
+              out['search_pages'].append(rec)
+
+          detail_urls=sorted(set(detail_urls))
+          print('DETAIL_URLS',json.dumps(detail_urls,ensure_ascii=False),flush=True)
+          pdf_candidates=[]
+          for j,url in enumerate(detail_urls):
+              rec={'url':url}
+              try:
+                  r=s.get(url,timeout=60,allow_redirects=True); rec.update({'status':r.status_code,'final_url':r.url,'bytes':len(r.content)})
+                  Path(f'output/html/detail_{j}.html').write_text(r.text,encoding='utf-8')
+                  soup=BeautifulSoup(r.text,'lxml'); rec['title']=soup.title.get_text(' ',strip=True) if soup.title else ''
+                  rec['body']=' '.join(soup.get_text(' ',strip=True).split())[:100000]
+                  rec['links']=[]
+                  normalized=r.text.replace('\\/','/')
+                  for tag in soup.find_all(['a','iframe','embed','object','source']):
+                      raw=tag.get('href') or tag.get('src') or tag.get('data')
+                      if not raw: continue
+                      u=urljoin(r.url,raw); t=' '.join(tag.get_text(' ',strip=True).split())
+                      rec['links'].append({'tag':tag.name,'text':t,'url':u})
+                      if '.pdf' in u.lower() or re.search(r'(download|file|attachment|report)',u,re.I): pdf_candidates.append((u,url))
+                  for u in re.findall(r'https?://[^\"\'<>\\s]+?\.pdf(?:\?[^\"\'<>\\s]*)?',normalized,re.I): pdf_candidates.append((u,url))
+                  for rel in re.findall(r'[\"\']([^\"\']+?\.pdf(?:\?[^\"\']*)?)[\"\']',normalized,re.I): pdf_candidates.append((urljoin(r.url,rel),url))
+                  print('DETAIL',url,json.dumps({'status':r.status_code,'title':rec['title'],'body':rec['body'][:3000],'links':rec['links']},ensure_ascii=False)[:20000],flush=True)
+              except Exception as e: rec['error']=repr(e)
+              out['details'][url]=rec
+
+          seen=set()
+          for pdf_url,ref in pdf_candidates:
+              if pdf_url in seen: continue
+              seen.add(pdf_url)
+              for headers in [{'Referer':ref,'Accept':'application/pdf,*/*'},{'Referer':base,'Accept':'application/pdf,*/*'},{'Accept':'application/pdf,*/*'}]:
+                  try:
+                      r=s.get(pdf_url,headers=headers,timeout=90,allow_redirects=True)
+                      print('DIRECT',r.status_code,r.url,r.headers.get('content-type'),len(r.content),flush=True)
+                      if save_pdf(r.content,r.url,ref): break
+                  except Exception as e: print('DIRECT_ERR',pdf_url,repr(e),flush=True)
+
+          # Browser inspection for dynamically injected attachments.
+          chrome=shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage'])
+              ctx=browser.new_context(user_agent=ua,locale='zh-HK',accept_downloads=True,viewport={'width':1440,'height':1000})
+              for j,url in enumerate(detail_urls):
+                  page=ctx.new_page(); captured=[]
+                  def on_resp(resp,url=url,captured=captured):
+                      try: ct=resp.headers.get('content-type','')
+                      except: ct=''
+                      if '.pdf' in resp.url.lower() or 'application/pdf' in ct.lower():
+                          item={'url':resp.url,'status':resp.status,'content_type':ct}
+                          try:
+                              data=resp.body(); item['bytes']=len(data); save_pdf(data,resp.url,url)
+                          except Exception as e:item['error']=repr(e)
+                          captured.append(item)
+                  page.on('response',on_resp)
+                  try:
+                      rr=page.goto(url,wait_until='domcontentloaded',timeout=90000)
+                      try:page.wait_for_load_state('networkidle',timeout=25000)
+                      except PWTimeout:pass
+                      page.wait_for_timeout(2000)
+                      key=url
+                      out['details'].setdefault(key,{})['browser_status']=rr.status if rr else None
+                      out['details'][key]['browser_url']=page.url
+                      out['details'][key]['browser_links']=page.eval_on_selector_all('a,iframe,embed,object',"els=>els.map(e=>({tag:e.tagName,text:(e.innerText||e.textContent||'').trim(),url:e.href||e.src||e.data||'',onclick:e.getAttribute('onclick')||'',outer:e.outerHTML}))")
+                      out['details'][key]['captured']=captured
+                      Path(f'output/html/detail_{j}_browser.html').write_text(page.content(),encoding='utf-8')
+                      page.screenshot(path=f'output/screens/detail_{j}.png',full_page=True)
+                      for text in ['PDF','下載','下载','查看報告','查看报告']:
+                          loc=page.get_by_text(text,exact=False)
+                          if not loc.count():continue
+                          try:
+                              with page.expect_download(timeout=5000) as di:loc.first.click(timeout=5000,force=True)
+                              d=di.value; target=Path('output/pdfs')/f'download_{j}_{d.suggested_filename}'; d.save_as(str(target)); save_pdf(target.read_bytes(),d.url,url)
+                          except Exception:pass
+                  except Exception as e:out['details'].setdefault(url,{})['browser_error']=repr(e)
+                  page.close()
+              browser.close()
+          Path('output/result.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL',len(out['pdfs']),flush=True)
+          PY
+      - name: Upload files
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinahongqiao-firstshanghai-official
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
