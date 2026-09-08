@@ -1,0 +1,329 @@
+name: Download China Hongqiao broker research PDFs
+on:
+  push:
+    branches:
+      - tmp-eastmoney-chinahongqiao-reports-20260908
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+      - name: Query, download and validate original PDFs
+        run: |
+          set -euo pipefail
+          mkdir -p output/raw_json output/pdfs output/package
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, json, re, time, zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from typing import Any
+          import requests
+          from pypdf import PdfReader
+
+          API = 'https://reportapi.eastmoney.com/report/list'
+          PDF_TEMPLATES = [
+              'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+              'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{ts}.pdf',
+          ]
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': UA,
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def parse_json(resp: requests.Response) -> dict[str, Any]:
+              try:
+                  return resp.json()
+              except Exception:
+                  txt = resp.text.strip()
+                  m = re.search(r'^[^(]*\((.*)\)\s*;?$', txt, re.S)
+                  if m:
+                      return json.loads(m.group(1))
+                  return json.loads(txt)
+
+          def clean(v: Any) -> str:
+              if v is None:
+                  return ''
+              return str(v).strip()
+
+          def safe_name(s: str, max_len: int = 110) -> str:
+              s = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', s)
+              s = re.sub(r'\s+', ' ', s).strip(' ._')
+              return s[:max_len] or 'report'
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          # Search multiple exact aliases. Code-only searches sometimes fail for HK stocks,
+          # so the Chinese company name is the primary key.
+          searches = []
+          all_rows: list[dict[str, Any]] = []
+          for keyword in ['中国宏桥', 'China Hongqiao', '01378', '1378']:
+              for qtype in ['0', '1']:
+                  for page_no in range(1, 8):
+                      params = {
+                          'industryCode': '*',
+                          'pageSize': '100',
+                          'industry': '*',
+                          'rating': '*',
+                          'ratingChange': '*',
+                          'beginTime': '2020-01-01',
+                          'endTime': '2026-09-08',
+                          'pageNo': str(page_no),
+                          'qType': qtype,
+                          'keyword': keyword,
+                      }
+                      try:
+                          resp = session.get(API, params=params, timeout=45)
+                          rec = {
+                              'keyword': keyword,
+                              'qType': qtype,
+                              'pageNo': page_no,
+                              'status': resp.status_code,
+                              'url': resp.url,
+                              'content_type': resp.headers.get('content-type', ''),
+                              'bytes': len(resp.content),
+                          }
+                          data = parse_json(resp) if resp.ok else {}
+                          Path(f'output/raw_json/{safe_name(keyword)}_q{qtype}_p{page_no}.json').write_text(
+                              json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8'
+                          )
+                          rows = data.get('data') or data.get('result', {}).get('data') or []
+                          total_page = data.get('TotalPage') or data.get('totalPage') or data.get('result', {}).get('pages') or 1
+                          rec.update({'row_count': len(rows), 'total_page': total_page})
+                          searches.append(rec)
+                          all_rows.extend(x for x in rows if isinstance(x, dict))
+                          print('QUERY', keyword, qtype, page_no, resp.status_code, len(rows), total_page, flush=True)
+                          if not rows or page_no >= int(total_page or 1):
+                              break
+                      except Exception as exc:
+                          searches.append({'keyword': keyword, 'qType': qtype, 'pageNo': page_no, 'error': repr(exc)})
+                          print('QUERY_ERROR', keyword, qtype, page_no, repr(exc), flush=True)
+                          break
+                      time.sleep(0.25)
+
+          # Deduplicate records and retain only clear China Hongqiao hits.
+          records_by_code: dict[str, dict[str, Any]] = {}
+          for row in all_rows:
+              info = clean(row.get('infoCode') or row.get('info_code'))
+              if not info:
+                  continue
+              blob = ' '.join(clean(row.get(k)) for k in [
+                  'title', 'stockName', 'stockCode', 'secuName', 'secuCode',
+                  'industryName', 'orgSName', 'orgName', 'researcher'
+              ]).lower()
+              is_target = (
+                  '中国宏桥' in blob or 'china hongqiao' in blob or
+                  re.search(r'(^|\D)0?1378(?:\.hk)?($|\D)', blob) is not None
+              )
+              if is_target:
+                  records_by_code[info] = row
+
+          records = list(records_by_code.values())
+          Path('output/searches.json').write_text(json.dumps(searches, ensure_ascii=False, indent=2), encoding='utf-8')
+          Path('output/target_records.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('TARGET_RECORD_COUNT', len(records), flush=True)
+          for row in records:
+              print('RECORD', json.dumps({
+                  'infoCode': row.get('infoCode'),
+                  'publishDate': row.get('publishDate'),
+                  'orgSName': row.get('orgSName'),
+                  'title': row.get('title'),
+                  'stockName': row.get('stockName'),
+                  'stockCode': row.get('stockCode'),
+                  'rating': row.get('emRatingName') or row.get('rating'),
+              }, ensure_ascii=False), flush=True)
+
+          validations: list[dict[str, Any]] = []
+          for row in records:
+              info = clean(row.get('infoCode'))
+              date = clean(row.get('publishDate'))[:10]
+              broker = clean(row.get('orgSName') or row.get('orgName') or '未知券商')
+              title = clean(row.get('title') or '中国宏桥研究报告')
+              dest = Path('output/pdfs') / f'{date}_{safe_name(broker,40)}_{safe_name(title,100)}.pdf'
+              result: dict[str, Any] = {
+                  'infoCode': info,
+                  'date': date,
+                  'broker': broker,
+                  'title': title,
+                  'stockName': clean(row.get('stockName') or row.get('secuName')),
+                  'stockCode': clean(row.get('stockCode') or row.get('secuCode')),
+                  'rating': clean(row.get('emRatingName') or row.get('rating')),
+                  'download_attempts': [],
+              }
+              content = None
+              source_url = ''
+              for tpl in PDF_TEMPLATES:
+                  url = tpl.format(code=info, ts=int(time.time() * 1000))
+                  try:
+                      resp = session.get(url, timeout=90, allow_redirects=True)
+                      att = {
+                          'url': url,
+                          'final_url': resp.url,
+                          'status': resp.status_code,
+                          'content_type': resp.headers.get('content-type', ''),
+                          'bytes': len(resp.content),
+                          'header': resp.content[:8].decode('latin1', errors='replace'),
+                      }
+                      result['download_attempts'].append(att)
+                      if resp.status_code == 200 and resp.content.startswith(b'%PDF') and len(resp.content) > 20_000:
+                          content = resp.content
+                          source_url = resp.url
+                          break
+                  except Exception as exc:
+                      result['download_attempts'].append({'url': url, 'error': repr(exc)})
+              if content is None:
+                  result['valid'] = False
+                  result['reason'] = 'PDF download failed'
+                  validations.append(result)
+                  continue
+
+              dest.write_bytes(content)
+              try:
+                  reader = PdfReader(str(dest))
+                  pages = len(reader.pages)
+                  first5 = ''.join((reader.pages[i].extract_text() or '') for i in range(min(5, pages)))
+                  sample_indices = sorted(set([0, min(1,pages-1), min(4,pages-1), max(0,pages//2), max(0,pages-2), pages-1]))
+                  sampled = ''.join((reader.pages[i].extract_text() or '') for i in sample_indices)
+                  searchable_chars = len(re.sub(r'\s+', '', sampled))
+                  first_text = ' '.join(first5.split())[:5000]
+                  result.update({
+                      'file': str(dest),
+                      'filename': dest.name,
+                      'source_url': source_url,
+                      'bytes': dest.stat().st_size,
+                      'pages': pages,
+                      'searchable_chars_sample': searchable_chars,
+                      'first_text': first_text,
+                      'sha256': sha256_file(dest),
+                  })
+                  identity_blob = (title + ' ' + first_text).lower()
+                  target_identity = '中国宏桥' in identity_blob or 'china hongqiao' in identity_blob
+                  deep_hint = any(k in title for k in ['深度', '首次覆盖', '公司研究', '公司报告', '首次'])
+                  result['target_identity'] = target_identity
+                  result['deep_hint'] = deep_hint
+                  result['valid'] = bool(pages >= 12 and searchable_chars >= 300 and target_identity)
+                  if not result['valid']:
+                      result['reason'] = f'validation threshold failed: pages={pages}, searchable={searchable_chars}, identity={target_identity}'
+              except Exception as exc:
+                  result['valid'] = False
+                  result['reason'] = repr(exc)
+              validations.append(result)
+              print('PDF_VALIDATION', json.dumps({k: result.get(k) for k in ['date','broker','title','pages','searchable_chars_sample','valid','reason','filename']}, ensure_ascii=False), flush=True)
+
+          Path('output/validations.json').write_text(json.dumps(validations, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          valid = [v for v in validations if v.get('valid')]
+          # Prioritize known full deep/initial-coverage reports, then deep-title hints, recency and length.
+          preferred = [
+              ('华创证券', '2025-05'),
+              ('西部证券', '2025-04'),
+              ('信达证券', '2024-05'),
+          ]
+          def score(v: dict[str, Any]) -> tuple:
+              pref = 0
+              for rank, (broker, month) in enumerate(preferred[::-1], start=1):
+                  if broker in v.get('broker','') and v.get('date','').startswith(month):
+                      pref = rank * 10000
+              title = v.get('title','')
+              deep = 5000 if any(k in title for k in ['深度', '首次覆盖', '首次']) else 0
+              date_num = int(re.sub(r'\D', '', v.get('date','')) or 0)
+              return (pref + deep, date_num, int(v.get('pages') or 0))
+
+          chosen = []
+          used_brokers = set()
+          for v in sorted(valid, key=score, reverse=True):
+              broker = v.get('broker','')
+              if broker in used_brokers:
+                  continue
+              chosen.append(v)
+              used_brokers.add(broker)
+              if len(chosen) >= 3:
+                  break
+
+          # Require at least two complete original searchable PDFs.
+          if len(chosen) < 2:
+              print('INSUFFICIENT_VALID_REPORTS', len(chosen), flush=True)
+              raise SystemExit(2)
+
+          package_dir = Path('output/package')
+          manifest_rows = []
+          for idx, v in enumerate(chosen, start=1):
+              src = Path(v['file'])
+              out_name = f"{idx:02d}_{v['date']}_{safe_name(v['broker'],40)}_{safe_name(v['title'],100)}.pdf"
+              dst = package_dir / out_name
+              dst.write_bytes(src.read_bytes())
+              manifest_rows.append({
+                  '序号': idx,
+                  '报告日期': v['date'],
+                  '券商': v['broker'],
+                  '报告标题': v['title'],
+                  '页数': v['pages'],
+                  '文件大小_字节': v['bytes'],
+                  '可检索文本抽样字符数': v['searchable_chars_sample'],
+                  'SHA256': v['sha256'],
+                  '来源': v['source_url'],
+                  '文件名': out_name,
+              })
+
+          with (package_dir / '报告清单与校验值.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=list(manifest_rows[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest_rows)
+
+          readme = [
+              '中国宏桥（01378.HK）券商深度报告包',
+              f'生成日期：2026-09-08',
+              '',
+              '本压缩包仅收入可公开直接下载、PDF文件头有效、页数不少于12页、可提取文本且封面/正文明确指向中国宏桥的原始PDF。',
+              '未使用网页预览截图或逐页图片拼接。',
+              '',
+              '文件清单：',
+          ]
+          for row in manifest_rows:
+              readme.append(f"{row['序号']}. {row['券商']}｜{row['报告日期']}｜{row['报告标题']}｜{row['页数']}页")
+          readme += ['', '研报观点仅代表原发布机构，不构成投资建议。']
+          (package_dir / 'README.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          zip_path = Path('output/China_Hongqiao_01378_Broker_Deep_Reports.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for p in sorted(package_dir.iterdir()):
+                  zf.write(p, arcname=p.name)
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+          summary = {
+              'chosen': chosen,
+              'zip': str(zip_path),
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': sha256_file(zip_path),
+          }
+          Path('output/final_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps({
+              'count': len(chosen),
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': summary['zip_sha256'],
+              'reports': [{k:v.get(k) for k in ['date','broker','title','pages','searchable_chars_sample','filename']} for v in chosen],
+          }, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload candidate and final package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinahongqiao-eastmoney-reports
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
