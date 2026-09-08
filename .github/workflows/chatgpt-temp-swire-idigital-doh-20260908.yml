@@ -1,0 +1,183 @@
+name: chatgpt-temp-swire-idigital-doh-20260908
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-swire-idigital-doh-20260908.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve public directory, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet beautifulsoup4 requests pypdf pymupdf pillow
+          mkdir -p swire_idigital_doh
+          echo 'Resolving A/CNAME records via DNS-over-HTTPS'
+          curl -fsSL --retry 3 --retry-delay 2 -H 'accept: application/dns-json' 'https://dns.google/resolve?name=aigc.idigital.com.cn&type=A' -o swire_idigital_doh/dns-a.json || true
+          curl -fsSL --retry 3 --retry-delay 2 -H 'accept: application/dns-json' 'https://cloudflare-dns.com/dns-query?name=aigc.idigital.com.cn&type=A' -o swire_idigital_doh/dns-cf.json || true
+          cat swire_idigital_doh/dns-a.json || true
+          cat swire_idigital_doh/dns-cf.json || true
+          python <<'PY'
+          import json
+          from pathlib import Path
+          ips=[]
+          for f in ['swire_idigital_doh/dns-a.json','swire_idigital_doh/dns-cf.json']:
+              p=Path(f)
+              if not p.exists(): continue
+              try:o=json.loads(p.read_text())
+              except:continue
+              for a in o.get('Answer') or []:
+                  d=str(a.get('data','')).strip().rstrip('.')
+                  if a.get('type')==1 and d and d not in ips: ips.append(d)
+          Path('swire_idigital_doh/ips.txt').write_text('\n'.join(ips)+'\n')
+          print('IPS',ips,flush=True)
+          if not ips: raise SystemExit('No A records from DoH')
+          PY
+          ok=0
+          while read -r ip; do
+            [ -n "$ip" ] || continue
+            echo "Trying $ip"
+            if curl -fkSL --connect-timeout 20 --max-time 180 --retry 2 --retry-delay 2 --resolve "aigc.idigital.com.cn:443:$ip" 'https://aigc.idigital.com.cn/djyanbao/' -o swire_idigital_doh/index.html; then
+              if grep -q '太古地产' swire_idigital_doh/index.html; then ok=1; echo "$ip" > swire_idigital_doh/working_ip.txt; break; fi
+            fi
+          done < swire_idigital_doh/ips.txt
+          [ "$ok" = 1 ] || { echo 'Unable to fetch usable index'; exit 1; }
+          python <<'PY'
+          import hashlib, html, io, json, re, subprocess, urllib.parse, zipfile
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageStat
+          import pymupdf
+          from pypdf import PdfReader
+
+          W=Path('swire_idigital_doh')
+          ROOT=W/'太古地产_01972_券商深度报告'
+          PDFDIR=ROOT/'PDF'; QA=W/'qa_renders'
+          PDFDIR.mkdir(parents=True,exist_ok=True); QA.mkdir(parents=True,exist_ok=True)
+          host='aigc.idigital.com.cn'; ip=W.joinpath('working_ip.txt').read_text().strip()
+          base='https://aigc.idigital.com.cn/djyanbao/'
+          raw=W.joinpath('index.html').read_bytes()
+          # Autoindex is generally UTF-8 but try common encodings.
+          text=None
+          for enc in ['utf-8','gb18030','gbk']:
+              try:
+                  t=raw.decode(enc)
+                  if '太古地产' in t: text=t; break
+              except: pass
+          if text is None: text=raw.decode('utf-8','ignore')
+          soup=BeautifulSoup(text,'html.parser')
+          links=[]
+          for a in soup.find_all('a',href=True):
+              label=' '.join(a.get_text(' ',strip=True).split())
+              href=html.unescape(a['href'])
+              u=urllib.parse.urljoin(base,href)
+              dec=urllib.parse.unquote(u)
+              if '太古地产' in label or '太古地产' in dec:
+                  links.append({'label':label,'href':href,'url':u,'decoded_url':dec})
+          # Regex fallback on HTML text/attributes.
+          for m in re.finditer(r'href=["\']([^"\']+)["\']',text,re.I):
+              href=html.unescape(m.group(1));u=urllib.parse.urljoin(base,href);dec=urllib.parse.unquote(u)
+              if '太古地产' in dec and all(x['url']!=u for x in links):
+                  links.append({'label':'','href':href,'url':u,'decoded_url':dec})
+          W.joinpath('swire_links.json').write_text(json.dumps(links,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SWIRE_LINKS',json.dumps(links,ensure_ascii=False),flush=True)
+          if not links: raise RuntimeError('Index contains 太古地产 text but no href was parsed')
+
+          def classify(x):
+              s=x['label']+' '+x['decoded_url']
+              if '重奢运营久久为功' in s: return 300
+              if '高端商业资产抗周期' in s: return 290
+              if '行稳致远' in s: return 280
+              if '千亿投资计划' in s: return 270
+              if '深度' in s or '首次覆盖' in s: return 200
+              return 50
+          links=sorted(links,key=classify,reverse=True)
+          selected=[]; seen_content=set(); seen_title=set()
+          for idx,x in enumerate(links):
+              if len(selected)>=3: break
+              dec=x['decoded_url']; label=x['label'] or Path(urllib.parse.urlparse(dec).path).name
+              if classify(x)<180: continue
+              out=W/f'candidate_{idx:03d}.pdf'
+              cmd=['curl','-fkSL','--connect-timeout','20','--max-time','240','--retry','3','--retry-delay','2','--resolve',f'{host}:443:{ip}',x['url'],'-o',str(out)]
+              p=subprocess.run(cmd,capture_output=True,text=True)
+              print('CURL',p.returncode,label,p.stdout,p.stderr[-1000:],flush=True)
+              if p.returncode or not out.exists(): continue
+              data=out.read_bytes()
+              if not data.startswith(b'%PDF-') or len(data)<80000:
+                  print('REJECT_NOT_PDF',label,len(data),data[:50],flush=True); continue
+              sha=hashlib.sha256(data).hexdigest()
+              if sha in seen_content: continue
+              try:
+                  reader=PdfReader(str(out),strict=False); pages=len(reader.pages)
+                  doc=pymupdf.open(str(out))
+                  if doc.page_count!=pages or pages<10: raise RuntimeError(f'bad pages {pages}/{doc.page_count}')
+                  first_text=''.join(doc[i].get_text() for i in range(min(6,pages)))
+                  if not any(k.lower() in first_text.lower() for k in ['太古地产','01972','1972.hk','swire properties']):
+                      raise RuntimeError('company identifier absent')
+                  checks=[]
+                  for pn,suf in [(0,'first'),(pages//2,'middle'),(pages-1,'last')]:
+                      pix=doc[pn].get_pixmap(matrix=pymupdf.Matrix(1.15,1.15),alpha=False)
+                      png=QA/f'{idx:03d}_{suf}.png';pix.save(str(png))
+                      sd=ImageStat.Stat(Image.open(png).convert('L').resize((64,64))).stddev[0]
+                      if sd<1: raise RuntimeError('blank page render')
+                      checks.append({'page':pn+1,'stddev':round(sd,4)})
+                  # Identify institution/title/date from document text where possible.
+                  doc_text=''.join(doc[i].get_text() for i in range(min(3,pages)))
+                  doc.close()
+              except Exception as e:
+                  print('REJECT_VALIDATION',label,repr(e),flush=True);out.unlink(missing_ok=True);continue
+              inst='券商'
+              for name in ['华创证券','兴业证券','申万宏源','开源证券','中信建投','东方证券']:
+                  if name in label or name in doc_text:
+                      inst=name;break
+              date=''
+              m=re.search(r'(20\d{2})[-年/.](\d{1,2})[-月/.](\d{1,2})',doc_text)
+              if m: date=f'{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
+              if not date:
+                  m=re.search(r'-(20\d{2})-(\d{2})-(\d{2})\.pdf',dec)
+                  if m: date=f'{m.group(1)}-{m.group(2)}-{m.group(3)}'
+              title=Path(urllib.parse.unquote(urllib.parse.urlparse(dec).path)).stem
+              title=re.sub(r'^〖[^〗]+〗','',title)
+              title=re.sub(r'-20\d{2}-\d{2}-\d{2}$','',title)
+              clean=re.sub(r'[\\/:*?"<>|]+','_',f'{date}_{inst}_{title}')[:180]+'.pdf'
+              dest=PDFDIR/clean;out.replace(dest)
+              rec={'date':date,'institution':inst,'title':title,'filename':f'PDF/{clean}','pages':pages,'size_bytes':len(data),'sha256':sha,'source_url':x['url'],'render_checks':checks,'source_kind':'public_full_pdf'}
+              selected.append(rec);seen_content.add(sha);seen_title.add(title)
+              print('VALID',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          if len(selected)<2:
+              raise RuntimeError(f'Only {len(selected)} validated public full PDFs found')
+          selected.sort(key=lambda r:r['date'],reverse=True)
+          notes=['太古地产（01972.HK）券商深度报告资料包','整理日期：2026-09-08','','文件清单：']
+          for i,r in enumerate(selected,1): notes.append(f'{i}. {r["date"]} | {r["institution"]} | {r["title"]} | {r["pages"]}页')
+          notes += ['','说明：','1. PDF来自无需登录即可访问的公开文件目录。','2. 已核验PDF文件头、实际页数、公司名称或证券代码，并渲染检查首、中、尾页。','3. 本资料仅供研究参考，不构成投资建议；版权归原券商及作者所有。']
+          (ROOT/'文件说明.txt').write_text('\n'.join(notes)+'\n',encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps({'company':'太古地产有限公司','stock_code':'01972.HK','checked_as_of':'2026-09-08','report_count':len(selected),'reports':selected},ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text('\n'.join(f'{r["sha256"]}  {r["filename"]}' for r in selected)+'\n',encoding='utf-8')
+          z=W/f'Swire_Properties_01972_Broker_Deep_Reports_{len(selected)}.zip'
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as zz:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file(): zz.write(p,arcname=str(Path(ROOT.name)/p.relative_to(ROOT)))
+          with zipfile.ZipFile(z) as zz:
+              bad=zz.testzip(); assert bad is None,bad
+              assert len([n for n in zz.namelist() if n.lower().endswith('.pdf')])==len(selected)
+          meta={'filename':z.name,'size_bytes':z.stat().st_size,'sha256':hashlib.sha256(z.read_bytes()).hexdigest(),'report_count':len(selected),'reports':selected}
+          W.joinpath('zip_metadata.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps(meta,ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Swire-Properties-Public-Full-Reports
+          path: |
+            swire_idigital_doh/Swire_Properties_01972_Broker_Deep_Reports_*.zip
+            swire_idigital_doh/zip_metadata.json
+            swire_idigital_doh/swire_links.json
+            swire_idigital_doh/index.html
+            swire_idigital_doh/dns-*.json
+          retention-days: 1
+          compression-level: 0
