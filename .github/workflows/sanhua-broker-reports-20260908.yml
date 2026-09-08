@@ -1,0 +1,211 @@
+name: Build verified Sanhua broker report package 20260908
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sanhua-broker-reports-20260908.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          package_name = '三花智控_券商深度报告_公开完整版_3份'
+          out = Path(package_name)
+          work = Path('_sanhua_work')
+          renders = work / 'renders'
+          out.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+          renders.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'order': 1,
+                  'broker': '东吴证券',
+                  'date': '2025-02-24',
+                  'title': '人形元年，三花聚顶，万象可期（勘误版）',
+                  'pages': 33,
+                  'rating': '买入（维持）',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP202502241643442546_1.pdf',
+                  'filename': '01_东吴证券_人形元年三花聚顶万象可期_20250224_33页.pdf',
+              },
+              {
+                  'order': 2,
+                  'broker': '长江证券',
+                  'date': '2024-01-18',
+                  'title': '三花智控：多维协同，新启征程',
+                  'pages': 21,
+                  'rating': '买入（维持）',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP202401191617711972_1.pdf',
+                  'filename': '02_长江证券_多维协同新启征程_20240118_21页.pdf',
+              },
+              {
+                  'order': 3,
+                  'broker': '国盛证券',
+                  'date': '2022-07-10',
+                  'title': '制冷龙头，热管理赛道高歌猛进',
+                  'pages': 33,
+                  'rating': '买入（首次覆盖）',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP202207111576031470_1.pdf',
+                  'filename': '03_国盛证券_制冷龙头热管理赛道高歌猛进_20220710_33页.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/',
+          })
+
+          def download_pdf(report, dest):
+              errors = []
+              for attempt in range(1, 6):
+                  try:
+                      response = session.get(report['url'], timeout=(20, 180), allow_redirects=True)
+                      data = response.content
+                      print('DOWNLOAD', report['broker'], attempt, response.status_code, len(data), response.url, response.headers.get('content-type'), flush=True)
+                      if response.status_code == 200 and data.startswith(b'%PDF-') and len(data) > 100_000:
+                          dest.write_bytes(data)
+                          return
+                      errors.append(f"HTTP {response.status_code}, bytes={len(data)}, sig={data[:12]!r}")
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(attempt * 2)
+              raise RuntimeError(f"download failed for {report['title']}: {errors}")
+
+          records = []
+          for report in reports:
+              raw = work / report['filename']
+              download_pdf(report, raw)
+
+              reader = PdfReader(str(raw), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != report['pages']:
+                  raise RuntimeError(f"page mismatch for {report['broker']}: expected {report['pages']}, got {actual_pages}")
+
+              first_text = ''
+              for page in reader.pages[: min(3, actual_pages)]:
+                  try:
+                      first_text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              normalized = first_text.replace(' ', '').replace('\n', '')
+              if '三花智控' not in normalized and '002050' not in normalized:
+                  raise RuntimeError(f"company identity not found in first pages: {report['broker']}")
+
+              qcheck = subprocess.run(['qpdf', '--check', str(raw)], capture_output=True, text=True)
+              if qcheck.returncode not in (0, 3):
+                  raise RuntimeError(f"qpdf check failed for {report['broker']}: {qcheck.stderr[-1500:]}")
+
+              doc = pymupdf.open(str(raw))
+              sample_pages = sorted(set([0, actual_pages // 2, actual_pages - 1]))
+              rendered_pages = []
+              for page_index in sample_pages:
+                  pix = doc.load_page(page_index).get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+                  render_path = renders / f"{report['order']:02d}_{page_index + 1:03d}.png"
+                  pix.save(str(render_path))
+                  if render_path.stat().st_size < 8_000 or pix.width < 500 or pix.height < 500:
+                      raise RuntimeError(f"render verification failed for {report['broker']} page {page_index + 1}")
+                  rendered_pages.append(page_index + 1)
+              doc.close()
+
+              data = raw.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              final_pdf = out / report['filename']
+              final_pdf.write_bytes(data)
+              records.append({
+                  **report,
+                  'actual_pages': actual_pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'rendered_pages': rendered_pages,
+                  'source_type': '公开可直接下载的券商研究报告PDF',
+              })
+
+          total_pages = sum(item['actual_pages'] for item in records)
+          lines = [
+              '三花智控（002050.SZ / 02050.HK）券商深度报告',
+              '',
+              f'本压缩包包含 {len(records)} 份完整 PDF，共 {total_pages} 页。',
+              '筛选标准：公司深度或首次覆盖报告；排除短篇财报点评、会议纪要和仅有预览页的文件。',
+              '',
+          ]
+          for item in records:
+              lines.extend([
+                  f"{item['order']}. {item['broker']}：《{item['title']}》",
+                  f"   日期：{item['date']}；评级：{item['rating']}；页数：{item['actual_pages']} 页；大小：{item['bytes']/1048576:.2f} MB",
+                  f"   来源：{item['url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF 文件头、公司身份、实际页数、qpdf 结构检查、首页/中间页/末页渲染、SHA-256、ZIP CRC。',
+              '报告中的历史评级、目标价及预测不构成当前投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(package_name + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for file_path in sorted(out.iterdir()):
+                  archive.write(file_path, arcname=f'{package_name}/{file_path.name}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdf_count = len([name for name in archive.namelist() if name.lower().endswith('.pdf')])
+              if pdf_count != 3:
+                  raise RuntimeError(f'PDF count mismatch in ZIP: {pdf_count}')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'REPORTS', len(records), 'PAGES', total_pages, flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanhua-broker-reports-final
+          path: 三花智控_券商深度报告_公开完整版_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload validation renders
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanhua-broker-reports-validation
+          path: _sanhua_work/renders/
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 6
