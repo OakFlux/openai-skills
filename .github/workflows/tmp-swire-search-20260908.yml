@@ -1,0 +1,221 @@
+name: Search public Swire Pacific broker reports
+on:
+  push:
+    branches: [tmp-swire-search-20260908]
+permissions:
+  contents: read
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml playwright pypdf
+          python -m playwright install --with-deps chromium
+      - name: Search public report sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from pathlib import Path
+          from urllib.parse import quote, urljoin, urlparse, parse_qs, unquote
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          OUT = Path('output')
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          terms = ['太古股份公司', '太古股份公司A', '太古A', '00019.HK', '00019', 'Swire Pacific']
+          target_tokens = ['太古股份公司', '太古a', 'swire pacific', '00019', '0019.hk', '19.hk']
+          exclude_tokens = ['太古地产', 'swire properties', '01972', '1972.hk']
+          result = {'sdyanbao': [], 'hangyan_search': [], 'hangyan_reports': [], 'web_search': [], 'fxbaogao': []}
+
+          session = requests.Session()
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          # 1) Public research index API.
+          sd = requests.Session()
+          sd.headers.update({
+              'User-Agent': UA,
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/report',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Accept': 'application/json, text/plain, */*',
+          })
+          seen_sd = set()
+          for kw in terms:
+              for page_no in range(1, 8):
+                  payload = {
+                      'device': 1, 'hideTrader': 0, 'onlyTitle': 0, 'order': 1,
+                      'page': page_no, 'pageSize': 100, 'pageCount': 0,
+                      'dateRange': 0, 'startTime': '', 'endTime': '',
+                      'typeIds': '', 'industryIds': '', 'keyword': kw,
+                  }
+                  try:
+                      response = sd.post('https://api.sdyanbao.com/api/file/search', json=payload, timeout=90)
+                      obj = response.json()
+                      files = ((obj.get('data') or {}).get('files') or [])
+                      print('SD', kw, page_no, response.status_code, len(files), flush=True)
+                      for item in files:
+                          raw = json.dumps(item, ensure_ascii=False)
+                          low = raw.lower()
+                          if not any(t in low for t in target_tokens):
+                              continue
+                          if any(t in low for t in exclude_tokens) and not any(t in low for t in ['太古股份公司', 'swire pacific', '00019']):
+                              continue
+                          key = str(item.get('id') or item.get('file_id') or item.get('name') or raw[:150])
+                          if key in seen_sd:
+                              continue
+                          seen_sd.add(key)
+                          result['sdyanbao'].append(item)
+                          print('SD_MATCH', item.get('name'), item.get('organization'), item.get('page_count'), flush=True)
+                      if len(files) < 100:
+                          break
+                  except Exception as exc:
+                      result['sdyanbao'].append({'query': kw, 'page': page_no, 'error': repr(exc)})
+                      break
+
+          # 2) Bing/DDG search results.
+          queries = [
+              '"太古股份公司" 券商 研报 PDF',
+              '"太古股份公司A" 深度报告',
+              '"太古A" 研究报告 PDF',
+              '"Swire Pacific" equity research PDF',
+              '"Swire Pacific" initiating coverage PDF',
+              '"00019.HK" research report PDF',
+              'site:hangyan.co/reports "太古股份公司"',
+              'site:reportify.cn/reports "太古股份公司"',
+              'site:fxbaogao.com "太古股份公司"',
+          ]
+          seen_urls = set()
+          for query in queries:
+              for engine_url in [
+                  'https://www.bing.com/search?q=' + quote(query) + '&count=50',
+                  'https://html.duckduckgo.com/html/?q=' + quote(query),
+              ]:
+                  try:
+                      r = session.get(engine_url, timeout=60)
+                      soup = BeautifulSoup(r.text, 'lxml')
+                      entries = []
+                      for a in soup.find_all('a', href=True):
+                          href = a.get('href', '').strip()
+                          text = ' '.join(a.get_text(' ', strip=True).split())
+                          if 'uddg=' in href:
+                              try: href = unquote(parse_qs(urlparse(href).query).get('uddg', [''])[0])
+                              except Exception: pass
+                          href = urljoin(r.url, href)
+                          if not href.startswith('http') or href in seen_urls:
+                              continue
+                          hay = (href + ' ' + text).lower()
+                          if not any(t in hay for t in target_tokens + ['hangyan.co/reports', 'reportify.cn/reports', 'fxbaogao.com/detail', '.pdf']):
+                              continue
+                          seen_urls.add(href)
+                          entries.append({'url': href, 'text': text})
+                      result['web_search'].append({'query': query, 'engine': engine_url.split('/')[2], 'status': r.status_code, 'entries': entries})
+                      print('WEB', query, engine_url.split('/')[2], len(entries), flush=True)
+                  except Exception as exc:
+                      result['web_search'].append({'query': query, 'engine': engine_url, 'error': repr(exc)})
+
+          # 3) Dynamic Hangyan search and individual report pages.
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'])
+              context = browser.new_context(viewport={'width': 1440, 'height': 1200}, locale='zh-CN', user_agent=UA, accept_downloads=True)
+              context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+              report_links = {}
+              for kw in ['太古股份公司', '太古股份公司A', '太古A', '00019.HK', 'Swire Pacific']:
+                  page = context.new_page()
+                  row = {'query': kw, 'requests': [], 'responses': []}
+                  def on_request(req):
+                      if any(k in req.url.lower() for k in ['search', 'autocomplete', 'report', 'query', 'algolia']):
+                          row['requests'].append({'url': req.url, 'method': req.method, 'post_data': req.post_data})
+                  def on_response(resp):
+                      if any(k in resp.url.lower() for k in ['search', 'autocomplete', 'report', 'query', 'algolia']):
+                          rec = {'url': resp.url, 'status': resp.status, 'content_type': resp.headers.get('content-type')}
+                          try:
+                              if 'json' in (rec['content_type'] or '') or 'text' in (rec['content_type'] or ''):
+                                  rec['body'] = resp.text()[:400000]
+                          except Exception as exc:
+                              rec['error'] = repr(exc)
+                          row['responses'].append(rec)
+                  page.on('request', on_request)
+                  page.on('response', on_response)
+                  try:
+                      page.goto('https://www.hangyan.co/', wait_until='domcontentloaded', timeout=120000)
+                      page.wait_for_timeout(2500)
+                      inp = page.locator('#autocomplete-0-input')
+                      if inp.count() == 0:
+                          inp = page.locator('input[type="search"]').first
+                      inp.fill(kw)
+                      page.wait_for_timeout(4500)
+                      suggestions = page.eval_on_selector_all('a', 'els=>els.map(e=>({href:e.href,text:(e.innerText||e.textContent||"").trim()}))')
+                      row['suggestions'] = suggestions
+                      search_url = None
+                      for item in suggestions:
+                          if '/reports?q=' in item.get('href',''):
+                              search_url = item['href']; break
+                      if not search_url:
+                          search_url = 'https://www.hangyan.co/reports?q=' + quote(kw)
+                      page.goto(search_url, wait_until='domcontentloaded', timeout=120000)
+                      try: page.wait_for_load_state('networkidle', timeout=25000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(5000)
+                      row['search_url'] = page.url
+                      row['title'] = page.title()
+                      row['body'] = ' '.join(page.locator('body').inner_text().split())[:120000]
+                      links = page.eval_on_selector_all('a[href*="/reports/"]', 'els=>els.map(e=>({href:e.href,text:(e.innerText||e.textContent||"").trim(),html:e.outerHTML}))')
+                      row['report_links'] = links
+                      for item in links:
+                          hay = (item.get('text','') + ' ' + item.get('href','')).lower()
+                          if any(t in hay for t in target_tokens) and not any(t in hay for t in exclude_tokens):
+                              report_links[item['href']] = item.get('text','')
+                      page.screenshot(path=str(OUT / ('hangyan_' + re.sub(r'[^A-Za-z0-9]+','_',kw) + '.png')), full_page=True)
+                  except Exception as exc:
+                      row['error'] = repr(exc)
+                  result['hangyan_search'].append(row)
+                  page.close()
+
+              # Inspect relevant report pages and record all PDF-like URLs/network responses.
+              for report_url, search_text in list(report_links.items())[:40]:
+                  page = context.new_page()
+                  rec = {'url': report_url, 'search_text': search_text, 'responses': []}
+                  def inspect_response(resp):
+                      low = resp.url.lower()
+                      if any(k in low for k in ['.pdf', 'document_report', 'download', '/api/', 'report']):
+                          x = {'url': resp.url, 'status': resp.status, 'content_type': resp.headers.get('content-type')}
+                          try:
+                              if 'json' in (x['content_type'] or '') or 'text' in (x['content_type'] or ''):
+                                  x['body'] = resp.text()[:400000]
+                          except Exception as exc:
+                              x['error'] = repr(exc)
+                          rec['responses'].append(x)
+                  page.on('response', inspect_response)
+                  try:
+                      page.goto(report_url, wait_until='domcontentloaded', timeout=120000)
+                      try: page.wait_for_load_state('networkidle', timeout=25000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(4000)
+                      rec['final_url'] = page.url
+                      rec['title'] = page.title()
+                      rec['body'] = ' '.join(page.locator('body').inner_text().split())[:100000]
+                      rec['html'] = page.content()[:1000000]
+                      rec['links'] = page.eval_on_selector_all('a,iframe,embed,object,button', 'els=>els.map(e=>({tag:e.tagName,href:e.href||e.src||e.data||"",text:(e.innerText||e.textContent||"").trim(),html:e.outerHTML}))')
+                  except Exception as exc:
+                      rec['error'] = repr(exc)
+                  result['hangyan_reports'].append(rec)
+                  page.close()
+              context.close(); browser.close()
+
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('SUMMARY', json.dumps({k: len(v) for k,v in result.items()}, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: swire-pacific-broker-report-search
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
