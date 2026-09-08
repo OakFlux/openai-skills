@@ -1,0 +1,441 @@
+name: Build Huabao International annual report archive
+on:
+  push:
+    branches:
+      - tmp-huabao-reports-20260908
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet 'httpx[http2]' pypdf pymupdf pillow
+      - name: Query HKEX, download PDFs, verify and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pdfs work/renders
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import httpx
+          import fitz
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+
+          OUTPUT = Path('output')
+          WORK = Path('work')
+          PDF_DIR = WORK / 'pdfs'
+          RENDER_DIR = WORK / 'renders'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          RENDER_DIR.mkdir(parents=True, exist_ok=True)
+
+          STOCK_ID = '612'
+          STOCK_CODE = '00336'
+          BASE_SEARCH = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          BASE_SITE = 'https://www1.hkexnews.hk/'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+
+          client = httpx.Client(
+              http2=True,
+              follow_redirects=True,
+              timeout=httpx.Timeout(240.0, connect=45.0),
+              headers={
+                  'User-Agent': UA,
+                  'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=612',
+              },
+          )
+
+          def flatten_records(obj):
+              out = []
+              if isinstance(obj, list):
+                  for item in obj:
+                      out.extend(flatten_records(item))
+              elif isinstance(obj, dict):
+                  if obj.get('FILE_LINK') and obj.get('TITLE'):
+                      out.append(obj)
+                  else:
+                      for value in obj.values():
+                          out.extend(flatten_records(value))
+              return out
+
+          def hkex_search(from_date: str, to_date: str, t2code: str, title: str = ''):
+              params = {
+                  'sortDir': '1',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': from_date,
+                  'toDate': to_date,
+                  'title': title,
+                  'searchType': '1',
+                  't1code': '40000',
+                  't2Gcode': '-2',
+                  't2code': t2code,
+                  'rowRange': '2000',
+                  'lang': 'EN',
+              }
+              last_error = None
+              for attempt in range(1, 7):
+                  try:
+                      response = client.get(BASE_SEARCH, params=params)
+                      print('SEARCH', response.status_code, response.url, 'bytes', len(response.content), flush=True)
+                      response.raise_for_status()
+                      outer = response.json()
+                      inner = outer.get('result', outer) if isinstance(outer, dict) else outer
+                      if isinstance(inner, str):
+                          inner = json.loads(inner)
+                      records = flatten_records(inner)
+                      print('SEARCH_RECORDS', from_date, to_date, t2code, repr(title), len(records), flush=True)
+                      return records
+                  except Exception as exc:
+                      last_error = exc
+                      print('SEARCH_RETRY', attempt, repr(exc), flush=True)
+                      time.sleep(min(2 ** attempt, 20))
+              raise RuntimeError(f'HKEX search failed: {last_error!r}')
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(str(value or ''))
+              value = re.sub(r'<[^>]+>', ' ', value)
+              return re.sub(r'\s+', ' ', value).strip()
+
+          def normalized_stock(value: str) -> str:
+              digits = re.sub(r'\D', '', str(value or ''))
+              return digits.zfill(5)[-5:]
+
+          def link_for(item: dict) -> str:
+              link = str(item.get('FILE_LINK') or '').strip()
+              if link.startswith('http://') or link.startswith('https://'):
+                  return link
+              return urljoin(BASE_SITE, link.lstrip('/'))
+
+          def release_date(item: dict) -> str:
+              raw = str(item.get('DATE_TIME') or item.get('DATE') or '').strip()
+              matches = re.search(r'(20\d{2})[/-](\d{1,2})[/-](\d{1,2})', raw)
+              if matches:
+                  return f'{int(matches.group(1)):04d}-{int(matches.group(2)):02d}-{int(matches.group(3)):02d}'
+              matches = re.search(r'(\d{1,2})[/-](\d{1,2})[/-](20\d{2})', raw)
+              if matches:
+                  return f'{int(matches.group(3)):04d}-{int(matches.group(2)):02d}-{int(matches.group(1)):02d}'
+              return raw or 'date_unknown'
+
+          def annual_candidate(item: dict, year: int) -> bool:
+              if normalized_stock(item.get('STOCK_CODE')) != STOCK_CODE:
+                  return False
+              title = clean_title(item.get('TITLE')).upper()
+              if str(year) not in title:
+                  return False
+              if 'ANNUAL REPORT' not in title and '年報' not in title and '年度報告' not in title and '年度报告' not in title:
+                  return False
+              excluded = ['ENVIRONMENTAL', 'ESG', 'NOTIFICATION', 'REPLY FORM', 'SUMMARY', '摘要', '更正', '補充', '补充']
+              return not any(term in title for term in excluded)
+
+          def interim_report_candidate(item: dict, year: int) -> bool:
+              if normalized_stock(item.get('STOCK_CODE')) != STOCK_CODE:
+                  return False
+              title = clean_title(item.get('TITLE')).upper()
+              if str(year) not in title:
+                  return False
+              if 'INTERIM REPORT' not in title and '中期報告' not in title and '中期报告' not in title:
+                  return False
+              excluded = ['NOTIFICATION', 'REPLY FORM', 'SUMMARY', '摘要']
+              return not any(term in title for term in excluded)
+
+          def interim_results_candidate(item: dict, year: int) -> bool:
+              if normalized_stock(item.get('STOCK_CODE')) != STOCK_CODE:
+                  return False
+              title = clean_title(item.get('TITLE')).upper()
+              if str(year) not in title:
+                  return False
+              return ('INTERIM RESULTS' in title or '中期業績' in title or '中期业绩' in title) and 'PRESENTATION' not in title
+
+          def choose_best(items: list[dict], predicate) -> dict | None:
+              candidates = [item for item in items if predicate(item)]
+              if not candidates:
+                  return None
+              def score(item):
+                  title = clean_title(item.get('TITLE')).upper()
+                  file_info = str(item.get('FILE_INFO') or '').upper()
+                  score_value = 0
+                  if 'ANNUAL REPORT' in title or 'INTERIM REPORT' in title:
+                      score_value += 30
+                  if 'RESULTS' in title:
+                      score_value += 10
+                  if 'MULTI' in file_info or '多' in file_info:
+                      score_value -= 100
+                  score_value += len(title) * -0.01
+                  return score_value
+              return sorted(candidates, key=score, reverse=True)[0]
+
+          selected = []
+          search_audit = []
+
+          for year in range(2020, 2026):
+              release_year = year + 1
+              variants = [
+                  (f'{release_year}0101', f'{release_year}0630', '40200', ''),
+                  (f'{year}1201', f'{release_year}0930', '40200', str(year)),
+                  (f'{year}1201', f'{release_year}0930', '-1', 'ANNUAL REPORT'),
+              ]
+              all_records = []
+              for args in variants:
+                  try:
+                      rows = hkex_search(*args)
+                      all_records.extend(rows)
+                      search_audit.append({'purpose': f'annual_{year}', 'args': args, 'count': len(rows)})
+                      item = choose_best(all_records, lambda x, y=year: annual_candidate(x, y))
+                      if item:
+                          break
+                  except Exception as exc:
+                      search_audit.append({'purpose': f'annual_{year}', 'args': args, 'error': repr(exc)})
+              item = choose_best(all_records, lambda x, y=year: annual_candidate(x, y))
+              if not item:
+                  raise RuntimeError(f'Could not locate official {year} annual report. Sample titles: {[clean_title(x.get("TITLE")) for x in all_records[:30]]}')
+              selected.append({'kind': 'annual', 'report_year': year, 'item': item})
+              print('SELECT_ANNUAL', year, release_date(item), clean_title(item.get('TITLE')), link_for(item), flush=True)
+
+          # Prefer a complete 2026 interim report. If it has not yet been published, use the official 2026 interim-results announcement.
+          latest_item = None
+          latest_kind = None
+          records_2026_interim = []
+          for args in [
+              ('20260801', '20260908', '40300', ''),
+              ('20260801', '20261031', '40300', '2026'),
+          ]:
+              try:
+                  rows = hkex_search(*args)
+                  records_2026_interim.extend(rows)
+                  search_audit.append({'purpose': 'latest_2026_interim_report', 'args': args, 'count': len(rows)})
+              except Exception as exc:
+                  search_audit.append({'purpose': 'latest_2026_interim_report', 'args': args, 'error': repr(exc)})
+          latest_item = choose_best(records_2026_interim, lambda x: interim_report_candidate(x, 2026))
+          if latest_item:
+              latest_kind = '2026_interim_report'
+          else:
+              results_records = []
+              for args in [
+                  ('20260801', '20260908', '40100', ''),
+                  ('20260801', '20260908', '-1', 'INTERIM RESULTS'),
+              ]:
+                  try:
+                      rows = hkex_search(*args)
+                      results_records.extend(rows)
+                      search_audit.append({'purpose': 'latest_2026_interim_results', 'args': args, 'count': len(rows)})
+                  except Exception as exc:
+                      search_audit.append({'purpose': 'latest_2026_interim_results', 'args': args, 'error': repr(exc)})
+              latest_item = choose_best(results_records, lambda x: interim_results_candidate(x, 2026))
+              latest_kind = '2026_interim_results_announcement'
+
+          if not latest_item:
+              raise RuntimeError('Could not locate the official 2026 interim report or interim-results announcement.')
+          selected.append({'kind': latest_kind, 'report_year': 2026, 'item': latest_item})
+          print('SELECT_LATEST', latest_kind, release_date(latest_item), clean_title(latest_item.get('TITLE')), link_for(latest_item), flush=True)
+
+          # If the complete 2026 interim report is not yet available, add the latest complete interim report (2025) as a clearly labelled supplement.
+          if latest_kind == '2026_interim_results_announcement':
+              prior_records = []
+              for args in [
+                  ('20250801', '20251031', '40300', ''),
+                  ('20250801', '20251031', '-1', 'INTERIM REPORT'),
+              ]:
+                  try:
+                      rows = hkex_search(*args)
+                      prior_records.extend(rows)
+                      search_audit.append({'purpose': 'latest_complete_interim_report', 'args': args, 'count': len(rows)})
+                  except Exception as exc:
+                      search_audit.append({'purpose': 'latest_complete_interim_report', 'args': args, 'error': repr(exc)})
+              prior_item = choose_best(prior_records, lambda x: interim_report_candidate(x, 2025))
+              if prior_item:
+                  selected.append({'kind': '2025_interim_report_supplement', 'report_year': 2025, 'item': prior_item})
+                  print('SELECT_SUPPLEMENT', release_date(prior_item), clean_title(prior_item.get('TITLE')), link_for(prior_item), flush=True)
+
+          def safe_filename(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', ' ', value).strip(' ._')
+              return value[:180]
+
+          manifest_rows = []
+          first_page_paths = []
+          seen_urls = set()
+
+          for sequence, entry in enumerate(selected, 1):
+              item = entry['item']
+              url = link_for(item)
+              if url in seen_urls:
+                  continue
+              seen_urls.add(url)
+              title = clean_title(item.get('TITLE'))
+              date = release_date(item)
+              kind = entry['kind']
+              report_year = entry['report_year']
+
+              if kind == 'annual':
+                  display = f'{report_year}年年度报告'
+              elif kind == '2026_interim_report':
+                  display = '2026年中期报告（最新定期财务报告）'
+              elif kind == '2026_interim_results_announcement':
+                  display = '2026年中期业绩公告（最新集团财务披露）'
+              else:
+                  display = '2025年中期报告（最新完整中期报告补充）'
+
+              filename = safe_filename(f'{sequence:02d}_{display}_华宝国际_00336.pdf')
+              path = PDF_DIR / filename
+
+              last_error = None
+              for attempt in range(1, 7):
+                  try:
+                      response = client.get(url, headers={'Accept': 'application/pdf,*/*', 'Referer': 'https://www1.hkexnews.hk/'})
+                      print('DOWNLOAD', attempt, response.status_code, len(response.content), url, flush=True)
+                      response.raise_for_status()
+                      data = response.content
+                      if b'%PDF-' not in data[:2048] or len(data) < 30_000:
+                          raise RuntimeError(f'Invalid or too-small PDF ({len(data)} bytes)')
+                      reader = PdfReader(io.BytesIO(data), strict=False)
+                      pages = len(reader.pages)
+                      if pages < 2:
+                          raise RuntimeError(f'Unexpected page count: {pages}')
+                      sample_parts = []
+                      for page in reader.pages[:5]:
+                          try:
+                              sample_parts.append(page.extract_text() or '')
+                          except Exception:
+                              pass
+                      sample = '\n'.join(sample_parts).upper()
+                      if not any(term in sample for term in ['HUABAO INTERNATIONAL', '華寶國際', '华宝国际']):
+                          raise RuntimeError('Company identity check failed in first five pages.')
+                      if kind == 'annual' and str(report_year) not in sample:
+                          raise RuntimeError(f'Year identity check failed for annual report {report_year}.')
+                      path.write_bytes(data)
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      print('DOWNLOAD_RETRY', attempt, repr(exc), flush=True)
+                      time.sleep(min(2 ** attempt, 20))
+              else:
+                  raise RuntimeError(f'Download failed for {url}: {last_error!r}')
+
+              sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+              doc = fitz.open(path)
+              pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.25, 1.25), alpha=False)
+              render_path = RENDER_DIR / f'{sequence:02d}.png'
+              pix.save(render_path)
+              doc.close()
+              first_page_paths.append(render_path)
+
+              manifest_rows.append({
+                  '序号': sequence,
+                  '文件名': filename,
+                  '报告类型': display,
+                  '报告年度': report_year,
+                  '港交所披露日期': date,
+                  '港交所标题': title,
+                  'PDF页数': pages,
+                  '文件大小_字节': path.stat().st_size,
+                  'SHA256': sha256,
+                  '官方来源': url,
+              })
+              print('VERIFIED', filename, pages, path.stat().st_size, sha256, flush=True)
+
+          if len([row for row in manifest_rows if '年度报告' in row['报告类型']]) != 6:
+              raise RuntimeError('Annual report count is not six after download.')
+
+          manifest_path = PDF_DIR / '文件清单与校验值.csv'
+          with manifest_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=list(manifest_rows[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest_rows)
+
+          readme_lines = [
+              '华宝国际控股有限公司（00336.HK）2020-2025年报及最新财务报告资料包',
+              '打包日期：2026-09-08',
+              '',
+              '收录范围：',
+              '1. 2020年至2025年完整年度报告，共6份。',
+              '2. 截至打包日最新的集团层面定期财务披露。',
+              '3. 如2026年完整中期报告尚未发布，则收入2026年中期业绩公告，并补充最新已发布的完整中期报告。',
+              '',
+              '华宝国际为香港上市公司，不按A股格式发布公司层面第一季度和第三季度报告。',
+              '所有PDF均取自港交所披露易，已检查PDF文件头、可解析性、实际页数、公司名称和年度。',
+              '压缩包已执行ZIP CRC完整性测试。',
+              '',
+          ]
+          for row in manifest_rows:
+              readme_lines.extend([
+                  f"{row['序号']}. {row['报告类型']}｜披露日期 {row['港交所披露日期']}｜{row['PDF页数']}页",
+                  f"   文件：{row['文件名']}",
+                  f"   来源：{row['官方来源']}",
+                  '',
+              ])
+          (PDF_DIR / 'README.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (OUTPUT / 'search_audit.json').write_text(json.dumps(search_audit, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUTPUT / 'manifest.json').write_text(json.dumps(manifest_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Create a first-page contact sheet for visual QA.
+          cards = []
+          for render_path in first_page_paths:
+              with Image.open(render_path) as image:
+                  rgb = image.convert('RGB')
+                  rgb.thumbnail((430, 610))
+                  card = Image.new('RGB', (470, 660), 'white')
+                  card.paste(rgb, ((470 - rgb.width) // 2, 10))
+                  draw = ImageDraw.Draw(card)
+                  draw.text((15, 625), render_path.stem, fill='black')
+                  cards.append(card)
+          cols = 4
+          rows = (len(cards) + cols - 1) // cols
+          sheet = Image.new('RGB', (470 * cols, 660 * rows), 'white')
+          for idx, card in enumerate(cards):
+              sheet.paste(card, ((idx % cols) * 470, (idx // cols) * 660))
+              card.close()
+          sheet.save(OUTPUT / 'first_page_contact_sheet.jpg', quality=90)
+          sheet.close()
+
+          archive_path = OUTPUT / 'Huabao_International_00336_2020-2025_Annual_and_Latest_Reports.zip'
+          with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(PDF_DIR.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(archive_path, 'r') as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad is not None:
+                  raise RuntimeError(f'ZIP CRC failed at {bad}')
+              if len(pdfs) < 7:
+                  raise RuntimeError(f'Unexpected PDF count in ZIP: {len(pdfs)}')
+
+          result = {
+              'ok': True,
+              'archive': archive_path.name,
+              'archive_bytes': archive_path.stat().st_size,
+              'pdf_count': len(pdfs),
+              'zip_crc_ok': True,
+              'reports': manifest_rows,
+          }
+          (OUTPUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          client.close()
+          PY
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: huabao-international-reports-package
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
