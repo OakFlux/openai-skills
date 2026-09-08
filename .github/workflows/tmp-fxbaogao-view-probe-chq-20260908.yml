@@ -1,0 +1,148 @@
+name: Probe FXBaogao China Hongqiao viewer
+on:
+  push:
+    branches:
+      - tmp-fxbaogao-view-probe-chq-20260908
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet playwright requests beautifulsoup4 lxml pypdf
+      - name: Probe viewer and capture public PDF responses
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          ids=['4864892','4802165','4307103']
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8','Referer':'https://www.fxbaogao.com/'})
+          result={'static':{},'browser':{},'validations':[]}
+          pattern=re.compile(r'(\.pdf(?:$|[?&#])|pdf|download|attachment|document|file|oss|cos|cdn|view|api)',re.I)
+
+          # Static inspection of detail and view pages.
+          for rid in ids:
+              result['static'][rid]={}
+              for kind,url in [('detail',f'https://www.fxbaogao.com/detail/{rid}'),('view',f'https://www.fxbaogao.com/view?id={rid}')]:
+                  rec={'url':url}
+                  try:
+                      r=s.get(url,timeout=35,allow_redirects=True)
+                      rec.update({'status':r.status_code,'final_url':r.url,'content_type':r.headers.get('content-type',''),'bytes':len(r.content),'headers':dict(r.headers)})
+                      Path(f'output/{rid}_{kind}.html').write_bytes(r.content)
+                      text=r.text.replace('\\/','/')
+                      soup=BeautifulSoup(text,'lxml')
+                      rec['title']=soup.title.get_text(' ',strip=True) if soup.title else ''
+                      rec['body']=' '.join(soup.get_text(' ',strip=True).split())[:100000]
+                      elems=[]
+                      for tag in soup.find_all(True):
+                          for attr in ['href','src','action','data-url','data-href','data-file','data-pdf','data-src','onclick']:
+                              val=tag.get(attr)
+                              if not isinstance(val,str): continue
+                              absu=urljoin(r.url,val)
+                              if pattern.search(absu) or pattern.search(val):
+                                  elems.append({'tag':tag.name,'attr':attr,'value':val,'absolute':absu,'text':' '.join(tag.get_text(' ',strip=True).split())[:300]})
+                      rec['elements']=elems[:1000]
+                      urls=[]
+                      for m in re.finditer(r'https?://[^"\'<>\\s]+',text):
+                          u=m.group(0)
+                          if pattern.search(u): urls.append(u)
+                      rec['urls']=sorted(set(urls))[:2000]
+                      snippets=[]
+                      for m in pattern.finditer(text): snippets.append(' '.join(text[max(0,m.start()-400):m.start()+1400].split())[:2000])
+                      rec['snippets']=snippets[:100]
+                      print('STATIC',rid,kind,json.dumps(rec,ensure_ascii=False)[:40000],flush=True)
+                  except Exception as exc: rec['error']=repr(exc)
+                  result['static'][rid][kind]=rec
+
+          # Browser inspection. Use wait_until=commit and continue even on timeout.
+          chrome=shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          with sync_playwright() as pw:
+              browser=pw.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage'])
+              ctx=browser.new_context(user_agent=ua,locale='zh-CN',viewport={'width':1440,'height':1100},accept_downloads=True)
+              for rid in ids:
+                  page=ctx.new_page(); reqs=[]; resps=[]; downloads=[]
+                  def on_req(req):
+                      if pattern.search(req.url): reqs.append({'url':req.url,'method':req.method,'resource_type':req.resource_type,'post_data':req.post_data})
+                  def on_resp(resp):
+                      try: ct=resp.headers.get('content-type','')
+                      except Exception: ct=''
+                      if pattern.search(resp.url) or 'pdf' in ct.lower():
+                          item={'url':resp.url,'status':resp.status,'content_type':ct}
+                          resps.append(item)
+                          if 'pdf' in ct.lower() or resp.url.lower().split('?')[0].endswith('.pdf'):
+                              try:
+                                  body=resp.body()
+                                  if body.startswith(b'%PDF') and len(body)>20000:
+                                      sha=hashlib.sha256(body).hexdigest(); p=Path(f'output/{rid}_network_{len(resps)}_{sha[:10]}.pdf'); p.write_bytes(body); item['saved_as']=str(p); item['bytes']=len(body)
+                              except Exception as exc: item['save_error']=repr(exc)
+                  page.on('request',on_req); page.on('response',on_resp)
+                  rec={'requests':reqs,'responses':resps,'downloads':downloads}
+                  for kind,url in [('view',f'https://www.fxbaogao.com/view?id={rid}'),('detail',f'https://www.fxbaogao.com/detail/{rid}')]:
+                      item={'url':url}
+                      try:
+                          try:
+                              resp=page.goto(url,wait_until='commit',timeout=25000)
+                              item['status']=resp.status if resp else None
+                          except PWTimeout as exc:
+                              item['goto_timeout']=repr(exc)
+                          page.wait_for_timeout(5000)
+                          item.update({'final_url':page.url,'title':page.title(),'body':' '.join(page.locator('body').inner_text(timeout=10000).split())[:100000]})
+                          item['elements']=page.eval_on_selector_all('a,button,input,iframe,embed,object','els=>els.map(e=>({tag:e.tagName,text:(e.innerText||e.textContent||"").trim(),href:e.href||"",src:e.src||"",onclick:e.getAttribute("onclick")||"",download:e.download||"",outer:e.outerHTML.slice(0,3000)}))')
+                          item['globals']=page.evaluate("""() => {const out={}; for(const k of ['__NEXT_DATA__','__NUXT__','__INITIAL_STATE__']){try{if(window[k]!==undefined)out[k]=window[k]}catch(e){}}; try{out.localStorage={...localStorage}}catch(e){}; try{out.sessionStorage={...sessionStorage}}catch(e){}; return out;}""")
+                          Path(f'output/{rid}_{kind}_browser.html').write_text(page.content(),encoding='utf-8')
+                          page.screenshot(path=f'output/{rid}_{kind}.png',full_page=True)
+                          # Click only clearly public controls; stop if login/payment gate appears.
+                          for text in ['点击免费查看完整报告','免费查看完整报告','查看完整报告','打开报告原文','查看原文']:
+                              loc=page.get_by_text(text,exact=False)
+                              if loc.count():
+                                  cr={'text':text,'before_url':page.url}
+                                  try:
+                                      try:
+                                          with page.expect_download(timeout=7000) as di:
+                                              loc.first.click(force=True,timeout=7000)
+                                          d=di.value; p=Path(f'output/{rid}_download_{d.suggested_filename}'); d.save_as(str(p)); cr['download']={'url':d.url,'file':str(p),'bytes':p.stat().st_size}; downloads.append(cr['download'])
+                                      except Exception as exc:
+                                          cr['download_error']=repr(exc)
+                                          try: loc.first.click(force=True,timeout=5000)
+                                          except Exception as exc2: cr['click_error']=repr(exc2)
+                                      page.wait_for_timeout(4000)
+                                      cr['after_url']=page.url
+                                      cr['after_body']=' '.join(page.locator('body').inner_text(timeout=5000).split())[:30000]
+                                  except Exception as exc: cr['error']=repr(exc)
+                                  item.setdefault('clicks',[]).append(cr)
+                                  if re.search(r'(登录|注册|会员|付费|购买|扫码)',cr.get('after_body','')): break
+                      except Exception as exc: item['error']=repr(exc)
+                      rec[kind]=item
+                  result['browser'][rid]=rec
+                  page.close()
+              browser.close()
+
+          # Validate captured PDFs.
+          for p in sorted(Path('output').glob('*.pdf')):
+              v={'file':str(p),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+              try:
+                  reader=PdfReader(str(p)); v['pages']=len(reader.pages); text=''.join((x.extract_text() or '') for x in reader.pages[:5]); v['text']=' '.join(text.split())[:5000]; v['target']=('中国宏桥' in text or 'China Hongqiao' in text)
+              except Exception as exc: v['error']=repr(exc)
+              result['validations'].append(v); print('PDF',json.dumps(v,ensure_ascii=False),flush=True)
+          Path('output/result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-chinahongqiao-view-probe
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
