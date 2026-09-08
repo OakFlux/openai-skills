@@ -1,0 +1,132 @@
+name: chatgpt-temp-dbs-hongqiao-download
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-dbs-hongqiao-download.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture public DBS PDF downloads
+        shell: bash
+        run: |
+          python -m pip install --quiet playwright pypdf
+          python <<'PY'
+          import asyncio, json, os, re
+          from pathlib import Path
+          from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+          from pypdf import PdfReader
+
+          W=Path('dbs_hongqiao'); W.mkdir(exist_ok=True)
+          targets=[
+            ('2026_company_guide','https://www.dbs.com.hk/treasures/aics/templatedata/article/equity/data/en/DBSV/012014/1378_HK.xml'),
+            ('2024_integrated_value_chain','https://www.dbs.com.hk/private-banking/aics/templatedata/article/recentdevelopment/data/en/DBSV/092024/1378_HK_09262024.xml'),
+          ]
+
+          async def main():
+            async with async_playwright() as p:
+              exe=next((x for x in ['/usr/bin/google-chrome','/usr/bin/google-chrome-stable','/usr/bin/chromium','/usr/bin/chromium-browser'] if os.path.exists(x)),None)
+              browser=await p.chromium.launch(headless=True,executable_path=exe,args=['--no-sandbox','--disable-dev-shm-usage'])
+              ctx=await browser.new_context(viewport={'width':1440,'height':1200},user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',locale='en-US',accept_downloads=True)
+              summary=[]
+              for key,url in targets:
+                d=W/key;d.mkdir(exist_ok=True)
+                page=await ctx.new_page(); reqs=[]; resps=[]; tasks=[]; pdfs=[]
+                page.on('request',lambda r,reqs=reqs:reqs.append({'method':r.method,'url':r.url,'type':r.resource_type,'post':r.post_data[:2000] if r.post_data else None}))
+                async def cap(resp,resps=resps,d=d,pdfs=pdfs):
+                  row={'status':resp.status,'url':resp.url,'ct':(await resp.all_headers()).get('content-type','')}
+                  if re.search(r'pdf|download|research|aics|1378|document',resp.url,re.I):
+                    try:
+                      b=await resp.body();row['bytes']=len(b);row['head']=b[:500].decode('utf-8','replace')
+                      if b.startswith(b'%PDF-') and len(b)>100000:
+                        f=d/f'captured_{len(pdfs)}.pdf';f.write_bytes(b);pdfs.append({'file':f.name,'url':resp.url,'bytes':len(b)});row['pdf_file']=f.name
+                      elif len(b)<10_000_000 and ('text' in row['ct'] or 'json' in row['ct'] or 'javascript' in row['ct'] or 'xml' in row['ct']):
+                        f=d/f'resp_{len(resps):04d}.txt';f.write_bytes(b);row['file']=f.name
+                    except Exception as e:row['error']=repr(e)
+                  resps.append(row)
+                page.on('response',lambda r,tasks=tasks:tasks.append(asyncio.create_task(cap(r))))
+                try:
+                  r=await page.goto(url,wait_until='domcontentloaded',timeout=120000)
+                  await page.wait_for_timeout(8000)
+                  try:await page.wait_for_load_state('networkidle',timeout=20000)
+                  except:pass
+                  title=await page.title();body=await page.locator('body').inner_text();html=await page.content()
+                  (d/'page.html').write_text(html,encoding='utf-8');(d/'body.txt').write_text(body,encoding='utf-8')
+                  dom=await page.evaluate('''()=>({
+                    links:[...document.querySelectorAll('a')].map((x,i)=>({i,text:(x.innerText||x.textContent||'').trim(),href:x.href||x.getAttribute('href')||'',onclick:x.getAttribute('onclick')||'',outer:x.outerHTML.slice(0,4000)})),
+                    buttons:[...document.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')].map((x,i)=>({i,text:(x.innerText||x.value||'').trim(),onclick:x.getAttribute('onclick')||'',outer:x.outerHTML.slice(0,4000)})),
+                    resources:performance.getEntriesByType('resource').map(x=>x.name),
+                    scripts:[...document.scripts].map(x=>({src:x.src,text:(x.textContent||'').slice(0,10000)}))
+                  })''')
+                  (d/'dom.json').write_text(json.dumps(dom,ensure_ascii=False,indent=2),encoding='utf-8')
+                  candidates=[x for x in dom['links'] if re.search(r'download\s*pdf|pdf',x['text']+' '+x['href']+' '+x['onclick']+' '+x['outer'],re.I)]
+                  print('PAGE',key,r.status if r else None,title,page.url,flush=True)
+                  print('CANDIDATES',key,json.dumps(candidates,ensure_ascii=False)[:50000],flush=True)
+                  downloads=[]
+                  # Probe directly exposed absolute links first.
+                  for ci,x in enumerate(candidates):
+                    href=x.get('href') or ''
+                    if href.startswith('http') and re.search(r'\.pdf(?:$|\?)|download',href,re.I):
+                      try:
+                        rr=await ctx.request.get(href,headers={'Referer':page.url},timeout=120000,fail_on_status_code=False);b=await rr.body()
+                        print('DIRECT_PROBE',key,ci,rr.status,len(b),rr.url,rr.headers.get('content-type',''),flush=True)
+                        if b.startswith(b'%PDF-') and len(b)>100000:
+                          f=d/f'direct_{ci}.pdf';f.write_bytes(b);pdfs.append({'file':f.name,'url':rr.url,'bytes':len(b)});break
+                      except Exception as e:print('DIRECT_ERROR',key,ci,repr(e),flush=True)
+                  # Click visible Download PDF controls.
+                  loc=page.get_by_text(re.compile(r'Download\s*PDF',re.I))
+                  count=await loc.count();print('DOWNLOAD_LOCATORS',key,count,flush=True)
+                  for i in range(min(count,8)):
+                    el=loc.nth(i)
+                    try:
+                      if not await el.is_visible():continue
+                      outer=await el.evaluate('(x)=>x.outerHTML');print('CLICK_CONTROL',key,i,outer[:4000],flush=True)
+                      before_pages=set(ctx.pages)
+                      try:
+                        async with page.expect_download(timeout=8000) as di:
+                          await el.click(timeout=10000,force=True)
+                        dl=await di.value;f=d/f'download_{i}_{dl.suggested_filename}';await dl.save_as(str(f));downloads.append({'file':f.name,'url':dl.url,'bytes':f.stat().st_size});print('DOWNLOAD_EVENT',key,json.dumps(downloads[-1]),flush=True)
+                      except PWTimeout:
+                        await page.wait_for_timeout(3000)
+                      except Exception as e:print('DOWNLOAD_CLICK_ERROR',key,i,repr(e),flush=True)
+                      new_pages=[x for x in ctx.pages if x not in before_pages]
+                      for np in new_pages:
+                        try:
+                          print('POPUP',key,np.url,flush=True);await np.wait_for_timeout(3000)
+                          u=np.url
+                          if u.startswith('http'):
+                            rr=await ctx.request.get(u,headers={'Referer':page.url},timeout=120000,fail_on_status_code=False);b=await rr.body();print('POPUP_PROBE',key,rr.status,len(b),rr.url,rr.headers.get('content-type',''),flush=True)
+                            if b.startswith(b'%PDF-') and len(b)>100000:
+                              f=d/f'popup_{i}.pdf';f.write_bytes(b);pdfs.append({'file':f.name,'url':rr.url,'bytes':len(b)})
+                          await np.close()
+                        except Exception as e:print('POPUP_ERROR',key,repr(e),flush=True)
+                      if downloads or pdfs:break
+                    except Exception as e:print('CONTROL_ERROR',key,i,repr(e),flush=True)
+                  if tasks:await asyncio.gather(*tasks,return_exceptions=True)
+                  # Always create a faithful browser print for the public page as a fallback research-page PDF.
+                  await page.emulate_media(media='screen')
+                  print_pdf=d/f'{key}_official_webpage.pdf';await page.pdf(path=str(print_pdf),format='A4',print_background=True,margin={'top':'12mm','bottom':'12mm','left':'10mm','right':'10mm'})
+                  print('PRINT_PDF',key,print_pdf.stat().st_size,flush=True)
+                  (d/'requests.json').write_text(json.dumps(reqs,ensure_ascii=False,indent=2),encoding='utf-8');(d/'responses.json').write_text(json.dumps(resps,ensure_ascii=False,indent=2),encoding='utf-8')
+                  valid=[]
+                  for f in sorted(d.glob('*.pdf')):
+                    try:
+                      pages=len(PdfReader(str(f),strict=False).pages);valid.append({'file':f.name,'pages':pages,'bytes':f.stat().st_size,'sha256':__import__('hashlib').sha256(f.read_bytes()).hexdigest()});print('PDF_FILE',key,json.dumps(valid[-1]),flush=True)
+                    except Exception as e:print('PDF_INVALID',key,f.name,repr(e),flush=True)
+                  summary.append({'key':key,'source_page':url,'status':r.status if r else None,'title':title,'candidate_links':candidates,'captured':pdfs,'downloads':downloads,'valid_pdfs':valid})
+                except Exception as e:
+                  print('TARGET_ERROR',key,repr(e),flush=True);summary.append({'key':key,'source_page':url,'error':repr(e)})
+                await page.close()
+              (W/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8');print('FINAL',json.dumps(summary,ensure_ascii=False),flush=True);await browser.close()
+          asyncio.run(main())
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DBS-China-Hongqiao-Public-Research
+          path: dbs_hongqiao
+          retention-days: 1
+          compression-level: 0
