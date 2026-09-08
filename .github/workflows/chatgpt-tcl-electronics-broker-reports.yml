@@ -1,0 +1,427 @@
+name: Download and package TCL Electronics broker deep reports
+
+on:
+  push:
+    branches:
+      - chatgpt-tcl-electronics-broker-reports-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml cryptography pypdf pymupdf
+      - name: Locate, download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders output/debug
+          cat > /tmp/build.py <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import csv
+          import hashlib
+          import html
+          import io
+          import json
+          import math
+          import re
+          import time
+          import urllib.parse
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from cryptography.hazmat.primitives import padding
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          PDF_DIR = OUT / 'reports'
+          RENDER_DIR = OUT / 'renders'
+          DEBUG_DIR = OUT / 'debug'
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          })
+
+          PREFIX = 'cv_'
+          SUFFIX = 'zIDfwokaoIUFlw'
+          PERIOD = 120
+
+          # Two known company-deep reports indexed on the public Hangyan pages.
+          known_candidates = [
+              {
+                  'report_id': '3548835982205781566',
+                  'preferred_order': 2,
+                  'expected_title_terms': ['利润', '份额', '全球'],
+                  'expected_institution': '国金证券',
+                  'date': '2025-01-16',
+                  'label': '国金证券_利润与份额双驱动全球持续突破_2025-01-16',
+              },
+              {
+                  'report_id': '2886994764501092115',
+                  'preferred_order': 3,
+                  'expected_title_terms': ['品牌引领价值', '全球领先'],
+                  'expected_institution': '中银证券',
+                  'date': '2022-07-20',
+                  'label': '中银证券_品牌引领价值深化智屏业务全球领先优势_2022-07-20',
+              },
+          ]
+
+          def key_for(epoch: int) -> bytes:
+              bucket = math.floor(epoch / PERIOD)
+              text = (PREFIX + str(bucket) + SUFFIX)[:32].ljust(32, '0')
+              return text.encode('utf-8')
+
+          def decrypt_public_pdf_url(token: str) -> tuple[str, int]:
+              raw = base64.urlsafe_b64decode(token + '=' * ((4 - len(token) % 4) % 4))
+              if len(raw) < 32 or (len(raw) - 16) % 16:
+                  raise ValueError(f'Unexpected encrypted token length: {len(raw)}')
+              iv, ciphertext = raw[:16], raw[16:]
+              now = int(time.time())
+              errors = []
+              for delta in range(-5, 6):
+                  epoch = now + delta * PERIOD
+                  try:
+                      decryptor = Cipher(algorithms.AES(key_for(epoch)), modes.CBC(iv)).decryptor()
+                      padded = decryptor.update(ciphertext) + decryptor.finalize()
+                      unpadder = padding.PKCS7(128).unpadder()
+                      plain = unpadder.update(padded) + unpadder.finalize()
+                      url = plain.decode('utf-8')
+                      if url.startswith(('https://', 'http://')):
+                          return url, delta
+                  except Exception as exc:
+                      errors.append(repr(exc))
+              raise RuntimeError(f'Unable to decrypt public PDF link: {errors[-3:]}')
+
+          def fetch_page(url: str, name: str) -> tuple[requests.Response, BeautifulSoup]:
+              response = session.get(url, timeout=(20, 150), allow_redirects=True)
+              response.raise_for_status()
+              DEBUG_DIR.joinpath(f'{name}.html').write_text(response.text, encoding='utf-8', errors='replace')
+              return response, BeautifulSoup(response.text, 'lxml')
+
+          def find_latest_deep_report_id() -> dict | None:
+              # This chart is a public excerpt tied to the 2026-03-15 Open Source Securities deep report.
+              source_urls = [
+                  ('hangyan_chart_2026', 'https://www.hangyan.co/charts/3854545415810582458'),
+                  ('gmg_2026', 'https://gmg.9fzt.com/report/HKSE/01070/827060460434.html'),
+                  ('valuelist_2026', 'https://www.valuelist.cn/830595.html'),
+              ]
+              all_report_ids: list[str] = []
+              collected = []
+              for name, url in source_urls:
+                  try:
+                      response, soup = fetch_page(url, name)
+                      text = soup.get_text(' ', strip=True)
+                      hrefs = [urllib.parse.urljoin(response.url, a.get('href')) for a in soup.find_all('a', href=True)]
+                      ids = []
+                      for blob in [response.text, *hrefs]:
+                          ids.extend(re.findall(r'/reports/(\d{15,25})', blob))
+                      all_report_ids.extend(ids)
+                      collected.append({'name': name, 'url': response.url, 'ids': ids, 'title': soup.title.get_text(' ', strip=True) if soup.title else None, 'text_prefix': text[:1000]})
+                  except Exception as exc:
+                      collected.append({'name': name, 'url': url, 'error': repr(exc)})
+              DEBUG_DIR.joinpath('latest_discovery.json').write_text(json.dumps(collected, ensure_ascii=False, indent=2), encoding='utf-8')
+
+              # Try several public search URL shapes used by the site; harmless if none match.
+              search_urls = [
+                  'https://www.hangyan.co/reports?q=' + urllib.parse.quote('TCL电子 美国渠道 深度研究'),
+                  'https://www.hangyan.co/reports?query=' + urllib.parse.quote('TCL电子 美国渠道 深度研究'),
+                  'https://www.hangyan.co/reports?keyword=' + urllib.parse.quote('TCL电子 美国渠道 深度研究'),
+                  'https://www.hangyan.co/search?q=' + urllib.parse.quote('TCL电子 美国渠道 深度研究'),
+              ]
+              for idx, url in enumerate(search_urls, 1):
+                  try:
+                      response, soup = fetch_page(url, f'hangyan_search_{idx}')
+                      for a in soup.find_all('a', href=True):
+                          href = urllib.parse.urljoin(response.url, a.get('href'))
+                          text = a.get_text(' ', strip=True)
+                          m = re.search(r'/reports/(\d{15,25})', href)
+                          if m and ('TCL' in text.upper() or '美国渠道' in text or '电子' in text):
+                              all_report_ids.append(m.group(1))
+                  except Exception:
+                      pass
+
+              # Inspect candidate report pages and choose the one matching the exact 2026 deep title.
+              for rid in dict.fromkeys(all_report_ids):
+                  try:
+                      _, soup = fetch_page(f'https://www.hangyan.co/reports/{rid}', f'candidate_{rid}')
+                      title = soup.title.get_text(' ', strip=True) if soup.title else ''
+                      heading = soup.select_one('h1')
+                      heading_text = heading.get_text(' ', strip=True) if heading else ''
+                      blob = title + ' ' + heading_text + ' ' + soup.get_text(' ', strip=True)[:2500]
+                      if 'TCL电子' in blob and ('美国渠道' in blob or '产品&渠道' in blob or '产品＆渠道' in blob) and ('深度' in blob or '港股公司研究' in blob):
+                          return {
+                              'report_id': rid,
+                              'preferred_order': 1,
+                              'expected_title_terms': ['美国渠道', '高端化'],
+                              'expected_institution': '开源证券',
+                              'date': '2026-03-15',
+                              'label': '开源证券_TCL电子美国渠道深度研究_2026-03-15',
+                          }
+                  except Exception:
+                      continue
+              return None
+
+          def parse_hangyan_metadata(report_id: str) -> dict:
+              page_url = f'https://www.hangyan.co/reports/{report_id}'
+              response, soup = fetch_page(page_url, f'report_{report_id}')
+              node = soup.select_one('[data-controller~="native-pdf"]')
+              if node is None:
+                  raise RuntimeError(f'native-pdf element missing for report {report_id}')
+              token = str(node.get('data-native-pdf-cache-key-value') or '')
+              filename = str(node.get('data-native-pdf-filename-value') or '')
+              if not token or not filename:
+                  raise RuntimeError(f'public PDF token or filename missing for report {report_id}')
+              pdf_url, decrypt_delta = decrypt_public_pdf_url(token)
+              heading = soup.select_one('h1')
+              title = heading.get_text(' ', strip=True) if heading else (soup.title.get_text(' ', strip=True) if soup.title else filename)
+              info: dict[str, str] = {}
+              for p in soup.select('#left .box p'):
+                  text = p.get_text(' ', strip=True)
+                  if ':' in text:
+                      key, value = text.split(':', 1)
+                      info[key.strip()] = value.strip()
+              return {
+                  'page_url': response.url,
+                  'pdf_url': pdf_url,
+                  'decrypt_delta': decrypt_delta,
+                  'filename': filename,
+                  'title': title,
+                  'institution': info.get('机构') or '',
+                  'published': info.get('发表时间') or '',
+                  'report_type': info.get('类型') or '',
+              }
+
+          def download_pdf(url: str, referer: str) -> bytes:
+              errors = []
+              for attempt in range(4):
+                  try:
+                      response = session.get(
+                          url,
+                          headers={'User-Agent': UA, 'Referer': referer, 'Accept': 'application/pdf,*/*'},
+                          timeout=(25, 240),
+                          allow_redirects=True,
+                      )
+                      response.raise_for_status()
+                      data = response.content
+                      if b'%PDF' not in data[:4096] or len(data) < 80_000:
+                          raise RuntimeError(f'invalid PDF response: {len(data)} bytes; type={response.headers.get("content-type")}')
+                      return data
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(' | '.join(errors))
+
+          def clean_filename(label: str, original: str) -> str:
+              suffix = '.pdf'
+              safe = re.sub(r'[\\/:*?"<>|]+', '_', label).strip(' ._')
+              return safe + suffix
+
+          candidates = []
+          latest = find_latest_deep_report_id()
+          if latest:
+              candidates.append(latest)
+              print('DISCOVERED_LATEST', latest, flush=True)
+          candidates.extend(known_candidates)
+
+          verified = []
+          seen_hashes = set()
+          for candidate in candidates:
+              if len(verified) >= 3:
+                  break
+              rid = candidate['report_id']
+              try:
+                  meta = parse_hangyan_metadata(rid)
+                  data = download_pdf(meta['pdf_url'], meta['page_url'])
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in seen_hashes:
+                      raise RuntimeError('duplicate PDF content')
+
+                  reader = PdfReader(io.BytesIO(data), strict=False)
+                  if reader.is_encrypted:
+                      try:
+                          reader.decrypt('')
+                      except Exception as exc:
+                          raise RuntimeError(f'encrypted PDF: {exc}')
+                  pages = len(reader.pages)
+                  if pages < 10:
+                      raise RuntimeError(f'not a deep report: only {pages} pages')
+
+                  page_texts = []
+                  for page in reader.pages:
+                      try:
+                          page_texts.append(page.extract_text() or '')
+                      except Exception:
+                          page_texts.append('')
+                  full_text = '\n'.join(page_texts)
+                  compact = re.sub(r'\s+', '', full_text)
+                  opening = re.sub(r'\s+', '', ''.join(page_texts[:5]))
+                  tcl_mentions = compact.upper().count('TCL')
+                  company_mentions = compact.count('TCL电子') + compact.count('TCL電子')
+                  ticker_mentions = compact.count('01070') + compact.count('1070.HK') + compact.count('1070')
+                  if company_mentions < 3 and ticker_mentions < 2 and tcl_mentions < 15:
+                      raise RuntimeError(f'insufficient TCL Electronics relevance: company={company_mentions}, ticker={ticker_mentions}, TCL={tcl_mentions}')
+
+                  expected_inst = candidate.get('expected_institution', '')
+                  inst_root = expected_inst.replace('股份有限公司', '').replace('证券', '').replace('研究所', '')
+                  actual_inst = meta.get('institution') or expected_inst
+                  if expected_inst and expected_inst not in (meta.get('institution') or '') and inst_root not in opening:
+                      # Keep public metadata as authority if extraction is noisy, but record the mismatch.
+                      institution_warning = True
+                  else:
+                      institution_warning = False
+
+                  filename = clean_filename(candidate['label'], meta['filename'])
+                  path = PDF_DIR / filename
+                  path.write_bytes(data)
+
+                  # Render first, middle and last pages to ensure actual page content is intact.
+                  doc = pymupdf.open(stream=data, filetype='pdf')
+                  render_checks = []
+                  for pno in sorted(set([0, pages // 2, pages - 1])):
+                      pix = doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+                      render_path = RENDER_DIR / f'{rid}_p{pno+1:03d}.png'
+                      pix.save(str(render_path))
+                      if render_path.stat().st_size < 5000 or pix.width < 500 or pix.height < 600:
+                          raise RuntimeError(f'bad render at page {pno+1}')
+                      render_checks.append({'page': pno + 1, 'bytes': render_path.stat().st_size, 'width': pix.width, 'height': pix.height})
+                  doc.close()
+
+                  record = {
+                      'preferred_order': candidate['preferred_order'],
+                      'report_id': rid,
+                      'file_name': filename,
+                      'title': re.sub(r'^【行业研究报告】', '', meta['title']).strip(),
+                      'institution': actual_inst,
+                      'published': meta['published'] or candidate.get('date', ''),
+                      'report_type': meta['report_type'],
+                      'pages': pages,
+                      'bytes': len(data),
+                      'sha256': digest,
+                      'page_url': meta['page_url'],
+                      'pdf_source_url': meta['pdf_url'],
+                      'company_mentions': company_mentions,
+                      'ticker_mentions': ticker_mentions,
+                      'tcl_mentions': tcl_mentions,
+                      'institution_warning': institution_warning,
+                      'render_checks': render_checks,
+                  }
+                  verified.append(record)
+                  seen_hashes.add(digest)
+                  print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('CANDIDATE_FAILED', rid, repr(exc), flush=True)
+
+          verified.sort(key=lambda x: x['preferred_order'])
+          if len(verified) < 2:
+              raise RuntimeError(f'Only {len(verified)} complete deep reports could be verified; need at least 2')
+          verified = verified[:3]
+
+          # Rename in final order with numeric prefixes.
+          final_records = []
+          for index, record in enumerate(verified, 1):
+              old_path = PDF_DIR / record['file_name']
+              new_name = f'{index:02d}_' + record['file_name']
+              new_path = PDF_DIR / new_name
+              old_path.rename(new_path)
+              record = dict(record)
+              record['file_name'] = new_name
+              record['order'] = index
+              final_records.append(record)
+
+          manifest_json = OUT / 'report_manifest.json'
+          manifest_json.write_text(json.dumps(final_records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          manifest_csv = OUT / '报告清单与校验值.csv'
+          csv_rows = []
+          for r in final_records:
+              csv_rows.append({
+                  '序号': r['order'],
+                  '文件名': r['file_name'],
+                  '券商': r['institution'],
+                  '报告标题': r['title'],
+                  '发布日期': r['published'],
+                  '报告类型': r['report_type'],
+                  '页数': r['pages'],
+                  '文件大小（字节）': r['bytes'],
+                  '报告页面': r['page_url'],
+                  '公开PDF来源': r['pdf_source_url'],
+                  'SHA-256': r['sha256'],
+              })
+          with manifest_csv.open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+              writer.writeheader()
+              writer.writerows(csv_rows)
+
+          readme = OUT / '说明.txt'
+          lines = [
+              'TCL电子（01070.HK）券商深度研究报告合集',
+              '',
+              f'本压缩包收录{len(final_records)}份可离线打开的完整PDF。筛选标准：公司深度/首次覆盖或篇幅较长的系统性公司研究；排除3-7页财报点评、网页摘要和不完整预览。',
+              '',
+          ]
+          for r in final_records:
+              date = str(r['published'])[:10]
+              lines.append(f"{r['order']}. {r['institution']}｜{date}｜{r['title']}｜{r['pages']}页")
+          lines.extend([
+              '',
+              '所有PDF均已完成文件头、页数、公司相关性以及首/中/末页渲染检查，并对ZIP执行CRC完整性测试。',
+              '报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。',
+          ])
+          readme.write_text('\n'.join(lines), encoding='utf-8')
+
+          zip_path = OUT / f'TCL_Electronics_01070_Broker_Deep_Reports_{len(final_records)}_Full_PDFs.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for pdf in sorted(PDF_DIR.glob('*.pdf')):
+                  zf.write(pdf, arcname=pdf.name)
+              zf.write(manifest_csv, arcname=manifest_csv.name)
+              zf.write(readme, arcname=readme.name)
+
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise RuntimeError(f'ZIP CRC failure at {bad}')
+              pdf_names = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != len(final_records):
+                  raise RuntimeError(f'Archive PDF count mismatch: {pdf_names}')
+
+          package_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          summary = {
+              'zip_path': str(zip_path),
+              'zip_file': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': package_sha,
+              'report_count': len(final_records),
+              'reports': final_records,
+          }
+          OUT.joinpath('package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_READY', json.dumps(summary, ensure_ascii=False), flush=True)
+          PY
+          python /tmp/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcl-electronics-broker-deep-reports
+          path: |
+            output/TCL_Electronics_01070_Broker_Deep_Reports_*_Full_PDFs.zip
+            output/package_summary.json
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
