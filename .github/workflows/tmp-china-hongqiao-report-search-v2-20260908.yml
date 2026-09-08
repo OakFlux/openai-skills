@@ -1,0 +1,373 @@
+name: Search and package public China Hongqiao broker reports
+on:
+  push:
+    branches:
+      - tmp-china-hongqiao-report-search-v2-20260908
+permissions:
+  contents: read
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf ddgs
+      - name: Search public web and validate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/pdfs output/html
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, parse_qs, unquote
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+
+          try:
+              from ddgs import DDGS
+          except Exception as exc:
+              DDGS = None
+              print('DDGS_IMPORT_ERROR', repr(exc), flush=True)
+
+          OUT = Path('output')
+          PDFDIR = OUT / 'pdfs'
+          HTMLDIR = OUT / 'html'
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+          })
+
+          exact_titles = [
+              '高景气+一体化+高分红，电解铝龙头静待价值重估',
+              '全球电解铝龙头，一体化打造盈利护城河，高分红属性明显',
+              '成本企稳+铝行业高景气，电解铝龙头扬帆起航',
+              '全球电解铝龙头，兼具一体化优势与高分红属性',
+              '全产业链铸就成本护城河，高股息引领价值重估',
+              '电解铝龙头弹性显著',
+              '电解铝龙头企业，产业链一体化布局完善',
+          ]
+          queries = []
+          for t in exact_titles:
+              queries += [f'"{t}" PDF', f'"中国宏桥" "{t}"', f'"01378.HK" "{t}"']
+          queries += [
+              '中国宏桥 券商 深度报告 PDF',
+              '中国宏桥 公司深度研究 PDF',
+              '中国宏桥 首次覆盖 报告 PDF',
+              '中国宏桥 01378 券商研报 PDF',
+              'China Hongqiao initiation report PDF broker',
+              'China Hongqiao deep dive equity research PDF',
+              'site:pdf.dfcfw.com 中国宏桥 01378',
+              'site:researchreport.cn 中国宏桥 PDF',
+              'site:stock.finance.sina.com.cn 中国宏桥 研报 PDF',
+              'site:baogaobox.com 中国宏桥 研报',
+              'site:yanbaoke.com 中国宏桥 研报',
+              'site:hangyan.co 中国宏桥 研报',
+              'site:reportify.cn 中国宏桥 研报',
+          ]
+          # preserve order and remove duplicates
+          queries = list(dict.fromkeys(queries))
+
+          results: list[dict] = []
+          seen_urls: set[str] = set()
+
+          def clean_url(url: str) -> str:
+              if not url:
+                  return ''
+              url = url.replace('&amp;', '&').strip()
+              if url.startswith('//'):
+                  url = 'https:' + url
+              if 'duckduckgo.com/l/?' in url:
+                  qs = parse_qs(urlparse(url).query)
+                  if qs.get('uddg'):
+                      url = unquote(qs['uddg'][0])
+              if url.startswith('/url?q='):
+                  url = url.split('/url?q=', 1)[1].split('&', 1)[0]
+              return url.split('#')[0]
+
+          def add_result(url: str, title: str = '', snippet: str = '', source: str = ''):
+              url = clean_url(url)
+              if not url.startswith(('http://', 'https://')):
+                  return
+              if url in seen_urls:
+                  return
+              seen_urls.add(url)
+              results.append({'url': url, 'title': title or '', 'snippet': snippet or '', 'source': source})
+
+          # DDGS search
+          if DDGS:
+              for q in queries:
+                  try:
+                      with DDGS(timeout=30) as ddgs:
+                          for r in ddgs.text(q, region='cn-zh', safesearch='off', max_results=40):
+                              add_result(r.get('href') or r.get('url') or '', r.get('title',''), r.get('body',''), 'ddgs:' + q)
+                  except Exception as exc:
+                      print('DDGS_ERROR', q, repr(exc), flush=True)
+
+          # Search-engine HTML fallbacks
+          def search_bing(q: str):
+              r = session.get('https://www.bing.com/search', params={'q': q, 'count': 50, 'setlang': 'zh-hans'}, timeout=35)
+              soup = BeautifulSoup(r.text, 'lxml')
+              for li in soup.select('li.b_algo'):
+                  a = li.select_one('h2 a')
+                  if not a:
+                      continue
+                  p = li.select_one('.b_caption p')
+                  add_result(a.get('href',''), a.get_text(' ', strip=True), p.get_text(' ', strip=True) if p else '', 'bing:' + q)
+
+          def search_google(q: str):
+              r = session.get('https://www.google.com/search', params={'q': q, 'num': 50, 'hl': 'zh-CN'}, timeout=35)
+              soup = BeautifulSoup(r.text, 'lxml')
+              for a in soup.select('a[href]'):
+                  href = clean_url(a.get('href',''))
+                  txt = ' '.join(a.get_text(' ', strip=True).split())
+                  if href.startswith('http') and txt:
+                      add_result(href, txt, '', 'google:' + q)
+
+          def search_baidu(q: str):
+              r = session.get('https://www.baidu.com/s', params={'wd': q, 'rn': 50}, timeout=35)
+              soup = BeautifulSoup(r.text, 'lxml')
+              for h3 in soup.select('h3'):
+                  a = h3.find('a', href=True)
+                  if a:
+                      add_result(a.get('href',''), a.get_text(' ', strip=True), '', 'baidu:' + q)
+
+          for q in queries:
+              for fn in (search_bing, search_google, search_baidu):
+                  try:
+                      fn(q)
+                  except Exception as exc:
+                      print('ENGINE_ERROR', fn.__name__, q, repr(exc), flush=True)
+
+          Path(OUT / 'search_results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('SEARCH_RESULT_COUNT', len(results), flush=True)
+
+          company_re = re.compile(r'(中国宏桥|中國宏橋|China\s+Hongqiao|01378(?:\.HK)?|\b1378\.HK\b)', re.I)
+          broker_re = re.compile(r'(证券|證券|securities|research|研报|研報|研究报告|研究報告|深度|首次覆盖|首次覆蓋|initiation|coverage|company report|equity report)', re.I)
+          pdf_ext_re = re.compile(r'\.pdf(?:$|[?&#])', re.I)
+          link_interest_re = re.compile(r'(pdf|download|下载|下載|附件|原文|报告|報告|document|attachment|file)', re.I)
+
+          candidates: list[dict] = []
+          candidate_seen: set[str] = set()
+          def add_candidate(url: str, context: str = '', title: str = '', source: str = ''):
+              url = clean_url(url)
+              if not url.startswith(('http://','https://')) or url in candidate_seen:
+                  return
+              candidate_seen.add(url)
+              candidates.append({'url': url, 'context': context, 'title': title, 'source': source})
+
+          # Prefer results explicitly about China Hongqiao or PDF-like.
+          for item in results:
+              blob = ' '.join([item['url'], item['title'], item['snippet']])
+              if company_re.search(blob) and (broker_re.search(blob) or pdf_ext_re.search(item['url'])):
+                  add_candidate(item['url'], blob[:3000], item['title'], item['source'])
+
+          # Known public landing pages from indexed search results.
+          known_pages = [
+              'https://www.sdyanbao.com/detail/886387',
+              'https://www.sdyanbao.com/detail/892745',
+              'https://www.fxbaogao.com/detail/4802165',
+              'https://www.fxbaogao.com/detail/4864892',
+              'https://www.vzkoo.com/read/20250528cadc25e0bf397f71233f77c6.html',
+              'https://www.vzkoo.com/read/202406132f337967da1467c08bce7800.html',
+              'https://max.book118.com/html/2025/0421/5340102234012140.shtm',
+          ]
+          for u in known_pages:
+              add_candidate(u, 'known indexed landing page', '', 'known')
+
+          inspections: list[dict] = []
+          discovered_links: list[dict] = []
+
+          def inspect_url(item: dict, idx: int) -> dict:
+              url = item['url']
+              rec = dict(item)
+              try:
+                  resp = session.get(url, timeout=60, allow_redirects=True)
+                  data = resp.content
+                  rec.update({
+                      'status': resp.status_code,
+                      'final_url': resp.url,
+                      'content_type': resp.headers.get('content-type',''),
+                      'bytes': len(data),
+                  })
+                  if data.startswith(b'%PDF'):
+                      sha = hashlib.sha256(data).hexdigest()
+                      path = PDFDIR / f'{idx:04d}_{sha[:16]}.pdf'
+                      path.write_bytes(data)
+                      rec['is_pdf'] = True
+                      rec['sha256'] = sha
+                      rec['saved_path'] = str(path)
+                      try:
+                          doc = fitz.open(stream=data, filetype='pdf')
+                          rec['pages'] = doc.page_count
+                          sample_indices = list(dict.fromkeys([0, min(1, doc.page_count-1), min(4, doc.page_count-1), max(0, doc.page_count//2), max(0, doc.page_count-1)]))
+                          text = '\n'.join(doc[p].get_text('text') for p in sample_indices if 0 <= p < doc.page_count)
+                          doc.close()
+                          rec['sample_text'] = ' '.join(text.split())[:15000]
+                          rec['mentions_company'] = bool(company_re.search(text))
+                          rec['mentions_broker_report'] = bool(broker_re.search(text))
+                      except Exception as exc:
+                          rec['pdf_parse_error'] = repr(exc)
+                      return rec
+
+                  rec['is_pdf'] = False
+                  ctype = rec['content_type'].lower()
+                  if 'html' in ctype or b'<html' in data[:2000].lower() or b'<!doctype' in data[:2000].lower():
+                      text = data.decode(resp.encoding or 'utf-8', errors='replace')
+                      html_path = HTMLDIR / f'{idx:04d}.html'
+                      html_path.write_text(text, encoding='utf-8')
+                      rec['html_path'] = str(html_path)
+                      soup = BeautifulSoup(text, 'lxml')
+                      links = []
+                      for tag in soup.find_all(['a','iframe','embed','object','form','link','script']):
+                          for attr in ('href','src','data','action','data-url','data-href','data-file','data-src','data-pdf'):
+                              val = tag.get(attr)
+                              if not isinstance(val, str) or not val.strip():
+                                  continue
+                              absu = urljoin(resp.url, val.strip())
+                              label = ' '.join(tag.get_text(' ', strip=True).split())[:500]
+                              if pdf_ext_re.search(absu) or link_interest_re.search(absu + ' ' + label):
+                                  links.append({'url': absu, 'label': label, 'attr': attr})
+                      # Extract absolute URL strings embedded in scripts/JSON.
+                      normalized = text.replace('\\/','/').replace('\\u002F','/')
+                      for m in re.finditer(r'https?://[^\"\'<>\s\\]+', normalized):
+                          absu = m.group(0).rstrip('),.;]')
+                          if pdf_ext_re.search(absu) or link_interest_re.search(absu):
+                              links.append({'url': absu, 'label': 'embedded URL', 'attr': 'source'})
+                      uniq = []
+                      seen = set()
+                      for link in links:
+                          u = clean_url(link['url'])
+                          if u and u not in seen:
+                              seen.add(u)
+                              link['url'] = u
+                              uniq.append(link)
+                              discovered_links.append({'url': u, 'context': rec.get('title','') + ' ' + link.get('label',''), 'title': link.get('label',''), 'source': resp.url})
+                      rec['links'] = uniq[:500]
+                      rec['body_text'] = ' '.join(soup.get_text(' ', strip=True).split())[:20000]
+              except Exception as exc:
+                  rec['error'] = repr(exc)
+              return rec
+
+          # First pass: landing/search result pages.
+          for idx, item in enumerate(candidates[:350], 1):
+              rec = inspect_url(item, idx)
+              inspections.append(rec)
+              if rec.get('is_pdf'):
+                  print('PDF_FOUND_PASS1', json.dumps({k: rec.get(k) for k in ['url','final_url','title','status','bytes','pages','mentions_company','sample_text']}, ensure_ascii=False), flush=True)
+
+          # Second pass: explicit PDF/download links discovered in those pages.
+          for item in discovered_links:
+              add_candidate(item['url'], item.get('context',''), item.get('title',''), item.get('source',''))
+          second_start = len(inspections) + 1
+          second_items = [x for x in candidates if not any(y.get('url') == x.get('url') for y in inspections)]
+          for j, item in enumerate(second_items[:500], second_start):
+              rec = inspect_url(item, j)
+              inspections.append(rec)
+              if rec.get('is_pdf'):
+                  print('PDF_FOUND_PASS2', json.dumps({k: rec.get(k) for k in ['url','final_url','title','status','bytes','pages','mentions_company','sample_text']}, ensure_ascii=False), flush=True)
+
+          Path(OUT / 'inspections.json').write_text(json.dumps(inspections, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Deduplicate and rank usable reports.
+          dedup: dict[str, dict] = {}
+          for rec in inspections:
+              if not rec.get('is_pdf') or not rec.get('sha256'):
+                  continue
+              if not rec.get('mentions_company'):
+                  continue
+              if int(rec.get('pages') or 0) < 8:
+                  continue
+              dedup.setdefault(rec['sha256'], rec)
+
+          good = list(dedup.values())
+          def score(rec: dict) -> tuple:
+              txt = ' '.join([rec.get('title',''), rec.get('context',''), rec.get('sample_text','')])
+              exact = sum(1 for t in exact_titles if t.replace('+','')[:8] in txt.replace('+',''))
+              return (exact, int(rec.get('pages') or 0), int(rec.get('bytes') or 0))
+          good.sort(key=score, reverse=True)
+
+          selected = good[:3]
+          manifest = []
+          package_dir = OUT / 'package'
+          package_dir.mkdir(exist_ok=True)
+          used_names = set()
+          for i, rec in enumerate(selected, 1):
+              text = rec.get('sample_text','')
+              broker = ''
+              for b in ['东吴证券','华源证券','华创证券','西部证券','开源证券','浙商证券','天风证券','华泰证券','第一上海','国联民生证券']:
+                  if b in text or b in rec.get('title','') or b in rec.get('context',''):
+                      broker = b
+                      break
+              date_match = re.search(r'20\d{2}[年\-/]\d{1,2}[月\-/]\d{1,2}', text)
+              date = date_match.group(0).replace('年','-').replace('月','-').replace('日','') if date_match else '日期不详'
+              title = ''
+              for t in exact_titles:
+                  if t[:8] in text or t[:8] in rec.get('context','') or t[:8] in rec.get('title',''):
+                      title = t
+                      break
+              if not title:
+                  title = rec.get('title') or '中国宏桥券商研究报告'
+              safe = re.sub(r'[\\/:*?"<>|]+', '_', f'{i:02d}_{date}_{broker}_{title}')[:150]
+              if not safe.lower().endswith('.pdf'):
+                  safe += '.pdf'
+              base = safe
+              n = 2
+              while safe in used_names:
+                  safe = base[:-4] + f'_{n}.pdf'; n += 1
+              used_names.add(safe)
+              src = Path(rec['saved_path'])
+              dest = package_dir / safe
+              dest.write_bytes(src.read_bytes())
+              manifest.append({
+                  '序号': i,
+                  '文件名': safe,
+                  '券商': broker or '未识别',
+                  '报告日期': date,
+                  '页数': rec.get('pages'),
+                  '文件大小_MB': round(dest.stat().st_size/1024/1024, 2),
+                  '来源页面': rec.get('source') or rec.get('url'),
+                  'PDF地址': rec.get('final_url') or rec.get('url'),
+                  'SHA256': rec.get('sha256'),
+              })
+
+          readme = [
+              '# 中国宏桥（01378.HK）券商深度报告',
+              '',
+              f'共筛选 {len(manifest)} 份可公开下载且经 PDF 结构、页数和公司名称校验的报告。',
+              '',
+          ]
+          for m in manifest:
+              readme.append(f"{m['序号']}. {m['文件名']}｜{m['页数']}页｜{m['文件大小_MB']} MB")
+          readme += ['', '仅供个人研究使用，请遵守原报告版权与使用条款。']
+          (package_dir / '报告清单.md').write_text('\n'.join(readme), encoding='utf-8')
+          (package_dir / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = OUT / 'China_Hongqiao_01378_Broker_Deep_Reports_Verified.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+              for p in sorted(package_dir.iterdir()):
+                  zf.write(p, p.name)
+
+          status = {
+              'selected_count': len(manifest),
+              'zip_path': str(zip_path),
+              'zip_bytes': zip_path.stat().st_size,
+              'reports': manifest,
+              'all_good_count': len(good),
+          }
+          (OUT / 'status.json').write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_STATUS', json.dumps(status, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload search package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-hongqiao-broker-reports-v2
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
