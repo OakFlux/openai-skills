@@ -1,0 +1,358 @@
+name: Build verified Lee Man Paper report archive
+on:
+  push:
+    branches:
+      - tmp-leemanpaper-reports-20260908-v3
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF and browser dependencies
+        run: |
+          python -m pip install --quiet requests pypdf pymupdf playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Discover HKEX originals, validate PDFs, and prepare package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package audit
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+          PACKAGE = Path('package')
+          AUDIT = Path('audit')
+          TITLE_URL = 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=6560'
+
+          TARGETS = [
+              ('2020 Annual Report', '01_Lee_Man_Paper_2020_Annual_Report.pdf', 2020, 'Annual Report', 100),
+              ('2021 Annual Report', '02_Lee_Man_Paper_2021_Annual_Report.pdf', 2021, 'Annual Report', 100),
+              ('2022 Annual Report', '03_Lee_Man_Paper_2022_Annual_Report.pdf', 2022, 'Annual Report', 100),
+              ('2023 Annual Report', '04_Lee_Man_Paper_2023_Annual_Report.pdf', 2023, 'Annual Report', 100),
+              ('2024 Annual Report', '05_Lee_Man_Paper_2024_Annual_Report.pdf', 2024, 'Annual Report', 100),
+              ('2025 Annual Report', '06_Lee_Man_Paper_2025_Annual_Report.pdf', 2025, 'Annual Report', 100),
+              ('2026 Interim Report', '07_Lee_Man_Paper_2026_Interim_Report.pdf', 2026, 'Interim Report', 20),
+          ]
+          target_names = {item[0] for item in TARGETS}
+
+          def normalize(text: str) -> str:
+              return re.sub(r'\s+', ' ', text or '').strip()
+
+          discovered: dict[str, str] = {}
+          load_audit: list[dict] = []
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True,
+                  args=['--no-sandbox', '--disable-dev-shm-usage'],
+              )
+              context = browser.new_context(
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+                  locale='en-US',
+                  viewport={'width': 1440, 'height': 1000},
+              )
+              page = context.new_page()
+              response = page.goto(TITLE_URL, wait_until='domcontentloaded', timeout=120000)
+              if response is None or response.status >= 400:
+                  raise RuntimeError(f'HKEX title-search request failed: {None if response is None else response.status}')
+              try:
+                  page.wait_for_load_state('networkidle', timeout=30000)
+              except PlaywrightTimeout:
+                  pass
+              page.wait_for_timeout(2500)
+
+              def collect() -> None:
+                  anchors = page.eval_on_selector_all(
+                      'a[href]',
+                      "els => els.map(e => ({text:(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim(), href:e.href}))",
+                  )
+                  for anchor in anchors:
+                      text = normalize(anchor.get('text', ''))
+                      href = anchor.get('href', '')
+                      if text in target_names and href.lower().split('?')[0].endswith('.pdf'):
+                          discovered[text] = href
+
+              stagnant = 0
+              for attempt in range(15):
+                  collect()
+                  anchor_count_before = page.locator('a[href]').count()
+                  load_audit.append({
+                      'attempt': attempt,
+                      'anchor_count': anchor_count_before,
+                      'found': sorted(discovered),
+                  })
+                  if target_names.issubset(discovered):
+                      break
+
+                  page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                  page.wait_for_timeout(600)
+                  load_more = page.get_by_text('LOAD MORE', exact=True)
+                  if load_more.count() == 0:
+                      load_more = page.get_by_text('Load More', exact=True)
+                  if load_more.count() == 0:
+                      break
+
+                  clicked = False
+                  for index in range(load_more.count() - 1, -1, -1):
+                      item = load_more.nth(index)
+                      try:
+                          if item.is_visible():
+                              item.scroll_into_view_if_needed()
+                              item.evaluate('(element) => element.click()')
+                              clicked = True
+                              break
+                      except Exception:
+                          continue
+                  if not clicked:
+                      break
+
+                  for _ in range(30):
+                      page.wait_for_timeout(500)
+                      if page.locator('a[href]').count() > anchor_count_before:
+                          break
+                  anchor_count_after = page.locator('a[href]').count()
+                  if anchor_count_after <= anchor_count_before:
+                      stagnant += 1
+                  else:
+                      stagnant = 0
+                  if stagnant >= 2:
+                      break
+
+              collect()
+              (AUDIT / 'hkex_titles.html').write_text(page.content(), encoding='utf-8')
+              page.screenshot(path=str(AUDIT / 'hkex_titles_viewport.png'), full_page=False)
+              browser.close()
+
+          # These three official URLs are retained as deterministic fallbacks if HKEX changes the load-more control.
+          discovered.setdefault('2023 Annual Report', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0408/2024040800539.pdf')
+          discovered.setdefault('2024 Annual Report', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0331/2025033100429.pdf')
+          discovered.setdefault('2025 Annual Report', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0324/2026032400352.pdf')
+
+          (AUDIT / 'discovery.json').write_text(
+              json.dumps({'title_url': TITLE_URL, 'load_attempts': load_audit, 'discovered': discovered}, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          missing = sorted(target_names.difference(discovered))
+          if missing:
+              raise RuntimeError(f'Missing official HKEX PDF links: {missing}; discovered={discovered}')
+
+          retry = Retry(
+              total=7,
+              connect=7,
+              read=7,
+              status=7,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=frozenset(['GET']),
+          )
+          session = requests.Session()
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Referer': TITLE_URL,
+          })
+
+          manifest: list[dict] = []
+          validation_notes: list[dict] = []
+
+          for sequence, (title, filename, year, report_type, minimum_pages) in enumerate(TARGETS, 1):
+              url = discovered[title]
+              host = urlparse(url).netloc.lower()
+              if not host.endswith('hkexnews.hk'):
+                  raise RuntimeError(f'Non-HKEX source rejected for {title}: {url}')
+
+              last_error: Exception | None = None
+              for attempt in range(1, 8):
+                  try:
+                      response = session.get(url, timeout=(30, 300), allow_redirects=True)
+                      response.raise_for_status()
+                      data = response.content
+                      if b'%PDF-' not in data[:2048]:
+                          raise RuntimeError(f'No PDF header, received {len(data)} bytes')
+                      if len(data) < 100_000:
+                          raise RuntimeError(f'PDF payload unexpectedly small: {len(data)} bytes')
+
+                      reader = PdfReader(io.BytesIO(data), strict=False)
+                      page_count = len(reader.pages)
+                      if page_count < minimum_pages:
+                          raise RuntimeError(f'Unexpectedly short PDF: {page_count} pages')
+
+                      sample_indices = sorted(set([
+                          0,
+                          min(1, page_count - 1),
+                          min(4, page_count - 1),
+                          max(0, page_count // 2),
+                          max(0, page_count - 2),
+                          page_count - 1,
+                      ]))
+                      pypdf_text_parts = []
+                      for page_index in sample_indices:
+                          try:
+                              pypdf_text_parts.append(reader.pages[page_index].extract_text() or '')
+                          except Exception:
+                              pass
+
+                      output_path = PACKAGE / filename
+                      output_path.write_bytes(data)
+                      document = fitz.open(output_path)
+                      fitz_text_parts = []
+                      for page_index in sample_indices:
+                          try:
+                              fitz_text_parts.append(document[page_index].get_text('text') or '')
+                          except Exception:
+                              pass
+                      combined_text = normalize('\n'.join(pypdf_text_parts + fitz_text_parts)).upper()
+
+                      company_tokens = ['LEE & MAN PAPER', 'LEE AND MAN PAPER', '理文造紙', '理文造纸']
+                      if not any(token.upper() in combined_text for token in company_tokens):
+                          raise RuntimeError('Company identity was not found in sampled PDF text')
+                      if str(year) not in combined_text:
+                          raise RuntimeError(f'Report year {year} was not found in sampled PDF text')
+                      if report_type.upper() not in combined_text:
+                          raise RuntimeError(f'Report type {report_type!r} was not found in sampled PDF text')
+
+                      for page_index, suffix in [(0, 'first'), (page_count - 1, 'last')]:
+                          pixmap = document[page_index].get_pixmap(matrix=fitz.Matrix(0.75, 0.75), alpha=False)
+                          pixmap.save(str(AUDIT / f'{sequence:02d}_{year}_{suffix}.png'))
+                      document.close()
+
+                      row = {
+                          '序号': sequence,
+                          '文件名': filename,
+                          '报告类型': report_type,
+                          '报告年度': year,
+                          'PDF页数': page_count,
+                          '文件大小_字节': len(data),
+                          'SHA256': hashlib.sha256(data).hexdigest(),
+                          '港交所原始链接': response.url,
+                      }
+                      manifest.append(row)
+                      validation_notes.append({
+                          'title': title,
+                          'sample_pages': sample_indices,
+                          'company_identity_ok': True,
+                          'year_ok': True,
+                          'report_type_ok': True,
+                          'first_and_last_page_rendered': True,
+                      })
+                      print('VERIFIED', json.dumps(row, ensure_ascii=False), flush=True)
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      output_candidate = PACKAGE / filename
+                      if output_candidate.exists():
+                          output_candidate.unlink()
+                      print('RETRY', title, attempt, repr(exc), flush=True)
+                      time.sleep(min(2 ** attempt, 20))
+              else:
+                  raise RuntimeError(f'Failed to download and validate {title}: {last_error!r}')
+
+          if len(manifest) != 7:
+              raise RuntimeError(f'Expected 7 verified PDFs, got {len(manifest)}')
+          annual_years = [row['报告年度'] for row in manifest if row['报告类型'] == 'Annual Report']
+          if annual_years != [2020, 2021, 2022, 2023, 2024, 2025]:
+              raise RuntimeError(f'Annual-report coverage mismatch: {annual_years}')
+
+          manifest_path = PACKAGE / '文件清单与校验值.csv'
+          with manifest_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          readme_lines = [
+              '理文造纸有限公司（Lee & Man Paper Manufacturing Limited，02314.HK）',
+              '2020—2025年年度报告及最新定期财务报告资料包',
+              '整理日期：2026-09-08',
+              '',
+              '本压缩包包括：',
+              '1. 2020—2025年完整年度报告，共6份。',
+              '2. 2026年中期报告，共1份；报告期截至2026年6月30日，港交所披露日期为2026年8月12日。',
+              '',
+              '披露口径说明：理文造纸为香港上市公司，通常不发布A股式一季报和三季报，因此以截至整理日最新的完整中期报告替代“最新季报”。',
+              '',
+              '所有PDF均为港交所披露易原始附件。已检查PDF文件头、可解析性、实际页数、公司名称、报告年度和报告类型，并渲染检查首页与末页。',
+              '详细页数、文件大小、SHA-256和官方来源见“文件清单与校验值.csv”。',
+              '',
+          ]
+          for row in manifest:
+              readme_lines.append(
+                  f"{row['序号']}. {row['文件名']}｜{row['PDF页数']}页｜{row['港交所原始链接']}"
+              )
+          (PACKAGE / 'README_CN.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+
+          validation = {
+              'ok': True,
+              'company': 'Lee & Man Paper Manufacturing Limited',
+              'stock_code': '02314.HK',
+              'pdf_count': len(manifest),
+              'annual_years': annual_years,
+              'latest_report': '2026 Interim Report',
+              'manifest': manifest,
+              'validation_notes': validation_notes,
+          }
+          (PACKAGE / 'VALIDATION.json').write_text(
+              json.dumps(validation, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          # Independently compress the exact package contents and test every CRC entry.
+          crc_archive = AUDIT / 'LeeManPaper_internal_crc_test.zip'
+          with zipfile.ZipFile(crc_archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(PACKAGE.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(crc_archive, 'r') as archive:
+              bad_member = archive.testzip()
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad_member is not None:
+                  raise RuntimeError(f'ZIP CRC test failed at {bad_member}')
+              if len(pdf_members) != 7:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_members)}')
+
+          (AUDIT / 'result.json').write_text(
+              json.dumps({**validation, 'internal_zip_crc_ok': True}, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          print('PACKAGE_READY', json.dumps({**validation, 'internal_zip_crc_ok': True}, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final downloadable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeeManPaper-02314-2020-2025-Annual-and-2026-Interim
+          path: package/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeeManPaper-validation-evidence
+          path: audit/*
+          retention-days: 1
+          if-no-files-found: warn
+          compression-level: 6
