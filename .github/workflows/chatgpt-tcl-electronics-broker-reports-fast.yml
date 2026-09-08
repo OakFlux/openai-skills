@@ -1,0 +1,115 @@
+name: Build verified TCL Electronics broker report package
+
+on:
+  push:
+    branches:
+      - chatgpt-tcl-electronics-broker-reports-fast-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml cryptography pypdf pymupdf
+      - name: Download and package two full company-deep reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders
+          cat > /tmp/build.py <<'PY'
+          from __future__ import annotations
+          import base64, csv, hashlib, io, json, math, re, time, zipfile
+          from pathlib import Path
+          import requests, pymupdf
+          from bs4 import BeautifulSoup
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+          from cryptography.hazmat.primitives import padding
+          from pypdf import PdfReader
+
+          OUT=Path('output'); PDF_DIR=OUT/'reports'; RENDER_DIR=OUT/'renders'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+          reports=[
+            {'id':'3548835982205781566','broker':'国金证券','date':'2025-01-16','short':'利润与份额双驱动，全球持续突破','filename':'01_Guojin_Securities_TCL_Electronics_Deep_Report_2025-01-16.pdf'},
+            {'id':'2886994764501092115','broker':'中银证券','date':'2022-07-20','short':'品牌引领价值，深化智屏业务全球领先优势','filename':'02_BOCOM_International_TCL_Electronics_Deep_Report_2022-07-20.pdf'},
+          ]
+          PREFIX='cv_'; SUFFIX='zIDfwokaoIUFlw'; PERIOD=120
+          def key_for(epoch:int)->bytes:
+            bucket=math.floor(epoch/PERIOD)
+            return ((PREFIX+str(bucket)+SUFFIX)[:32].ljust(32,'0')).encode()
+          def decrypt(token:str)->str:
+            raw=base64.urlsafe_b64decode(token+'='*((4-len(token)%4)%4)); iv,ciphertext=raw[:16],raw[16:]
+            now=int(time.time())
+            for delta in range(-6,7):
+              try:
+                dec=Cipher(algorithms.AES(key_for(now+delta*PERIOD)),modes.CBC(iv)).decryptor()
+                padded=dec.update(ciphertext)+dec.finalize(); unpad=padding.PKCS7(128).unpadder(); plain=unpad.update(padded)+unpad.finalize()
+                url=plain.decode()
+                if url.startswith('http'): return url
+              except Exception: pass
+            raise RuntimeError('Unable to decrypt public PDF link')
+          records=[]
+          for r in reports:
+            page_url=f'https://www.hangyan.co/reports/{r["id"]}'
+            page=s.get(page_url,timeout=(20,120)); page.raise_for_status(); soup=BeautifulSoup(page.text,'lxml')
+            node=soup.select_one('[data-controller~="native-pdf"]')
+            if not node: raise RuntimeError(f'No PDF node for {r["id"]}')
+            token=node.get('data-native-pdf-cache-key-value'); original=node.get('data-native-pdf-filename-value')
+            pdf_url=decrypt(str(token))
+            pdf=s.get(pdf_url,headers={'User-Agent':UA,'Referer':page_url,'Accept':'application/pdf,*/*'},timeout=(25,240)); pdf.raise_for_status(); data=pdf.content
+            if b'%PDF' not in data[:4096] or len(data)<80000: raise RuntimeError(f'Invalid PDF {r["id"]}: {len(data)}')
+            reader=PdfReader(io.BytesIO(data),strict=False); pages=len(reader.pages)
+            if pages<10: raise RuntimeError(f'Not deep enough {r["id"]}: {pages} pages')
+            texts=[]
+            for p in reader.pages:
+              try: texts.append(p.extract_text() or '')
+              except Exception: texts.append('')
+            compact=re.sub(r'\s+','', '\n'.join(texts))
+            tcl=compact.upper().count('TCL'); company=compact.count('TCL电子')+compact.count('TCL電子'); ticker=compact.count('01070')+compact.count('1070.HK')
+            if company<3 and ticker<2 and tcl<15: raise RuntimeError(f'Relevance check failed {r["id"]}: {company}/{ticker}/{tcl}')
+            path=PDF_DIR/r['filename']; path.write_bytes(data)
+            doc=pymupdf.open(stream=data,filetype='pdf')
+            for pno in sorted(set([0,pages//2,pages-1])):
+              pix=doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.2,1.2),alpha=False)
+              rp=RENDER_DIR/f'{r["id"]}_p{pno+1}.png'; pix.save(str(rp))
+              if rp.stat().st_size<5000 or pix.width<500 or pix.height<600: raise RuntimeError('Render check failed')
+            doc.close()
+            digest=hashlib.sha256(data).hexdigest()
+            heading=soup.select_one('h1'); title=heading.get_text(' ',strip=True) if heading else r['short']
+            records.append({'文件名':r['filename'],'券商':r['broker'],'发布日期':r['date'],'报告标题':title,'页数':pages,'文件大小（字节）':len(data),'报告页面':page_url,'公开PDF来源':pdf_url,'SHA-256':digest,'原始文件名':original})
+            print('VERIFIED',r['broker'],r['date'],pages,len(data),digest,flush=True)
+          manifest=OUT/'报告清单与校验值.csv'
+          with manifest.open('w',encoding='utf-8-sig',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=list(records[0].keys())); w.writeheader(); w.writerows(records)
+          readme=OUT/'说明.txt'
+          readme.write_text('TCL电子（01070.HK）券商深度报告合集\n\n本包收录2份完整公司深度研究PDF，未收录短篇财报点评或网页预览。\n\n1. 国金证券，2025-01-16，《利润+份额双驱动，全球持续突破》。\n2. 中银证券，2022-07-20，《品牌引领价值，深化智屏业务全球领先优势，智能家居全品类布局持续突破》。\n\n已完成PDF文件头、页数、公司相关性及首/中/末页渲染检查；ZIP已进行CRC完整性测试。\n报告版权归原券商及作者所有，仅供研究参考。\n',encoding='utf-8')
+          zip_path=OUT/'TCL_Electronics_01070_Broker_Deep_Reports_2_Full_PDFs.zip'
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(PDF_DIR.glob('*.pdf')): z.write(p,arcname=p.name)
+            z.write(manifest,arcname=manifest.name); z.write(readme,arcname=readme.name)
+          with zipfile.ZipFile(zip_path) as z:
+            if z.testzip() is not None: raise RuntimeError('ZIP CRC failed')
+            if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=2: raise RuntimeError('Wrong PDF count')
+          summary={'zip_file':zip_path.name,'zip_bytes':zip_path.stat().st_size,'zip_sha256':hashlib.sha256(zip_path.read_bytes()).hexdigest(),'reports':records}
+          (OUT/'package_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PACKAGE_READY',json.dumps(summary,ensure_ascii=False),flush=True)
+          PY
+          python /tmp/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcl-electronics-broker-deep-reports-fast
+          path: |
+            output/TCL_Electronics_01070_Broker_Deep_Reports_2_Full_PDFs.zip
+            output/package_summary.json
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
