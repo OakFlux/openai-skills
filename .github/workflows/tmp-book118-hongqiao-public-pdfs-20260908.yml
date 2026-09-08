@@ -1,0 +1,174 @@
+name: Validate public Book118 China Hongqiao PDFs
+on:
+  push:
+    branches:
+      - tmp-book118-hongqiao-public-pdfs-20260908
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf playwright pillow
+      - name: Discover, download, and validate public files
+        run: |
+          set -euo pipefail
+          mkdir -p output/pdfs output/html
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, shutil
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          pages = {
+            'guosheng_2024': {
+              'url':'https://max.book118.com/html/2024/0122/8075026052006030.shtm',
+              'broker':'国盛证券','date':'2024-01-22','expected_pages':39,
+              'title':'铝材料领军企业，产品高端化电解铝高景气开启新征程'},
+            'xibu_2025_a': {
+              'url':'https://max.book118.com/html/2025/0421/5340102234012140.shtm',
+              'broker':'西部证券','date':'2025-04-21','expected_pages':27,
+              'title':'高景气+一体化+高分红，电解铝龙头静待价值重估'},
+            'xibu_2025_b': {
+              'url':'https://max.book118.com/html/2025/0423/7061153036010064.shtm',
+              'broker':'西部证券','date':'2025-04-21','expected_pages':27,
+              'title':'高景气+一体化+高分红，电解铝龙头静待价值重估'},
+            'dongwu_2026': {
+              'url':'https://max.book118.com/html/2026/0808/5214112110013303.shtm',
+              'broker':'东吴证券','date':'2026-08-07','expected_pages':28,
+              'title':'全产业链铸就成本护城河，高股息引领价值重估'},
+          }
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          out={}
+
+          def safe_name(x):
+              return re.sub(r'[\\/:*?"<>|]+','_',x).strip()[:110]
+
+          def validate_pdf(data: bytes, source_url: str, meta: dict, tag: str):
+              rec={'url':source_url,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'header':data[:8].decode('latin1','replace')}
+              if not data.startswith(b'%PDF'):
+                  rec['is_pdf']=False; return rec
+              rec['is_pdf']=True
+              tmp=Path('output')/f'_tmp_{tag}_{rec["sha256"][:12]}.pdf'; tmp.write_bytes(data)
+              try:
+                  reader=PdfReader(str(tmp)); n=len(reader.pages)
+                  idxs=sorted(set([0,min(1,n-1),min(4,n-1),max(0,n//2),max(0,n-2),n-1]))
+                  text='\n'.join((reader.pages[i].extract_text() or '') for i in idxs)
+                  compact=' '.join(text.split())
+                  rec.update({'pages':n,'sample_text':compact[:12000],
+                              'mentions_company':bool(re.search(r'中国宏桥|中國宏橋|01378|1378\.HK',compact,re.I)),
+                              'mentions_broker':meta['broker'] in compact,
+                              'full_by_page_count': n >= meta['expected_pages']-1})
+                  if rec['mentions_company'] and rec['full_by_page_count']:
+                      final=Path('output/pdfs')/f"{meta['date']}_{safe_name(meta['broker'])}_中国宏桥_{safe_name(meta['title'])}.pdf"
+                      if not final.exists() or final.stat().st_size < len(data): final.write_bytes(data)
+                      rec['saved_as']=str(final)
+              except Exception as exc:
+                  rec['parse_error']=repr(exc)
+              tmp.unlink(missing_ok=True)
+              return rec
+
+          for key,meta in pages.items():
+              rec={'meta':meta,'static':{},'candidates':[],'browser':{}}
+              try:
+                  r=s.get(meta['url'],timeout=60,allow_redirects=True)
+                  Path(f'output/html/{key}.html').write_bytes(r.content)
+                  text=r.text.replace('\\/','/')
+                  rec['static']={'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'content_type':r.headers.get('content-type','')}
+                  soup=BeautifulSoup(text,'lxml')
+                  cand=[]
+                  for a in soup.find_all('a',href=True):
+                      href=urljoin(r.url,a['href'])
+                      label=' '.join(a.get_text(' ',strip=True).split())
+                      if re.search(r'(try_down|\.pdf(?:$|\?)|download|downfile)',href,re.I) or re.search(r'(原文免费试下载|免费下载|试下载)',label):
+                          cand.append({'url':href,'label':label})
+                  # also extract script-embedded public file URLs
+                  for pat in [r'https?://[^\"\'<>\s]+?\.pdf(?:\?[^\"\'<>\s]*)?',r'/try_down/[^\"\'<>\s]+?\.pdf']:
+                      for m in re.finditer(pat,text,re.I):
+                          cand.append({'url':urljoin(r.url,m.group(0)),'label':'regex'})
+                  seen=set(); cand2=[]
+                  for c in cand:
+                      u=c['url'].replace('&amp;','&')
+                      if u not in seen: seen.add(u); cand2.append({'url':u,'label':c['label']})
+                  rec['static']['public_candidates']=cand2
+                  for i,c in enumerate(cand2):
+                      try:
+                          rr=s.get(c['url'],headers={'Referer':r.url},timeout=90,allow_redirects=True)
+                          v=validate_pdf(rr.content,rr.url,meta,f'{key}_{i}')
+                          v.update({'requested_url':c['url'],'label':c['label'],'status':rr.status_code,'content_type':rr.headers.get('content-type','')})
+                          rec['candidates'].append(v)
+                          print('CANDIDATE',key,json.dumps(v,ensure_ascii=False)[:20000],flush=True)
+                      except Exception as exc:
+                          rec['candidates'].append({'requested_url':c['url'],'label':c['label'],'error':repr(exc)})
+              except Exception as exc:
+                  rec['static']['error']=repr(exc)
+              out[key]=rec
+
+          # Browser-only observation of links/downloads exposed by the public page; no account or payment bypass.
+          chrome=shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          if chrome:
+            with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage'])
+              ctx=browser.new_context(user_agent=ua,locale='zh-CN',viewport={'width':1500,'height':1200},accept_downloads=True)
+              for key,meta in pages.items():
+                pg=ctx.new_page(); responses=[]; downloads=[]
+                def on_resp(resp):
+                    try: ct=resp.headers.get('content-type','')
+                    except Exception: ct=''
+                    if '.pdf' in resp.url.lower() or 'try_down' in resp.url.lower() or 'download' in resp.url.lower():
+                        responses.append({'url':resp.url,'status':resp.status,'content_type':ct})
+                pg.on('response',on_resp)
+                brec={'responses':responses,'downloads':downloads}
+                try:
+                    rr=pg.goto(meta['url'],wait_until='domcontentloaded',timeout=120000)
+                    try: pg.wait_for_load_state('networkidle',timeout=25000)
+                    except PWTimeout: pass
+                    pg.wait_for_timeout(2000)
+                    # Scroll through content that the anonymous public page itself renders.
+                    for _ in range(25):
+                        pg.evaluate('window.scrollBy(0, Math.max(900, window.innerHeight*0.85))')
+                        pg.wait_for_timeout(250)
+                    body=' '.join(pg.locator('body').inner_text(timeout=15000).split())
+                    links=pg.eval_on_selector_all('a','els=>els.map(e=>({text:(e.innerText||e.textContent||"").trim(),href:e.href||"",download:e.download||""}))')
+                    brec.update({'status':rr.status if rr else None,'url':pg.url,'title':pg.title(),'body':body[:120000],
+                                 'links':[x for x in links if re.search(r'(try_down|\.pdf|download|试下载|下载文档)',json.dumps(x,ensure_ascii=False),re.I)]})
+                    for i,x in enumerate(brec['links'][:20]):
+                        if not x.get('href'): continue
+                        try:
+                            res=ctx.request.get(x['href'],headers={'Referer':meta['url']},timeout=60000)
+                            data=res.body()
+                            v=validate_pdf(data,x['href'],meta,f'{key}_browser_{i}')
+                            v.update({'status':res.status,'content_type':res.headers.get('content-type',''),'label':x.get('text','')})
+                            downloads.append(v)
+                        except Exception as exc: downloads.append({'url':x.get('href'),'error':repr(exc)})
+                    pg.screenshot(path=f'output/html/{key}.png',full_page=True)
+                except Exception as exc: brec['error']=repr(exc)
+                out[key]['browser']=brec
+                print('BROWSER',key,json.dumps(brec,ensure_ascii=False)[:25000],flush=True)
+                pg.close()
+              browser.close()
+
+          Path('output/result.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          # Deduplicate final PDFs by SHA-256.
+          seen={}
+          for f in sorted(Path('output/pdfs').glob('*.pdf')):
+              sha=hashlib.sha256(f.read_bytes()).hexdigest()
+              if sha in seen: f.unlink()
+              else: seen[sha]=str(f)
+          print('FINAL_PDFS',json.dumps(seen,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload validated files
+        uses: actions/upload-artifact@v4
+        with:
+          name: book118-hongqiao-public-pdfs
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
