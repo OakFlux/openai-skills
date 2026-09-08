@@ -1,0 +1,418 @@
+name: chatgpt-temp-carsgen-filings-20260908
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-carsgen-filings-20260908.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download validate and package official CARsgen filings
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf pillow fonttools
+          python <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader, PdfWriter
+
+          STOCK_ID = '1000099082'
+          STOCK_CODE = '02171'
+          AS_OF = '2026-09-08'
+          WORK = Path('carsgen_filings_work')
+          ROOT = WORK / '科济药业_02171_年报_招股说明书_最新财务报告'
+          PDF_DIR = ROOT / 'PDF'
+          QA_DIR = WORK / '_qa'
+          RAW_DIR = WORK / '_raw'
+          for d in (PDF_DIR, QA_DIR, RAW_DIR):
+              d.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh-TW;q=0.9,en;q=0.8',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/',
+          })
+
+          logs = []
+          def log(message):
+              message = str(message)
+              print(message, flush=True)
+              logs.append(message)
+
+          def normalized(text):
+              return re.sub(r'\s+', '', str(text or '')).replace('（', '(').replace('）', ')').lower()
+
+          def get(url, *, params=None, timeout=90):
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      response = session.get(url, params=params, timeout=timeout, allow_redirects=True)
+                      log(f'GET attempt={attempt} status={response.status_code} bytes={len(response.content)} type={response.headers.get("content-type")} final={response.url}')
+                      if response.status_code == 200:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      log(f'GET_ERROR attempt={attempt} url={url} error={exc!r}')
+                  time.sleep(attempt * 2)
+              raise RuntimeError(f'Unable to fetch {url}: {last!r}')
+
+          # Fetch narrow yearly windows in both languages so the HKEX result set is not truncated.
+          title_pages = []
+          for lang in ('ZH', 'EN'):
+              for year in range(2021, 2027):
+                  params = {
+                      'lang': lang,
+                      'category': '0',
+                      'market': 'SEHK',
+                      'stockId': STOCK_ID,
+                      'documentType': '-1',
+                      'searchType': '0',
+                      't1code': '-2',
+                      't2Gcode': '-2',
+                      't2code': '-2',
+                      'from': f'{year}0101',
+                      'to': AS_OF.replace('-', '') if year == 2026 else f'{year}1231',
+                  }
+                  response = get('https://www1.hkexnews.hk/search/titlesearch.xhtml', params=params)
+                  path = RAW_DIR / f'titles_{lang}_{year}.html'
+                  path.write_bytes(response.content)
+                  title_pages.append((lang, year, response.url, response.text))
+
+          entries = []
+          seen_entries = set()
+          for lang, year, base_url, html in title_pages:
+              soup = BeautifulSoup(html, 'html.parser')
+              for anchor in soup.find_all('a', href=True):
+                  href = urljoin(base_url, anchor.get('href'))
+                  if 'hkexnews.hk' not in href:
+                      continue
+                  if not any(token in href.lower() for token in ['/listedco/listconews/', '.pdf', '.htm']):
+                      continue
+                  text = ' '.join(anchor.get_text(' ', strip=True).split())
+                  container = anchor.find_parent('tr')
+                  if container is None:
+                      container = anchor.find_parent(['li', 'div'])
+                  context = ' '.join(container.get_text(' ', strip=True).split()) if container else text
+                  key = (lang, href, text, context)
+                  if key in seen_entries:
+                      continue
+                  seen_entries.add(key)
+                  entries.append({'lang': lang, 'year': year, 'text': text, 'context': context, 'href': href})
+
+          (WORK / 'title_entries.json').write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')
+          for entry in entries:
+              blob = normalized(entry['text'] + ' ' + entry['context'])
+              if any(term in blob for term in ['annualreport', '年度報告', '年度报告', 'interimreport', '中期報告', '中期报告', 'interimresults', '中期業績', '中期业绩', 'prospectus', '招股章程', '全球發售', '全球发售', 'globaloffering']):
+                  log('ENTRY ' + json.dumps(entry, ensure_ascii=False))
+
+          def choose_direct(candidates, prefer_lang='ZH'):
+              candidates = [e for e in candidates if '.pdf' in e['href'].lower()]
+              if not candidates:
+                  return None
+              candidates.sort(key=lambda e: (
+                  0 if e['lang'] == prefer_lang else 1,
+                  0 if '_c.pdf' in e['href'].lower() else 1,
+                  len(e['context']),
+              ))
+              return candidates[0]
+
+          annual_choices = {}
+          for report_year in range(2021, 2026):
+              candidates = []
+              for entry in entries:
+                  blob = normalized(entry['text'] + ' ' + entry['context'])
+                  if str(report_year) not in blob:
+                      continue
+                  is_annual = any(term in blob for term in ['annualreport', '年度報告', '年度报告'])
+                  is_results = any(term in blob for term in ['annualresults', '年度業績', '年度业绩', 'finalresults'])
+                  if is_annual and not is_results:
+                      candidates.append(entry)
+              selected = choose_direct(candidates)
+              if not selected:
+                  raise RuntimeError(f'No direct annual report PDF found for {report_year}; candidates={json.dumps(candidates, ensure_ascii=False)}')
+              annual_choices[report_year] = selected
+              log(f'ANNUAL_SELECTED {report_year} ' + json.dumps(selected, ensure_ascii=False))
+
+          # Latest periodic filing: prefer a complete 2026 interim report; otherwise use the 2026 interim-results announcement.
+          full_interim_candidates = []
+          interim_results_candidates = []
+          for entry in entries:
+              blob = normalized(entry['text'] + ' ' + entry['context'])
+              if '2026' not in blob:
+                  continue
+              if any(term in blob for term in ['interimreport', '中期報告', '中期报告', '半年度報告', '半年度报告']):
+                  if not any(term in blob for term in ['results', '業績', '业绩']):
+                      full_interim_candidates.append(entry)
+              if any(term in blob for term in ['interimresults', '中期業績', '中期业绩']):
+                  interim_results_candidates.append(entry)
+          latest_choice = choose_direct(full_interim_candidates)
+          latest_kind = '2026年中期报告'
+          if not latest_choice:
+              latest_choice = choose_direct(interim_results_candidates)
+              latest_kind = '2026年中期业绩公告'
+          if not latest_choice:
+              raise RuntimeError('No 2026 interim report or interim-results PDF found')
+          log('LATEST_SELECTED ' + latest_kind + ' ' + json.dumps(latest_choice, ensure_ascii=False))
+
+          # Locate the final prospectus dated June 7, 2021. Prefer a direct PDF, otherwise assemble the official HKEX section PDFs.
+          prospectus_direct_candidates = []
+          offering_pages = []
+          for entry in entries:
+              if entry['year'] != 2021:
+                  continue
+              blob = normalized(entry['text'] + ' ' + entry['context'])
+              if any(bad in blob for bad in ['applicationproof', '申請版本', '申请版本', 'hearinginformationpack', '聆訊後資料集', '聆讯后资料集']):
+                  continue
+              if any(term in blob for term in ['prospectus', '招股章程']):
+                  if '.pdf' in entry['href'].lower():
+                      prospectus_direct_candidates.append(entry)
+                  else:
+                      offering_pages.append(entry)
+              elif any(term in blob for term in ['globaloffering', '全球發售', '全球发售']):
+                  offering_pages.append(entry)
+
+          prospectus_choice = choose_direct(prospectus_direct_candidates)
+          prospectus_section_urls = []
+          prospectus_source_page = None
+          if not prospectus_choice:
+              # De-duplicate and prefer Chinese final Global Offering page.
+              unique_pages = []
+              seen_urls = set()
+              for entry in offering_pages:
+                  if entry['href'] in seen_urls:
+                      continue
+                  seen_urls.add(entry['href'])
+                  unique_pages.append(entry)
+              unique_pages.sort(key=lambda e: (0 if e['lang'] == 'ZH' else 1, 0 if 'global' in normalized(e['context']) or '全球' in e['context'] else 1))
+              for page_entry in unique_pages:
+                  try:
+                      response = get(page_entry['href'])
+                      page_text = BeautifulSoup(response.text, 'html.parser').get_text(' ', strip=True)
+                      pblob = normalized(page_text)
+                      if any(bad in pblob for bad in ['applicationproof', '申請版本', '申请版本']) and not any(good in pblob for good in ['globaloffering', '全球發售', '全球发售', '招股章程']):
+                          continue
+                      soup = BeautifulSoup(response.text, 'html.parser')
+                      links = []
+                      for anchor in soup.find_all('a', href=True):
+                          href = urljoin(response.url, anchor.get('href'))
+                          if '.pdf' not in href.lower():
+                              continue
+                          text = ' '.join(anchor.get_text(' ', strip=True).split())
+                          links.append({'text': text, 'href': href})
+                      # Prefer a single full/whole prospectus link.
+                      full_links = [x for x in links if any(term in normalized(x['text']) for term in ['fullprospectus', 'wholeprospectus', 'entireprospectus', '整份招股章程', '完整招股章程', '招股章程全文'])]
+                      if full_links:
+                          prospectus_choice = {'lang': page_entry['lang'], 'year': 2021, 'text': full_links[0]['text'], 'context': page_text[:500], 'href': full_links[0]['href']}
+                          prospectus_source_page = response.url
+                          break
+                      # Otherwise retain all official section PDFs in page order.
+                      filtered = []
+                      seen_pdf = set()
+                      for link in links:
+                          if link['href'] in seen_pdf:
+                              continue
+                          seen_pdf.add(link['href'])
+                          t = normalized(link['text'])
+                          if any(term in t for term in ['warning', '警告']) and len(links) > 20:
+                              # Warning is not part of the prospectus body.
+                              continue
+                          filtered.append(link['href'])
+                      if len(filtered) >= 15:
+                          prospectus_section_urls = filtered
+                          prospectus_source_page = response.url
+                          break
+                  except Exception as exc:
+                      log(f'PROSPECTUS_PAGE_ERROR {page_entry["href"]} {exc!r}')
+
+          if not prospectus_choice and not prospectus_section_urls:
+              raise RuntimeError('Unable to locate final 2021 prospectus or its HKEX section PDFs')
+          if prospectus_choice:
+              log('PROSPECTUS_DIRECT ' + json.dumps(prospectus_choice, ensure_ascii=False))
+          else:
+              log(f'PROSPECTUS_SECTIONS count={len(prospectus_section_urls)} page={prospectus_source_page}')
+
+          def download_pdf(url):
+              response = get(url, timeout=240)
+              data = response.content
+              if not data.startswith(b'%PDF-') or len(data) < 30_000:
+                  raise RuntimeError(f'Not a valid PDF: {url}, bytes={len(data)}, type={response.headers.get("content-type")}')
+              return data, response.url
+
+          def sample_text(path, max_pages=16):
+              reader = PdfReader(str(path), strict=False)
+              total = len(reader.pages)
+              indices = list(range(min(max_pages, total)))
+              for idx in (total // 2, max(0, total - 2)):
+                  if idx not in indices:
+                      indices.append(idx)
+              chunks = []
+              for idx in indices:
+                  try:
+                      chunks.append(reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              return total, re.sub(r'\s+', ' ', '\n'.join(chunks))
+
+          def render_check(path, stem):
+              document = pymupdf.open(str(path))
+              checks = []
+              for page_no, tag in [(0, 'first'), (max(0, document.page_count // 2), 'middle'), (max(0, document.page_count - 1), 'last')]:
+                  pix = document.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(1.1, 1.1), alpha=False)
+                  out = QA_DIR / f'{stem}_{tag}.png'
+                  pix.save(str(out))
+                  image = Image.open(out).convert('L').resize((64, 64))
+                  std = float(ImageStat.Stat(image).stddev[0])
+                  if std < 1.0:
+                      raise RuntimeError(f'Near-blank rendered page: {path} page {page_no + 1}')
+                  checks.append({'page': page_no + 1, 'stddev': round(std, 4)})
+              document.close()
+              return checks
+
+          manifest = []
+          identity_markers = ['CARSGEN', '科濟藥業', '科济药业', '02171', '2171.HK']
+
+          def save_and_validate(data, destination, *, label, expected_year=None, report_type=None, source_url=None, min_pages=20):
+              destination.write_bytes(data)
+              pages, text = sample_text(destination)
+              upper = text.upper()
+              if pages < min_pages:
+                  raise RuntimeError(f'{label}: page count {pages} < {min_pages}')
+              if not any(marker.upper() in upper for marker in identity_markers):
+                  raise RuntimeError(f'{label}: company identity not detected')
+              if expected_year and str(expected_year) not in text:
+                  log(f'WARNING {label}: year {expected_year} not found in extracted sample text')
+              if report_type == 'annual' and not any(x in upper for x in ['ANNUAL REPORT', '年度報告', '年度报告']):
+                  raise RuntimeError(f'{label}: annual-report marker not detected')
+              if report_type == 'interim' and not any(x in upper for x in ['INTERIM REPORT', 'INTERIM RESULTS', '中期報告', '中期报告', '中期業績', '中期业绩']):
+                  raise RuntimeError(f'{label}: interim marker not detected')
+              if report_type == 'prospectus' and not any(x in upper for x in ['PROSPECTUS', 'GLOBAL OFFERING', '招股章程', '全球發售', '全球发售']):
+                  raise RuntimeError(f'{label}: prospectus marker not detected')
+              checks = render_check(destination, destination.stem)
+              raw = destination.read_bytes()
+              record = {
+                  'label': label,
+                  'filename': str(destination.relative_to(ROOT)),
+                  'pages': pages,
+                  'size_bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'source_url': source_url,
+                  'render_checks': checks,
+              }
+              manifest.append(record)
+              log('VALID ' + json.dumps(record, ensure_ascii=False))
+              return record
+
+          # Download annual reports.
+          for year in range(2021, 2026):
+              entry = annual_choices[year]
+              data, final_url = download_pdf(entry['href'])
+              destination = PDF_DIR / f'科济药业_02171_{year}年年度报告.pdf'
+              save_and_validate(data, destination, label=f'{year}年年度报告', expected_year=year, report_type='annual', source_url=final_url, min_pages=80)
+
+          # Download or assemble the final prospectus.
+          prospectus_destination = PDF_DIR / '科济药业_02171_2021年全球发售招股章程.pdf'
+          if prospectus_choice:
+              data, final_url = download_pdf(prospectus_choice['href'])
+              save_and_validate(data, prospectus_destination, label='2021年全球发售招股章程', expected_year=2021, report_type='prospectus', source_url=final_url, min_pages=300)
+          else:
+              writer = PdfWriter()
+              section_sources = []
+              for idx, url in enumerate(prospectus_section_urls, 1):
+                  data, final_url = download_pdf(url)
+                  section_path = WORK / f'prospectus_section_{idx:02d}.pdf'
+                  section_path.write_bytes(data)
+                  reader = PdfReader(str(section_path), strict=False)
+                  for page in reader.pages:
+                      writer.add_page(page)
+                  section_sources.append(final_url)
+              with prospectus_destination.open('wb') as handle:
+                  writer.write(handle)
+              save_and_validate(prospectus_destination.read_bytes(), prospectus_destination, label='2021年全球发售招股章程（由港交所官方章节合并）', expected_year=2021, report_type='prospectus', source_url=prospectus_source_page, min_pages=300)
+              manifest[-1]['section_source_urls'] = section_sources
+
+          # Download the latest periodic financial filing.
+          latest_data, latest_url = download_pdf(latest_choice['href'])
+          latest_filename = '科济药业_02171_2026年中期报告.pdf' if '报告' in latest_kind else '科济药业_02171_2026年中期业绩公告.pdf'
+          save_and_validate(latest_data, PDF_DIR / latest_filename, label=latest_kind, expected_year=2026, report_type='interim', source_url=latest_url, min_pages=20)
+
+          annual_years = sorted(item['label'][:4] for item in manifest if '年度报告' in item['label'])
+          if annual_years != ['2021', '2022', '2023', '2024', '2025']:
+              raise RuntimeError(f'Annual year coverage mismatch: {annual_years}')
+          if len(manifest) != 7:
+              raise RuntimeError(f'Expected 7 PDFs, got {len(manifest)}')
+
+          readme = [
+              '# 科济药业（02171.HK）官方财务文件资料包',
+              '',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '收录范围：',
+              '- 2021—2025 年全部上市后年度报告；',
+              '- 2021 年 6 月 7 日全球发售最终招股章程；',
+              f'- 最新一期财务披露：{latest_kind}。',
+              '',
+              '说明：科济药业为香港上市公司，通常按年度及半年度披露定期财务报告，不按A股规则强制披露一季报和三季报。因此本包以截至2026年6月30日止六个月的最新中期财务文件替代“最新季报”。',
+              '',
+              '| 序号 | 文件 | 页数 | 大小（字节） |',
+              '|---:|---|---:|---:|',
+          ]
+          for idx, item in enumerate(manifest, 1):
+              readme.append(f"| {idx} | {item['filename']} | {item['pages']} | {item['size_bytes']} |")
+          readme.extend(['', '全部PDF均来自香港交易所披露易，已核验PDF文件头、公司身份、报告类型、页数，并抽样渲染首、中、尾页。', '详细来源及SHA-256校验值见 manifest.json 与 SHA256SUMS.txt。'])
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps({'company': '科济药业控股有限公司', 'stock_code': '02171.HK', 'as_of': AS_OF, 'latest_periodic_filing': latest_kind, 'files': manifest}, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{item['sha256']}  {item['filename']}" for item in manifest) + '\n', encoding='utf-8')
+          (WORK / 'run.log').write_text('\n'.join(logs) + '\n', encoding='utf-8')
+
+          zip_path = WORK / '科济药业_02171_所有年报_招股说明书_最新财务报告.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 7:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_members)}')
+
+          zip_data = zip_path.read_bytes()
+          metadata = {
+              'filename': zip_path.name,
+              'size_bytes': len(zip_data),
+              'sha256': hashlib.sha256(zip_data).hexdigest(),
+              'pdf_count': 7,
+              'reports': manifest,
+          }
+          (WORK / 'zip_metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL ' + json.dumps(metadata, ensure_ascii=False), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CARsgen-02171-Official-Filings
+          path: |
+            carsgen_filings_work/科济药业_02171_所有年报_招股说明书_最新财务报告.zip
+            carsgen_filings_work/zip_metadata.json
+            carsgen_filings_work/run.log
+            carsgen_filings_work/title_entries.json
+          retention-days: 1
+          compression-level: 0
