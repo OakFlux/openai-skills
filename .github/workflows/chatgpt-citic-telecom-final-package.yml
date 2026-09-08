@@ -1,0 +1,295 @@
+name: Build verified CITIC Telecom broker research package
+
+on:
+  push:
+    branches:
+      - chatgpt-citic-telecom-final-build-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml playwright pypdf pymupdf
+      - name: Build, validate, and package research PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders
+          cat > /tmp/build.py <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, html, io, json, re, shutil, textwrap, urllib.parse, zipfile
+          from pathlib import Path
+          import requests
+          import pymupdf
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+          from pypdf import PdfReader
+
+          OUT=Path('output'); PDF_DIR=OUT/'reports'; RENDER_DIR=OUT/'renders'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          session=requests.Session(); session.trust_env=False
+          session.headers.update({'User-Agent':UA,'Accept-Language':'en-US,en;q=0.9'})
+
+          items=[
+            {
+              'order':1,
+              'kind':'Company Guide / company-deep research page',
+              'date':'2026-03-17',
+              'title':'CITIC Telecom - Company Guide',
+              'url':'https://www.dbs.com.sg/treasures/aics/templatedata/article/equity/data/en/DBSV/012014/1883_HK.xml',
+              'filename':'01_DBS_CITIC_Telecom_Company_Guide_2026-03-17.pdf',
+              'start_markers':['CITIC Telecom\nQuick View','CITIC Telecom\r\nQuick View'],
+              'manual_pdf_paths':['/content/article/pdf/000000_HK/1883_HK.pdf'],
+            },
+            {
+              'order':2,
+              'kind':'Latest company research update',
+              'date':'2026-08-14',
+              'title':'CITIC Telecom - Stable 1H26 earnings; appealing 7%+ dividend yield',
+              'url':'https://www.dbs.com.sg/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/082026/1883_HK_08142026.xml',
+              'filename':'02_DBS_CITIC_Telecom_1H26_Research_Update_2026-08-14.pdf',
+              'start_markers':['CITIC Telecom - Stable 1H26 earnings; appealing 7%+ dividend yield'],
+              'manual_pdf_paths':['/content/article/pdf/1883_HK_EQUITY/2026/08/1883_HK_EQUITY_57_14082026.pdf'],
+            },
+          ]
+
+          def sha(data:bytes)->str: return hashlib.sha256(data).hexdigest()
+
+          def inspect_pdf(data:bytes, *, min_pages:int=1)->tuple[int,str]:
+            if b'%PDF' not in data[:4096] or len(data)<25000:
+              raise ValueError(f'not a valid PDF response ({len(data)} bytes)')
+            reader=PdfReader(io.BytesIO(data),strict=False)
+            if reader.is_encrypted:
+              try: reader.decrypt('')
+              except Exception as exc: raise ValueError('encrypted PDF') from exc
+            pages=len(reader.pages)
+            if pages<min_pages: raise ValueError(f'PDF has only {pages} pages')
+            text='\n'.join((p.extract_text() or '') for p in reader.pages[:min(12,pages)])
+            compact=re.sub(r'\s+','',text).lower()
+            if not ('citictelecom' in compact or '中信国际电讯' in compact or '1883_hk' in compact or '1883hk' in compact):
+              raise ValueError('company relevance check failed')
+            return pages,text
+
+          def extract_pdf_paths(page_html:str)->list[str]:
+            txt=html.unescape(page_html).replace('\\/','/')
+            out=[]
+            patterns=[
+              r'(?:ArticlePDFPath|ArticlePdfPath|ReportPdfPath|ReportPDFPath)[^/]{0,100}(/content/article/pdf/[^"\'<>\\\s]+\.pdf)',
+              r'(/content/article/pdf/(?:1883_HK_EQUITY|000000_HK)/[^"\'<>\\\s]+\.pdf)',
+            ]
+            for pat in patterns:
+              for m in re.finditer(pat,txt,re.I): out.append(m.group(1))
+            return list(dict.fromkeys(out))
+
+          def try_original(item:dict, page_html:str)->dict|None:
+            paths=list(item.get('manual_pdf_paths',[]))+extract_pdf_paths(page_html)
+            paths=list(dict.fromkeys(paths))
+            attempts=[]
+            for path in paths:
+              enc=urllib.parse.quote(path,safe='')
+              urls=[
+                'https://www.dbs.com.sg'+path,
+                'https://www.dbs.com.hk'+path,
+                'https://www.dbs.com.sg/wrapperapi/generic/download-pdf?pdf_path='+enc,
+                'https://www.dbs.com.hk/wrapperapi/generic/download-pdf?pdf_path='+enc,
+              ]
+              for u in urls:
+                try:
+                  r=session.get(u,headers={'User-Agent':UA,'Referer':item['url'],'Accept':'application/pdf,*/*'},timeout=(15,120),allow_redirects=True)
+                  rec={'url':u,'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'ctype':r.headers.get('content-type')}
+                  attempts.append(rec)
+                  if r.status_code==200 and b'%PDF' in r.content[:4096] and len(r.content)>25000:
+                    pages,_=inspect_pdf(r.content,min_pages=1)
+                    return {'data':r.content,'pages':pages,'source_url':r.url,'attempts':attempts,'source_type':'DBS original-layout PDF (public direct URL)'}
+                except Exception as exc:
+                  attempts.append({'url':u,'error':repr(exc)})
+            item['original_pdf_attempts']=attempts
+            return None
+
+          def clean_text(full_text:str,item:dict)->str:
+            text=full_text.replace('\r\n','\n').replace('\r','\n')
+            start=-1
+            for marker in item['start_markers']:
+              pos=text.find(marker)
+              if pos>=0:
+                start=pos; break
+            if start<0:
+              # Fallback to the first company-title occurrence after the navigation block.
+              positions=[m.start() for m in re.finditer(r'CITIC Telecom',text,re.I)]
+              if not positions: raise RuntimeError('report start marker not found')
+              start=positions[0]
+            text=text[start:]
+            end_candidates=[]
+            for marker in ['\nUseful Links\n','\n#### Useful Links','\nPricing Guide\n','\nMarkets\nSingapore\n']:
+              pos=text.find(marker)
+              if pos>1000: end_candidates.append(pos)
+            if end_candidates: text=text[:min(end_candidates)]
+            lines=[]; blank=False
+            noise={
+              'Created with Sketch.','Print','Download PDF','Have a question?','Yes, contact me',
+              'Manage your portfolio from your iWealth account','Start Now','Read More','Image',
+            }
+            for raw in text.splitlines():
+              line=re.sub(r'[ \t]+',' ',raw).strip()
+              if line in noise: continue
+              if not line:
+                if not blank: lines.append('')
+                blank=True
+              else:
+                lines.append(line); blank=False
+            cleaned='\n'.join(lines).strip()
+            if len(cleaned)<3500: raise RuntimeError(f'public report text unexpectedly short: {len(cleaned)} chars')
+            compact=re.sub(r'\s+','',cleaned).lower()
+            if 'citictelecom' not in compact or not any(k in compact for k in ['1883','macau','ctm']):
+              raise RuntimeError('public report text relevance check failed')
+            return cleaned
+
+          def text_to_html(text:str,item:dict,source_url:str)->str:
+            headings={
+              'Quick View','Profile','Previous Close Price','Key Statistics','Recent Developments','Our Views','Risks','Valuation',
+              'Research Platform: Insights Direct','GENERAL DISCLOSURE/DISCLAIMER','RESTRICTIONS ON DISTRIBUTION',
+              'FY25 Results Highlights','Outlook','Related Stories','1H26 Results Highlights','Investment Summary',
+            }
+            blocks=[]
+            for line in text.splitlines():
+              esc=html.escape(line)
+              if not line:
+                blocks.append('<div class="spacer"></div>')
+              elif line==item['title'] or (item['order']==1 and line=='CITIC Telecom'):
+                blocks.append(f'<h1>{esc}</h1>')
+              elif line in headings or line.isupper() and 4<=len(line)<=70:
+                blocks.append(f'<h2>{esc}</h2>')
+              elif re.match(r'^[-•]\s+',line):
+                blocks.append(f'<div class="bullet">{esc}</div>')
+              elif re.match(r'^(\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|Tsz Wang Tam\b)',line):
+                blocks.append(f'<p class="meta">{esc}</p>')
+              elif len(line)<90 and line.endswith(':'):
+                blocks.append(f'<h3>{esc}</h3>')
+              else:
+                blocks.append(f'<p>{esc}</p>')
+            return f'''<!doctype html><html><head><meta charset="utf-8"><style>
+              @page {{ size:A4; margin:15mm 14mm 17mm; }}
+              body {{ font-family: Arial, Helvetica, sans-serif; color:#202020; font-size:10.2pt; line-height:1.42; margin:0; }}
+              .sourcebox {{ border:1px solid #b8b8b8; background:#f5f5f5; padding:9px 11px; margin:0 0 16px; font-size:8.5pt; line-height:1.35; }}
+              h1 {{ font-size:20pt; line-height:1.18; margin:0 0 8px; color:#111; }}
+              h2 {{ font-size:13pt; margin:17px 0 6px; border-bottom:1px solid #bbb; padding-bottom:3px; page-break-after:avoid; }}
+              h3 {{ font-size:11pt; margin:12px 0 4px; page-break-after:avoid; }}
+              p {{ margin:0 0 7px; text-align:justify; orphans:3; widows:3; }}
+              .meta {{ font-weight:600; color:#444; }}
+              .bullet {{ margin:0 0 5px 16px; text-indent:-12px; }}
+              .spacer {{ height:4px; }}
+              a {{ color:#222; text-decoration:none; }}
+              .footer-note {{ margin-top:18px; padding-top:8px; border-top:1px solid #bbb; font-size:8pt; color:#555; }}
+            </style></head><body>
+              <div class="sourcebox"><b>Source:</b> DBS Bank (Hong Kong) Limited public research webpage<br>
+              <b>Public-page date:</b> {html.escape(item['date'])}<br>
+              <b>Source URL:</b> {html.escape(source_url)}<br>
+              <b>Edition:</b> Complete public webpage export prepared for offline reading. The DBS original-layout download may require an iWealth login.</div>
+              {''.join(blocks)}
+              <div class="footer-note">Research copyright and views belong to DBS and the named analyst(s). This file is an offline export of the publicly accessible research page and is not investment advice.</div>
+            </body></html>'''
+
+          chrome=shutil.which('google-chrome') or shutil.which('chromium') or shutil.which('chromium-browser')
+          records=[]
+          with sync_playwright() as pw:
+            browser=pw.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage']) if chrome else pw.chromium.launch(headless=True)
+            context=browser.new_context(user_agent=UA,locale='en-US',ignore_https_errors=True,viewport={'width':1440,'height':1000})
+            for item in items:
+              source_page=context.new_page()
+              source_page.goto(item['url'],wait_until='domcontentloaded',timeout=120000)
+              source_page.wait_for_timeout(7000)
+              page_html=source_page.content()
+              body_text=source_page.locator('body').inner_text(timeout=30000)
+              detected_title=source_page.title()
+              source_page.close()
+
+              original=try_original(item,page_html)
+              if original:
+                data=original['data']; pages=original['pages']; source_type=original['source_type']; actual_source=original['source_url']
+              else:
+                cleaned=clean_text(body_text,item)
+                html_doc=text_to_html(cleaned,item,item['url'])
+                render_page=context.new_page()
+                render_page.set_content(html_doc,wait_until='load')
+                temp=PDF_DIR/item['filename']
+                render_page.pdf(path=str(temp),format='A4',print_background=True,display_header_footer=True,
+                  header_template='<span></span>',
+                  footer_template='<div style="font-size:7px;width:100%;text-align:center;color:#777"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
+                  margin={'top':'15mm','bottom':'18mm','left':'14mm','right':'14mm'})
+                render_page.close()
+                data=temp.read_bytes()
+                pages,_=inspect_pdf(data,min_pages=2)
+                source_type='DBS complete public research webpage exported to searchable PDF'
+                actual_source=item['url']
+
+              # Final write and validation.
+              path=PDF_DIR/item['filename']; path.write_bytes(data)
+              pages,text_sample=inspect_pdf(data,min_pages=2 if source_type.startswith('DBS complete') else 1)
+              doc=pymupdf.open(stream=data,filetype='pdf')
+              render_checks=[]
+              for pno in sorted(set([0,pages//2,pages-1])):
+                pix=doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.25,1.25),alpha=False)
+                rp=RENDER_DIR/f'{item["order"]:02d}_p{pno+1:03d}.png'; pix.save(str(rp))
+                if rp.stat().st_size<5000 or pix.width<500 or pix.height<650: raise RuntimeError(f'render check failed for {path.name} p{pno+1}')
+                render_checks.append({'page':pno+1,'file':rp.name,'width':pix.width,'height':pix.height,'bytes':rp.stat().st_size})
+              doc.close()
+              record={
+                '序号':item['order'],'文件名':path.name,'券商':'DBS Bank (Hong Kong) Limited / 星展银行（香港）',
+                '发布日期':item['date'],'报告标题':item['title'],'报告类型':item['kind'],'页数':pages,'文件大小（字节）':len(data),
+                '来源类型':source_type,'官方公开研究页面':item['url'],'实际PDF来源':actual_source,'SHA-256':sha(data),
+                '网页标题':detected_title,'渲染核验':render_checks,
+              }
+              records.append(record)
+              print('VERIFIED',json.dumps(record,ensure_ascii=False),flush=True)
+            browser.close()
+
+          # Confirm the two PDFs are distinct.
+          if len(records)!=2 or len({r['SHA-256'] for r in records})!=2: raise RuntimeError('expected two distinct verified PDFs')
+
+          manifest=OUT/'报告清单与校验值.csv'
+          csv_fields=['序号','文件名','券商','发布日期','报告标题','报告类型','页数','文件大小（字节）','来源类型','官方公开研究页面','实际PDF来源','SHA-256','网页标题']
+          with manifest.open('w',encoding='utf-8-sig',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=csv_fields,extrasaction='ignore'); w.writeheader(); w.writerows(records)
+          readme=OUT/'说明.txt'
+          readme.write_text(
+            '中信国际电讯（01883.HK）券商公司研究资料包\n\n'
+            '本包收录2份星展银行（香港）公司研究资料：\n'
+            '1. 2026-03-17公司指南/公司深度研究页。\n'
+            '2. 2026-08-14最新1H26公司研究更新。\n\n'
+            '重要说明：星展官网完整研究正文可公开阅读，但原始版式PDF下载入口可能要求iWealth登录。'
+            '因此，若匿名直链不能取得原始PDF，本包采用官方完整公开研究网页转存为可搜索PDF；不是只含一两页的预览，也不是下载脚本。'
+            '每份文件均保留官方来源地址，并已核验PDF文件头、可解析页数、公司名称及首/中/末页渲染。\n\n'
+            '报告版权及观点归星展银行和相关分析师所有，仅供研究参考，不构成投资建议。\n',encoding='utf-8')
+
+          zip_path=OUT/'CITIC_Telecom_01883_Broker_Research_2_Public_Full_PDFs.zip'
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(PDF_DIR.glob('*.pdf')): z.write(p,arcname=p.name)
+            z.write(manifest,arcname=manifest.name); z.write(readme,arcname=readme.name)
+          with zipfile.ZipFile(zip_path) as z:
+            bad=z.testzip(); names=z.namelist()
+            if bad is not None: raise RuntimeError(f'ZIP CRC failure: {bad}')
+            if len([n for n in names if n.lower().endswith('.pdf')])!=2: raise RuntimeError(f'wrong PDF count: {names}')
+          summary={'zip_file':zip_path.name,'zip_bytes':zip_path.stat().st_size,'zip_sha256':sha(zip_path.read_bytes()),'reports':records}
+          (OUT/'package_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PACKAGE_READY',json.dumps(summary,ensure_ascii=False),flush=True)
+          PY
+          python /tmp/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: citic-telecom-broker-research-final
+          path: |
+            output/CITIC_Telecom_01883_Broker_Research_2_Public_Full_PDFs.zip
+            output/package_summary.json
+            output/renders/
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
