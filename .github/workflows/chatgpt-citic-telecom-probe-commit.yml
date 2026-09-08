@@ -1,0 +1,154 @@
+name: Persist CITIC Telecom broker report probe results
+
+on:
+  push:
+    branches:
+      - chatgpt-citic-telecom-broker-reports-20260908
+    paths:
+      - '.github/workflows/chatgpt-citic-telecom-probe-commit.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt-citic-telecom-broker-reports-20260908
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Probe and persist results
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p citic_probe
+          cat > /tmp/probe.py <<'PY'
+          from __future__ import annotations
+          import base64, html, json, re, time, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          terms=['中信国际电讯','中信國際電訊','CITIC Telecom International','CITIC Telecom','01883.HK','1883.HK','01883']
+          queries=[
+            'site:hangyan.co/reports 中信国际电讯',
+            'site:hangyan.co/reports 中信國際電訊',
+            'site:hangyan.co/reports "CITIC Telecom International"',
+            'site:hangyan.co/reports 01883',
+            '中信国际电讯 券商 研报 深度 报告 PDF',
+            '中信国际电讯 首次覆盖 报告',
+            '中信國際電訊 券商 研究 報告 PDF',
+            'CITIC Telecom International 01883 research report PDF',
+          ]
+          engines={
+            'bing':'https://www.bing.com/search?q={q}&count=50',
+            '360':'https://www.so.com/s?q={q}',
+            'baidu':'https://www.baidu.com/s?wd={q}&rn=50',
+            'sogou':'https://www.sogou.com/web?query={q}&num=50',
+          }
+          def get(url,timeout=(15,90),**kw):
+            return s.get(url,timeout=timeout,allow_redirects=True,**kw)
+          records=[]; urls=set(); ids=set()
+          for q in queries:
+            for eng,tpl in engines.items():
+              u=tpl.format(q=urllib.parse.quote(q))
+              try:
+                r=get(u); soup=BeautifulSoup(r.text,'lxml')
+                hits=[]
+                for a in soup.find_all('a',href=True):
+                  text=a.get_text(' ',strip=True); href=html.unescape(a['href']); au=urllib.parse.urljoin(r.url,href)
+                  blob=(text+' '+au).lower()
+                  if any(t.lower() in blob for t in terms) or any(k in blob for k in ['hangyan.co/reports','sgpjbg.com/baogao','vzkoo.com/document','nxny.com/report','pdf']):
+                    hits.append({'text':text[:500],'url':au}); urls.add(au)
+                    for m in re.finditer(r'hangyan\.co/reports/(\d+)',au): ids.add(m.group(1))
+                for raw in re.findall(r'https?://[^\s"\'<>\\]+',r.text):
+                  raw=html.unescape(raw).rstrip(');,]')
+                  if any(t.lower() in raw.lower() for t in terms) or 'hangyan.co/reports' in raw.lower():
+                    urls.add(raw)
+                    for m in re.finditer(r'hangyan\.co/reports/(\d+)',raw): ids.add(m.group(1))
+                records.append({'engine':eng,'query':q,'status':r.status_code,'bytes':len(r.content),'hits':hits})
+              except Exception as e:
+                records.append({'engine':eng,'query':q,'error':repr(e)})
+              time.sleep(.1)
+
+          # Inspect Hangyan report index and its search form.
+          index=[]
+          try:
+            r=get('https://www.hangyan.co/reports'); soup=BeautifulSoup(r.text,'lxml')
+            forms=[]
+            for f in soup.find_all('form'):
+              forms.append({'action':f.get('action'),'method':f.get('method'),'inputs':[{'name':i.get('name'),'value':i.get('value'),'type':i.get('type')} for i in f.find_all('input')]})
+            index.append({'url':r.url,'status':r.status_code,'bytes':len(r.content),'forms':forms,'prefix':r.text[:5000]})
+            names=sorted({i.get('name') for f in soup.find_all('form') for i in f.find_all('input') if i.get('name')})
+          except Exception as e:
+            names=[]; index.append({'url':'https://www.hangyan.co/reports','error':repr(e)})
+          names=sorted(set(names+['q','query','keyword','search','term','title']))
+          for name in names:
+            for term in ['中信国际电讯','中信國際電訊','CITIC Telecom International','01883']:
+              for path in ['/reports','/search']:
+                u='https://www.hangyan.co'+path+'?'+urllib.parse.urlencode({name:term})
+                try:
+                  r=get(u); text=r.text
+                  found=sorted(set(re.findall(r'/reports/(\d{8,})',text)))
+                  for rid in found: ids.add(rid)
+                  if found or any(t.lower() in text.lower() for t in terms):
+                    index.append({'url':u,'status':r.status_code,'bytes':len(r.content),'ids':found,'title':BeautifulSoup(text,'lxml').title.get_text(' ',strip=True) if BeautifulSoup(text,'lxml').title else None,'prefix':text[:3000]})
+                except Exception as e: pass
+
+          # Resolve opaque search links.
+          resolved=[]
+          for u in list(urls):
+            try:
+              pu=urllib.parse.urlparse(u); qs=urllib.parse.parse_qs(pu.query)
+              val=(qs.get('u') or [None])[0]
+              if val and val.startswith('a1'):
+                dec=base64.b64decode(val[2:]+'='*((4-len(val[2:])%4)%4)).decode('utf-8','ignore')
+                urls.add(dec)
+                m=re.search(r'hangyan\.co/reports/(\d+)',dec)
+                if m: ids.add(m.group(1))
+            except Exception: pass
+            if any(h in u for h in ['bing.com/ck/a','so.com/link','sogou.com/link','baidu.com/link']):
+              try:
+                rr=get(u,timeout=(10,45)); final=rr.url
+                resolved.append({'source':u,'final':final,'status':rr.status_code,'title':BeautifulSoup(rr.text,'lxml').title.get_text(' ',strip=True) if BeautifulSoup(rr.text,'lxml').title else None})
+                for target in [final]+re.findall(r'https?://[^\s"\'<>\\]+',rr.text):
+                  m=re.search(r'hangyan\.co/reports/(\d+)',target)
+                  if m: ids.add(m.group(1))
+              except Exception as e:
+                resolved.append({'source':u,'error':repr(e)})
+
+          candidates=[]
+          for rid in sorted(ids):
+            u=f'https://www.hangyan.co/reports/{rid}'
+            try:
+              r=get(u); soup=BeautifulSoup(r.text,'lxml'); body=soup.get_text('\n',strip=True)
+              h=soup.select_one('h1'); node=soup.select_one('[data-controller~="native-pdf"]')
+              title=h.get_text(' ',strip=True) if h else (soup.title.get_text(' ',strip=True) if soup.title else '')
+              meta=[p.get_text(' ',strip=True) for p in soup.select('#left .box p')]
+              filename=node.get('data-native-pdf-filename-value') if node else None
+              relevant=any(t.lower() in (title+'\n'+body+'\n'+str(filename)).lower() for t in terms)
+              candidates.append({'id':rid,'url':u,'status':r.status_code,'title':title,'meta':meta,'filename':filename,'has_token':bool(node and node.get('data-native-pdf-cache-key-value')),'relevant':relevant,'text_prefix':body[:5000]})
+            except Exception as e:
+              candidates.append({'id':rid,'url':u,'error':repr(e)})
+          result={'terms':terms,'search_records':records,'hangyan_index':index,'raw_urls':sorted(urls),'resolved':resolved,'ids':sorted(ids),'candidates':candidates}
+          Path('citic_probe/results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          summary=[]
+          for c in candidates:
+            if c.get('relevant'):
+              summary.append(f"{c.get('id')}\t{c.get('title')}\t{' | '.join(c.get('meta') or [])}\t{c.get('filename')}")
+          Path('citic_probe/summary.txt').write_text('\n'.join(summary),encoding='utf-8')
+          PY
+          python /tmp/probe.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add citic_probe/results.json citic_probe/summary.txt
+          git commit -m 'Persist CITIC Telecom broker report probe results [skip ci]'
+          git push origin HEAD:chatgpt-citic-telecom-broker-reports-20260908
