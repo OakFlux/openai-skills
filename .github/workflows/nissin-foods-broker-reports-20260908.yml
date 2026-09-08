@@ -1,0 +1,221 @@
+name: Build verified Nissin Foods broker report package 20260908
+
+on:
+  push:
+    paths:
+      - '.github/workflows/nissin-foods-broker-reports-20260908.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download, verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+
+          package = '日清食品_券商深度报告_完整PDF_3份'
+          out = Path(package)
+          out.mkdir(exist_ok=True)
+          work = Path('_nissin_work')
+          work.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'order': 1,
+                  'broker': '中信建投证券',
+                  'date': '2019-09-06',
+                  'title': '稳步增长的优质即食面先行者',
+                  'pages': 39,
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP201909061349654038_1.pdf',
+                  'referer': 'https://data.eastmoney.com/report/zw_stock.jshtml?infocode=AP201909061349654038',
+                  'filename': '01_中信建投证券_稳步增长的优质即食面先行者_20190906_39页.pdf',
+              },
+              {
+                  'order': 2,
+                  'broker': '第一上海证券',
+                  'date': '2019-06-27',
+                  'title': '稳步前行的高端速食面市场龙头',
+                  'pages': 21,
+                  'url': 'https://www.mystockhk.com/UploadFiles/informationpdf/27104225F72B0C62.pdf',
+                  'referer': 'https://www.mystockhk.com/',
+                  'filename': '02_第一上海证券_稳步前行的高端速食面市场龙头_20190627_21页.pdf',
+              },
+              {
+                  'order': 3,
+                  'broker': '星展银行_DBS',
+                  'date': '2023-03-27',
+                  'title': 'Solid long-term prospects',
+                  'pages': 12,
+                  'url': 'https://www.dbs.com.sg/content/article/pdf/1475_HK_Equity/2023/03/1475_HK_Equity_57_27032023.pdf',
+                  'referer': 'https://www.dbs.com.sg/',
+                  'filename': '03_星展银行_DBS_Solid_long-term_prospects_20230327_12页.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          common_headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Connection': 'keep-alive',
+          }
+
+          def download(report, target):
+              errors = []
+              headers = {**common_headers, 'Referer': report['referer']}
+              for attempt in range(1, 5):
+                  try:
+                      with session.get(report['url'], headers=headers, timeout=(25, 240), allow_redirects=True, stream=True) as r:
+                          print('GET', report['broker'], attempt, r.status_code, r.url, r.headers.get('content-type'), flush=True)
+                          r.raise_for_status()
+                          tmp = target.with_suffix('.part')
+                          with tmp.open('wb') as f:
+                              for chunk in r.iter_content(1024 * 1024):
+                                  if chunk:
+                                      f.write(chunk)
+                          data = tmp.read_bytes()
+                          if len(data) < 100_000:
+                              raise RuntimeError(f'file too small: {len(data)} bytes')
+                          if not data.startswith(b'%PDF-'):
+                              raise RuntimeError(f'not a PDF: first bytes={data[:32]!r}')
+                          tmp.replace(target)
+                          return
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      time.sleep(2 * attempt)
+              # curl fallback, useful for servers with different TLS/HTTP behaviour
+              cmd = [
+                  'curl', '-fL', '--retry', '4', '--retry-all-errors', '--connect-timeout', '30', '--max-time', '300',
+                  '--http1.1', '-A', common_headers['User-Agent'], '-e', report['referer'],
+                  '-H', 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  '-o', str(target), report['url']
+              ]
+              p = subprocess.run(cmd, capture_output=True, text=True)
+              if p.returncode == 0 and target.exists() and target.stat().st_size >= 100_000 and target.read_bytes().startswith(b'%PDF-'):
+                  return
+              raise RuntimeError(f"download failed for {report['broker']}: {errors}; curl={p.stderr[-1500:]}")
+
+          manifest = []
+          for report in reports:
+              raw = work / f"report_{report['order']:02d}.pdf"
+              download(report, raw)
+
+              reader = PdfReader(str(raw), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != report['pages']:
+                  raise RuntimeError(f"page mismatch for {report['broker']}: expected {report['pages']}, got {actual_pages}")
+
+              q = subprocess.run(['qpdf', '--check', str(raw)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f"qpdf validation failed for {report['broker']}: {q.stderr[-1200:]}")
+
+              doc = fitz.open(str(raw))
+              if doc.page_count != report['pages']:
+                  raise RuntimeError(f"PyMuPDF page mismatch for {report['broker']}")
+              rendered = []
+              for pno in sorted({0, report['pages'] // 2, report['pages'] - 1}):
+                  pix = doc.load_page(pno).get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False)
+                  if pix.width < 300 or pix.height < 300:
+                      raise RuntimeError(f"render too small for {report['broker']} page {pno+1}")
+                  rendered.append(pno + 1)
+              doc.close()
+
+              data = raw.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              final_pdf = out / report['filename']
+              final_pdf.write_bytes(data)
+              manifest.append({
+                  'broker': report['broker'],
+                  'title': report['title'],
+                  'report_date': report['date'],
+                  'filename': report['filename'],
+                  'pages': actual_pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': report['url'],
+                  'render_checked_pages': rendered,
+              })
+              print('VERIFIED', report['broker'], actual_pages, len(data), digest, flush=True)
+
+          readme = [
+              '日清食品（01475.HK）券商深度/公司研究报告',
+              '',
+              '本压缩包包含3份可离线打开的原始PDF，共72页：',
+          ]
+          for idx, item in enumerate(manifest, 1):
+              readme.extend([
+                  f"{idx}. {item['broker']}：《{item['title']}》",
+                  f"   报告日期：{item['report_date']}；页数：{item['pages']}页；大小：{item['bytes']/1048576:.2f} MB",
+                  f"   文件名：{item['filename']}",
+                  f"   原始来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '核验项目：PDF文件头、实际页数、PyPDF解析、qpdf结构检查、首页/中间页/末页渲染、SHA-256、ZIP CRC。',
+              '其中前两份为长篇首次覆盖/公司深度报告；第三份为较新的DBS公司研究更新，便于补充近年经营判断。',
+              '历史评级、目标价及盈利预测仅反映报告发布时点，不构成当前投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{m['sha256']}  {m['filename']}\n" for m in manifest), encoding='utf-8'
+          )
+
+          zip_path = Path(package + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path, arcname=f'{package}/{path.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed at {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in zf.namelist())
+              if pdf_count != 3:
+                  raise RuntimeError(f'PDF count mismatch in ZIP: {pdf_count}')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', 3, 'PAGES', sum(m['pages'] for m in manifest), flush=True)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: nissin-foods-broker-reports-final
+          path: 日清食品_券商深度报告_完整PDF_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nissin-foods-broker-reports-diagnostics
+          path: _nissin_work/
+          if-no-files-found: ignore
+          retention-days: 7
