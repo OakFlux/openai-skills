@@ -1,0 +1,110 @@
+name: chatgpt-temp-seg-report-discovery-20260908
+on:
+  push:
+    branches: [chatgpt-temp-china-lesso-reports-20260908]
+    paths: ['.github/workflows/chatgpt-temp-seg-report-discovery-20260908.yml']
+  workflow_dispatch:
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Crawl official SEG site for reports
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python <<'PY'
+          import json, re, time, urllib.parse, warnings
+          from collections import deque
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          warnings.filterwarnings('ignore')
+
+          OUT=Path('seg_discovery'); OUT.mkdir(exist_ok=True)
+          s=requests.Session(); s.verify=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36'})
+          starts=[
+            'https://www.segroup.cn/segroup/en/',
+            'http://www.segroup.cn/segroup/en/',
+            'https://www.segroup.cn/segroup/',
+            'http://www.segroup.cn/segroup/',
+          ]
+          q=deque((u,0) for u in starts); seen=set(); rows=[]; target=[]
+          allow_ext={'','.html','.shtml','.htm','.xhtml','.jsp','.aspx'}
+          def norm(base,href):
+            if not href: return None
+            href=href.strip().replace('&amp;','&')
+            if href.startswith(('javascript:','mailto:','tel:','#')): return None
+            u=urllib.parse.urljoin(base,href)
+            p=urllib.parse.urlsplit(u)
+            if p.scheme not in ('http','https'): return None
+            if not (p.netloc.endswith('segroup.cn') or p.netloc.endswith('sinopec.com')): return None
+            return urllib.parse.urlunsplit((p.scheme,p.netloc,p.path,p.query,''))
+          while q and len(seen)<800:
+            url,depth=q.popleft()
+            if url in seen or depth>5: continue
+            seen.add(url)
+            try:
+              r=s.get(url,timeout=35,allow_redirects=True)
+              ct=r.headers.get('content-type','').lower()
+              row={'url':url,'final':r.url,'status':r.status_code,'ct':ct,'bytes':len(r.content),'depth':depth}
+              rows.append(row)
+              print('FETCH',r.status_code,len(r.content),depth,r.url,flush=True)
+              if r.status_code!=200: continue
+              if 'pdf' in ct or r.content[:5]==b'%PDF':
+                target.append({'source_page':None,'text':'DIRECT PDF','url':r.url,'status':r.status_code,'bytes':len(r.content)})
+                continue
+              if 'html' not in ct and b'<html' not in r.content[:2000].lower(): continue
+              html=r.text
+              soup=BeautifulSoup(html,'lxml')
+              title=(soup.title.get_text(' ',strip=True) if soup.title else '')
+              body=soup.get_text(' ',strip=True)
+              if re.search(r'annual report|interim report|年度报告|年度報告|中期报告|中期報告',title+' '+body,re.I):
+                (OUT/f'page_{len(rows):04d}.html').write_text(html,encoding='utf-8',errors='ignore')
+              for a in soup.find_all(['a','iframe','embed','object']):
+                href=a.get('href') or a.get('src') or a.get('data')
+                u=norm(r.url,href)
+                if not u: continue
+                txt=' '.join(a.get_text(' ',strip=True).split())
+                signal=(txt+' '+u)
+                if re.search(r'\.pdf(?:$|\?)|annual|interim|report|年度|年报|年報|中期|业绩|業績',signal,re.I):
+                  target.append({'source_page':r.url,'text':txt[:500],'url':u})
+                ext=Path(urllib.parse.urlsplit(u).path).suffix.lower()
+                if ext in allow_ext and depth<5 and u not in seen:
+                  # Prioritize investor/report paths, but also crawl the whole official site within limits.
+                  if depth<2 or re.search(r'invest|report|announce|disclos|ir|股东|投资|公告|报告|報告',signal,re.I):
+                    q.append((u,depth+1))
+              # Catch naked PDF URLs and attachment paths in scripts.
+              for m in re.finditer(r'''(?:https?:)?//[^\"'<>\s]+?\.pdf(?:\?[^\"'<>\s]*)?|[\w./%-]+\.pdf(?:\?[^\"'<>\s]*)?''',html,re.I):
+                u=norm(r.url,m.group(0))
+                if u: target.append({'source_page':r.url,'text':'REGEX','url':u})
+            except Exception as e:
+              rows.append({'url':url,'error':repr(e),'depth':depth})
+              print('ERROR',url,repr(e),flush=True)
+          # Deduplicate and probe candidates.
+          uniq=[]; used=set()
+          for x in target:
+            u=x['url']
+            if u in used: continue
+            used.add(u); uniq.append(x)
+          for i,x in enumerate(uniq):
+            try:
+              rr=s.get(x['url'],timeout=40,allow_redirects=True,stream=False)
+              x.update({'probe_status':rr.status_code,'probe_final':rr.url,'probe_ct':rr.headers.get('content-type',''),'probe_bytes':len(rr.content),'pdf_magic':rr.content[:5]==b'%PDF'})
+              if rr.content[:5]==b'%PDF' and len(rr.content)>30000:
+                p=OUT/f'candidate_{i:04d}.pdf'; p.write_bytes(rr.content); x['saved']=str(p)
+              print('PROBE',x.get('probe_status'),x.get('probe_bytes'),x.get('pdf_magic'),x['url'],x.get('text','')[:100],flush=True)
+            except Exception as e:
+              x['probe_error']=repr(e)
+          (OUT/'crawl.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'candidates.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY pages',len(rows),'candidates',len(uniq),'saved',sum(1 for x in uniq if x.get('saved')),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SEG-official-report-discovery
+          path: seg_discovery
+          retention-days: 1
+          compression-level: 6
