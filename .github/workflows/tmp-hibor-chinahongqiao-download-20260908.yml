@@ -1,0 +1,170 @@
+name: Inspect Hibor China Hongqiao report download
+on:
+  push:
+    branches:
+      - tmp-hibor-chinahongqiao-download-20260908
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Install Python dependencies
+        run: python -m pip install --quiet playwright beautifulsoup4 lxml requests pypdf
+      - name: Inspect and attempt public download
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, shutil, time
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          url = 'https://wap.hibor.com.cn/repinfodetail_4073301.html'
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+          result = {'url': url, 'static': {}, 'browser': {}}
+
+          # Static inspection.
+          s = requests.Session()
+          s.headers.update(headers)
+          r = s.get(url, timeout=60)
+          result['static'] = {'status': r.status_code, 'final_url': r.url, 'content_type': r.headers.get('content-type'), 'bytes': len(r.content)}
+          Path('output/static.html').write_bytes(r.content)
+          soup = BeautifulSoup(r.text, 'lxml')
+          attrs = []
+          for tag in soup.find_all(['a','button','input','label','iframe','embed','object','form','script']):
+              rec = {'tag': tag.name, 'text': ' '.join(tag.get_text(' ', strip=True).split())[:500]}
+              for k, v in tag.attrs.items():
+                  if k in {'href','src','onclick','action','id','name','class','value','type','data-url','data-href','data-id','data-reportid','data-file'} or k.startswith('data-'):
+                      rec[k] = v
+              blob = json.dumps(rec, ensure_ascii=False)
+              if re.search(r'(下载|原文|免责|agree|pdf|report|down|file|4073301)', blob, re.I):
+                  attrs.append(rec)
+          result['static']['interesting_elements'] = attrs
+          for m in re.finditer(r'.{0,300}(?:下载报告|打开报告原文|免责条款|4073301|\.pdf).{0,600}', r.text, re.I|re.S):
+              print('STATIC_SNIPPET', ' '.join(m.group(0).split())[:1200], flush=True)
+          print('STATIC_ELEMENTS', json.dumps(attrs[:100], ensure_ascii=False), flush=True)
+
+          # Browser inspection and public interaction.
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          events = {'requests': [], 'responses': [], 'downloads': [], 'pages': []}
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, executable_path=chrome, args=['--no-sandbox','--disable-dev-shm-usage'])
+              context = browser.new_context(user_agent=headers['User-Agent'], locale='zh-CN', viewport={'width': 1440, 'height': 1100}, accept_downloads=True)
+              page = context.new_page()
+
+              def on_request(req):
+                  if re.search(r'(pdf|download|down|report|file|document|4073301)', req.url, re.I):
+                      events['requests'].append({'url': req.url, 'method': req.method, 'resource_type': req.resource_type, 'post_data': req.post_data})
+
+              def on_response(resp):
+                  try:
+                      ct = resp.headers.get('content-type','')
+                  except Exception:
+                      ct = ''
+                  if re.search(r'(pdf|download|down|report|file|document|4073301)', resp.url, re.I) or 'pdf' in ct.lower():
+                      rec = {'url': resp.url, 'status': resp.status, 'content_type': ct}
+                      events['responses'].append(rec)
+                      if 'pdf' in ct.lower() or resp.url.lower().split('?')[0].endswith('.pdf'):
+                          try:
+                              body = resp.body()
+                              if body.startswith(b'%PDF'):
+                                  fn = f"output/network_{len(events['responses'])}.pdf"
+                                  Path(fn).write_bytes(body)
+                                  rec['saved_as'] = fn
+                                  rec['bytes'] = len(body)
+                          except Exception as exc:
+                              rec['save_error'] = repr(exc)
+
+              page.on('request', on_request)
+              page.on('response', on_response)
+              resp = page.goto(url, wait_until='domcontentloaded', timeout=120000)
+              try:
+                  page.wait_for_load_state('networkidle', timeout=30000)
+              except PWTimeout:
+                  pass
+              page.wait_for_timeout(2500)
+              result['browser']['initial'] = {'status': resp.status if resp else None, 'url': page.url, 'title': page.title(), 'body': ' '.join(page.locator('body').inner_text().split())[:100000]}
+              result['browser']['elements'] = page.eval_on_selector_all('a,button,input,label,iframe,embed,object,form', "els => els.map(e => ({tag:e.tagName,text:(e.innerText||e.textContent||'').trim(),href:e.href||'',src:e.src||'',onclick:e.getAttribute('onclick')||'',type:e.type||'',name:e.name||'',id:e.id||'',value:e.value||'',checked:e.checked||false,outer:e.outerHTML.slice(0,2000)}))")
+              Path('output/initial.html').write_text(page.content(), encoding='utf-8')
+              page.screenshot(path='output/initial.png', full_page=True)
+              print('BROWSER_ELEMENTS', json.dumps([x for x in result['browser']['elements'] if re.search(r'(下载|原文|免责|agree|pdf|report|down|file)', json.dumps(x, ensure_ascii=False), re.I)][:100], ensure_ascii=False), flush=True)
+
+              # Agree to the displayed disclaimer when a checkbox exists.
+              for i in range(page.locator('input[type=checkbox]').count()):
+                  try:
+                      page.locator('input[type=checkbox]').nth(i).check(force=True, timeout=5000)
+                  except Exception:
+                      pass
+
+              # Try public report-original and download controls. Do not attempt login or payment gates.
+              for label in ['打开报告原文', '下载报告']:
+                  loc = page.get_by_text(label, exact=False)
+                  n = min(loc.count(), 4)
+                  for i in range(n):
+                      click_rec = {'label': label, 'index': i, 'before_url': page.url}
+                      before_pages = len(context.pages)
+                      try:
+                          try:
+                              with page.expect_download(timeout=7000) as dinfo:
+                                  loc.nth(i).click(force=True, timeout=7000)
+                              d = dinfo.value
+                              target = f"output/download_{label}_{i}_{d.suggested_filename}"
+                              d.save_as(target)
+                              click_rec['download'] = {'url': d.url, 'suggested_filename': d.suggested_filename, 'saved_as': target}
+                              events['downloads'].append(click_rec['download'])
+                          except Exception as exc:
+                              click_rec['download_wait'] = repr(exc)
+                              try:
+                                  loc.nth(i).click(force=True, timeout=7000)
+                              except Exception as exc2:
+                                  click_rec['click_error'] = repr(exc2)
+                          page.wait_for_timeout(3000)
+                      except Exception as exc:
+                          click_rec['error'] = repr(exc)
+                      click_rec['after_url'] = page.url
+                      click_rec['page_count'] = len(context.pages)
+                      result['browser'].setdefault('clicks', []).append(click_rec)
+                      for idx, pg in enumerate(context.pages):
+                          try:
+                              events['pages'].append({'index': idx, 'url': pg.url, 'title': pg.title(), 'body': ' '.join(pg.locator('body').inner_text(timeout=5000).split())[:30000]})
+                              Path(f'output/after_{label}_{i}_page{idx}.html').write_text(pg.content(), encoding='utf-8')
+                              pg.screenshot(path=f'output/after_{label}_{i}_page{idx}.png', full_page=True)
+                          except Exception as exc:
+                              events['pages'].append({'index': idx, 'url': pg.url, 'error': repr(exc)})
+
+              browser.close()
+
+          result['browser']['events'] = events
+
+          # Validate any captured/downloaded PDFs.
+          validations = []
+          for pdf in Path('output').glob('*.pdf'):
+              rec = {'file': str(pdf), 'bytes': pdf.stat().st_size, 'header': pdf.read_bytes()[:8].decode('latin1', errors='replace')}
+              try:
+                  reader = PdfReader(str(pdf))
+                  text = ''.join((p.extract_text() or '') for p in reader.pages[:3])
+                  rec.update({'pages': len(reader.pages), 'first_text': ' '.join(text.split())[:4000], 'searchable_chars_first3': len(text.strip())})
+              except Exception as exc:
+                  rec['error'] = repr(exc)
+              validations.append(rec)
+          result['validations'] = validations
+          print('EVENTS', json.dumps(events, ensure_ascii=False), flush=True)
+          print('VALIDATIONS', json.dumps(validations, ensure_ascii=False), flush=True)
+          Path('output/result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+      - name: Upload inspection output
+        uses: actions/upload-artifact@v4
+        with:
+          name: hibor-chinahongqiao-download-inspection
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
