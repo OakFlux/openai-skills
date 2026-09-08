@@ -1,0 +1,159 @@
+name: Validate public China Hongqiao report views
+on:
+  push:
+    branches:
+      - tmp-fxbaogao-hongqiao-public-view-20260908
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet playwright pillow pypdf requests
+      - name: Inspect public detail and view pages
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, shutil, time
+          from pathlib import Path
+          from urllib.parse import urlparse
+          from PIL import Image
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          reports = {
+              '4983769': {'broker':'东方财富证券','date':'2025-08-05','title':'产业升级顺势而为，前瞻布局穿越周期','expected_pages':38},
+              '5587515': {'broker':'东吴证券','date':'2026-08-07','title':'全产业链铸就成本护城河，高股息引领价值重估','expected_pages':28},
+              '4802165': {'broker':'西部证券','date':'2025-04-21','title':'高景气+一体化+高分红，电解铝龙头静待价值重估','expected_pages':27},
+              '4864892': {'broker':'华创证券','date':'2025-05-27','title':'全球电解铝龙头，一体化打造盈利护城河，高分红属性明显','expected_pages':28},
+          }
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          if not chrome:
+              raise RuntimeError('No system Chrome/Chromium found')
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          out={}
+
+          def report_page_no(url: str):
+              m=re.search(r'/report-image/\d{4}/\d{2}/\d{2}/(\d+)-(\d+)\.(?:png|jpe?g|webp)',url,re.I)
+              if not m: return None
+              return int(m.group(2))
+
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage'])
+              context=browser.new_context(user_agent=ua,locale='zh-CN',viewport={'width':1500,'height':1200},accept_downloads=True)
+              for rid,meta in reports.items():
+                  page=context.new_page()
+                  observed=[]
+                  responses=[]
+                  downloads=[]
+                  def on_response(resp):
+                      try: ct=resp.headers.get('content-type','')
+                      except Exception: ct=''
+                      if ('report-image' in resp.url or '.pdf' in resp.url.lower() or 'download' in resp.url.lower() or '/view' in resp.url):
+                          responses.append({'url':resp.url,'status':resp.status,'content_type':ct})
+                          if 'report-image' in resp.url:
+                              observed.append(resp.url)
+                  page.on('response',on_response)
+                  rec={'meta':meta,'detail':{},'view':{},'responses':responses,'downloads':downloads}
+                  detail=f'https://www.fxbaogao.com/detail/{rid}'
+                  try:
+                      r=page.goto(detail,wait_until='domcontentloaded',timeout=120000)
+                      try: page.wait_for_load_state('networkidle',timeout=25000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(2500)
+                      body=' '.join(page.locator('body').inner_text(timeout=15000).split())
+                      links=page.eval_on_selector_all('a','els=>els.map(e=>({text:(e.innerText||e.textContent||"").trim(),href:e.href||""}))')
+                      rec['detail']={'status':r.status if r else None,'url':page.url,'title':page.title(),'body':body[:100000],'links':links}
+                      Path(f'output/{rid}_detail.html').write_text(page.content(),encoding='utf-8')
+                      page.screenshot(path=f'output/{rid}_detail.png',full_page=True)
+                  except Exception as exc:
+                      rec['detail']['error']=repr(exc)
+
+                  # The detail page exposes /view?id=<id> as its public full-view link. Open it directly.
+                  view=f'https://www.fxbaogao.com/view?id={rid}'
+                  try:
+                      r=page.goto(view,wait_until='domcontentloaded',timeout=120000)
+                      try: page.wait_for_load_state('networkidle',timeout=30000)
+                      except PWTimeout: pass
+                      page.wait_for_timeout(2500)
+                      # Incremental scrolling to trigger only images the public viewer itself requests.
+                      last_height=0
+                      stable=0
+                      for _ in range(80):
+                          h=page.evaluate('document.documentElement.scrollHeight')
+                          page.evaluate('window.scrollBy(0, Math.max(900, window.innerHeight*0.85))')
+                          page.wait_for_timeout(350)
+                          nh=page.evaluate('document.documentElement.scrollHeight')
+                          if nh==last_height and page.evaluate('window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 20'):
+                              stable+=1
+                          else:
+                              stable=0
+                          last_height=nh
+                          if stable>=4: break
+                      page.wait_for_timeout(2000)
+                      body=' '.join(page.locator('body').inner_text(timeout=15000).split())
+                      imgs=page.eval_on_selector_all('img','els=>els.map(e=>({src:e.currentSrc||e.src||"",alt:e.alt||"",w:e.naturalWidth||0,h:e.naturalHeight||0}))')
+                      canvases=page.eval_on_selector_all('canvas','els=>els.map(e=>({w:e.width||0,h:e.height||0,className:e.className||""}))')
+                      gate=bool(re.search(r'(登录|注册|购买|付费|会员|报告豆|充值|扫码登录)',body))
+                      rec['view']={'status':r.status if r else None,'url':page.url,'title':page.title(),'body':body[:120000],'images':imgs,'canvases':canvases,'gate_detected':gate}
+                      Path(f'output/{rid}_view.html').write_text(page.content(),encoding='utf-8')
+                      page.screenshot(path=f'output/{rid}_view.png',full_page=True)
+
+                      urls=[]
+                      for x in imgs:
+                          if 'report-image' in x.get('src',''): urls.append(x['src'])
+                      urls.extend(observed)
+                      # Normalize away processing query strings, dedupe by actual page number.
+                      by_page={}
+                      for u in urls:
+                          n=report_page_no(u)
+                          if n is not None and n not in by_page:
+                              by_page[n]=u
+                      rec['view']['observed_report_pages']=sorted(by_page)
+                      rec['view']['observed_report_image_urls']=[by_page[n] for n in sorted(by_page)]
+
+                      # Download only URLs actually requested/exposed by the public viewer.
+                      images=[]
+                      image_meta=[]
+                      for n,u in sorted(by_page.items()):
+                          try:
+                              rr=context.request.get(u,headers={'Referer':view},timeout=60000)
+                              data=rr.body()
+                              im=Image.open(io.BytesIO(data)).convert('RGB')
+                              images.append((n,im.copy()))
+                              image_meta.append({'page':n,'url':u,'status':rr.status,'bytes':len(data),'width':im.width,'height':im.height,'sha256':hashlib.sha256(data).hexdigest()})
+                          except Exception as exc:
+                              image_meta.append({'page':n,'url':u,'error':repr(exc)})
+                      rec['view']['downloaded_images']=image_meta
+
+                      expected=meta['expected_pages']
+                      page_nums=[n for n,_ in images]
+                      # Accept 1-based sequence exactly matching expected count. Do not infer or probe missing URLs.
+                      public_complete=(not gate and len(images)==expected and page_nums==list(range(1,expected+1)))
+                      rec['view']['public_complete']=public_complete
+                      if public_complete:
+                          pdf_path=Path('output')/f"{meta['date']}_{meta['broker']}_中国宏桥_{meta['title']}.pdf"
+                          pil=[im for _,im in images]
+                          pil[0].save(pdf_path,save_all=True,append_images=pil[1:],resolution=150.0)
+                          reader=PdfReader(str(pdf_path))
+                          rec['view']['pdf']={'path':str(pdf_path),'bytes':pdf_path.stat().st_size,'pages':len(reader.pages),'sha256':hashlib.sha256(pdf_path.read_bytes()).hexdigest()}
+                  except Exception as exc:
+                      rec['view']['error']=repr(exc)
+                  out[rid]=rec
+                  print('REPORT_RESULT',rid,json.dumps({'title':meta['title'],'view':rec.get('view',{})},ensure_ascii=False)[:30000],flush=True)
+                  page.close()
+              browser.close()
+          Path('output/result.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-hongqiao-public-view
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
