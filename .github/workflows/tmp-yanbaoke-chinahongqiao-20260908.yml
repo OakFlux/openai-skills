@@ -1,0 +1,244 @@
+name: Inspect Yanbaoke China Hongqiao report downloads
+on:
+  push:
+    branches:
+      - tmp-yanbaoke-chinahongqiao-20260908
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet playwright requests beautifulsoup4 lxml pypdf
+      - name: Search and inspect public downloads
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          BASE='https://www.yanbaoke.com/'
+          KNOWN='https://www.yanbaoke.com/info/3c4w88jePCXFD2J5cwD4Ze'
+          headers={
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+          s=requests.Session(); s.headers.update(headers)
+          result={'static':{},'browser':{},'validations':[]}
+          interesting=re.compile(r'(中国宏桥|china hongqiao|01378|1378|\.pdf(?:$|[?&#])|download|fileurl|pdfurl|attachment|api|search)',re.I)
+
+          # Static homepage and known report page inspection.
+          script_urls=[]
+          for name,url in [('home',BASE),('known',KNOWN)]:
+              rec={'url':url}
+              try:
+                  r=s.get(url,timeout=60,allow_redirects=True)
+                  text=r.text.replace('\\/','/')
+                  Path(f'output/{name}_static.html').write_text(text,encoding='utf-8')
+                  rec.update({'status':r.status_code,'final_url':r.url,'content_type':r.headers.get('content-type',''),'bytes':len(r.content)})
+                  soup=BeautifulSoup(text,'lxml')
+                  scripts=[urljoin(r.url,t.get('src')) for t in soup.find_all('script',src=True)]
+                  script_urls.extend(scripts)
+                  rec['scripts']=scripts
+                  elems=[]
+                  for tag in soup.find_all(True):
+                      attrs={k:v for k,v in tag.attrs.items() if k in {'href','src','action','onclick','id','name','class','value','type','download','placeholder'} or k.startswith('data-') or 'url' in k.lower() or 'file' in k.lower()}
+                      item={'tag':tag.name,'text':' '.join(tag.get_text(' ',strip=True).split())[:1000],'attrs':attrs}
+                      if interesting.search(json.dumps(item,ensure_ascii=False)) or '下载pdf版本' in item['text'] or '搜索研报' in item['text']:
+                          elems.append(item)
+                  rec['elements']=elems[:1000]
+                  urls=sorted(set(re.findall(r'https?://[^\"\'<>\s\\]+',text)))
+                  rec['candidate_urls']=[u for u in urls if interesting.search(u)][:2000]
+                  snippets=[]
+                  for m in interesting.finditer(text):
+                      snippets.append(' '.join(text[max(0,m.start()-500):m.start()+1800].split())[:2800])
+                  rec['snippets']=snippets[:300]
+                  print('STATIC',name,json.dumps(rec,ensure_ascii=False)[:50000],flush=True)
+              except Exception as exc:
+                  rec['error']=repr(exc)
+              result['static'][name]=rec
+
+          # Inspect same-origin scripts for API/download routes.
+          script_records=[]
+          for i,u in enumerate(sorted(set(script_urls))[:100]):
+              if not urlparse(u).netloc.endswith('yanbaoke.com'):
+                  continue
+              rec={'url':u}
+              try:
+                  r=s.get(u,timeout=40,allow_redirects=True)
+                  text=r.text.replace('\\/','/')
+                  rec.update({'status':r.status_code,'final_url':r.url,'content_type':r.headers.get('content-type',''),'bytes':len(r.content)})
+                  Path(f'output/script_{i:03d}.js').write_text(text,encoding='utf-8')
+                  snippets=[]
+                  for pat in [r'/api/[A-Za-z0-9_./?=&${}:+-]+',r'https?://[^\"\'<>\s\\]+',r'.{0,300}(?:download|pdfUrl|fileUrl|搜索|search).{0,1200}']:
+                      for m in re.finditer(pat,text,re.I|re.S):
+                          val=' '.join(m.group(0).split())[:2000]
+                          if interesting.search(val): snippets.append(val)
+                  rec['snippets']=list(dict.fromkeys(snippets))[:500]
+                  if rec['snippets']:
+                      print('SCRIPT',i,json.dumps(rec,ensure_ascii=False)[:50000],flush=True)
+              except Exception as exc:
+                  rec['error']=repr(exc)
+              script_records.append(rec)
+          result['static']['scripts']=script_records
+
+          chrome=shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True,executable_path=chrome,args=['--no-sandbox','--disable-dev-shm-usage'])
+              context=browser.new_context(user_agent=headers['User-Agent'],locale='zh-CN',viewport={'width':1440,'height':1200},accept_downloads=True)
+              page=context.new_page()
+              events={'requests':[],'responses':[],'json_bodies':[],'downloads':[],'popups':[]}
+
+              def on_request(req):
+                  if req.resource_type in {'xhr','fetch','document'} or interesting.search(req.url):
+                      events['requests'].append({'url':req.url,'method':req.method,'resource_type':req.resource_type,'post_data':req.post_data})
+
+              def on_response(resp):
+                  try: ct=resp.headers.get('content-type','')
+                  except Exception: ct=''
+                  if resp.request.resource_type in {'xhr','fetch','document'} or interesting.search(resp.url) or 'pdf' in ct.lower():
+                      item={'url':resp.url,'status':resp.status,'content_type':ct,'resource_type':resp.request.resource_type}
+                      events['responses'].append(item)
+                      try:
+                          if 'json' in ct.lower() or resp.request.resource_type in {'xhr','fetch'}:
+                              body=resp.body()
+                              if len(body)<=3_000_000:
+                                  txt=body.decode('utf-8','replace')
+                                  if interesting.search(txt) or 'api' in resp.url.lower():
+                                      fn=f'output/network_json_{len(events["json_bodies"]):03d}.txt'
+                                      Path(fn).write_text(txt,encoding='utf-8')
+                                      events['json_bodies'].append({'url':resp.url,'status':resp.status,'content_type':ct,'file':fn,'snippet':' '.join(txt.split())[:5000]})
+                          if 'pdf' in ct.lower() or resp.url.lower().split('?')[0].endswith('.pdf'):
+                              body=resp.body()
+                              if body.startswith(b'%PDF') and len(body)>20000:
+                                  fn=Path(f'output/network_{len(events["responses"]):03d}.pdf')
+                                  fn.write_bytes(body)
+                                  item['saved_as']=str(fn); item['bytes']=len(body)
+                      except Exception as exc:
+                          item['body_error']=repr(exc)
+
+              page.on('request',on_request); page.on('response',on_response)
+              try:
+                  resp=page.goto(BASE,wait_until='domcontentloaded',timeout=120000)
+                  try: page.wait_for_load_state('networkidle',timeout=30000)
+                  except PWTimeout: pass
+                  page.wait_for_timeout(2000)
+                  result['browser']['home']={'status':resp.status if resp else None,'url':page.url,'title':page.title(),'body':' '.join(page.locator('body').inner_text(timeout=15000).split())[:120000]}
+                  result['browser']['home']['inputs']=page.eval_on_selector_all('input',"els=>els.map(e=>({placeholder:e.placeholder||'',type:e.type||'',name:e.name||'',id:e.id||'',className:e.className||'',outer:e.outerHTML.slice(0,2000)}))")
+                  Path('output/home_browser.html').write_text(page.content(),encoding='utf-8')
+                  page.screenshot(path='output/home_browser.png',full_page=True)
+
+                  # Find and use the visible search field.
+                  search=None
+                  for selector in ["input[placeholder*='搜索研报']","input[placeholder*='搜索']","input[type='search']","input"]:
+                      loc=page.locator(selector)
+                      if loc.count():
+                          search=loc.first; break
+                  if search is not None:
+                      search.fill('中国宏桥')
+                      search.press('Enter')
+                      page.wait_for_timeout(5000)
+                      try: page.wait_for_load_state('networkidle',timeout=20000)
+                      except PWTimeout: pass
+                  result['browser']['search']={'url':page.url,'title':page.title(),'body':' '.join(page.locator('body').inner_text(timeout=15000).split())[:150000]}
+                  result['browser']['search']['links']=page.eval_on_selector_all('a',"els=>els.map(e=>({text:(e.innerText||e.textContent||'').trim(),href:e.href||'',download:e.download||'',outer:e.outerHTML.slice(0,2500)}))")
+                  Path('output/search_browser.html').write_text(page.content(),encoding='utf-8')
+                  page.screenshot(path='output/search_browser.png',full_page=True)
+                  print('SEARCH_RESULT',json.dumps(result['browser']['search'],ensure_ascii=False)[:50000],flush=True)
+              except Exception as exc:
+                  result['browser']['home_search_error']=repr(exc)
+
+              # Collect report info URLs from search and include known page.
+              info_urls={KNOWN}
+              for x in result['browser'].get('search',{}).get('links',[]):
+                  href=x.get('href','')
+                  if '/info/' in href and ('中国宏桥' in x.get('text','') or '01378' in x.get('text','') or '1378' in x.get('text','')):
+                      info_urls.add(href)
+              result['browser']['info_urls']=sorted(info_urls)
+
+              for idx,url in enumerate(sorted(info_urls)):
+                  pg=context.new_page()
+                  # Share same event handlers.
+                  pg.on('request',on_request); pg.on('response',on_response)
+                  rec={'url':url}
+                  try:
+                      resp=pg.goto(url,wait_until='domcontentloaded',timeout=120000)
+                      try: pg.wait_for_load_state('networkidle',timeout=30000)
+                      except PWTimeout: pass
+                      pg.wait_for_timeout(2500)
+                      rec.update({'status':resp.status if resp else None,'final_url':pg.url,'title':pg.title(),'body':' '.join(pg.locator('body').inner_text(timeout=15000).split())[:150000]})
+                      rec['elements']=pg.eval_on_selector_all('a,button,input,iframe,embed,object',"els=>els.map(e=>({tag:e.tagName,text:(e.innerText||e.textContent||'').trim(),href:e.href||'',src:e.src||'',onclick:e.getAttribute('onclick')||'',download:e.download||'',id:e.id||'',className:e.className||'',outer:e.outerHTML.slice(0,4000)}))")
+                      rec['globals']=pg.evaluate("""() => {const out={}; for(const k of ['__NEXT_DATA__','__NUXT__','__INITIAL_STATE__']){try{if(window[k]!==undefined)out[k]=window[k]}catch(e){}}; try{out.localStorage={...localStorage}}catch(e){}; return out;}""")
+                      Path(f'output/info_{idx}_initial.html').write_text(pg.content(),encoding='utf-8')
+                      pg.screenshot(path=f'output/info_{idx}_initial.png',full_page=True)
+                      print('INFO_ELEMENTS',url,json.dumps([x for x in rec['elements'] if interesting.search(json.dumps(x,ensure_ascii=False)) or '下载pdf版本' in x.get('text','')],ensure_ascii=False)[:50000],flush=True)
+
+                      # Click public PDF download control. Stop on app/login/payment gate; do not bypass.
+                      candidates=[]
+                      for text in ['下载pdf版本','下载PDF','下载 pdf','下载']:
+                          loc=pg.get_by_text(text,exact=False)
+                          for i in range(min(loc.count(),4)): candidates.append((text,i))
+                      for cidx,(text,i) in enumerate(candidates[:6]):
+                          item={'text':text,'index':i,'before_url':pg.url}
+                          try:
+                              try:
+                                  with pg.expect_download(timeout=10000) as dinfo:
+                                      pg.get_by_text(text,exact=False).nth(i).click(force=True,timeout=8000)
+                                  d=dinfo.value
+                                  fn=Path('output')/f'yanbaoke_download_{idx}_{cidx}_{d.suggested_filename}'
+                                  d.save_as(str(fn))
+                                  dl={'url':d.url,'suggested_filename':d.suggested_filename,'saved_as':str(fn),'bytes':fn.stat().st_size}
+                                  events['downloads'].append(dl); item['download']=dl
+                              except Exception as exc:
+                                  item['download_wait_error']=repr(exc)
+                                  try: pg.get_by_text(text,exact=False).nth(i).click(force=True,timeout=7000)
+                                  except Exception as exc2: item['click_error']=repr(exc2)
+                              pg.wait_for_timeout(3000)
+                          except Exception as exc: item['error']=repr(exc)
+                          item['after_url']=pg.url
+                          try: item['after_body']=' '.join(pg.locator('body').inner_text(timeout=5000).split())[:50000]
+                          except Exception: pass
+                          rec.setdefault('clicks',[]).append(item)
+                          if re.search(r'(安装APP|登录|注册|会员|购买|付费|扫码)',item.get('after_body','')):
+                              break
+                      Path(f'output/info_{idx}_after.html').write_text(pg.content(),encoding='utf-8')
+                      pg.screenshot(path=f'output/info_{idx}_after.png',full_page=True)
+                  except Exception as exc:
+                      rec['error']=repr(exc)
+                  result['browser'].setdefault('infos',[]).append(rec)
+                  pg.close()
+
+              result['browser']['events']=events
+              browser.close()
+
+          # Validate every captured PDF.
+          vals=[]
+          for pdf in sorted(Path('output').glob('*.pdf')):
+              rec={'file':str(pdf),'bytes':pdf.stat().st_size,'header':pdf.read_bytes()[:8].decode('latin1','replace'),'sha256':hashlib.sha256(pdf.read_bytes()).hexdigest()}
+              try:
+                  reader=PdfReader(str(pdf)); pages=len(reader.pages)
+                  idxs=sorted(set([0,min(1,pages-1),min(4,pages-1),max(0,pages//2),max(0,pages-2),pages-1]))
+                  text=''.join((reader.pages[i].extract_text() or '') for i in idxs)
+                  rec.update({'pages':pages,'searchable_chars_sample':len(re.sub(r'\s+','',text)),'sample_text':' '.join(text.split())[:6000]})
+              except Exception as exc: rec['error']=repr(exc)
+              vals.append(rec); print('PDF_VALIDATION',json.dumps(rec,ensure_ascii=False),flush=True)
+          result['validations']=vals
+          Path('output/result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps(result,ensure_ascii=False)[:120000],flush=True)
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: yanbaoke-chinahongqiao-inspection
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
