@@ -1,0 +1,135 @@
+name: Inspect DBS CITIC Telecom PDF download endpoints
+
+on:
+  push:
+    branches:
+      - chatgpt-citic-telecom-dbs-probe-20260908
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Inspect DBS pages and PDF links
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > /tmp/dbs_probe.py <<'PY'
+          from __future__ import annotations
+          import html, json, re, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'en-US,en;q=0.9'})
+          pages={
+            'equity':'https://www.dbs.com.sg/treasures/aics/templatedata/article/equity/data/en/DBSV/012014/1883_HK.xml',
+            'fy25':'https://www.dbs.com.sg/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/032026/1883_HK_03172026.xml',
+            'h1_25':'https://www.dbs.com.sg/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/082025/1883_HK_08192025.xml',
+            'fy24':'https://www.dbs.com.sg/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/032025/1883_HK_03132025.xml',
+            'h1_24':'https://www.dbs.com.sg/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/082024/1883_HK_08192024.xml',
+          }
+          results={}
+          all_urls=[]
+          for name,url in pages.items():
+            r=s.get(url,timeout=(15,90),allow_redirects=True)
+            r.raise_for_status()
+            text=r.text
+            Path(f'out/{name}.html').write_text(text,encoding='utf-8')
+            soup=BeautifulSoup(text,'lxml')
+            attrs=[]
+            for tag in soup.find_all(True):
+              for k,v in tag.attrs.items():
+                vals=v if isinstance(v,list) else [v]
+                for vv in vals:
+                  if vv is None: continue
+                  sv=str(vv)
+                  if any(x in sv.lower() for x in ['pdf','download','1883','03172026','08192025','03132025','08192024']):
+                    attrs.append({'tag':tag.name,'attr':k,'value':sv[:1000],'text':tag.get_text(' ',strip=True)[:200]})
+                    if k in ('href','src','data','data-url','data-href'):
+                      all_urls.append(urllib.parse.urljoin(r.url,sv))
+            raw_urls=[]
+            for m in re.finditer(r'https?://[^\s"\'<>\\]+',text):
+              u=html.unescape(m.group(0)).rstrip(');,]')
+              if any(x in u.lower() for x in ['pdf','download','1883','dbsv','article']): raw_urls.append(u)
+            rel=[]
+            for m in re.finditer(r'["\']([^"\']*(?:pdf|download|1883)[^"\']*)["\']',text,re.I):
+              v=html.unescape(m.group(1))
+              if len(v)<2000: rel.append(v)
+            scripts=[]
+            for sc in soup.find_all('script'):
+              src=sc.get('src')
+              if src: scripts.append(urllib.parse.urljoin(r.url,src))
+            rec={'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'content_type':r.headers.get('content-type'),'title':soup.title.get_text(' ',strip=True) if soup.title else None,'attrs':attrs,'raw_urls':list(dict.fromkeys(raw_urls)),'relative_strings':list(dict.fromkeys(rel)),'scripts':scripts}
+            results[name]=rec
+            print('\nPAGE',name,r.status_code,len(r.content),r.url,flush=True)
+            for x in attrs: print('ATTR',json.dumps(x,ensure_ascii=False),flush=True)
+            for x in rec['raw_urls']: print('RAWURL',x,flush=True)
+            for x in rec['relative_strings'][:300]: print('REL',x,flush=True)
+            for x in scripts: print('SCRIPT',x,flush=True)
+
+          # Inspect relevant JS files for PDF handlers.
+          js_results={}
+          scripts=list(dict.fromkeys(u for rec in results.values() for u in rec['scripts']))
+          for i,u in enumerate(scripts[:100]):
+            try:
+              rr=s.get(u,timeout=(10,60)); txt=rr.text
+              if any(k in txt.lower() for k in ['pdfcontroller','download pdf','downloadpdf','pdfpath','pdfurl']):
+                snippets=[]
+                for term in ['pdfController','downloadPDF','download pdf','pdfpath','pdfurl']:
+                  for m in list(re.finditer(re.escape(term),txt,re.I))[:20]: snippets.append(txt[max(0,m.start()-700):m.start()+1600])
+                js_results[u]={'status':rr.status_code,'bytes':len(rr.content),'snippets':snippets[:50]}
+                print('\nJS_MATCH',u,rr.status_code,len(rr.content),flush=True)
+                for sn in snippets[:20]: print('JS_SNIP',re.sub(r'\s+',' ',sn)[:2200],flush=True)
+            except Exception as e: print('JS_FAIL',u,repr(e),flush=True)
+
+          # Probe plausible direct PDF/controller URLs.
+          plausible=set(all_urls)
+          bases=['https://www.dbs.com.sg','https://www.dbs.com.hk']
+          dates=[('032026','1883_HK_03172026'),('082025','1883_HK_08192025'),('032025','1883_HK_03132025'),('082024','1883_HK_08192024')]
+          templates=[
+            '/treasures/aics/pdfController.page?pdfpath=/content/article/pdf/DBSV/{month}/{stem}.pdf',
+            '/treasures/aics/pdfController.page?pdfpath=/content/article/pdf/DBSV/{month}/{stem}_1.pdf',
+            '/treasures/aics/templatedata/article/recentdevelopment/data/en/DBSV/{month}/{stem}.pdf',
+            '/iwov-resources/pdf/DBSV/{month}/{stem}.pdf',
+            '/content/article/pdf/DBSV/{month}/{stem}.pdf',
+          ]
+          for base in bases:
+            for month,stem in dates:
+              for t in templates: plausible.add(base+t.format(month=month,stem=stem))
+          probes=[]
+          for u in sorted(plausible):
+            if not u.startswith('http'): continue
+            if not any(k in u.lower() for k in ['pdf','download','pdfcontroller']): continue
+            try:
+              rr=s.get(u,timeout=(10,90),allow_redirects=True)
+              head=rr.content[:4096]
+              rec={'url':u,'status':rr.status_code,'final_url':rr.url,'bytes':len(rr.content),'ctype':rr.headers.get('content-type'),'is_pdf':b'%PDF' in head}
+              probes.append(rec)
+              print('PROBE',json.dumps(rec,ensure_ascii=False),flush=True)
+              if rec['is_pdf'] and len(rr.content)>20000:
+                fn=re.sub(r'[^A-Za-z0-9._-]+','_',urllib.parse.urlparse(rr.url).path.split('/')[-1] or f'file_{len(probes)}.pdf')
+                if not fn.lower().endswith('.pdf'): fn += '.pdf'
+                Path('out',fn).write_bytes(rr.content)
+            except Exception as e:
+              print('PROBE_FAIL',u,repr(e),flush=True)
+          Path('out/results.json').write_text(json.dumps({'pages':results,'js':js_results,'probes':probes},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/dbs_probe.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: citic-telecom-dbs-pdf-probe
+          path: out/
+          retention-days: 3
+          if-no-files-found: error
