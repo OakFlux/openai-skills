@@ -1,0 +1,151 @@
+name: chatgpt-temp-avic-report-source-inspect
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-avic-report-source-inspect.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect public report pages and search APIs
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 playwright
+          python <<'PY'
+          import asyncio, json, os, re, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          W=Path('avic_source_inspect'); W.mkdir(exist_ok=True)
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          urls={
+            'west_sgpjbg':'https://www.sgpjbg.com/bgdown/187495.html',
+            'minsheng_fx_detail':'https://www.fxbaogao.com/detail/4141785',
+            'minsheng_fx_view':'https://www.fxbaogao.com/view?id=4141785',
+            'fx_preview_api':'https://api.fxbaogao.com/mofoun/report/report/getReportPreviewImages?reportId=4141785',
+            'sdy_home':'https://www.sdyanbao.com/',
+            'fx_home':'https://www.fxbaogao.com/',
+          }
+          req_summary=[]
+          for name,url in urls.items():
+            try:
+              r=s.get(url,timeout=120,allow_redirects=True)
+              rec={'name':name,'url':url,'final':r.url,'status':r.status_code,'bytes':len(r.content),'ct':r.headers.get('content-type'),'head':r.text[:3000] if 'text' in (r.headers.get('content-type') or '') or 'json' in (r.headers.get('content-type') or '') else ''}
+              req_summary.append(rec); print('REQUEST',json.dumps(rec,ensure_ascii=False),flush=True)
+              W.joinpath(name+'.bin').write_bytes(r.content)
+              if 'html' in (r.headers.get('content-type') or ''):
+                soup=BeautifulSoup(r.text,'html.parser')
+                analysis={
+                  'title':soup.title.get_text(' ',strip=True) if soup.title else '',
+                  'links':[{'text':' '.join(a.get_text(' ',strip=True).split()),'href':urllib.parse.urljoin(r.url,a.get('href'))} for a in soup.find_all('a',href=True)],
+                  'images':[{'src':urllib.parse.urljoin(r.url,img.get('src') or img.get('data-src') or img.get('data-original') or ''),'attrs':dict(img.attrs)} for img in soup.find_all('img')],
+                  'scripts':[urllib.parse.urljoin(r.url,x.get('src')) for x in soup.find_all('script',src=True)],
+                  'raw_urls':list(dict.fromkeys(re.findall(r'(?:https?:)?//[^"\'<>\s]+|/[A-Za-z0-9_./?=&%:+-]+',r.text)))[:5000],
+                }
+                W.joinpath(name+'_analysis.json').write_text(json.dumps(analysis,ensure_ascii=False,indent=2),encoding='utf-8')
+                print('HTML_ANALYSIS',name,'title',analysis['title'],'links',len(analysis['links']),'images',len(analysis['images']),'scripts',len(analysis['scripts']),flush=True)
+                print('RELEVANT_LINKS',name,json.dumps([x for x in analysis['links'] if re.search(r'pdf|download|报告|研报|preview|image',x['text']+' '+x['href'],re.I)][:200],ensure_ascii=False),flush=True)
+                print('IMAGES',name,json.dumps(analysis['images'][:200],ensure_ascii=False),flush=True)
+            except Exception as e:
+              rec={'name':name,'url':url,'error':repr(e)};req_summary.append(rec);print('REQUEST_ERROR',json.dumps(rec,ensure_ascii=False),flush=True)
+          W.joinpath('requests_summary.json').write_text(json.dumps(req_summary,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Search JS bundles for candidate API endpoint strings.
+          for source_name in ['sdy_home','fx_home','west_sgpjbg']:
+            ap=W.joinpath(source_name+'_analysis.json')
+            if not ap.exists(): continue
+            obj=json.loads(ap.read_text(encoding='utf-8'))
+            hits=[]
+            for i,src in enumerate(obj.get('scripts',[])[:80]):
+              try:
+                rr=s.get(src,timeout=90)
+                text=rr.text
+                W.joinpath(f'{source_name}_script_{i:03d}.js').write_text(text,encoding='utf-8',errors='ignore')
+                for pat in [r'/api/[A-Za-z0-9_./-]{3,100}',r'https?://[^"\' ]{3,200}',r'getReportPreviewImages',r'file/[A-Za-z0-9_./-]+',r'search[A-Za-z0-9_./-]*']:
+                  for m in re.finditer(pat,text,re.I):
+                    val=m.group(0)
+                    if any(k in val.lower() for k in ['search','file','report','download','detail','preview']):hits.append({'script':src,'value':val})
+              except Exception as e: hits.append({'script':src,'error':repr(e)})
+            # de-dup
+            out=[];seen=set()
+            for x in hits:
+              k=json.dumps(x,ensure_ascii=False,sort_keys=True)
+              if k not in seen:seen.add(k);out.append(x)
+            W.joinpath(source_name+'_api_hits.json').write_text(json.dumps(out[:10000],ensure_ascii=False,indent=2),encoding='utf-8')
+            print('API_HITS',source_name,json.dumps(out[:500],ensure_ascii=False)[:100000],flush=True)
+
+          browser_records=[]
+          async def main():
+            async with async_playwright() as p:
+              exe=next((x for x in ['/usr/bin/google-chrome','/usr/bin/google-chrome-stable','/usr/bin/chromium'] if os.path.exists(x)),None)
+              browser=await p.chromium.launch(headless=True,executable_path=exe,args=['--no-sandbox','--disable-dev-shm-usage'])
+              context=await browser.new_context(viewport={'width':1440,'height':1100},user_agent=ua,locale='zh-CN')
+              pages=[
+                ('sdy_home','https://www.sdyanbao.com/'),
+                ('sdy_search_q','https://www.sdyanbao.com/search?keyword=%E4%B8%AD%E8%88%AA%E7%A7%91%E5%B7%A5'),
+                ('sdy_search_path','https://www.sdyanbao.com/search/%E4%B8%AD%E8%88%AA%E7%A7%91%E5%B7%A5'),
+                ('fx_search_q','https://www.fxbaogao.com/search?keyword=%E4%B8%AD%E8%88%AA%E7%A7%91%E5%B7%A5'),
+                ('fx_detail','https://www.fxbaogao.com/detail/4141785'),
+                ('fx_view','https://www.fxbaogao.com/view?id=4141785'),
+                ('sgpjbg','https://www.sgpjbg.com/bgdown/187495.html'),
+              ]
+              for name,url in pages:
+                page=await context.new_page(); reqs=[]; resps=[]; tasks=[]
+                page.on('request',lambda r,reqs=reqs:reqs.append({'method':r.method,'url':r.url,'type':r.resource_type,'post':r.post_data[:3000] if r.post_data else None}))
+                async def cap(resp,resps=resps,name=name):
+                  ct=(await resp.all_headers()).get('content-type','');u=resp.url
+                  row={'url':u,'status':resp.status,'ct':ct}
+                  if re.search(r'api|search|file|report|detail|download|preview|image|pdf|187495|4141785|中航',u,re.I):
+                    try:
+                      body=await resp.body(); row['bytes']=len(body);row['head']=body[:3000].decode('utf-8','replace')
+                      if len(body)<6_000_000 and ('json' in ct or 'text' in ct or 'javascript' in ct):
+                        fn=W/f'{name}_resp_{len(resps):04d}.txt';fn.write_bytes(body);row['file']=fn.name
+                    except Exception as e:row['error']=repr(e)
+                  resps.append(row)
+                page.on('response',lambda r,tasks=tasks:tasks.append(asyncio.create_task(cap(r))))
+                try:
+                  r=await page.goto(url,wait_until='domcontentloaded',timeout=120000);await page.wait_for_timeout(8000)
+                  # On home pages, identify and use the visible public search box if available.
+                  if name=='sdy_home':
+                    inputs=page.locator('input')
+                    for i in range(await inputs.count()):
+                      el=inputs.nth(i)
+                      try:
+                        if await el.is_visible():
+                          ph=await el.get_attribute('placeholder') or ''
+                          typ=await el.get_attribute('type') or ''
+                          if '搜' in ph or '关键' in ph or typ=='search':
+                            await el.fill('中航科工');await el.press('Enter');await page.wait_for_timeout(8000);break
+                      except:pass
+                  body=await page.locator('body').inner_text();html=await page.content()
+                  W.joinpath(name+'_browser_body.txt').write_text(body,encoding='utf-8')
+                  W.joinpath(name+'_browser.html').write_text(html,encoding='utf-8')
+                  dom=await page.evaluate('''()=>({url:location.href,title:document.title,images:[...document.images].map(x=>({src:x.src,currentSrc:x.currentSrc,w:x.naturalWidth,h:x.naturalHeight,alt:x.alt,outer:x.outerHTML.slice(0,1500)})),links:[...document.querySelectorAll('a[href]')].map(x=>({text:(x.innerText||'').trim(),href:x.href,outer:x.outerHTML.slice(0,1000)})),inputs:[...document.querySelectorAll('input')].map(x=>({type:x.type,placeholder:x.placeholder,value:x.value,outer:x.outerHTML.slice(0,1000)})),buttons:[...document.querySelectorAll('button,[role="button"],.download')].map(x=>({text:(x.innerText||'').trim(),outer:x.outerHTML.slice(0,1500)})),resources:performance.getEntriesByType('resource').map(x=>({name:x.name,initiator:x.initiatorType,encoded:x.encodedBodySize,decoded:x.decodedBodySize}))})''')
+                  W.joinpath(name+'_dom.json').write_text(json.dumps(dom,ensure_ascii=False,indent=2),encoding='utf-8')
+                  if tasks:await asyncio.gather(*tasks,return_exceptions=True)
+                  W.joinpath(name+'_requests.json').write_text(json.dumps(reqs,ensure_ascii=False,indent=2),encoding='utf-8')
+                  W.joinpath(name+'_responses.json').write_text(json.dumps(resps,ensure_ascii=False,indent=2),encoding='utf-8')
+                  rel=[x for x in reqs if re.search(r'api|search|file|report|detail|download|preview|image|pdf|187495|4141785|中航',x['url'],re.I)]
+                  rec={'name':name,'nav_status':r.status if r else None,'final_url':page.url,'title':await page.title(),'body_head':body[:3000],'images':dom['images'][:100],'relevant_requests':rel[:500]}
+                  browser_records.append(rec);print('BROWSER',json.dumps(rec,ensure_ascii=False)[:100000],flush=True)
+                except Exception as e:
+                  rec={'name':name,'url':url,'error':repr(e),'final_url':page.url};browser_records.append(rec);print('BROWSER_ERROR',json.dumps(rec,ensure_ascii=False),flush=True)
+                await page.close()
+              await browser.close()
+          asyncio.run(main())
+          W.joinpath('browser_summary.json').write_text(json.dumps(browser_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AVIC-China-Report-Source-Inspection
+          path: avic_source_inspect
+          retention-days: 1
+          compression-level: 6
