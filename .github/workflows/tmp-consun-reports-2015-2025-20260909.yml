@@ -1,0 +1,574 @@
+name: Build Consun Pharmaceutical 2015-2025 reports
+on:
+  push:
+    branches:
+      - tmp-consun-reports-2015-2025-20260909
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf playwright
+      - name: Discover, download, validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/package output/audit work
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urlencode, urljoin, urlparse
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          PACKAGE = Path('output/package')
+          AUDIT = Path('output/audit')
+          WORK = Path('work')
+          PACKAGE.mkdir(parents=True, exist_ok=True)
+          AUDIT.mkdir(parents=True, exist_ok=True)
+          WORK.mkdir(parents=True, exist_ok=True)
+
+          STOCK_ID = '98238'
+          STOCK_CODE = '01681'
+          COMPANY_EN = 'CONSUN PHARMACEUTICAL GROUP LIMITED'
+          COMPANY_ZH = '康臣葯業集團有限公司'
+          SEARCH_PAGE = 'https://www1.hkexnews.hk/search/titlesearch.xhtml'
+          SEARCH_API = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36'
+
+          retry = Retry(
+              total=8,
+              connect=8,
+              read=8,
+              status=8,
+              backoff_factor=1.0,
+              status_forcelist=(429, 500, 502, 503, 504),
+              allowed_methods=frozenset(['GET', 'POST']),
+          )
+          session = requests.Session()
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+          })
+
+          def clean_text(value: Any) -> str:
+              return re.sub(r'\s+', ' ', str(value or '')).strip()
+
+          def normalize_url(value: Any, base: str = SEARCH_PAGE) -> str | None:
+              if value is None:
+                  return None
+              text = str(value).strip().replace('\\/', '/').replace('&amp;', '&')
+              if not text:
+                  return None
+              if text.startswith('//'):
+                  text = 'https:' + text
+              text = urljoin(base, text)
+              if not text.startswith(('http://', 'https://')):
+                  return None
+              return text
+
+          def is_pdf_url(url: str) -> bool:
+              lower = url.lower()
+              return '.pdf' in lower or '/listedco/listconews/' in lower
+
+          def candidate_key(item: dict[str, Any]) -> tuple[str, str]:
+              return (item.get('url', '').split('#')[0], clean_text(item.get('title')).upper())
+
+          def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+              out: list[dict[str, Any]] = []
+              seen: set[str] = set()
+              for item in items:
+                  url = normalize_url(item.get('url'))
+                  if not url or not is_pdf_url(url):
+                      continue
+                  url = url.split('#')[0]
+                  if url in seen:
+                      continue
+                  seen.add(url)
+                  out.append({
+                      'url': url,
+                      'title': clean_text(item.get('title')),
+                      'source': clean_text(item.get('source')),
+                  })
+              return out
+
+          def parse_html(text: str, base_url: str, source: str) -> list[dict[str, Any]]:
+              items: list[dict[str, Any]] = []
+              soup = BeautifulSoup(text, 'lxml')
+              for anchor in soup.find_all('a', href=True):
+                  url = normalize_url(anchor.get('href'), base_url)
+                  if url and is_pdf_url(url):
+                      items.append({'url': url, 'title': clean_text(anchor.get_text(' ', strip=True)), 'source': source})
+              decoded = text.replace('\\/', '/')
+              for match in re.finditer(r'(?:https?:)?//[^"\'<>\s]+?\.pdf(?:\?[^"\'<>\s]*)?|/listedco/listconews/[^"\'<>\s]+?\.pdf', decoded, re.I):
+                  url = normalize_url(match.group(0), base_url)
+                  if url:
+                      start = max(0, match.start() - 500)
+                      end = min(len(decoded), match.end() + 500)
+                      nearby = clean_text(BeautifulSoup(decoded[start:end], 'lxml').get_text(' ', strip=True))
+                      items.append({'url': url, 'title': nearby[:500], 'source': source + ':regex'})
+              return items
+
+          def parse_json_object(obj: Any, source: str) -> list[dict[str, Any]]:
+              items: list[dict[str, Any]] = []
+
+              def walk(node: Any) -> None:
+                  if isinstance(node, dict):
+                      strings = {str(k): str(v) for k, v in node.items() if isinstance(v, (str, int, float))}
+                      title = ''
+                      for key, value in strings.items():
+                          if any(token in key.lower() for token in ['title', 'headline', 'name', 'subject', 'docname']):
+                              title = clean_text(value)
+                              if title:
+                                  break
+                      for key, value in strings.items():
+                          url = normalize_url(value)
+                          if url and is_pdf_url(url):
+                              items.append({'url': url, 'title': title or clean_text(json.dumps(node, ensure_ascii=False))[:500], 'source': source + ':' + key})
+                      for value in node.values():
+                          walk(value)
+                  elif isinstance(node, list):
+                      for value in node:
+                          walk(value)
+                  elif isinstance(node, str):
+                      url = normalize_url(node)
+                      if url and is_pdf_url(url):
+                          items.append({'url': url, 'title': '', 'source': source + ':string'})
+
+              walk(obj)
+              return items
+
+          def search_requests(from_date: str, to_date: str, lang: str = 'EN') -> list[dict[str, Any]]:
+              common = {
+                  'category': '0',
+                  'documentType': '-1',
+                  'from': from_date,
+                  'lang': lang,
+                  'market': 'SEHK',
+                  'searchType': '0',
+                  'stockId': STOCK_ID,
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'to': to_date,
+              }
+              items: list[dict[str, Any]] = []
+              audit: list[dict[str, Any]] = []
+              try:
+                  first = session.get(SEARCH_PAGE, params=common, timeout=(30, 180))
+                  audit.append({'kind': 'GET page', 'status': first.status_code, 'bytes': len(first.content), 'url': first.url})
+                  first.raise_for_status()
+                  items.extend(parse_html(first.text, first.url, 'GET-page'))
+              except Exception as exc:
+                  audit.append({'kind': 'GET page', 'error': repr(exc)})
+              api_payload = {
+                  **common,
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'rowRange': '1000',
+                  'title': '',
+              }
+              for method in ['POST', 'GET']:
+                  try:
+                      if method == 'POST':
+                          response = session.post(
+                              SEARCH_API,
+                              data=api_payload,
+                              headers={'Referer': SEARCH_PAGE, 'X-Requested-With': 'XMLHttpRequest'},
+                              timeout=(30, 180),
+                          )
+                      else:
+                          response = session.get(
+                              SEARCH_API,
+                              params=api_payload,
+                              headers={'Referer': SEARCH_PAGE, 'X-Requested-With': 'XMLHttpRequest'},
+                              timeout=(30, 180),
+                          )
+                      audit.append({'kind': method + ' API', 'status': response.status_code, 'bytes': len(response.content), 'url': response.url, 'content_type': response.headers.get('content-type', '')})
+                      response.raise_for_status()
+                      try:
+                          obj = response.json()
+                          items.extend(parse_json_object(obj, method + '-api-json'))
+                      except Exception:
+                          items.extend(parse_html(response.text, response.url, method + '-api-text'))
+                  except Exception as exc:
+                      audit.append({'kind': method + ' API', 'error': repr(exc)})
+              (AUDIT / f'requests_{from_date}_{to_date}_{lang}.json').write_text(
+                  json.dumps({'audit': audit, 'candidates': dedupe(items)}, ensure_ascii=False, indent=2),
+                  encoding='utf-8',
+              )
+              return dedupe(items)
+
+          browser = None
+          playwright = None
+
+          def ensure_browser():
+              global browser, playwright
+              if browser is not None:
+                  return
+              playwright = sync_playwright().start()
+              chrome = shutil.which('google-chrome-stable') or shutil.which('google-chrome') or shutil.which('chromium')
+              browser = playwright.chromium.launch(
+                  headless=True,
+                  executable_path=chrome,
+                  args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+              )
+
+          def search_browser(from_date: str, to_date: str, lang: str = 'EN') -> list[dict[str, Any]]:
+              ensure_browser()
+              params = {
+                  'category': '0',
+                  'documentType': '-1',
+                  'from': from_date,
+                  'lang': lang,
+                  'market': 'SEHK',
+                  'searchType': '0',
+                  'stockId': STOCK_ID,
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'to': to_date,
+              }
+              url = SEARCH_PAGE + '?' + urlencode(params)
+              context = browser.new_context(
+                  user_agent=UA,
+                  locale='en-US' if lang == 'EN' else 'zh-HK',
+                  viewport={'width': 1440, 'height': 1000},
+                  extra_http_headers={'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8'},
+              )
+              page = context.new_page()
+              responses: list[dict[str, Any]] = []
+
+              def on_response(response):
+                  if 'titleSearchServlet' in response.url or 'titlesearch' in response.url:
+                      try:
+                          responses.append({'url': response.url, 'status': response.status, 'content_type': response.headers.get('content-type', '')})
+                      except Exception:
+                          pass
+
+              page.on('response', on_response)
+              items: list[dict[str, Any]] = []
+              audit: dict[str, Any] = {'url': url, 'responses': responses}
+              try:
+                  response = page.goto(url, wait_until='domcontentloaded', timeout=120000)
+                  audit['status'] = response.status if response else None
+                  try:
+                      page.wait_for_load_state('networkidle', timeout=30000)
+                  except PlaywrightTimeout:
+                      pass
+                  page.wait_for_timeout(3000)
+                  for _ in range(20):
+                      locator = page.get_by_text(re.compile(r'LOAD MORE|載入更多|加载更多', re.I))
+                      if locator.count() == 0:
+                          break
+                      button = locator.first
+                      try:
+                          if not button.is_visible():
+                              break
+                          button.click(timeout=7000)
+                          page.wait_for_timeout(1500)
+                      except Exception:
+                          break
+                  links = page.eval_on_selector_all(
+                      'a[href]',
+                      "els => els.map(e => ({href:e.href, text:(e.innerText||e.textContent||'').trim()}))",
+                  )
+                  for link in links:
+                      url2 = normalize_url(link.get('href'), page.url)
+                      if url2 and is_pdf_url(url2):
+                          items.append({'url': url2, 'title': clean_text(link.get('text')), 'source': 'browser'})
+                  html = page.content()
+                  items.extend(parse_html(html, page.url, 'browser-html'))
+                  audit.update({'title': page.title(), 'body': clean_text(page.locator('body').inner_text())[:10000], 'link_count': len(links), 'candidate_count': len(dedupe(items)), 'final_url': page.url})
+                  (AUDIT / f'browser_{from_date}_{to_date}_{lang}.html').write_text(html, encoding='utf-8')
+              except Exception as exc:
+                  audit['error'] = repr(exc)
+              finally:
+                  context.close()
+              (AUDIT / f'browser_{from_date}_{to_date}_{lang}.json').write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding='utf-8')
+              return dedupe(items)
+
+          all_search_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+          def search_period(from_date: str, to_date: str) -> list[dict[str, Any]]:
+              key = (from_date, to_date)
+              if key in all_search_cache:
+                  return all_search_cache[key]
+              items: list[dict[str, Any]] = []
+              for lang in ['EN', 'ZH']:
+                  items.extend(search_requests(from_date, to_date, lang))
+              unique = dedupe(items)
+              # Browser is the authoritative fallback and also expands hidden AJAX results.
+              if not unique or not any('ANNUAL' in clean_text(x.get('title')).upper() or '年度' in clean_text(x.get('title')) or 'INTERIM' in clean_text(x.get('title')).upper() or '中期' in clean_text(x.get('title')) for x in unique):
+                  for lang in ['EN', 'ZH']:
+                      unique.extend(search_browser(from_date, to_date, lang))
+              else:
+                  # Still use one browser pass to capture records omitted from static HTML.
+                  unique.extend(search_browser(from_date, to_date, 'EN'))
+              unique = dedupe(unique)
+              (AUDIT / f'combined_{from_date}_{to_date}.json').write_text(json.dumps(unique, ensure_ascii=False, indent=2), encoding='utf-8')
+              all_search_cache[key] = unique
+              return unique
+
+          def annual_score(item: dict[str, Any], year: int) -> int:
+              title = clean_text(item.get('title'))
+              upper = title.upper()
+              score = 0
+              if 'ANNUAL REPORT' in upper or '年度報告' in title or '年度报告' in title:
+                  score += 100
+              if str(year) in title:
+                  score += 40
+              if re.search(rf'ANNUAL\s+REPORT\s*{year}', upper):
+                  score += 40
+              if any(term in upper for term in ['ANNUAL RESULTS', 'RESULTS ANNOUNCEMENT', 'ESG', 'ENVIRONMENTAL', 'SUSTAINABILITY']):
+                  score -= 150
+              if any(term in title for term in ['全年業績', '全年业绩', '環境', '环境', '可持續', '可持续']):
+                  score -= 150
+              if 'hkexnews.hk/listedco/listconews' in item.get('url', '').lower():
+                  score += 15
+              return score
+
+          def choose_annual(year: int) -> dict[str, Any]:
+              release_year = year + 1
+              periods = [
+                  (f'{release_year}0201', f'{release_year}0630'),
+                  (f'{release_year}0101', f'{release_year}1231'),
+              ]
+              candidates: list[dict[str, Any]] = []
+              for start, end in periods:
+                  candidates.extend(search_period(start, end))
+                  ranked = sorted(dedupe(candidates), key=lambda x: annual_score(x, year), reverse=True)
+                  if ranked and annual_score(ranked[0], year) >= 100:
+                      return ranked[0]
+              ranked = sorted(dedupe(candidates), key=lambda x: annual_score(x, year), reverse=True)
+              raise RuntimeError(f'Annual report {year} not found. Top candidates: {ranked[:12]}')
+
+          def latest_score(item: dict[str, Any]) -> int:
+              title = clean_text(item.get('title'))
+              upper = title.upper()
+              score = 0
+              if 'INTERIM REPORT 2026' in upper or ('2026' in title and ('中期報告' in title or '中期报告' in title)):
+                  score += 300
+              if 'INTERIM RESULTS ANNOUNCEMENT' in upper and '2026' in title:
+                  score += 220
+              if 'INTERIM RESULTS' in upper and '30 JUNE 2026' in upper:
+                  score += 200
+              if '中期業績' in title and '2026' in title:
+                  score += 180
+              if any(term in upper for term in ['DIVIDEND', 'BOARD MEETING', 'MONTHLY RETURN']):
+                  score -= 200
+              if 'hkexnews.hk/listedco/listconews' in item.get('url', '').lower():
+                  score += 15
+              return score
+
+          def choose_latest() -> dict[str, Any]:
+              candidates = search_period('20260801', '20260909')
+              ranked = sorted(candidates, key=latest_score, reverse=True)
+              if ranked and latest_score(ranked[0]) >= 180:
+                  return ranked[0]
+              raise RuntimeError(f'Latest 2026 interim financial report not found. Top candidates: {ranked[:15]}')
+
+          selected: list[dict[str, Any]] = []
+          for year in range(2015, 2026):
+              item = choose_annual(year)
+              selected.append({'kind': '年度报告', 'report_year': year, **item})
+              print('SELECTED_ANNUAL', year, json.dumps(item, ensure_ascii=False), flush=True)
+          latest = choose_latest()
+          selected.append({'kind': '最新中期财务披露', 'report_year': 2026, **latest})
+          print('SELECTED_LATEST', json.dumps(latest, ensure_ascii=False), flush=True)
+          (AUDIT / 'selected_candidates.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def release_date_from_url(url: str) -> str:
+              path = urlparse(url).path
+              match = re.search(r'/((?:19|20)\d{2})/(\d{2})(\d{2})/', path)
+              if match:
+                  return f'{match.group(1)}-{match.group(2)}-{match.group(3)}'
+              match = re.search(r'/((?:19|20)\d{2})/(\d{4})/', path)
+              if match:
+                  mmdd = match.group(2)
+                  return f'{match.group(1)}-{mmdd[:2]}-{mmdd[2:]}'
+              return ''
+
+          def download_pdf(url: str, destination: Path) -> tuple[bytes, str]:
+              last_error: Exception | None = None
+              for attempt in range(1, 8):
+                  try:
+                      response = session.get(
+                          url,
+                          headers={'Referer': SEARCH_PAGE, 'Accept': 'application/pdf,*/*;q=0.8'},
+                          timeout=(30, 300),
+                          allow_redirects=True,
+                      )
+                      print('DOWNLOAD', attempt, response.status_code, len(response.content), response.url, flush=True)
+                      response.raise_for_status()
+                      data = response.content
+                      if b'%PDF-' not in data[:2048] or len(data) < 25_000:
+                          raise RuntimeError(f'Invalid PDF payload ({len(data)} bytes)')
+                      destination.write_bytes(data)
+                      return data, response.url
+                  except Exception as exc:
+                      last_error = exc
+                      time.sleep(min(2 ** attempt, 20))
+              raise RuntimeError(f'Failed to download {url}: {last_error!r}')
+
+          def extract_sample(path: Path, page_limit: int = 12) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              page_count = len(reader.pages)
+              indices = list(range(min(page_count, page_limit)))
+              if page_count > page_limit:
+                  indices += [page_count - 2, page_count - 1]
+              seen: set[int] = set()
+              parts: list[str] = []
+              for index in indices:
+                  if index in seen or index < 0:
+                      continue
+                  seen.add(index)
+                  try:
+                      parts.append(reader.pages[index].extract_text() or '')
+                  except Exception:
+                      pass
+              return page_count, clean_text('\n'.join(parts))
+
+          manifest: list[dict[str, Any]] = []
+          seen_hashes: set[str] = set()
+          for sequence, item in enumerate(selected, 1):
+              year = int(item['report_year'])
+              if item['kind'] == '年度报告':
+                  filename = f'{sequence:02d}_康臣药业_{year}年年度报告.pdf'
+              else:
+                  title_upper = clean_text(item.get('title')).upper()
+                  suffix = '中期报告' if 'INTERIM REPORT' in title_upper and 'RESULTS' not in title_upper else '中期业绩公告'
+                  filename = f'{sequence:02d}_康臣药业_{year}年{suffix}.pdf'
+              path = PACKAGE / filename
+              data, final_url = download_pdf(item['url'], path)
+              sha256 = hashlib.sha256(data).hexdigest()
+              if sha256 in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {filename}')
+              seen_hashes.add(sha256)
+              page_count, sample = extract_sample(path)
+              sample_upper = sample.upper()
+              company_ok = (
+                  'CONSUN PHARMACEUTICAL' in sample_upper
+                  or '康臣葯業' in sample
+                  or '康臣药业' in sample
+                  or re.search(r'\b1681\b', sample_upper) is not None
+              )
+              year_ok = str(year) in sample
+              if not company_ok:
+                  raise RuntimeError(f'Company identity validation failed for {filename}: {sample[:1000]}')
+              if not year_ok:
+                  raise RuntimeError(f'Report year validation failed for {filename}: {sample[:1000]}')
+              doc = fitz.open(path)
+              fitz_pages = doc.page_count
+              if fitz_pages != page_count:
+                  raise RuntimeError(f'Page-count mismatch for {filename}: pypdf={page_count}, fitz={fitz_pages}')
+              for index in sorted(set([0, max(0, fitz_pages - 1)])):
+                  pix = doc[index].get_pixmap(matrix=fitz.Matrix(0.45, 0.45), alpha=False)
+                  if not pix.samples or pix.width < 100 or pix.height < 100:
+                      raise RuntimeError(f'Render validation failed for {filename} page {index + 1}')
+              doc.close()
+              manifest.append({
+                  '序号': sequence,
+                  '文件名': filename,
+                  '报告类型': item['kind'],
+                  '报告年度': year,
+                  '披露日期': release_date_from_url(final_url),
+                  'PDF页数': page_count,
+                  '文件大小（字节）': len(data),
+                  'SHA-256': sha256,
+                  '港交所官方来源': final_url,
+              })
+              print('VERIFIED', filename, page_count, sha256, flush=True)
+
+          if len(manifest) != 12:
+              raise RuntimeError(f'Expected 12 PDFs, got {len(manifest)}')
+          annual_years = [row['报告年度'] for row in manifest if row['报告类型'] == '年度报告']
+          if annual_years != list(range(2015, 2026)):
+              raise RuntimeError(f'Annual coverage mismatch: {annual_years}')
+
+          csv_path = PACKAGE / '文件清单与校验值.csv'
+          with csv_path.open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          readme_lines = [
+              '康臣药业集团有限公司（Consun Pharmaceutical Group Limited，01681.HK）',
+              '2015—2025年年度报告及最新中期财务披露资料包',
+              '打包日期：2026-09-09',
+              '',
+              '内容：',
+              '1. 2015—2025财年完整年度报告，共11份。',
+              '2. 截至2026年9月9日可取得的最新集团层面财务披露：截至2026年6月30日止六个月的中期业绩公告。',
+              '',
+              '说明：康臣药业为香港上市公司，通常不披露A股式第一季度、第三季度报告；本资料包按港股披露口径收录最新中期财务披露。',
+              '来源：全部PDF均来自香港交易所披露易（HKEXnews）官方文件。',
+              '校验：已检查PDF文件头、公司名称、报告年度、实际页数、首尾页渲染、SHA-256；并在上传前执行ZIP CRC完整性测试。',
+              '',
+              '文件列表：',
+          ]
+          for row in manifest:
+              readme_lines.append(f"{row['序号']:02d}. {row['文件名']}｜{row['PDF页数']}页｜披露日期 {row['披露日期']}｜{row['港交所官方来源']}")
+          (PACKAGE / 'README.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+
+          test_zip = WORK / 'validation.zip'
+          with zipfile.ZipFile(test_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(PACKAGE.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(test_zip, 'r') as archive:
+              bad = archive.testzip()
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad is not None:
+                  raise RuntimeError(f'ZIP CRC failed at {bad}')
+              if len(pdf_names) != 12:
+                  raise RuntimeError(f'Unexpected PDF count in validation ZIP: {len(pdf_names)}')
+          total_pages = sum(int(row['PDF页数']) for row in manifest)
+          status = {
+              'ok': True,
+              'company': COMPANY_EN,
+              'stock_code': STOCK_CODE,
+              'pdf_count': 12,
+              'annual_years': annual_years,
+              'latest_report_year': 2026,
+              'total_pages': total_pages,
+              'zip_crc_ok': True,
+              'reports': manifest,
+          }
+          (PACKAGE / '验证摘要.json').write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(status, ensure_ascii=False), flush=True)
+
+          if browser is not None:
+              browser.close()
+          if playwright is not None:
+              playwright.stop()
+          PY
+      - name: Upload verified report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: consun-pharma-2015-2025-reports
+          path: output/package/*
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 6
