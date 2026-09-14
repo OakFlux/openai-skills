@@ -1,0 +1,173 @@
+name: chatgpt-temp-cmbc-detail-inspect
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-cmbc-detail-inspect.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect detail pages, APIs, and browser network
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 playwright
+          python <<'PY'
+          import asyncio
+          import json
+          import os
+          import re
+          import urllib.parse
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          WORK = Path('cmbc_detail_inspect')
+          WORK.mkdir(exist_ok=True)
+          REPORTS = [
+              {'id': 160847, 'detail': 'https://www.sdyanbao.com/detail/160847'},
+              {'id': 112871, 'detail': 'https://www.sdyanbao.com/detail/112871'},
+              {'id': 99059, 'detail': 'https://www.sdyanbao.com/detail/99059'},
+          ]
+          UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          guessed_templates = [
+              'https://api.sdyanbao.com/api/file/detail?id={id}',
+              'https://api.sdyanbao.com/api/file/info?id={id}',
+              'https://api.sdyanbao.com/api/file/get?id={id}',
+              'https://api.sdyanbao.com/api/file/view?id={id}',
+              'https://api.sdyanbao.com/api/file/download?id={id}',
+              'https://api.sdyanbao.com/api/file/getDetail?id={id}',
+              'https://api.sdyanbao.com/api/file/getFileDetail?id={id}',
+              'https://api.sdyanbao.com/api/file/getFile?id={id}',
+              'https://api.sdyanbao.com/api/file/{id}',
+              'https://api.sdyanbao.com/api/detail/{id}',
+          ]
+
+          guessed = []
+          for report in REPORTS:
+              rdir = WORK / str(report['id'])
+              rdir.mkdir(exist_ok=True)
+              try:
+                  response = session.get(report['detail'], timeout=90, allow_redirects=True)
+                  print('DETAIL', report['id'], response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                  (rdir / 'detail.html').write_bytes(response.content)
+                  soup = BeautifulSoup(response.text, 'html.parser')
+                  analysis = {
+                      'title': soup.title.get_text(' ', strip=True) if soup.title else '',
+                      'text': soup.get_text(' ', strip=True)[:20000],
+                      'links': [],
+                      'scripts': [],
+                      'raw_urls': list(dict.fromkeys(re.findall(r'(?:https?:)?//[^"\'<>\s]+|/[A-Za-z0-9_./?=&%:-]+', response.text))),
+                      'ids': list(dict.fromkeys(re.findall(r'\b\d{5,18}\b', response.text))),
+                  }
+                  for anchor in soup.find_all('a', href=True):
+                      analysis['links'].append({
+                          'text': ' '.join(anchor.get_text(' ', strip=True).split()),
+                          'href': urllib.parse.urljoin(response.url, anchor['href']),
+                          'attrs': {k: str(v) for k, v in anchor.attrs.items()},
+                      })
+                  for script in soup.find_all('script'):
+                      analysis['scripts'].append({
+                          'src': urllib.parse.urljoin(response.url, script.get('src')) if script.get('src') else None,
+                          'text': (script.string or script.get_text() or '')[:300000],
+                      })
+                  (rdir / 'analysis.json').write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding='utf-8')
+              except Exception as exc:
+                  print('DETAIL_ERROR', report['id'], repr(exc), flush=True)
+
+              for template in guessed_templates:
+                  url = template.format(id=report['id'])
+                  try:
+                      rr = session.get(url, headers={'Referer': report['detail'], 'Accept': 'application/json,text/plain,*/*'}, timeout=60, allow_redirects=True)
+                      rec = {
+                          'id': report['id'],
+                          'url': url,
+                          'status': rr.status_code,
+                          'bytes': len(rr.content),
+                          'type': rr.headers.get('content-type'),
+                          'final': rr.url,
+                          'head': rr.text[:10000],
+                      }
+                  except Exception as exc:
+                      rec = {'id': report['id'], 'url': url, 'error': repr(exc)}
+                  guessed.append(rec)
+                  print('GUESS', json.dumps(rec, ensure_ascii=False), flush=True)
+          (WORK / 'guessed_api.json').write_text(json.dumps(guessed, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          async def browser_probe():
+              all_responses = []
+              async with async_playwright() as p:
+                  executable = next((x for x in ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium'] if os.path.exists(x)), None)
+                  browser = await p.chromium.launch(headless=True, executable_path=executable, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                  context = await browser.new_context(viewport={'width': 1440, 'height': 1200}, user_agent=UA, locale='zh-CN')
+                  for report in REPORTS:
+                      page = await context.new_page()
+                      responses = []
+
+                      async def on_response(resp):
+                          url = resp.url
+                          headers = await resp.all_headers()
+                          ctype = headers.get('content-type', '')
+                          if any(token in url.lower() for token in ['sdyanbao', 'oss.', 'pdf', 'download', '/file/', '/page/']) or 'application/pdf' in ctype or ctype.startswith('image/'):
+                              record = {
+                                  'url': url,
+                                  'status': resp.status,
+                                  'content_type': ctype,
+                                  'method': resp.request.method,
+                                  'post_data': resp.request.post_data,
+                              }
+                              try:
+                                  body = await resp.body()
+                                  record['bytes'] = len(body)
+                                  if len(body) <= 25_000_000:
+                                      filename = f"{report['id']}_resp_{len(responses):04d}.bin"
+                                      (WORK / filename).write_bytes(body)
+                                      record['file'] = filename
+                                      record['head'] = body[:5000].decode('utf-8', 'ignore')
+                              except Exception as exc:
+                                  record['error'] = repr(exc)
+                              responses.append(record)
+                              print('RESPONSE', report['id'], json.dumps(record, ensure_ascii=False), flush=True)
+
+                      page.on('response', on_response)
+                      try:
+                          await page.goto(report['detail'], wait_until='domcontentloaded', timeout=90000)
+                          await page.wait_for_timeout(12000)
+                          for position in range(0, 9000, 800):
+                              await page.evaluate(f'window.scrollTo(0,{position})')
+                              await page.wait_for_timeout(250)
+                          await page.wait_for_timeout(3000)
+                          (WORK / f"{report['id']}_body.txt").write_text(await page.locator('body').inner_text(), encoding='utf-8')
+                          (WORK / f"{report['id']}_dom.html").write_text(await page.content(), encoding='utf-8')
+                          for selector in ['text=在线阅读', 'text=查看报告', 'text=阅读全文', 'text=查看完整报告', 'text=下载报告']:
+                              try:
+                                  locator = page.locator(selector).first
+                                  if await locator.count() and await locator.is_visible():
+                                      await locator.click(timeout=5000)
+                                      await page.wait_for_timeout(5000)
+                                      print('CLICK', report['id'], selector, page.url, flush=True)
+                              except Exception as exc:
+                                  print('CLICK_ERROR', report['id'], selector, repr(exc), flush=True)
+                      except Exception as exc:
+                          print('PAGE_ERROR', report['id'], repr(exc), flush=True)
+                      await page.close()
+                      all_responses.append({'id': report['id'], 'responses': responses})
+                  await browser.close()
+              (WORK / 'browser_responses.json').write_text(json.dumps(all_responses, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          asyncio.run(browser_probe())
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CMBC-Detail-Inspect
+          path: cmbc_detail_inspect
+          retention-days: 1
+          compression-level: 6
