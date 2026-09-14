@@ -1,0 +1,257 @@
+name: Build PSBC 2020-2025 reports archive
+on:
+  push:
+    branches:
+      - tmp-psbc-reports-20260914
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf pymupdf
+      - name: Download, verify and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pdfs work/renders
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('output')
+          PDFDIR = Path('work/pdfs')
+          RENDERDIR = Path('work/renders')
+          OUT.mkdir(parents=True, exist_ok=True)
+          PDFDIR.mkdir(parents=True, exist_ok=True)
+          RENDERDIR.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'seq': 1,
+                  'kind': '年度报告',
+                  'period': '2020',
+                  'filename': '01_邮储银行_2020年年度报告.pdf',
+                  'url': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202103/P020210329678480837995.pdf',
+                  'tokens': ['2020', '中国邮政储蓄银行'],
+              },
+              {
+                  'seq': 2,
+                  'kind': '年度报告',
+                  'period': '2021',
+                  'filename': '02_邮储银行_2021年年度报告.pdf',
+                  'url': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202203/P020220330722507558806.pdf',
+                  'tokens': ['2021', '中国邮政储蓄银行'],
+              },
+              {
+                  'seq': 3,
+                  'kind': '年度报告',
+                  'period': '2022',
+                  'filename': '03_邮储银行_2022年年度报告.pdf',
+                  'url': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202303/P020230330654418000845.pdf',
+                  'tokens': ['2022', '中国邮政储蓄银行'],
+              },
+              {
+                  'seq': 4,
+                  'kind': '年度报告',
+                  'period': '2023',
+                  'filename': '04_邮储银行_2023年年度报告.pdf',
+                  'url': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202403/P020240328719578075690.pdf',
+                  'tokens': ['2023', '中国邮政储蓄银行'],
+              },
+              {
+                  'seq': 5,
+                  'kind': '年度报告',
+                  'period': '2024',
+                  'filename': '05_邮储银行_2024年年度报告.pdf',
+                  'url': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202503/P020250327777905099004.pdf',
+                  'tokens': ['2024', '中国邮政储蓄银行'],
+              },
+              {
+                  'seq': 6,
+                  'kind': '年度报告',
+                  'period': '2025',
+                  'filename': '06_邮储银行_2025年年度报告.pdf',
+                  'url': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202603/P020260327786964695291.pdf',
+                  'tokens': ['2025', '中国邮政储蓄银行'],
+              },
+              {
+                  'seq': 7,
+                  'kind': '第一季度报告',
+                  'period': '2026Q1',
+                  'filename': '07_邮储银行_2026年第一季度报告.pdf',
+                  'url': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202604/P020260429594132021106.pdf',
+                  'tokens': ['2026', '第一季度', '中国邮政储蓄银行'],
+              },
+              {
+                  'seq': 8,
+                  'kind': '半年度报告',
+                  'period': '2026H1',
+                  'filename': '08_邮储银行_2026年半年度报告.pdf',
+                  'url': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202608/P020260828639177870043.pdf',
+                  'tokens': ['2026', '半年度', '中国邮政储蓄银行'],
+              },
+          ]
+
+          retry = Retry(
+              total=8,
+              connect=8,
+              read=8,
+              status=8,
+              backoff_factor=1.2,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=frozenset(['GET']),
+          )
+          session = requests.Session()
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/',
+          })
+
+          def normalized(text: str) -> str:
+              return re.sub(r'\s+', '', text or '')
+
+          manifest = []
+          for spec in reports:
+              dest = PDFDIR / spec['filename']
+              last_error = None
+              for attempt in range(1, 9):
+                  try:
+                      print('DOWNLOAD', spec['seq'], attempt, spec['url'], flush=True)
+                      with session.get(spec['url'], stream=True, timeout=(30, 600), allow_redirects=True) as response:
+                          response.raise_for_status()
+                          h = hashlib.sha256()
+                          size = 0
+                          with dest.open('wb') as f:
+                              for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                  if not chunk:
+                                      continue
+                                  f.write(chunk)
+                                  h.update(chunk)
+                                  size += len(chunk)
+                      data_head = dest.read_bytes()[:2048]
+                      if b'%PDF-' not in data_head or size < 100000:
+                          raise RuntimeError(f'Invalid PDF payload: {size} bytes')
+
+                      reader = PdfReader(str(dest), strict=False)
+                      pages = len(reader.pages)
+                      if pages < 5:
+                          raise RuntimeError(f'Unexpected page count: {pages}')
+                      sample_parts = []
+                      for page in reader.pages[:10]:
+                          try:
+                              sample_parts.append(page.extract_text() or '')
+                          except Exception:
+                              pass
+                      text = normalized('\n'.join(sample_parts))
+                      for token in spec['tokens']:
+                          if normalized(token) not in text:
+                              raise RuntimeError(f'Identity token not found: {token}')
+
+                      doc = fitz.open(dest)
+                      for page_index, suffix in [(0, 'first'), (len(doc) - 1, 'last')]:
+                          pix = doc[page_index].get_pixmap(matrix=fitz.Matrix(0.7, 0.7), alpha=False)
+                          png = RENDERDIR / f"{spec['seq']:02d}_{suffix}.png"
+                          pix.save(str(png))
+                          if png.stat().st_size < 10000:
+                              raise RuntimeError(f'Render too small: {png}')
+                      doc.close()
+
+                      manifest.append({
+                          '序号': spec['seq'],
+                          '文件名': spec['filename'],
+                          '报告类型': spec['kind'],
+                          '报告期间': spec['period'],
+                          'PDF页数': pages,
+                          '文件大小（字节）': size,
+                          'SHA-256': h.hexdigest(),
+                          '官方来源': spec['url'],
+                      })
+                      print('VERIFIED', spec['filename'], pages, size, flush=True)
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      print('RETRY', spec['seq'], attempt, repr(exc), flush=True)
+                      dest.unlink(missing_ok=True)
+                      time.sleep(min(2 ** attempt, 30))
+              else:
+                  raise RuntimeError(f"Failed {spec['filename']}: {last_error!r}")
+
+          if len(manifest) != 8:
+              raise RuntimeError(f'Expected 8 verified PDFs, got {len(manifest)}')
+
+          csv_path = PDFDIR / '文件清单与校验值.csv'
+          with csv_path.open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          readme = PDFDIR / 'README.txt'
+          readme.write_text(
+              '\n'.join([
+                  '中国邮政储蓄银行（601658.SH / 01658.HK）定期报告资料包',
+                  '打包日期：2026-09-14',
+                  '',
+                  '内容：',
+                  '1. 2020-2025年完整年度报告，共6份。',
+                  '2. 2026年第一季度报告：严格意义上的最新季度报告。',
+                  '3. 2026年半年度报告：截至打包日最新披露的完整定期财务报告。',
+                  '',
+                  '全部PDF来自邮储银行官方网站。已检查PDF文件头、可解析性、实际页数、公司名称、报告期间、首末页渲染及SHA-256。',
+                  '压缩包已通过ZIP CRC完整性测试。',
+              ]),
+              encoding='utf-8',
+          )
+
+          final_en = OUT / 'PSBC_601658_2020-2025_Annual_and_2026_Latest_Reports.zip'
+          with zipfile.ZipFile(final_en, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for p in sorted(PDFDIR.iterdir()):
+                  z.write(p, arcname=p.name)
+          with zipfile.ZipFile(final_en, 'r') as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != 8:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={len(pdfs)}')
+
+          final_cn = OUT / '邮储银行_601658_2020-2025年报及2026年最新报告.zip'
+          shutil.copy2(final_en, final_cn)
+          result = {
+              'ok': True,
+              'archive_en': final_en.name,
+              'archive_cn': final_cn.name,
+              'archive_bytes': final_en.stat().st_size,
+              'pdf_count': 8,
+              'zip_crc_ok': True,
+              'reports': manifest,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbc-verified-reports
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
