@@ -1,0 +1,209 @@
+name: Build PSBC reports archive v2
+on:
+  push:
+    branches:
+      - tmp-psbc-reports-v2-20260914
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf pymupdf
+      - name: Download, verify and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pdfs work/renders
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('output')
+          PDFDIR = Path('work/pdfs')
+          RENDERDIR = Path('work/renders')
+
+          reports = [
+              (1, '年度报告', '2020', '01_邮储银行_2020年年度报告.pdf', 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202103/P020210329678480837995.pdf'),
+              (2, '年度报告', '2021', '02_邮储银行_2021年年度报告.pdf', 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202203/P020220330722507558806.pdf'),
+              (3, '年度报告', '2022', '03_邮储银行_2022年年度报告.pdf', 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202303/P020230330654418000845.pdf'),
+              (4, '年度报告', '2023', '04_邮储银行_2023年年度报告.pdf', 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202403/P020240328719578075690.pdf'),
+              (5, '年度报告', '2024', '05_邮储银行_2024年年度报告.pdf', 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202503/P020250327777905099004.pdf'),
+              (6, '年度报告', '2025', '06_邮储银行_2025年年度报告.pdf', 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202603/P020260327786964695291.pdf'),
+              (7, '第一季度报告', '2026Q1', '07_邮储银行_2026年第一季度报告.pdf', 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202604/P020260429594132021106.pdf'),
+              (8, '半年度报告', '2026H1', '08_邮储银行_2026年半年度报告.pdf', 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/202608/P020260828639177870043.pdf'),
+          ]
+
+          retry = Retry(
+              total=7, connect=7, read=7, status=7, backoff_factor=1.2,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=frozenset(['GET']),
+          )
+          session = requests.Session()
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www.psbc.com/cn/gyyc/tzzgx/cwxx/cwbg/cwxxagbg/',
+          })
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', '', text or '').upper()
+
+          def download(url: str, dest: Path) -> tuple[int, str]:
+              last = None
+              for attempt in range(1, 8):
+                  try:
+                      print('DOWNLOAD', attempt, url, flush=True)
+                      h = hashlib.sha256()
+                      size = 0
+                      with session.get(url, stream=True, timeout=(30, 900), allow_redirects=True) as r:
+                          r.raise_for_status()
+                          with dest.open('wb') as f:
+                              for chunk in r.iter_content(1024 * 1024):
+                                  if chunk:
+                                      f.write(chunk)
+                                      h.update(chunk)
+                                      size += len(chunk)
+                      if size < 100_000 or b'%PDF-' not in dest.read_bytes()[:2048]:
+                          raise RuntimeError(f'invalid PDF payload: {size} bytes')
+                      return size, h.hexdigest()
+                  except Exception as exc:
+                      last = exc
+                      dest.unlink(missing_ok=True)
+                      print('DOWNLOAD_RETRY', attempt, repr(exc), flush=True)
+                      time.sleep(min(2 ** attempt, 25))
+              raise RuntimeError(f'download failed: {url}: {last!r}')
+
+          manifest = []
+          render_records = []
+          for seq, kind, period, filename, url in reports:
+              dest = PDFDIR / filename
+              size, sha256 = download(url, dest)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              minimum_pages = 5 if kind != '年度报告' else 100
+              if pages < minimum_pages:
+                  raise RuntimeError(f'{filename}: unexpected page count {pages}')
+
+              text_parts = []
+              for page in reader.pages[:12]:
+                  try:
+                      text_parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              try:
+                  doc_for_text = pymupdf.open(dest)
+                  for idx in range(min(12, len(doc_for_text))):
+                      text_parts.append(doc_for_text[idx].get_text('text') or '')
+                  doc_for_text.close()
+              except Exception:
+                  pass
+              text = compact('\n'.join(text_parts))
+              company_ok = ('中国邮政储蓄银行' in text) or ('POSTALSAVINGSBANKOFCHINA' in text)
+              year = period[:4]
+              if not company_ok or year not in text:
+                  raise RuntimeError(f'{filename}: identity validation failed; company={company_ok}, year={year in text}')
+
+              doc = pymupdf.open(dest)
+              page_indexes = [0, len(doc) - 1]
+              for page_index, label in zip(page_indexes, ['first', 'last']):
+                  page = doc[page_index]
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(0.8, 0.8), alpha=False)
+                  if pix.width < 100 or pix.height < 100:
+                      raise RuntimeError(f'{filename}: invalid rendered dimensions {pix.width}x{pix.height}')
+                  render_path = RENDERDIR / f'{seq:02d}_{label}.png'
+                  pix.save(str(render_path))
+                  render_records.append({
+                      '文件名': filename,
+                      '页面': page_index + 1,
+                      '渲染宽度': pix.width,
+                      '渲染高度': pix.height,
+                      '渲染文件大小': render_path.stat().st_size,
+                  })
+              doc.close()
+
+              manifest.append({
+                  '序号': seq,
+                  '文件名': filename,
+                  '报告类型': kind,
+                  '报告期间': period,
+                  'PDF页数': pages,
+                  '文件大小（字节）': size,
+                  'SHA-256': sha256,
+                  '官方来源': url,
+              })
+              print('VERIFIED', filename, pages, size, flush=True)
+
+          if len(manifest) != 8:
+              raise RuntimeError(f'expected 8 PDFs, got {len(manifest)}')
+
+          with (PDFDIR / '文件清单与校验值.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          (PDFDIR / 'README.txt').write_text(
+              '\n'.join([
+                  '中国邮政储蓄银行（601658.SH / 01658.HK）定期报告资料包',
+                  '打包日期：2026-09-14',
+                  '',
+                  '收录内容：',
+                  '1. 2020—2025年完整年度报告，共6份。',
+                  '2. 2026年第一季度报告：严格意义上的最新季度报告。',
+                  '3. 2026年半年度报告：截至打包日最新披露的完整定期财务报告。',
+                  '',
+                  '全部PDF来自邮储银行官方网站。已核验PDF文件头、可解析性、实际页数、公司及报告年度，并渲染检查首末页。',
+                  '压缩包已通过ZIP CRC完整性测试。',
+              ]),
+              encoding='utf-8',
+          )
+
+          archive = OUT / 'PSBC_601658_2020-2025_Annual_and_2026_Latest_Reports.zip'
+          with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=5) as z:
+              for p in sorted(PDFDIR.iterdir()):
+                  z.write(p, arcname=p.name)
+          with zipfile.ZipFile(archive, 'r') as z:
+              bad = z.testzip()
+              pdf_names = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad is not None or len(pdf_names) != 8:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdf_count={len(pdf_names)}')
+
+          result = {
+              'ok': True,
+              'archive': archive.name,
+              'archive_bytes': archive.stat().st_size,
+              'pdf_count': 8,
+              'zip_crc_ok': True,
+              'reports': manifest,
+              'render_checks': render_records,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbc-verified-reports-v2
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
