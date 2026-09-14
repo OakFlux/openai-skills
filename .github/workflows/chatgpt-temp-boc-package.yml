@@ -1,0 +1,311 @@
+name: chatgpt-temp-boc-package
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-boc-broker-reports-20260914
+    paths:
+      - .github/workflows/chatgpt-temp-boc-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find, download, validate and package reports
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pillow img2pdf pypdf pymupdf
+          python <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+
+          CHECKED_AS_OF = '2026-09-14'
+          WORK = Path('boc_package_work')
+          ROOT = WORK / '中国银行_601988_03988_券商研究报告_2份'
+          PDF_DIR = ROOT / 'PDF'
+          IMG_DIR = WORK / '_images'
+          QA_DIR = WORK / '_qa'
+          for d in (PDF_DIR, IMG_DIR, QA_DIR):
+              d.mkdir(parents=True, exist_ok=True)
+
+          targets = [
+              {
+                  'key': '国际化先锋，分红稳定凸显股息价值',
+                  'preferred_org': '平安证券',
+                  'kind': '公司首次覆盖报告',
+              },
+              {
+                  'key': '详解中国银行2023年报：业绩优异；手续费正增；资产质量稳健',
+                  'preferred_org': '中泰证券',
+                  'kind': '公司经营深度分析',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+
+          logs = []
+          def log(*parts):
+              msg = ' '.join(str(p) for p in parts)
+              print(msg, flush=True)
+              logs.append(msg)
+
+          def search_record(target):
+              candidates = []
+              queries = [target['key'], f"中国银行 {target['key']}"]
+              for query in queries:
+                  for only_title in (1, 0):
+                      payload = {
+                          'device': 1,
+                          'hideTrader': 0,
+                          'onlyTitle': only_title,
+                          'order': 0,
+                          'page': 1,
+                          'pageSize': 100,
+                          'keyword': query,
+                          'pageCount': '',
+                          'dateRange': '',
+                          'startTime': '',
+                          'endTime': '',
+                          'typeIds': [],
+                          'industryIds': [],
+                          'opFrom': 1,
+                      }
+                      r = session.post('https://api.sdyanbao.com/api/file/search', json=payload, timeout=90)
+                      log('SEARCH', query, 'onlyTitle', only_title, 'status', r.status_code, 'bytes', len(r.content))
+                      r.raise_for_status()
+                      obj = r.json()
+                      files = ((obj.get('data') or {}).get('files') or [])
+                      for item in files:
+                          stock = item.get('stock') or {}
+                          name = item.get('name') or ''
+                          org = (item.get('organization') or {}).get('name') or ''
+                          if (stock.get('code') == '601988' or stock.get('name') == '中国银行' or '中国银行' in name) and target['key'].replace('；','').replace('，','')[:8] in name.replace('；','').replace('，',''):
+                              candidates.append(item)
+                      if candidates:
+                          break
+                  if candidates:
+                      break
+              if not candidates:
+                  raise RuntimeError(f"No report metadata found for {target['key']}")
+              candidates.sort(key=lambda x: (
+                  target['preferred_org'] in ((x.get('organization') or {}).get('name') or ''),
+                  int(x.get('page_count') or 0),
+                  int(x.get('create_time') or 0),
+              ), reverse=True)
+              chosen = candidates[0]
+              log('CHOSEN', json.dumps(chosen, ensure_ascii=False))
+              return chosen
+
+          def safe_name(s):
+              s = re.sub(r'[\\/:*?"<>|]+', '_', s)
+              s = re.sub(r'\s+', '', s)
+              return s[:110]
+
+          manifest = []
+          selected_records = []
+          for target in targets:
+              record = search_record(target)
+              selected_records.append(record)
+
+          for report_no, (target, record) in enumerate(zip(targets, selected_records), 1):
+              title_full = record.get('name') or target['key']
+              title = title_full
+              title = re.sub(r'^中国银行\s*[（(]?601988(?:\.SH)?[)）]?\s*', '', title)
+              org = (record.get('organization') or {}).get('name') or target['preferred_org']
+              date = record.get('time_text') or ''
+              original_pages = int(record.get('page_count') or 0)
+              page_base = record.get('page_url') or ''
+              if not page_base:
+                  share = record.get('share_url') or ''
+                  page_base = share.rsplit('/', 1)[0] if share else ''
+              if not page_base:
+                  raise RuntimeError(f'No public page URL for {title_full}')
+
+              report_img_dir = IMG_DIR / f'{report_no:02d}'
+              report_img_dir.mkdir(exist_ok=True)
+              page_paths = []
+              page_urls = []
+              page_hashes = []
+              dimensions = []
+              misses = 0
+              probe_limit = original_pages if original_pages > 0 else 80
+              for idx in range(probe_limit):
+                  url = f'{page_base}/{idx}.png'
+                  got = None
+                  last = None
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, headers={'Accept': 'image/*,*/*;q=0.8', 'Referer': 'https://www.sdyanbao.com/'}, timeout=120, allow_redirects=True)
+                          log('PAGE', record.get('id'), idx + 1, 'attempt', attempt, 'status', r.status_code, 'bytes', len(r.content), 'type', r.headers.get('content-type'))
+                          if r.status_code == 200 and len(r.content) > 15000:
+                              im = Image.open(io.BytesIO(r.content))
+                              im.load()
+                              if im.width >= 700 and im.height >= 950:
+                                  got = (r.content, r.url, im.width, im.height)
+                                  break
+                          last = f'HTTP {r.status_code}, {len(r.content)} bytes'
+                      except Exception as exc:
+                          last = repr(exc)
+                      time.sleep(attempt * 0.5)
+                  if got is None:
+                      misses += 1
+                      log('PAGE_MISS', record.get('id'), idx + 1, last)
+                      if idx == 0 or misses >= 1:
+                          break
+                      continue
+                  misses = 0
+                  data, final_url, width, height = got
+                  raw_path = report_img_dir / f'{idx + 1:03d}_raw.png'
+                  raw_path.write_bytes(data)
+                  with Image.open(raw_path) as im:
+                      rgb = im.convert('RGB')
+                      jpg_path = report_img_dir / f'{idx + 1:03d}.jpg'
+                      rgb.save(jpg_path, 'JPEG', quality=93, optimize=False)
+                  page_paths.append(jpg_path)
+                  page_urls.append(final_url)
+                  page_hashes.append(hashlib.sha256(data).hexdigest())
+                  dimensions.append({'page': idx + 1, 'width': width, 'height': height})
+
+              included_pages = len(page_paths)
+              if included_pages == 0:
+                  raise RuntimeError(f'No public pages downloaded for {title_full}')
+              if len(set(page_hashes)) != included_pages:
+                  raise RuntimeError(f'Duplicate page images detected for {title_full}')
+              complete = original_pages > 0 and included_pages == original_pages
+              access_label = '完整版' if complete else f'公开试读{included_pages}页_原报告{original_pages}页'
+              filename = f"{date}_{safe_name(org)}_中国银行_{safe_name(title)}_{access_label}.pdf"
+              pdf_path = PDF_DIR / filename
+              pdf_bytes = img2pdf.convert([str(p) for p in page_paths], layout_fun=img2pdf.get_fixed_dpi_layout_fun((150, 150)))
+              pdf_path.write_bytes(pdf_bytes)
+              if not pdf_bytes.startswith(b'%PDF-'):
+                  raise RuntimeError('Invalid PDF header')
+              actual_pages = len(PdfReader(str(pdf_path), strict=False).pages)
+              if actual_pages != included_pages:
+                  raise RuntimeError(f'PDF page count mismatch: {actual_pages} vs {included_pages}')
+
+              doc = pymupdf.open(str(pdf_path))
+              checks = []
+              for page_idx, tag in sorted(set([(0, 'first'), (actual_pages // 2, 'middle'), (actual_pages - 1, 'last')])):
+                  pix = doc.load_page(page_idx).get_pixmap(matrix=pymupdf.Matrix(1.1, 1.1), alpha=False)
+                  check_path = QA_DIR / f'{report_no:02d}_{tag}.png'
+                  pix.save(str(check_path))
+                  with Image.open(check_path) as check_im:
+                      stddev = float(ImageStat.Stat(check_im.convert('L').resize((64, 64))).stddev[0])
+                  if stddev < 1.0:
+                      raise RuntimeError(f'Near-blank page {page_idx + 1} in {filename}')
+                  checks.append({'page': page_idx + 1, 'stddev': round(stddev, 4)})
+              doc.close()
+
+              raw = pdf_path.read_bytes()
+              entry = {
+                  'date': date,
+                  'institution': org,
+                  'title': title,
+                  'stock_codes': ['601988.SH', '03988.HK'],
+                  'report_type': target['kind'],
+                  'source_detail_url': f"https://www.sdyanbao.com/detail/{record.get('id')}",
+                  'public_page_base': page_base,
+                  'included_pages': included_pages,
+                  'original_pages': original_pages,
+                  'is_complete': complete,
+                  'access_label': access_label,
+                  'filename': f'PDF/{filename}',
+                  'size_bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'page_dimensions': dimensions,
+                  'page_urls': page_urls,
+                  'render_checks': checks,
+              }
+              manifest.append(entry)
+              log('VALID', json.dumps(entry, ensure_ascii=False))
+
+          readme = [
+              '# 中国银行（601988.SH／03988.HK）券商研究报告资料包',
+              '',
+              f'资料核对日期：{CHECKED_AS_OF}',
+              '',
+              '本资料包收录2份以中国银行为主体的券商公司研究报告。',
+              '公开渠道可取得的页数与原报告页数可能不同；文件名、清单和 manifest 均据实标注“完整版”或“公开试读”，未将试读件标为完整报告。',
+              '',
+              '| 日期 | 券商 | 报告题目 | 类型 | 本包页数 | 原报告页数 | 状态 |',
+              '|---|---|---|---|---:|---:|---|',
+          ]
+          for e in manifest:
+              readme.append(f"| {e['date']} | {e['institution']} | {e['title']} | {e['report_type']} | {e['included_pages']} | {e['original_pages']} | {e['access_label']} |")
+          readme += [
+              '',
+              '处理与校验说明：',
+              '- PDF由公开展示的高清逐页图片按原顺序合成。',
+              '- 未登录账户、未使用会员权限、未绕过验证码、付费墙或其他访问控制。',
+              '- 已检查页面尺寸、重复页、PDF文件头和实际页数。',
+              '- 已重新渲染检查首、中、尾页，并执行ZIP CRC完整性校验。',
+              '- 来源URL及SHA-256校验值见 manifest.json 与 SHA256SUMS.txt。',
+          ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (ROOT / '文件说明.txt').write_text('\n'.join(line.replace('# ', '').replace('- ', '') for line in readme if not line.startswith('|')) + '\n', encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps({
+              'company': '中国银行股份有限公司',
+              'stock_codes': ['601988.SH', '03988.HK'],
+              'checked_as_of': CHECKED_AS_OF,
+              'pdf_count': len(manifest),
+              'files': manifest,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{e['sha256']}  {e['filename']}" for e in manifest) + '\n', encoding='utf-8')
+          (WORK / 'run.log').write_text('\n'.join(logs) + '\n', encoding='utf-8')
+
+          zip_path = WORK / '中国银行_601988_03988_券商研究报告_2份.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, arcname=str(Path(ROOT.name) / p.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_members = [x for x in zf.namelist() if x.lower().endswith('.pdf')]
+              if len(pdf_members) != 2:
+                  raise RuntimeError(f'Expected 2 PDFs, got {len(pdf_members)}')
+          zip_raw = zip_path.read_bytes()
+          metadata = {
+              'filename': zip_path.name,
+              'size_bytes': len(zip_raw),
+              'sha256': hashlib.sha256(zip_raw).hexdigest(),
+              'pdf_count': 2,
+              'reports': manifest,
+          }
+          (WORK / 'zip_metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL ' + json.dumps(metadata, ensure_ascii=False), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BOC-Broker-Reports-Package
+          path: |
+            boc_package_work/中国银行_601988_03988_券商研究报告_2份.zip
+            boc_package_work/zip_metadata.json
+            boc_package_work/run.log
+            boc_package_work/_qa
+          retention-days: 1
+          compression-level: 0
