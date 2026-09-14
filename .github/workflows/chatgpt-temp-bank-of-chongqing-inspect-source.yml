@@ -1,0 +1,147 @@
+name: chatgpt-temp-bank-of-chongqing-inspect-source
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-bank-of-chongqing-inspect-source.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect public detail pages and API responses
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 playwright
+          python <<'PY'
+          import asyncio
+          import json
+          import os
+          import re
+          import urllib.parse
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          WORK = Path('bank_of_chongqing_source_inspect')
+          WORK.mkdir(exist_ok=True)
+          REPORTS = [
+              {'id': 889780, 'detail': 'https://www.sdyanbao.com/detail/889780'},
+              {'id': 857288, 'detail': 'https://www.sdyanbao.com/detail/857288'},
+              {'id': 848131, 'detail': 'https://www.sdyanbao.com/detail/848131'},
+          ]
+          UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          guessed_templates = [
+              'https://api.sdyanbao.com/api/file/detail?id={id}',
+              'https://api.sdyanbao.com/api/file/info?id={id}',
+              'https://api.sdyanbao.com/api/file/get?id={id}',
+              'https://api.sdyanbao.com/api/file/view?id={id}',
+              'https://api.sdyanbao.com/api/file/download?id={id}',
+              'https://api.sdyanbao.com/api/file/getDetail?id={id}',
+              'https://api.sdyanbao.com/api/file/getFileDetail?id={id}',
+              'https://api.sdyanbao.com/api/file/getFile?id={id}',
+          ]
+          guessed = []
+          for report in REPORTS:
+              rdir = WORK / str(report['id'])
+              rdir.mkdir(exist_ok=True)
+              response = session.get(report['detail'], timeout=90, allow_redirects=True)
+              print('DETAIL', report['id'], response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+              (rdir / 'detail.html').write_bytes(response.content)
+              text = response.text
+              soup = BeautifulSoup(text, 'html.parser')
+              analysis = {
+                  'title': soup.title.get_text(' ', strip=True) if soup.title else '',
+                  'links': [],
+                  'scripts': [],
+                  'raw_urls': list(dict.fromkeys(re.findall(r'(?:https?:)?//[^"\'<>\s]+|/[A-Za-z0-9_./?=&%:-]+', text))),
+                  'ids': list(dict.fromkeys(re.findall(r'\b\d{5,18}\b', text))),
+              }
+              for a in soup.find_all('a', href=True):
+                  analysis['links'].append({'text': ' '.join(a.get_text(' ', strip=True).split()), 'href': urllib.parse.urljoin(response.url, a['href']), 'attrs': dict(a.attrs)})
+              for script in soup.find_all('script'):
+                  analysis['scripts'].append({'src': urllib.parse.urljoin(response.url, script.get('src')) if script.get('src') else None, 'text': (script.string or script.get_text() or '')[:250000]})
+              (rdir / 'html_analysis.json').write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding='utf-8')
+
+              for template in guessed_templates:
+                  url = template.format(id=report['id'])
+                  try:
+                      rr = session.get(url, headers={'Referer': report['detail'], 'Accept': 'application/json,text/plain,*/*'}, timeout=60, allow_redirects=True)
+                      rec = {'id': report['id'], 'url': url, 'status': rr.status_code, 'bytes': len(rr.content), 'type': rr.headers.get('content-type'), 'final': rr.url, 'head': rr.text[:5000]}
+                  except Exception as exc:
+                      rec = {'id': report['id'], 'url': url, 'error': repr(exc)}
+                  guessed.append(rec)
+                  print('GUESS', json.dumps(rec, ensure_ascii=False), flush=True)
+          (WORK / 'guessed_api.json').write_text(json.dumps(guessed, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          async def browser_probe():
+              all_responses = []
+              async with async_playwright() as p:
+                  executable = next((x for x in ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium'] if os.path.exists(x)), None)
+                  browser = await p.chromium.launch(headless=True, executable_path=executable, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                  context = await browser.new_context(viewport={'width': 1440, 'height': 1000}, user_agent=UA, locale='zh-CN')
+                  for report in REPORTS:
+                      page = await context.new_page()
+                      responses = []
+                      async def on_response(resp):
+                          url = resp.url
+                          content_type = (await resp.all_headers()).get('content-type', '')
+                          if ('api.sdyanbao.com' in url or 'oss.sdyanbao.com' in url or any(token in url.lower() for token in ['download', '.pdf', '/file/', 'report'])):
+                              record = {
+                                  'url': url,
+                                  'status': resp.status,
+                                  'content_type': content_type,
+                                  'request_method': resp.request.method,
+                                  'post_data': resp.request.post_data,
+                              }
+                              try:
+                                  body = await resp.body()
+                                  record['bytes'] = len(body)
+                                  if len(body) <= 5_000_000:
+                                      filename = f"{report['id']}_resp_{len(responses):04d}.bin"
+                                      (WORK / filename).write_bytes(body)
+                                      record['file'] = filename
+                                      record['head'] = body[:3000].decode('utf-8', 'ignore')
+                              except Exception as exc:
+                                  record['error'] = repr(exc)
+                              responses.append(record)
+                              print('RESPONSE', report['id'], json.dumps(record, ensure_ascii=False), flush=True)
+                      page.on('response', on_response)
+                      try:
+                          await page.goto(report['detail'], wait_until='domcontentloaded', timeout=90000)
+                          await page.wait_for_timeout(10000)
+                          body = await page.locator('body').inner_text()
+                          (WORK / f"{report['id']}_body.txt").write_text(body, encoding='utf-8')
+                          (WORK / f"{report['id']}_dom.html").write_text(await page.content(), encoding='utf-8')
+                          # Click only public, visible report-view or download buttons. Never submit credentials.
+                          for label in ['查看完整报告', '免费查看完整报告', '在线阅读', '立即阅读', '下载报告', '立即下载']:
+                              try:
+                                  locator = page.get_by_text(label, exact=True).first
+                                  if await locator.count():
+                                      await locator.click(timeout=5000)
+                                      await page.wait_for_timeout(5000)
+                                      print('CLICK', report['id'], label, page.url, flush=True)
+                              except Exception as exc:
+                                  print('CLICK_ERROR', report['id'], label, repr(exc), flush=True)
+                      except Exception as exc:
+                          print('PAGE_ERROR', report['id'], repr(exc), flush=True)
+                      await page.close()
+                      all_responses.append({'id': report['id'], 'responses': responses})
+                  await browser.close()
+              (WORK / 'browser_responses.json').write_text(json.dumps(all_responses, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          asyncio.run(browser_probe())
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bank-of-Chongqing-Source-Inspect
+          path: bank_of_chongqing_source_inspect
+          retention-days: 1
+          compression-level: 6
