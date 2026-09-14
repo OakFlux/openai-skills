@@ -1,0 +1,453 @@
+name: Build RoboSense reports archive
+on:
+  push:
+    branches:
+      - tmp-robosense-reports-20260914
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet 'httpx[http2]' pypdf pymupdf
+      - name: Query HKEX, download and verify official PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pdfs work/renders
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import io
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import httpx
+          import pymupdf
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          PDFDIR = Path('work/pdfs')
+          RENDERDIR = Path('work/renders')
+          OUT.mkdir(parents=True, exist_ok=True)
+          PDFDIR.mkdir(parents=True, exist_ok=True)
+          RENDERDIR.mkdir(parents=True, exist_ok=True)
+
+          STOCK_ID = '1000211551'
+          BASE = 'https://www1.hkexnews.hk/'
+          ENDPOINT = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=' + STOCK_ID,
+          }
+
+          def clean_text(value) -> str:
+              s = html.unescape(str(value or ''))
+              s = re.sub(r'<[^>]+>', ' ', s)
+              return re.sub(r'\s+', ' ', s).strip()
+
+          def norm(value) -> str:
+              return re.sub(r'[^A-Z0-9\u4e00-\u9fff]+', '', clean_text(value).upper())
+
+          def field(record: dict, *names: str):
+              cmap = {str(k).upper(): v for k, v in record.items()}
+              for name in names:
+                  if name.upper() in cmap:
+                      return cmap[name.upper()]
+              return ''
+
+          def collect_records(obj, out: list[dict]) -> None:
+              if isinstance(obj, dict):
+                  keys = {str(k).upper() for k in obj}
+                  if ('FILE_LINK' in keys or 'FILELINK' in keys) and ('TITLE' in keys or 'HEADLINE' in keys):
+                      out.append(obj)
+                  for value in obj.values():
+                      collect_records(value, out)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      collect_records(value, out)
+
+          def query_hkex(t2code: str = '-2', title: str = '') -> list[dict]:
+              params = {
+                  'sortDir': '1',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': '20230101',
+                  'toDate': '20260914',
+                  'title': title,
+                  'searchType': '1',
+                  't1code': '40000',
+                  't2Gcode': '-2',
+                  't2code': t2code,
+                  'rowRange': '2000',
+                  'lang': 'EN',
+              }
+              last_error = None
+              for attempt in range(1, 6):
+                  try:
+                      with httpx.Client(http2=True, follow_redirects=True, timeout=90, headers=HEADERS) as client:
+                          response = client.get(ENDPOINT, params=params)
+                      print('QUERY', t2code, title, response.status_code, len(response.content), response.url, flush=True)
+                      response.raise_for_status()
+                      outer = response.json()
+                      inner = outer.get('result', outer) if isinstance(outer, dict) else outer
+                      if isinstance(inner, str):
+                          inner = json.loads(inner)
+                      records: list[dict] = []
+                      collect_records(inner, records)
+                      return records
+                  except Exception as exc:
+                      last_error = exc
+                      print('QUERY_RETRY', attempt, repr(exc), flush=True)
+                      time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'HKEX query failed: {last_error!r}')
+
+          raw_records: list[dict] = []
+          for code in ['-2', '40200', '40300', '40400', '40500']:
+              raw_records.extend(query_hkex(code))
+          # Exact-title searches improve resilience if category codes change.
+          for keyword in ['ANNUAL REPORT', 'GLOBAL OFFERING', 'PROSPECTUS', 'QUARTER', 'INTERIM RESULTS']:
+              raw_records.extend(query_hkex('-2', keyword))
+
+          normalized_records = []
+          seen_links = set()
+          for record in raw_records:
+              link = clean_text(field(record, 'FILE_LINK', 'FILELINK', 'LINK', 'URL'))
+              title = clean_text(field(record, 'TITLE', 'HEADLINE', 'DOCUMENT_TITLE'))
+              date_time = clean_text(field(record, 'DATE_TIME', 'DATETIME', 'RELEASE_TIME', 'DATE'))
+              stock_code = clean_text(field(record, 'STOCK_CODE', 'STOCKCODE'))
+              stock_name = clean_text(field(record, 'STOCK_NAME', 'STOCKNAME'))
+              if not link or not title:
+                  continue
+              url = urljoin(BASE, link)
+              if url in seen_links:
+                  continue
+              seen_links.add(url)
+              normalized_records.append({
+                  'title': title,
+                  'date_time': date_time,
+                  'stock_code': stock_code,
+                  'stock_name': stock_name,
+                  'url': url,
+                  'raw': record,
+              })
+
+          (OUT / 'hkex_records.json').write_text(json.dumps(normalized_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('TOTAL_UNIQUE_RECORDS', len(normalized_records), flush=True)
+          for item in normalized_records:
+              up = item['title'].upper()
+              if any(k in up for k in ['ANNUAL REPORT', 'GLOBAL OFFERING', 'PROSPECTUS', 'QUARTER', 'INTERIM RESULTS']):
+                  print('CANDIDATE', item['date_time'], item['title'], item['url'], flush=True)
+
+          def parse_date(value: str) -> datetime:
+              digits = re.findall(r'\d+', value)
+              try:
+                  if len(digits) >= 3:
+                      return datetime(int(digits[0]), int(digits[1]), int(digits[2]))
+                  if len(digits) == 1 and len(digits[0]) >= 8:
+                      s = digits[0][:8]
+                      return datetime(int(s[:4]), int(s[4:6]), int(s[6:8]))
+              except Exception:
+                  pass
+              return datetime(1900, 1, 1)
+
+          def annual_candidates(year: int) -> list[dict]:
+              result = []
+              for item in normalized_records:
+                  up = item['title'].upper()
+                  if 'ANNUAL REPORT' in up and 'RESULT' not in up and 'ESG' not in up and str(year) in up:
+                      result.append(item)
+              return result
+
+          prospectus_candidates = [
+              item for item in normalized_records
+              if ('GLOBAL OFFERING' in item['title'].upper() or 'PROSPECTUS' in item['title'].upper())
+              and 'SUPPLEMENT' not in item['title'].upper()
+          ]
+          quarter_candidates = [
+              item for item in normalized_records
+              if 'QUARTER' in item['title'].upper()
+              and ('FINANCIAL RESULT' in item['title'].upper() or 'QUARTERLY RESULT' in item['title'].upper())
+          ]
+          interim_full_candidates = [
+              item for item in normalized_records
+              if '2026' in item['title'].upper() and 'INTERIM REPORT' in item['title'].upper()
+          ]
+          interim_result_candidates = [
+              item for item in normalized_records
+              if 'INTERIM RESULTS' in item['title'].upper()
+              and ('2026' in item['title'].upper() or parse_date(item['date_time']).year == 2026)
+          ]
+
+          if not prospectus_candidates:
+              raise RuntimeError('No prospectus candidate found')
+          if not quarter_candidates:
+              raise RuntimeError('No quarterly-results candidate found')
+          if not interim_full_candidates and not interim_result_candidates:
+              raise RuntimeError('No 2026 interim candidate found')
+          for year in [2023, 2024, 2025]:
+              if not annual_candidates(year):
+                  raise RuntimeError(f'No annual report candidate found for {year}')
+
+          client = httpx.Client(http2=True, follow_redirects=True, timeout=600, headers=HEADERS)
+
+          def download_candidate(item: dict, temp_name: str) -> dict:
+              path = Path('/tmp') / temp_name
+              last_error = None
+              for attempt in range(1, 7):
+                  try:
+                      with client.stream('GET', item['url']) as response:
+                          print('DOWNLOAD', attempt, response.status_code, item['title'], item['url'], flush=True)
+                          response.raise_for_status()
+                          h = hashlib.sha256()
+                          size = 0
+                          with path.open('wb') as f:
+                              for chunk in response.iter_bytes(1024 * 1024):
+                                  if not chunk:
+                                      continue
+                                  f.write(chunk)
+                                  h.update(chunk)
+                                  size += len(chunk)
+                      if size < 50000 or b'%PDF-' not in path.read_bytes()[:2048]:
+                          raise RuntimeError(f'Invalid PDF payload: {size}')
+                      reader = PdfReader(str(path), strict=False)
+                      pages = len(reader.pages)
+                      sample_parts = []
+                      indexes = list(range(min(15, pages)))
+                      indexes += list(range(max(0, pages - 3), pages))
+                      for idx in sorted(set(indexes)):
+                          try:
+                              sample_parts.append(reader.pages[idx].extract_text() or '')
+                          except Exception:
+                              pass
+                      sample = '\n'.join(sample_parts)
+                      return {
+                          **item,
+                          'temp_path': str(path),
+                          'pages': pages,
+                          'bytes': size,
+                          'sha256': h.hexdigest(),
+                          'sample': sample,
+                      }
+                  except Exception as exc:
+                      last_error = exc
+                      path.unlink(missing_ok=True)
+                      print('DOWNLOAD_RETRY', attempt, repr(exc), flush=True)
+                      time.sleep(min(2 ** attempt, 20))
+              raise RuntimeError(f'Download failed for {item["title"]}: {last_error!r}')
+
+          def choose_best(candidates: list[dict], label: str, preferred_year: int | None = None) -> dict:
+              evaluated = []
+              for idx, item in enumerate(candidates):
+                  evaluated.append(download_candidate(item, f'robosense_{label}_{idx}.pdf'))
+              def score(x: dict):
+                  title = x['title'].upper()
+                  s = x['pages']
+                  if preferred_year and str(preferred_year) in title:
+                      s += 5000
+                  if title.strip() in ({f'{preferred_year} ANNUAL REPORT'} if preferred_year else set()):
+                      s += 1000
+                  if 'GLOBAL OFFERING' in title:
+                      s += 5000
+                  if 'SUPPLEMENT' in title:
+                      s -= 10000
+                  s += parse_date(x['date_time']).timestamp() / 10**9
+                  return s
+              evaluated.sort(key=score, reverse=True)
+              best = evaluated[0]
+              for extra in evaluated[1:]:
+                  Path(extra['temp_path']).unlink(missing_ok=True)
+              return best
+
+          chosen = []
+          for year in [2023, 2024, 2025]:
+              chosen.append(('年度报告', str(year), choose_best(annual_candidates(year), f'annual_{year}', year)))
+          chosen.append(('上市最终招股章程', '2023', choose_best(prospectus_candidates, 'prospectus')))
+          chosen.append(('最新季度业绩', '2026Q1', choose_best(quarter_candidates, 'quarter')))
+          if interim_full_candidates:
+              chosen.append(('最新中期报告', '2026H1', choose_best(interim_full_candidates, 'interim_full')))
+          else:
+              chosen.append(('最新中期业绩公告', '2026H1', choose_best(interim_result_candidates, 'interim_results')))
+
+          specs = []
+          for index, (kind, period, item) in enumerate(chosen, 1):
+              if kind == '年度报告':
+                  filename = f'{index:02d}_速腾聚创_{period}年年度报告.pdf'
+                  minimum_pages = 100
+                  required = [period, 'ROBOSENSE']
+              elif kind == '上市最终招股章程':
+                  filename = f'{index:02d}_速腾聚创_上市最终招股章程.pdf'
+                  minimum_pages = 400
+                  required = ['ROBOSENSE']
+              elif kind == '最新季度业绩':
+                  filename = f'{index:02d}_速腾聚创_2026年第一季度业绩.pdf'
+                  minimum_pages = 5
+                  required = ['ROBOSENSE', 'FIRSTQUARTER', '2026']
+              else:
+                  filename = f'{index:02d}_速腾聚创_2026年中期业绩.pdf'
+                  minimum_pages = 10
+                  required = ['ROBOSENSE', 'INTERIM', '2026']
+              specs.append({
+                  'seq': index,
+                  'kind': kind,
+                  'period': period,
+                  'filename': filename,
+                  'minimum_pages': minimum_pages,
+                  'required': required,
+                  'item': item,
+              })
+
+          manifest = []
+          validation = []
+          for spec in specs:
+              item = spec['item']
+              source = Path(item['temp_path'])
+              dest = PDFDIR / spec['filename']
+              shutil.move(source, dest)
+              pages = item['pages']
+              if pages < spec['minimum_pages']:
+                  raise RuntimeError(f'Unexpectedly short {dest.name}: {pages} pages')
+              compact = norm(item['sample'])
+              if not ('ROBOSENSE' in compact or '速騰聚創' in compact or '速腾聚创' in compact):
+                  raise RuntimeError(f'Company identity not found in {dest.name}')
+              for token in spec['required']:
+                  if norm(token) not in compact:
+                      raise RuntimeError(f'Required token {token!r} missing in {dest.name}')
+              if spec['kind'] == '上市最终招股章程':
+                  title_up = item['title'].upper()
+                  if 'GLOBAL OFFERING' not in title_up and 'PROSPECTUS' not in title_up and 'GLOBALOFFERING' not in compact:
+                      raise RuntimeError('Selected prospectus is not the final listing prospectus')
+
+              doc = pymupdf.open(dest)
+              substantive = len(doc) - 1
+              for idx in range(len(doc) - 1, -1, -1):
+                  page = doc[idx]
+                  if len(page.get_text('text').strip()) > 20 or page.get_images(full=True):
+                      substantive = idx
+                      break
+              rendered = []
+              for page_idx, suffix in [(0, 'cover'), (substantive, 'last')]:
+                  pix = doc[page_idx].get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  out = RENDERDIR / f'{spec["seq"]:02d}_{suffix}.png'
+                  pix.save(str(out))
+                  if not out.exists() or out.stat().st_size < 500:
+                      raise RuntimeError(f'Render failure for {dest.name} page {page_idx + 1}')
+                  rendered.append({'page': page_idx + 1, 'path': str(out), 'bytes': out.stat().st_size})
+              doc.close()
+
+              manifest.append({
+                  '序号': spec['seq'],
+                  '文件名': dest.name,
+                  '报告类型': spec['kind'],
+                  '报告期间': spec['period'],
+                  '港交所标题': item['title'],
+                  '披露日期': item['date_time'],
+                  'PDF页数': pages,
+                  '文件大小（字节）': item['bytes'],
+                  'SHA-256': item['sha256'],
+                  '港交所官方来源': item['url'],
+              })
+              validation.append({
+                  '文件名': dest.name,
+                  'PDF文件头': '通过',
+                  '可解析性': '通过',
+                  '公司及期间识别': '通过',
+                  '渲染检查': rendered,
+              })
+
+          with (PDFDIR / '文件清单与校验值.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+          (PDFDIR / '验证记录.json').write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding='utf-8')
+          readme_lines = [
+              '速腾聚创（RoboSense Technology Co., Ltd，02498.HK）报告资料包',
+              '打包日期：2026-09-14',
+              '',
+              '收录范围：',
+              '1. 上市后全部完整年度报告：2023、2024、2025年。',
+              '2. 2023年上市最终招股章程。',
+              '3. 2026年第一季度未经审核财务业绩：严格意义上的最新季度业绩。',
+              '4. 2026年中期业绩：截至打包日更晚披露的集团层面定期财务信息。',
+              '',
+              '说明：截至打包日，港交所尚未发布2026年完整中期报告，因此收入2026年中期业绩公告。',
+              '全部文件来自港交所披露易。已核验PDF文件头、可解析性、公司名称、报告期间、实际页数、SHA-256，并渲染检查封面及末个有效页面。',
+          ]
+          (PDFDIR / 'README.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (PDFDIR / '港交所筛选记录.json').write_text(json.dumps([
+              {
+                  '报告类型': row['报告类型'],
+                  '报告期间': row['报告期间'],
+                  '港交所标题': row['港交所标题'],
+                  '披露日期': row['披露日期'],
+                  '官方来源': row['港交所官方来源'],
+              } for row in manifest
+          ], ensure_ascii=False, indent=2), encoding='utf-8')
+
+          full_zip = OUT / 'RoboSenseReports.zip'
+          with zipfile.ZipFile(full_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for path in sorted(PDFDIR.iterdir()):
+                  z.write(path, arcname=path.name)
+          with zipfile.ZipFile(full_zip, 'r') as z:
+              bad = z.testzip()
+              pdfs = [name for name in z.namelist() if name.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != len(specs):
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdf_count={len(pdfs)}')
+
+          cn_zip = OUT / '速腾聚创_02498_全部年报_招股说明书及最新季报.zip'
+          shutil.copy2(full_zip, cn_zip)
+
+          prospectus_zip = OUT / 'RoboSense_Prospectus.zip'
+          annual_latest_zip = OUT / 'RoboSense_Annual_and_Latest.zip'
+          with zipfile.ZipFile(prospectus_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for path in PDFDIR.iterdir():
+                  if '招股章程' in path.name or path.name in ['README.txt', '文件清单与校验值.csv', '验证记录.json']:
+                      z.write(path, arcname=path.name)
+          with zipfile.ZipFile(annual_latest_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for path in PDFDIR.iterdir():
+                  if '招股章程' not in path.name:
+                      z.write(path, arcname=path.name)
+          for part in [prospectus_zip, annual_latest_zip]:
+              with zipfile.ZipFile(part, 'r') as z:
+                  if z.testzip() is not None:
+                      raise RuntimeError(f'CRC failure in {part.name}')
+
+          result = {
+              'ok': True,
+              'archive': full_zip.name,
+              'archive_cn': cn_zip.name,
+              'prospectus_archive': prospectus_zip.name,
+              'annual_latest_archive': annual_latest_zip.name,
+              'archive_bytes': full_zip.stat().st_size,
+              'pdf_count': len(specs),
+              'zip_crc_ok': True,
+              'reports': manifest,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          client.close()
+          PY
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: robosense-02498-reports
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
