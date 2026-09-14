@@ -1,0 +1,514 @@
+name: Build RoboSense reports archive
+on:
+  push:
+    branches:
+      - tmp-robosense-reports-v2-20260914
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf playwright
+      - name: Discover, download, validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pdfs work/renders work/tmp
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader, PdfWriter
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('output')
+          PDFDIR = Path('work/pdfs')
+          RENDERDIR = Path('work/renders')
+          TMP = Path('work/tmp')
+          for p in [OUT, PDFDIR, RENDERDIR, TMP]:
+              p.mkdir(parents=True, exist_ok=True)
+
+          TITLE_URL = 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=1000211551'
+          USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36'
+
+          retry = Retry(
+              total=8,
+              connect=8,
+              read=8,
+              status=8,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=frozenset(['GET']),
+          )
+          session = requests.Session()
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': USER_AGENT,
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+              'Accept': 'text/html,application/pdf,*/*;q=0.8',
+          })
+
+          def clean_text(text: str) -> str:
+              return re.sub(r'\s+', ' ', text or '').strip()
+
+          def canonical_url(url: str) -> str:
+              return url.split('#', 1)[0].strip()
+
+          records: list[dict] = []
+          seen: set[tuple[str, str]] = set()
+
+          def add_records(items: list[dict], source: str) -> None:
+              for item in items:
+                  title = clean_text(item.get('text', ''))
+                  href = canonical_url(item.get('href', ''))
+                  if not title or not href:
+                      continue
+                  if 'hkexnews.hk/listedco/listconews/' not in href:
+                      continue
+                  key = (title.upper(), href)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  records.append({'title': title, 'url': href, 'source': source})
+
+          chrome = (
+              shutil.which('google-chrome')
+              or shutil.which('google-chrome-stable')
+              or shutil.which('chromium')
+              or shutil.which('chromium-browser')
+          )
+          if not chrome:
+              raise RuntimeError('No Chrome/Chromium executable found on runner')
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True,
+                  executable_path=chrome,
+                  args=['--no-sandbox', '--disable-dev-shm-usage'],
+              )
+              context = browser.new_context(
+                  user_agent=USER_AGENT,
+                  locale='en-US',
+                  viewport={'width': 1440, 'height': 1100},
+              )
+
+              def collect_page(page, source: str) -> None:
+                  for iteration in range(12):
+                      items = page.eval_on_selector_all(
+                          'a[href]',
+                          "els => els.map(e => ({text:(e.innerText||e.textContent||'').trim(), href:e.href}))"
+                      )
+                      add_records(items, f'{source}-iter{iteration}')
+                      candidates = [
+                          page.get_by_text('LOAD MORE', exact=True),
+                          page.locator('a:has-text("LOAD MORE")'),
+                          page.locator('button:has-text("LOAD MORE")'),
+                      ]
+                      button = None
+                      for loc in candidates:
+                          if loc.count() > 0:
+                              try:
+                                  if loc.first.is_visible():
+                                      button = loc.first
+                                      break
+                              except Exception:
+                                  pass
+                      if button is None:
+                          break
+                      before = len(records)
+                      try:
+                          page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                          button.click(timeout=10000)
+                          page.wait_for_timeout(1500)
+                      except Exception:
+                          break
+                      items2 = page.eval_on_selector_all(
+                          'a[href]',
+                          "els => els.map(e => ({text:(e.innerText||e.textContent||'').trim(), href:e.href}))"
+                      )
+                      add_records(items2, f'{source}-after{iteration}')
+                      if len(records) <= before:
+                          break
+
+              page = context.new_page()
+              page.goto(TITLE_URL, wait_until='domcontentloaded', timeout=120000)
+              try:
+                  page.wait_for_load_state('networkidle', timeout=25000)
+              except PlaywrightTimeoutError:
+                  pass
+              page.wait_for_timeout(2500)
+              collect_page(page, 'latest')
+              (OUT / 'hkex_latest_page.html').write_text(page.content(), encoding='utf-8')
+
+              # Attempt oldest-first sorting to expose listing documents even if LOAD MORE is limited.
+              try:
+                  oldest = page.get_by_text('Oldest information', exact=True)
+                  if oldest.count() > 0:
+                      oldest.first.click(timeout=10000)
+                      page.wait_for_timeout(3000)
+                      collect_page(page, 'oldest')
+                      (OUT / 'hkex_oldest_page.html').write_text(page.content(), encoding='utf-8')
+              except Exception as exc:
+                  (OUT / 'oldest_sort_error.txt').write_text(repr(exc), encoding='utf-8')
+
+              page.close()
+              context.close()
+              browser.close()
+
+          # Requests fallback: capture all static links from the current title page.
+          try:
+              response = session.get(TITLE_URL, timeout=(30, 120))
+              response.raise_for_status()
+              soup = BeautifulSoup(response.text, 'lxml')
+              add_records([
+                  {'text': a.get_text(' ', strip=True), 'href': urljoin(response.url, a.get('href'))}
+                  for a in soup.find_all('a', href=True)
+              ], 'requests')
+          except Exception as exc:
+              (OUT / 'requests_fallback_error.txt').write_text(repr(exc), encoding='utf-8')
+
+          (OUT / 'hkex_records.json').write_text(
+              json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          print('DISCOVERED_RECORDS', len(records), flush=True)
+          for rec in records:
+              upper = rec['title'].upper()
+              if any(term in upper for term in ['ANNUAL REPORT', 'PROSPECTUS', 'GLOBAL OFFERING', 'FIRST QUARTER OF 2026', 'INTERIM RESULTS ANNOUNCEMENT FOR THE SIX MONTHS ENDED JUNE 30, 2026', '2026 INTERIM REPORT']):
+                  print('CANDIDATE', rec['title'], rec['url'], flush=True)
+
+          def pick_exact(title: str) -> dict | None:
+              title_u = title.upper()
+              matches = [r for r in records if r['title'].upper() == title_u]
+              return matches[0] if matches else None
+
+          def pick_contains(*terms: str, exclude: tuple[str, ...] = ()) -> dict | None:
+              terms_u = [x.upper() for x in terms]
+              exclude_u = [x.upper() for x in exclude]
+              matches = []
+              for rec in records:
+                  title_u = rec['title'].upper()
+                  if all(t in title_u for t in terms_u) and not any(e in title_u for e in exclude_u):
+                      matches.append(rec)
+              if not matches:
+                  return None
+              matches.sort(key=lambda r: ('.pdf' in r['url'].lower(), r['url']), reverse=True)
+              return matches[0]
+
+          annual_2023 = pick_exact('2023 ANNUAL REPORT') or pick_contains('2023', 'ANNUAL REPORT')
+          annual_2024 = pick_exact('2024 ANNUAL REPORT') or pick_contains('2024', 'ANNUAL REPORT')
+          annual_2025 = pick_exact('2025 ANNUAL REPORT') or pick_contains('2025', 'ANNUAL REPORT')
+          q1_2026 = pick_contains('UNAUDITED FINANCIAL RESULTS', 'FIRST QUARTER OF 2026')
+          interim_2026 = pick_contains('INTERIM RESULTS ANNOUNCEMENT', 'SIX MONTHS ENDED JUNE 30, 2026')
+          full_interim_2026 = pick_exact('2026 INTERIM REPORT') or pick_contains('2026', 'INTERIM REPORT', exclude=('RESULTS',))
+
+          prospectus_candidates = []
+          for rec in records:
+              title_u = rec['title'].upper()
+              if any(term in title_u for term in ['PROSPECTUS', 'GLOBAL OFFERING']):
+                  if not any(bad in title_u for bad in ['APPLICATION PROOF', 'POST HEARING', 'PHIP', 'ALLOTMENT RESULTS']):
+                      prospectus_candidates.append(rec)
+          prospectus_candidates.sort(
+              key=lambda r: (
+                  'PROSPECTUS' in r['title'].upper(),
+                  '.pdf' in r['url'].lower(),
+                  '/2024/' in r['url'],
+                  r['url'],
+              ),
+              reverse=True,
+          )
+          prospectus = prospectus_candidates[0] if prospectus_candidates else None
+
+          selection = {
+              '2023_annual': annual_2023,
+              '2024_annual': annual_2024,
+              '2025_annual': annual_2025,
+              'prospectus': prospectus,
+              '2026_q1': q1_2026,
+              '2026_interim_results': interim_2026,
+              '2026_full_interim': full_interim_2026,
+          }
+          (OUT / 'selection.json').write_text(
+              json.dumps(selection, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          mandatory = ['2023_annual', '2024_annual', '2025_annual', 'prospectus', '2026_q1', '2026_interim_results']
+          missing = [key for key in mandatory if not selection.get(key)]
+          if missing:
+              nearby = [r for r in records if any(k in r['title'].upper() for k in ['ANNUAL', 'PROSPECT', 'OFFERING', 'QUARTER', 'INTERIM'])]
+              raise RuntimeError(f'Missing mandatory records: {missing}. Candidates: {nearby[:100]}')
+
+          def fetch_bytes(url: str, referer: str = TITLE_URL) -> tuple[bytes, str]:
+              last_error = None
+              for attempt in range(1, 9):
+                  try:
+                      response = session.get(
+                          url,
+                          headers={'Referer': referer, 'Accept': 'application/pdf,text/html,*/*;q=0.8'},
+                          timeout=(30, 600),
+                          allow_redirects=True,
+                      )
+                      print('FETCH', attempt, response.status_code, len(response.content), response.url, flush=True)
+                      response.raise_for_status()
+                      return response.content, response.url
+                  except Exception as exc:
+                      last_error = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'Failed to fetch {url}: {last_error!r}')
+
+          def materialize_pdf(rec: dict, destination: Path) -> str:
+              data, final_url = fetch_bytes(rec['url'])
+              if b'%PDF-' in data[:2048]:
+                  destination.write_bytes(data)
+                  return final_url
+
+              # Some listing documents are HTML wrappers with chapter PDFs.
+              text = data.decode('utf-8', errors='ignore')
+              soup = BeautifulSoup(text, 'lxml')
+              links: list[str] = []
+              for a in soup.find_all('a', href=True):
+                  href = urljoin(final_url, a.get('href'))
+                  if '.pdf' in href.lower() and href not in links:
+                      links.append(href)
+              if not links:
+                  raise RuntimeError(f'HTML wrapper has no PDF links: {final_url}')
+
+              chapter_paths = []
+              for index, link in enumerate(links, 1):
+                  chapter_data, chapter_final = fetch_bytes(link, referer=final_url)
+                  if b'%PDF-' not in chapter_data[:2048]:
+                      continue
+                  chapter_path = TMP / f'prospectus_chapter_{index:03d}.pdf'
+                  chapter_path.write_bytes(chapter_data)
+                  chapter_paths.append(chapter_path)
+              if not chapter_paths:
+                  raise RuntimeError(f'No valid PDF chapters found in {final_url}')
+
+              writer = PdfWriter()
+              for chapter_path in chapter_paths:
+                  reader = PdfReader(str(chapter_path), strict=False)
+                  for page in reader.pages:
+                      writer.add_page(page)
+              with destination.open('wb') as f:
+                  writer.write(f)
+              return final_url + ' [merged official chapter PDFs]'
+
+          specs = [
+              {
+                  'key': '2023_annual',
+                  'filename': '01_RoboSense_2023_Annual_Report.pdf',
+                  'type': '年度报告',
+                  'period': '2023',
+                  'min_pages': 100,
+                  'tokens': ['2023', 'ANNUAL REPORT'],
+              },
+              {
+                  'key': '2024_annual',
+                  'filename': '02_RoboSense_2024_Annual_Report.pdf',
+                  'type': '年度报告',
+                  'period': '2024',
+                  'min_pages': 100,
+                  'tokens': ['2024', 'ANNUAL REPORT'],
+              },
+              {
+                  'key': '2025_annual',
+                  'filename': '03_RoboSense_2025_Annual_Report.pdf',
+                  'type': '年度报告',
+                  'period': '2025',
+                  'min_pages': 100,
+                  'tokens': ['2025', 'ANNUAL REPORT'],
+              },
+              {
+                  'key': 'prospectus',
+                  'filename': '04_RoboSense_Prospectus.pdf',
+                  'type': '招股章程',
+                  'period': '2024上市',
+                  'min_pages': 400,
+                  'tokens_any': ['PROSPECTUS', 'GLOBAL OFFERING', 'HOW TO APPLY'],
+              },
+              {
+                  'key': '2026_q1',
+                  'filename': '05_RoboSense_2026_Q1_Results.pdf',
+                  'type': '第一季度报告',
+                  'period': '2026Q1',
+                  'min_pages': 10,
+                  'tokens': ['FIRST QUARTER OF 2026'],
+              },
+              {
+                  'key': '2026_interim_results',
+                  'filename': '06_RoboSense_2026_Interim_Results.pdf',
+                  'type': '中期业绩公告',
+                  'period': '2026H1',
+                  'min_pages': 20,
+                  'tokens': ['INTERIM RESULTS', '2026'],
+              },
+          ]
+          if full_interim_2026:
+              specs.append({
+                  'key': '2026_full_interim',
+                  'filename': '07_RoboSense_2026_Interim_Report.pdf',
+                  'type': '完整中期报告',
+                  'period': '2026H1',
+                  'min_pages': 40,
+                  'tokens': ['2026', 'INTERIM REPORT'],
+              })
+
+          manifest = []
+          for seq, spec in enumerate(specs, 1):
+              rec = selection[spec['key']]
+              destination = PDFDIR / spec['filename']
+              source_url = materialize_pdf(rec, destination)
+              raw = destination.read_bytes()
+              if b'%PDF-' not in raw[:2048] or len(raw) < 80000:
+                  raise RuntimeError(f'Invalid PDF payload: {destination} ({len(raw)} bytes)')
+
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'Unexpected page count for {destination}: {pages} < {spec["min_pages"]}')
+
+              sample_indices = sorted(set(list(range(min(15, pages))) + [max(0, pages // 2), max(0, pages - 3), pages - 1]))
+              sample_text_parts = []
+              for index in sample_indices:
+                  try:
+                      sample_text_parts.append(reader.pages[index].extract_text() or '')
+                  except Exception:
+                      pass
+              normalized = re.sub(r'\s+', ' ', '\n'.join(sample_text_parts)).upper()
+              if not any(token in normalized for token in ['ROBOSENSE TECHNOLOGY', '速騰聚創', '速腾聚创', 'STOCK CODE: 2498', 'STOCK CODE : 2498']):
+                  raise RuntimeError(f'Company identity not found in {destination}')
+              for token in spec.get('tokens', []):
+                  if token.upper() not in normalized:
+                      raise RuntimeError(f'Missing token {token!r} in {destination}')
+              if spec.get('tokens_any') and not any(token.upper() in normalized for token in spec['tokens_any']):
+                  raise RuntimeError(f'Prospectus identity tokens not found in {destination}')
+
+              doc = pymupdf.open(destination)
+              pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+              render_path = RENDERDIR / f'{seq:02d}_{destination.stem}_first.png'
+              pix.save(str(render_path))
+              if render_path.stat().st_size < 3000:
+                  raise RuntimeError(f'First-page render failed for {destination}')
+              doc.close()
+
+              manifest.append({
+                  '序号': seq,
+                  '文件名': destination.name,
+                  '报告类型': spec['type'],
+                  '报告期间': spec['period'],
+                  '港交所标题': rec['title'],
+                  'PDF页数': pages,
+                  '文件大小（字节）': len(raw),
+                  'SHA-256': hashlib.sha256(raw).hexdigest(),
+                  '官方来源': source_url,
+              })
+              print('VERIFIED', destination.name, pages, len(raw), source_url, flush=True)
+
+          csv_path = PDFDIR / '文件清单与校验值.csv'
+          with csv_path.open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          readme_lines = [
+              'RoboSense Technology Co., Ltd（速腾聚创，02498.HK）官方定期报告资料包',
+              '打包日期：2026-09-14',
+              '',
+              '收录范围：',
+              '1. 上市后全部年度报告：2023、2024、2025年度报告。',
+              '2. 上市正式招股章程。',
+              '3. 2026年第一季度未经审核财务业绩：严格意义上的最新季度报告。',
+              '4. 2026年中期业绩公告：截至打包日更晚的集团层面定期财务披露。',
+          ]
+          if full_interim_2026:
+              readme_lines.append('5. 2026年完整中期报告。')
+          else:
+              readme_lines.append('5. 截至打包日，港交所尚未列示2026年完整中期报告，因此未以2025年旧中报替代。')
+          readme_lines += [
+              '',
+              '全部PDF来自港交所披露易。已检查PDF文件头、可解析性、实际页数、公司名称、报告期间、首页渲染与SHA-256。',
+              'ZIP已通过CRC完整性测试。',
+              '',
+          ]
+          for row in manifest:
+              readme_lines.append(f"{row['序号']}. {row['文件名']} | {row['PDF页数']}页 | {row['官方来源']}")
+          (PDFDIR / 'README.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+
+          validation = {
+              'company': 'RoboSense Technology Co., Ltd',
+              'stock_code': '02498.HK',
+              'package_date': '2026-09-14',
+              'pdf_count': len(manifest),
+              'reports': manifest,
+              'selection': selection,
+          }
+          (PDFDIR / '验证记录.json').write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          complete_zip = OUT / 'RoboSense_2498_Reports.zip'
+          with zipfile.ZipFile(complete_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for path in sorted(PDFDIR.iterdir()):
+                  z.write(path, arcname=path.name)
+          with zipfile.ZipFile(complete_zip, 'r') as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != len(manifest):
+                  raise RuntimeError(f'Complete ZIP validation failed: bad={bad}, pdf_count={len(pdfs)}')
+
+          prospectus_zip = OUT / 'RoboSense_Prospectus.zip'
+          with zipfile.ZipFile(prospectus_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              z.write(PDFDIR / '04_RoboSense_Prospectus.pdf', arcname='RoboSense_Prospectus.pdf')
+              z.write(PDFDIR / 'README.txt', arcname='README.txt')
+
+          reports_zip = OUT / 'RoboSense_Annual_and_Latest.zip'
+          with zipfile.ZipFile(reports_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for path in sorted(PDFDIR.glob('*.pdf')):
+                  if path.name != '04_RoboSense_Prospectus.pdf':
+                      z.write(path, arcname=path.name)
+              for name in ['README.txt', '文件清单与校验值.csv', '验证记录.json']:
+                  z.write(PDFDIR / name, arcname=name)
+
+          result = {
+              'ok': True,
+              'complete_archive': complete_zip.name,
+              'prospectus_archive': prospectus_zip.name,
+              'reports_archive': reports_zip.name,
+              'complete_size_bytes': complete_zip.stat().st_size,
+              'pdf_count': len(manifest),
+              'zip_crc_ok': True,
+              'reports': manifest,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload verified report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: robosense-2498-reports
+          path: |
+            output/RoboSense_2498_Reports.zip
+            output/RoboSense_Prospectus.zip
+            output/RoboSense_Annual_and_Latest.zip
+            output/result.json
+            output/selection.json
+            output/hkex_records.json
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
