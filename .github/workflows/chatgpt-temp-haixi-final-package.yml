@@ -1,0 +1,352 @@
+name: chatgpt-temp-haixi-final-package
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-haixi-pharma-reports-20260914
+    paths:
+      - .github/workflows/chatgpt-temp-haixi-final-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download public report pages, build PDFs, validate and package
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pillow img2pdf pypdf pymupdf
+          python <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+
+          CHECKED_AS_OF = '2026-09-14'
+          WORK = Path('haixi_final_work')
+          ROOT = WORK / '海西新药_02637_券商深度报告_3份_公开资料'
+          PDF_DIR = ROOT / 'PDF'
+          RAW_DIR = WORK / '_raw'
+          QA_DIR = WORK / '_qa'
+          for directory in (PDF_DIR, RAW_DIR, QA_DIR):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          REPORTS = [
+              {
+                  'detail_id': '5683790',
+                  'institution': '国投证券',
+                  'fallback_date': '2026-09-08',
+                  'title': '口服小分子眼药有望破局眼底病治疗，仿创协同开启价值重估',
+                  'kind': '公司深度／首次覆盖',
+                  'rating': '买入-A（首次）',
+              },
+              {
+                  'detail_id': '5505534',
+                  'institution': '国泰海通证券',
+                  'fallback_date': '2026-07-02',
+                  'title': '仿创双轨推进，HXP056有望重塑眼底病用药格局',
+                  'kind': '公司深度／首次覆盖',
+                  'rating': '增持（首次）',
+              },
+              {
+                  'detail_id': '5535712',
+                  'institution': '兴证国际',
+                  'fallback_date': '2026-07-15',
+                  'title': 'HXP056全球研发即将启动，营收利润稳健增长',
+                  'kind': '公司研究',
+                  'rating': '无评级',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www.fxbaogao.com/',
+          })
+
+          logs = []
+          def log(message):
+              message = str(message)
+              print(message, flush=True)
+              logs.append(message)
+
+          def safe_name(text):
+              text = re.sub(r'[\\/:*?"<>|]+', '_', str(text))
+              text = re.sub(r'\s+', '', text)
+              return text[:120]
+
+          def fetch(url, *, timeout=120, headers=None):
+              last_error = None
+              for attempt in range(1, 5):
+                  try:
+                      response = session.get(url, timeout=timeout, allow_redirects=True, headers=headers)
+                      log(f'GET attempt={attempt} status={response.status_code} bytes={len(response.content)} type={response.headers.get("content-type")} final={response.url}')
+                      if response.status_code == 200:
+                          return response
+                      last_error = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last_error = exc
+                      log(f'GET_ERROR attempt={attempt} url={url} error={exc!r}')
+                  time.sleep(attempt)
+              raise RuntimeError(f'Unable to fetch {url}: {last_error!r}')
+
+          manifest = []
+          for report_number, report in enumerate(REPORTS, 1):
+              detail_url = f"https://www.fxbaogao.com/detail/{report['detail_id']}"
+              response = fetch(detail_url, timeout=90)
+              html = response.text
+              (RAW_DIR / f"detail_{report['detail_id']}.html").write_text(html, encoding='utf-8', errors='replace')
+              soup = BeautifulSoup(html, 'html.parser')
+              visible_text = ' '.join(soup.get_text(' ', strip=True).split())
+
+              dates = re.findall(r'20\d{2}-\d{2}-\d{2}', visible_text)
+              report_date = dates[0] if dates else report['fallback_date']
+
+              # Find the public report-image URL embedded in HTML/meta/scripts.
+              image_urls = []
+              for match in re.finditer(r'https?://public\.fxbaogao\.com/report-image/[^"\'<>\s]+', html, re.I):
+                  image_urls.append(match.group(0).replace('&amp;', '&'))
+              for tag in soup.find_all(['img', 'a', 'meta']):
+                  for attr in ('src', 'href', 'content'):
+                      value = tag.get(attr)
+                      if value and 'public.fxbaogao.com/report-image/' in value:
+                          image_urls.append(urljoin(response.url, value).replace('&amp;', '&'))
+              image_urls = list(dict.fromkeys(image_urls))
+              if not image_urls:
+                  raise RuntimeError(f"No public report-image URL found for detail {report['detail_id']}")
+
+              # Prefer an untransformed PNG URL and derive the sequential page template.
+              first_url = image_urls[0]
+              first_url = first_url.split('?')[0]
+              match = re.search(r'(.*/)(\d+)-(\d+)\.png$', first_url)
+              if not match:
+                  raise RuntimeError(f'Unexpected report-image URL format: {first_url}')
+              prefix, embedded_id, first_page = match.groups()
+              if embedded_id != report['detail_id']:
+                  # The public image file is normally keyed to the detail id; retain the embedded id if the site differs.
+                  log(f'IMAGE_ID_DIFFER detail={report["detail_id"]} embedded={embedded_id}')
+              page_template = prefix + embedded_id + '-{page}.png'
+
+              report_raw_dir = RAW_DIR / report['detail_id']
+              report_raw_dir.mkdir(exist_ok=True)
+              normalized_paths = []
+              page_sources = []
+              page_hashes = []
+              dimensions = []
+              consecutive_misses = 0
+
+              # Public viewers normally expose a contiguous sequence beginning with page 1.
+              for page_number in range(1, 81):
+                  page_url = page_template.format(page=page_number)
+                  try:
+                      page_response = fetch(
+                          page_url,
+                          timeout=90,
+                          headers={
+                              'Referer': detail_url,
+                              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                          },
+                      )
+                  except Exception as exc:
+                      log(f'PAGE_MISS detail={report["detail_id"]} page={page_number} error={exc!r}')
+                      consecutive_misses += 1
+                      if consecutive_misses >= 1:
+                          break
+                      continue
+
+                  data = page_response.content
+                  if len(data) < 10_000:
+                      log(f'PAGE_SMALL detail={report["detail_id"]} page={page_number} bytes={len(data)}')
+                      break
+                  try:
+                      image = Image.open(io.BytesIO(data))
+                      image.load()
+                  except Exception as exc:
+                      log(f'PAGE_INVALID_IMAGE detail={report["detail_id"]} page={page_number} error={exc!r}')
+                      break
+                  if image.width < 650 or image.height < 850:
+                      log(f'PAGE_UNEXPECTED_SIZE detail={report["detail_id"]} page={page_number} size={image.size}')
+                      break
+
+                  raw_path = report_raw_dir / f'{page_number:03d}_raw.png'
+                  raw_path.write_bytes(data)
+                  jpg_path = report_raw_dir / f'{page_number:03d}.jpg'
+                  image.convert('RGB').save(jpg_path, format='JPEG', quality=94, optimize=False)
+                  normalized_paths.append(jpg_path)
+                  page_sources.append(page_response.url)
+                  page_hashes.append(hashlib.sha256(data).hexdigest())
+                  dimensions.append({'page': page_number, 'width': image.width, 'height': image.height})
+                  consecutive_misses = 0
+
+              public_pages = len(normalized_paths)
+              if public_pages == 0:
+                  raise RuntimeError(f"No public pages downloaded for {report['title']}")
+              if len(set(page_hashes)) != public_pages:
+                  raise RuntimeError(f"Duplicate page images detected for {report['title']}")
+
+              # Search page text/HTML for an original page-count marker, but do not assume completeness without evidence.
+              count_candidates = []
+              patterns = [
+                  r'page[_-]?count["\'\s:=]+(\d{1,3})',
+                  r'pageCount["\'\s:=]+(\d{1,3})',
+                  r'共\s*(\d{1,3})\s*页',
+                  r'原报告\s*(\d{1,3})\s*页',
+              ]
+              for pattern in patterns:
+                  for found in re.findall(pattern, html, re.I):
+                      try:
+                          value = int(found)
+                          if 1 <= value <= 300:
+                              count_candidates.append(value)
+                      except Exception:
+                          pass
+              original_pages = max(count_candidates) if count_candidates else None
+              is_complete = original_pages == public_pages if original_pages else False
+              access_status = '完整版' if is_complete else (f'公开试读{public_pages}页_原报告{original_pages}页' if original_pages else f'公开展示{public_pages}页')
+
+              filename = f"{report_date}_{safe_name(report['institution'])}_海西新药_{safe_name(report['title'])}_{access_status}.pdf"
+              pdf_path = PDF_DIR / filename
+              pdf_bytes = img2pdf.convert(
+                  [str(path) for path in normalized_paths],
+                  layout_fun=img2pdf.get_fixed_dpi_layout_fun((150, 150)),
+              )
+              pdf_path.write_bytes(pdf_bytes)
+              if not pdf_bytes.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF header: {filename}')
+
+              actual_pages = len(PdfReader(str(pdf_path), strict=False).pages)
+              if actual_pages != public_pages:
+                  raise RuntimeError(f'PDF page-count mismatch for {filename}: {actual_pages} != {public_pages}')
+
+              # Render at approximately 200 DPI and inspect first, middle, and last pages.
+              document = pymupdf.open(str(pdf_path))
+              if document.page_count != actual_pages:
+                  raise RuntimeError(f'Renderer page-count mismatch for {filename}')
+              render_checks = []
+              for page_index, label in [(0, 'first'), (actual_pages // 2, 'middle'), (actual_pages - 1, 'last')]:
+                  pixmap = document.load_page(page_index).get_pixmap(matrix=pymupdf.Matrix(2.78, 2.78), alpha=False)
+                  output = QA_DIR / f'{report_number:02d}_{label}.png'
+                  pixmap.save(str(output))
+                  with Image.open(output) as rendered:
+                      standard_deviation = float(ImageStat.Stat(rendered.convert('L').resize((64, 64))).stddev[0])
+                  if standard_deviation < 1.0:
+                      raise RuntimeError(f'Near-blank rendered page in {filename}: page {page_index + 1}')
+                  render_checks.append({'page': page_index + 1, 'stddev': round(standard_deviation, 4)})
+              document.close()
+
+              raw_pdf = pdf_path.read_bytes()
+              record = {
+                  'date': report_date,
+                  'institution': report['institution'],
+                  'title': report['title'],
+                  'stock_code': '02637.HK',
+                  'report_type': report['kind'],
+                  'rating': report['rating'],
+                  'detail_url': detail_url,
+                  'public_image_template': page_template,
+                  'public_pages': public_pages,
+                  'original_pages': original_pages,
+                  'is_complete': is_complete,
+                  'access_status': access_status,
+                  'filename': f'PDF/{filename}',
+                  'size_bytes': len(raw_pdf),
+                  'sha256': hashlib.sha256(raw_pdf).hexdigest(),
+                  'page_sources': page_sources,
+                  'page_dimensions': dimensions,
+                  'render_checks': render_checks,
+              }
+              manifest.append(record)
+              log('VALID ' + json.dumps(record, ensure_ascii=False))
+
+          if len(manifest) != 3:
+              raise RuntimeError(f'Expected three reports, got {len(manifest)}')
+          if len({entry['sha256'] for entry in manifest}) != 3:
+              raise RuntimeError('Duplicate report PDF content detected')
+
+          readme = [
+              '# 海西新药（02637.HK）券商深度研究报告资料包',
+              '',
+              f'资料核对日期：{CHECKED_AS_OF}',
+              '',
+              '本包收录3份围绕海西新药HXP056、创新药管线及“仿制药+创新药”双轨模式的公司深度或首次覆盖研究。',
+              '公开渠道可取得的页数已在文件名和清单中据实标注；未将公开展示页误称为券商原始完整版。',
+              '',
+              '| 日期 | 券商 | 报告题目 | 类型 | 评级 | 收录页数 | 原报告页数 | 状态 |',
+              '|---|---|---|---|---|---:|---:|---|',
+          ]
+          for entry in manifest:
+              readme.append(
+                  f"| {entry['date']} | {entry['institution']} | {entry['title']} | {entry['report_type']} | {entry['rating']} | {entry['public_pages']} | {entry['original_pages'] or '未公开'} | {entry['access_status']} |"
+              )
+          readme += [
+              '',
+              '校验说明：',
+              '- PDF由公开展示的高清报告页面按原顺序合成。',
+              '- 未登录账户、未使用会员权限，也未绕过验证码、付费墙或其他访问控制。',
+              '- 已检查页面尺寸、重复页、PDF文件头和实际页数。',
+              '- 已按约200 DPI渲染检查每份报告的首页、中间页和末页。',
+              '- ZIP已执行CRC完整性检查；详细来源和SHA-256见 manifest.json 与 SHA256SUMS.txt。',
+          ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (ROOT / '文件说明.txt').write_text('\n'.join(line.replace('# ', '').replace('- ', '') for line in readme if not line.startswith('|')) + '\n', encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps({
+              'company': '福建海西新药创制股份有限公司',
+              'stock_code': '02637.HK',
+              'checked_as_of': CHECKED_AS_OF,
+              'pdf_count': 3,
+              'files': manifest,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{entry['sha256']}  {entry['filename']}" for entry in manifest) + '\n', encoding='utf-8')
+          (WORK / 'run.log').write_text('\n'.join(logs) + '\n', encoding='utf-8')
+
+          zip_path = WORK / '海西新药_02637_券商深度报告_3份_公开资料.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad_member = archive.testzip()
+              if bad_member:
+                  raise RuntimeError(f'ZIP CRC failure: {bad_member}')
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 3:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_members)}')
+
+          zip_raw = zip_path.read_bytes()
+          metadata = {
+              'filename': zip_path.name,
+              'size_bytes': len(zip_raw),
+              'sha256': hashlib.sha256(zip_raw).hexdigest(),
+              'pdf_count': 3,
+              'reports': manifest,
+          }
+          (WORK / 'zip_metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL ' + json.dumps(metadata, ensure_ascii=False), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Haixi-Pharma-Broker-Deep-Reports
+          path: |
+            haixi_final_work/海西新药_02637_券商深度报告_3份_公开资料.zip
+            haixi_final_work/zip_metadata.json
+            haixi_final_work/run.log
+            haixi_final_work/_qa
+          retention-days: 1
+          compression-level: 0
