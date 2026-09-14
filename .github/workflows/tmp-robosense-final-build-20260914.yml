@@ -1,0 +1,301 @@
+name: Build verified RoboSense report archive
+on:
+  push:
+    branches:
+      - tmp-robosense-final-build-20260914
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf pymupdf fonttools
+      - name: Download, verify and package official PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pdfs work/renders
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('output')
+          PDFDIR = Path('work/pdfs')
+          RENDERDIR = Path('work/renders')
+          OUT.mkdir(parents=True, exist_ok=True)
+          PDFDIR.mkdir(parents=True, exist_ok=True)
+          RENDERDIR.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'seq': 1,
+                  'kind': '年度报告',
+                  'period': '2023',
+                  'filename': '01_速腾聚创_2023年年度报告.pdf',
+                  'url': 'https://database.comein.cn/original-data/pdf/documentsAnnouncement/654d94b960d4accb8c7a57818d004785.PDF',
+                  'minimum_pages': 150,
+                  'required': ['ROBOSENSE', '2023'],
+                  'disclosure_date': '2024-04-26',
+                  'source_title': '2023年度报告',
+              },
+              {
+                  'seq': 2,
+                  'kind': '年度报告',
+                  'period': '2024',
+                  'filename': '02_速腾聚创_2024年年度报告.pdf',
+                  'url': 'https://database.comein.cn/original-data/pdf/documentsAnnouncement/0d5f6627e34741ed50f2ee070dc26098.PDF',
+                  'minimum_pages': 180,
+                  'required': ['ROBOSENSE', '2024'],
+                  'disclosure_date': '2025-04-28',
+                  'source_title': '2024年度报告',
+              },
+              {
+                  'seq': 3,
+                  'kind': '年度报告',
+                  'period': '2025',
+                  'filename': '03_速腾聚创_2025年年度报告.pdf',
+                  'url': 'https://database.comein.cn/original-data/pdf/documentsAnnouncement/62630a8c269038de17c4061212e63062.PDF',
+                  'minimum_pages': 150,
+                  'required': ['ROBOSENSE', '2025'],
+                  'disclosure_date': '2026-04-24',
+                  'source_title': '2025年度报告',
+              },
+              {
+                  'seq': 4,
+                  'kind': '上市最终招股章程',
+                  'period': '2023',
+                  'filename': '04_速腾聚创_上市最终招股章程_2023-12-27.pdf',
+                  'url': 'https://database.comein.cn/original-data/pdf/documentsAnnouncement/c8746e7a47e793a50a2155527d998e00.PDF',
+                  'minimum_pages': 450,
+                  'required': ['ROBOSENSE', 'GLOBALOFFERING'],
+                  'disclosure_date': '2023-12-27',
+                  'source_title': '全球发售（发售以供认购）',
+              },
+              {
+                  'seq': 5,
+                  'kind': '最新季度业绩',
+                  'period': '2026Q1',
+                  'filename': '05_速腾聚创_2026年第一季度未经审核财务业绩.pdf',
+                  'url': 'https://database.comein.cn/original-data/pdf/documentsAnnouncement/56cbabc73cb64c6db894389d36aab2b6.PDF',
+                  'minimum_pages': 10,
+                  'required': ['ROBOSENSE', '2026', 'FIRSTQUARTER'],
+                  'disclosure_date': '2026-05-27',
+                  'source_title': '2026年第一季度未经审核财务业绩公告',
+              },
+              {
+                  'seq': 6,
+                  'kind': '最新中期业绩公告',
+                  'period': '2026H1',
+                  'filename': '06_速腾聚创_2026年中期业绩公告.pdf',
+                  'url': 'https://database.comein.cn/original-data/pdf/documentsAnnouncement/6a1e4793b9ee1d4ae00bd5f4159c3436.PDF',
+                  'minimum_pages': 20,
+                  'required': ['ROBOSENSE', '2026', 'INTERIM'],
+                  'disclosure_date': '2026-08-26',
+                  'source_title': '截至2026年6月30日止六个月的中期业绩公告',
+              },
+          ]
+
+          retry = Retry(
+              total=8,
+              connect=8,
+              read=8,
+              status=8,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=frozenset(['GET']),
+          )
+          session = requests.Session()
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://ir.robosense.ai/',
+          })
+
+          def norm(text: str) -> str:
+              return re.sub(r'[^A-Z0-9\u4e00-\u9fff]+', '', (text or '').upper())
+
+          manifest = []
+          validation = []
+
+          for spec in reports:
+              dest = PDFDIR / spec['filename']
+              last_error = None
+              for attempt in range(1, 9):
+                  try:
+                      print('DOWNLOAD', spec['seq'], attempt, spec['url'], flush=True)
+                      h = hashlib.sha256()
+                      size = 0
+                      with session.get(spec['url'], stream=True, timeout=(30, 600), allow_redirects=True) as response:
+                          response.raise_for_status()
+                          final_url = response.url
+                          with dest.open('wb') as f:
+                              for chunk in response.iter_content(1024 * 1024):
+                                  if not chunk:
+                                      continue
+                                  f.write(chunk)
+                                  h.update(chunk)
+                                  size += len(chunk)
+                      if size < 100000 or b'%PDF-' not in dest.read_bytes()[:2048]:
+                          raise RuntimeError(f'Invalid PDF payload: {size} bytes')
+
+                      reader = PdfReader(str(dest), strict=False)
+                      pages = len(reader.pages)
+                      if pages < spec['minimum_pages']:
+                          raise RuntimeError(f'Unexpectedly short PDF: {pages} pages')
+                      indexes = list(range(min(20, pages))) + list(range(max(0, pages - 5), pages))
+                      sample_parts = []
+                      for index in sorted(set(indexes)):
+                          try:
+                              sample_parts.append(reader.pages[index].extract_text() or '')
+                          except Exception:
+                              pass
+                      sample = norm('\n'.join(sample_parts))
+                      if not any(company in sample for company in ['ROBOSENSE', '速騰聚創', '速腾聚创']):
+                          raise RuntimeError('Company identity not found')
+                      for token in spec['required']:
+                          if norm(token) not in sample:
+                              raise RuntimeError(f'Required token not found: {token}')
+
+                      document = pymupdf.open(dest)
+                      substantive = len(document) - 1
+                      for index in range(len(document) - 1, -1, -1):
+                          page = document[index]
+                          if len(page.get_text('text').strip()) > 20 or page.get_images(full=True):
+                              substantive = index
+                              break
+                      rendered = []
+                      for page_index, label in [(0, 'cover'), (substantive, 'last')]:
+                          pix = document[page_index].get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                          image_path = RENDERDIR / f"{spec['seq']:02d}_{label}.png"
+                          pix.save(str(image_path))
+                          if not image_path.exists() or image_path.stat().st_size < 500:
+                              raise RuntimeError(f'Render failed: {image_path}')
+                          rendered.append({
+                              '页面': page_index + 1,
+                              '渲染文件': image_path.name,
+                              '字节数': image_path.stat().st_size,
+                          })
+                      document.close()
+
+                      manifest.append({
+                          '序号': spec['seq'],
+                          '文件名': dest.name,
+                          '报告类型': spec['kind'],
+                          '报告期间': spec['period'],
+                          '披露日期': spec['disclosure_date'],
+                          '原始披露标题': spec['source_title'],
+                          'PDF页数': pages,
+                          '文件大小（字节）': size,
+                          'SHA-256': h.hexdigest(),
+                          '官方原始附件': final_url,
+                      })
+                      validation.append({
+                          '文件名': dest.name,
+                          'PDF文件头': '通过',
+                          '可解析性': '通过',
+                          '公司及报告期间识别': '通过',
+                          '实际页数': pages,
+                          '封面及末个有效页面渲染': rendered,
+                      })
+                      print('VERIFIED', dest.name, pages, size, flush=True)
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      print('RETRY', spec['seq'], attempt, repr(exc), flush=True)
+                      dest.unlink(missing_ok=True)
+                      time.sleep(min(2 ** attempt, 30))
+              else:
+                  raise RuntimeError(f"Failed {spec['filename']}: {last_error!r}")
+
+          if len(manifest) != len(reports):
+              raise RuntimeError(f'Expected {len(reports)} verified PDFs, got {len(manifest)}')
+
+          with (PDFDIR / '文件清单与校验值.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+          (PDFDIR / '验证记录.json').write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding='utf-8')
+          (PDFDIR / 'README.txt').write_text('\n'.join([
+              '速腾聚创（RoboSense Technology Co., Ltd，02498.HK）定期报告与上市文件资料包',
+              '打包日期：2026-09-14',
+              '',
+              '收录内容：',
+              '1. 上市后全部完整年度报告：2023、2024、2025年，共3份。',
+              '2. 2023年12月27日发布的上市最终招股章程（全球发售文件）。',
+              '3. 2026年第一季度未经审核财务业绩公告：严格意义上的最新季度报告。',
+              '4. 2026年中期业绩公告：截至打包日更晚披露的集团定期财务信息。',
+              '',
+              '截至打包日尚未发布2026年完整中期报告，因此以2026年8月26日发布的中期业绩公告补充最新披露口径。',
+              '全部PDF来自速腾聚创投资者关系网站所链接的官方原始公告附件。已核验PDF文件头、可解析性、公司名称、报告期间、实际页数、SHA-256，并渲染检查封面及末个有效页面。',
+              '压缩包已通过ZIP CRC完整性测试。',
+          ]), encoding='utf-8')
+
+          def make_zip(path: Path, selected_paths: list[Path]) -> None:
+              with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+                  for file_path in sorted(selected_paths):
+                      z.write(file_path, arcname=file_path.name)
+              with zipfile.ZipFile(path, 'r') as z:
+                  bad = z.testzip()
+                  if bad is not None:
+                      raise RuntimeError(f'ZIP CRC failure in {path.name}: {bad}')
+
+          all_paths = list(PDFDIR.iterdir())
+          full_zip = OUT / 'RoboSenseReports.zip'
+          make_zip(full_zip, all_paths)
+          with zipfile.ZipFile(full_zip, 'r') as z:
+              pdfs = [name for name in z.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 6:
+                  raise RuntimeError(f'Unexpected PDF count in full ZIP: {len(pdfs)}')
+
+          chinese_zip = OUT / '速腾聚创_02498_全部年报_招股说明书及最新季报.zip'
+          shutil.copy2(full_zip, chinese_zip)
+
+          prospectus_zip = OUT / 'RoboSense_Prospectus.zip'
+          prospectus_paths = [p for p in all_paths if '招股章程' in p.name or p.name in {'README.txt', '文件清单与校验值.csv', '验证记录.json'}]
+          make_zip(prospectus_zip, prospectus_paths)
+
+          annual_latest_zip = OUT / 'RoboSense_Annual_and_Latest.zip'
+          annual_latest_paths = [p for p in all_paths if '招股章程' not in p.name]
+          make_zip(annual_latest_zip, annual_latest_paths)
+
+          result = {
+              'ok': True,
+              'archive': full_zip.name,
+              'archive_cn': chinese_zip.name,
+              'prospectus_archive': prospectus_zip.name,
+              'annual_latest_archive': annual_latest_zip.name,
+              'archive_bytes': full_zip.stat().st_size,
+              'pdf_count': 6,
+              'zip_crc_ok': True,
+              'reports': manifest,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload verified packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: robosense-verified-report-packages
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
