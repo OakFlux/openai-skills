@@ -1,0 +1,167 @@
+name: chatgpt-temp-bank-of-chongqing-eastmoney-query
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-bank-of-chongqing-eastmoney-query.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query report API and probe original PDFs
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pypdf
+          python <<'PY'
+          import io
+          import json
+          import re
+          import time
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          WORK = Path('bank_of_chongqing_em_query')
+          WORK.mkdir(exist_ok=True)
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/601963.html',
+              'Accept': 'application/json,text/javascript,*/*;q=0.1',
+          })
+
+          variants = [
+              {'beginTime': '2018-01-01', 'endTime': '2026-09-14', 'rating': '', 'ratingChange': ''},
+              {'beginTime': '2018-01-01', 'endTime': '2026-09-14', 'rating': '*', 'ratingChange': '*'},
+              {'beginTime': '', 'endTime': '', 'rating': '', 'ratingChange': ''},
+          ]
+          all_records = []
+          seen = set()
+          raw_responses = []
+
+          def parse_jsonp(text):
+              text = text.strip()
+              try:
+                  return json.loads(text)
+              except Exception:
+                  start = text.find('{')
+                  end = text.rfind('}')
+                  if start >= 0 and end > start:
+                      return json.loads(text[start:end + 1])
+                  raise
+
+          for variant_index, variant in enumerate(variants, 1):
+              for page_no in range(1, 20):
+                  params = {
+                      'cb': 'showData',
+                      'pageSize': 100,
+                      'pageNo': page_no,
+                      'qType': 0,
+                      'code': '601963',
+                      'industryCode': '*',
+                      'industry': '*',
+                      'rating': variant['rating'],
+                      'ratingChange': variant['ratingChange'],
+                      'beginTime': variant['beginTime'],
+                      'endTime': variant['endTime'],
+                      'fields': '',
+                      'orgCode': '',
+                      'rcode': '',
+                      '_': int(time.time() * 1000),
+                  }
+                  response = session.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=90)
+                  print('QUERY', variant_index, page_no, response.status_code, len(response.content), response.url, response.text[:300], flush=True)
+                  raw_responses.append({'variant': variant_index, 'page': page_no, 'url': response.url, 'status': response.status_code, 'text': response.text})
+                  if response.status_code != 200:
+                      break
+                  try:
+                      payload = parse_jsonp(response.text)
+                  except Exception as exc:
+                      print('PARSE_ERROR', repr(exc), flush=True)
+                      break
+                  records = payload.get('data') or []
+                  if isinstance(records, dict):
+                      records = records.get('data') or records.get('list') or []
+                  if not isinstance(records, list):
+                      records = []
+                  for record in records:
+                      info_code = record.get('infoCode') or record.get('INFO_CODE')
+                      if info_code and info_code not in seen:
+                          seen.add(info_code)
+                          all_records.append(record)
+                          print('RECORD', json.dumps(record, ensure_ascii=False), flush=True)
+                  total_page = int(payload.get('TotalPage') or payload.get('totalPage') or 1)
+                  if not records or page_no >= total_page:
+                      break
+
+          (WORK / 'raw_responses.json').write_text(json.dumps(raw_responses, ensure_ascii=False, indent=2), encoding='utf-8')
+          (WORK / 'records.json').write_text(json.dumps(all_records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          probes = []
+          candidates = []
+          for record in all_records:
+              info_code = record.get('infoCode') or record.get('INFO_CODE')
+              pages_meta = int(record.get('attachPages') or record.get('ATTACH_PAGES') or 0)
+              title = record.get('title') or record.get('TITLE') or ''
+              date = str(record.get('publishDate') or record.get('PUBLISH_DATE') or '')[:10]
+              org = record.get('orgSName') or record.get('ORG_SNAME') or record.get('orgName') or ''
+              if pages_meta < 12:
+                  continue
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/{info_code}_1.pdf',
+              ]
+              valid = None
+              tried = []
+              for url in urls:
+                  try:
+                      response = session.get(url, headers={'Referer': 'https://data.eastmoney.com/'}, timeout=180, allow_redirects=True)
+                      tried.append({'url': url, 'status': response.status_code, 'bytes': len(response.content), 'type': response.headers.get('content-type'), 'final': response.url})
+                      print('PDF_PROBE', info_code, response.status_code, len(response.content), response.headers.get('content-type'), response.url, flush=True)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50_000:
+                          reader = PdfReader(io.BytesIO(response.content), strict=False)
+                          actual_pages = len(reader.pages)
+                          sample = ''
+                          for index in range(min(3, actual_pages)):
+                              try:
+                                  sample += '\n' + (reader.pages[index].extract_text() or '')
+                              except Exception:
+                                  pass
+                          valid = {
+                              'url': response.url,
+                              'bytes': len(response.content),
+                              'actual_pages': actual_pages,
+                              'company_detected': ('重庆银行' in sample or '601963' in sample or '01963' in sample),
+                          }
+                          break
+                  except Exception as exc:
+                      tried.append({'url': url, 'error': repr(exc)})
+              probe = {
+                  'infoCode': info_code,
+                  'date': date,
+                  'institution': org,
+                  'title': title,
+                  'metadata_pages': pages_meta,
+                  'valid_pdf': valid,
+                  'tried': tried,
+              }
+              probes.append(probe)
+              if valid:
+                  candidates.append({**probe, **valid})
+              print('PROBE_RESULT', json.dumps(probe, ensure_ascii=False), flush=True)
+
+          (WORK / 'pdf_probes.json').write_text(json.dumps(probes, ensure_ascii=False, indent=2), encoding='utf-8')
+          (WORK / 'valid_candidates.json').write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_VALID', len(candidates), json.dumps(candidates, ensure_ascii=False), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bank-of-Chongqing-Eastmoney-Query
+          path: bank_of_chongqing_em_query
+          retention-days: 1
+          compression-level: 6
