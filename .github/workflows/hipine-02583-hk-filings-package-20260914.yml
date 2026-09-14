@@ -1,0 +1,265 @@
+name: Build HIPINE 02583 HK filing package 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hipine-02583-hk-filings-package-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Download official HKEX filings, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          BASE = 'https://www1.hkexnews.hk'
+          PACKAGE = '西普尼_02583_港股_招股章程_年报_2026中期报告'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/json,text/plain,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=en',
+          })
+
+          def clean_title(value: str) -> str:
+              value = re.sub(r'<[^>]+>', ' ', value or '')
+              return re.sub(r'\s+', ' ', html.unescape(value)).strip()
+
+          def discover_latest_interim_report() -> dict | None:
+              mapping_url = BASE + '/ncms/script/eds/activestock_sehk_e.json'
+              r = session.get(mapping_url, timeout=(20, 60))
+              r.raise_for_status()
+              items = r.json()
+              internal_id = next((str(x.get('i', '')) for x in items if str(x.get('c', '')).zfill(5) == '02583'), '')
+              if not internal_id:
+                  raise RuntimeError('HKEX internal stockId for 02583 was not found')
+
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': internal_id,
+                  'documentType': '-1',
+                  'fromDate': '20250914',
+                  'toDate': '20260914',
+                  'title': '',
+                  'searchType': '0',
+                  't': '1',
+                  'lang': 'E',
+                  'rowRange': '200',
+              }
+              r = session.get(BASE + '/search/titleSearchServlet.do', params=params, timeout=(20, 60))
+              r.raise_for_status()
+              payload = r.json()
+              raw = payload.get('result')
+              rows = json.loads(raw) if isinstance(raw, str) and raw not in ('', 'null') else (raw or [])
+              print('HKEX_RECORD_COUNT', payload.get('recordCnt'), flush=True)
+              candidates = []
+              for row in rows:
+                  title = clean_title(str(row.get('TITLE', '')))
+                  link = str(row.get('FILE_LINK', '') or '')
+                  date_time = str(row.get('DATE_TIME', '') or '')
+                  print('HKEX_RECORD', date_time, title, link, flush=True)
+                  upper = title.upper()
+                  excluded = ('LETTER TO', 'NOTIFICATION', 'REPLY FORM', 'PROXY FORM', 'ANNOUNCEMENT', 'CIRCULAR')
+                  if 'INTERIM REPORT' in upper and not any(term in upper for term in excluded) and link.lower().endswith('.pdf'):
+                      candidates.append({'title': title, 'url': urljoin(BASE, link), 'date_time': date_time})
+              if not candidates:
+                  return None
+              # Search results are normally newest first; prefer titles beginning with the report name.
+              candidates.sort(key=lambda x: (not x['title'].upper().startswith(('2026 INTERIM REPORT', 'INTERIM REPORT 2026')), x['date_time']))
+              chosen = candidates[0]
+              print('SELECTED_INTERIM_REPORT', json.dumps(chosen, ensure_ascii=False), flush=True)
+              return chosen
+
+          def url_variants(url: str) -> list[str]:
+              variants = [url]
+              if 'www1.hkexnews.hk' in url:
+                  variants.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  variants.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              return list(dict.fromkeys(variants))
+
+          def download_pdf(urls: list[str], dest: Path, min_bytes: int = 50_000) -> str:
+              errors = []
+              for url in urls:
+                  for attempt in range(1, 5):
+                      tmp = dest.with_suffix(dest.suffix + '.part')
+                      try:
+                          with session.get(url, timeout=(30, 300), allow_redirects=True, stream=True) as r:
+                              print('DOWNLOAD', dest.name, attempt, r.status_code, url, 'FINAL', r.url, flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as f:
+                                  for chunk in r.iter_content(chunk_size=1024 * 1024):
+                                      if chunk:
+                                          f.write(chunk)
+                          size = tmp.stat().st_size
+                          with tmp.open('rb') as f:
+                              head = f.read(8)
+                          if size < min_bytes or not head.startswith(b'%PDF-'):
+                              raise RuntimeError(f'not a valid PDF response: bytes={size}, head={head!r}')
+                          tmp.replace(dest)
+                          return str(r.url)
+                      except Exception as exc:
+                          errors.append(f'{url} attempt {attempt}: {exc!r}')
+                          tmp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {dest.name}: {errors}')
+
+          discovered = discover_latest_interim_report()
+
+          docs = [
+              {
+                  'filename': '01_西普尼_02583_招股章程_中文版_2025-09-19.pdf',
+                  'title': '西普尼招股章程（中文版）',
+                  'date': '2025-09-19',
+                  'urls': url_variants('https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0919/2025091900020_c.pdf'),
+                  'min_pages': 100,
+              },
+              {
+                  'filename': '02_HIPINE_02583_Prospectus_English_2025-09-19.pdf',
+                  'title': 'HIPINE Prospectus (English)',
+                  'date': '2025-09-19',
+                  'urls': url_variants('https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0919/2025091900019.pdf'),
+                  'min_pages': 100,
+              },
+              {
+                  'filename': '03_西普尼_02583_2025年年度报告_2026-04-17.pdf',
+                  'title': '西普尼2025年年度报告（中英双语）',
+                  'date': '2026-04-17',
+                  'urls': url_variants('https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0417/2026041700513.pdf') + ['https://static.tigerbbs.com/1512eeb24cdf43d491a243b467521663'],
+                  'min_pages': 100,
+              },
+          ]
+
+          if discovered:
+              docs.append({
+                  'filename': '04_西普尼_02583_2026年中期报告_2026-09-10.pdf',
+                  'title': discovered['title'],
+                  'date': '2026-09-10',
+                  'urls': url_variants(discovered['url']),
+                  'min_pages': 20,
+              })
+
+          docs.append({
+              'filename': '05_西普尼_02583_2026年中期业绩公告_2026-08-28.pdf',
+              'title': '截至2026年6月30日止六个月中期业绩公告',
+              'date': '2026-08-28',
+              'urls': url_variants('https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0828/2026082803074.pdf') + ['https://static.tigerbbs.com/a5d30ffbba9d4131ad11c861b6a6358b'],
+              'min_pages': 5,
+          })
+
+          records = []
+          for doc in docs:
+              dest = out / doc['filename']
+              final_url = download_pdf(doc['urls'], dest)
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < doc['min_pages']:
+                  raise RuntimeError(f'page count too small for {dest.name}: {pages}')
+              text = ''
+              for p in reader.pages[: min(8, pages)]:
+                  try:
+                      text += '\n' + (p.extract_text() or '')
+                  except Exception:
+                      pass
+              identity_ok = any(x.lower() in text.lower() for x in ('HIPINE', '西普尼', '2583'))
+              if not identity_ok:
+                  raise RuntimeError(f'company identity could not be verified in {dest.name}')
+              q = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {dest.name}: {q.stderr[-1500:]}')
+              data = dest.read_bytes()
+              record = {
+                  'filename': doc['filename'],
+                  'title': doc['title'],
+                  'disclosure_date': doc['date'],
+                  'source_url': final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '西普尼（02583.HK）港股披露文件',
+              '整理日期：2026-09-14',
+              '',
+              '收录口径：仅收录香港联合交易所披露易公开文件。',
+              '西普尼于2025-09-30在港交所主板上市，因此上市后截至整理日只有一份完整年度报告，即2025年年度报告。',
+              '港股主板公司通常不按A股口径强制发布第一、第三季度报告；本包以2026年完整中期报告作为最新阶段性财务报告，并附中期业绩公告。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(records, 1):
+              readme.extend([
+                  f"{i}. {rec['title']}",
+                  f"   文件：{rec['filename']}",
+                  f"   披露日期：{rec['disclosure_date']}；页数：{rec['pages']}；大小：{rec['bytes']/1048576:.2f} MB",
+                  f"   来源：{rec['source_url']}",
+                  f"   SHA-256：{rec['sha256']}",
+                  '',
+              ])
+          readme.append('完整性核验：PDF文件头、公司身份、实际页数、qpdf结构检查及SHA-256校验。')
+          (out / '文件清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for p in sorted(out.iterdir()):
+                  zf.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) < 4:
+                  raise RuntimeError(f'PDF count mismatch: {len(pdfs)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDF_COUNT', len(pdfs), flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hipine-02583-hk-filings-final
+          path: 西普尼_02583_港股_招股章程_年报_2026中期报告.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
