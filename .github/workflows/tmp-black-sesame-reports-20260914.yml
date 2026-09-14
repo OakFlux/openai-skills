@@ -1,0 +1,435 @@
+name: Build Black Sesame reports archive
+on:
+  push:
+    branches:
+      - tmp-black-sesame-reports-20260914
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf playwright ddgs
+      - name: Download, validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package diagnostics
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import quote, urljoin, urlparse
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          try:
+              from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+          except Exception:
+              sync_playwright = None
+              PlaywrightTimeout = Exception
+
+          try:
+              from ddgs import DDGS
+          except Exception:
+              DDGS = None
+
+          PACKAGE = Path('package')
+          DIAG = Path('diagnostics')
+          PACKAGE.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+
+          retry = Retry(
+              total=7,
+              connect=7,
+              read=7,
+              status=7,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=frozenset(['GET']),
+          )
+          session = requests.Session()
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf,*/*;q=0.8',
+          })
+
+          fixed_reports = [
+              {
+                  'seq': 2,
+                  'kind': '年度报告',
+                  'period': '2024',
+                  'filename': '02_黑芝麻智能_2024年年度报告.pdf',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0425/2025042501583.pdf',
+                  'min_pages': 150,
+                  'tokens': ['BLACK SESAME', '2024', 'ANNUAL REPORT'],
+                  'note': '上市后的首份年度报告',
+              },
+              {
+                  'seq': 3,
+                  'kind': '年度报告',
+                  'period': '2025',
+                  'filename': '03_黑芝麻智能_2025年年度报告.pdf',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0427/2026042701016.pdf',
+                  'min_pages': 150,
+                  'tokens': ['BLACK SESAME', '2025', 'ANNUAL REPORT'],
+                  'note': '截至打包日最新完整年度报告',
+              },
+              {
+                  'seq': 4,
+                  'kind': '最新中期业绩公告',
+                  'period': '2026H1',
+                  'filename': '04_黑芝麻智能_2026年中期业绩公告.pdf',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0831/2026083100441.pdf',
+                  'min_pages': 20,
+                  'tokens': ['BLACK SESAME', '2026', 'INTERIM RESULTS'],
+                  'note': '截至2026-09-14最新集团层面定期财务披露',
+              },
+              {
+                  'seq': 5,
+                  'kind': '完整中期报告补充',
+                  'period': '2025H1',
+                  'filename': '05_黑芝麻智能_2025年中期报告_完整报告补充.pdf',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0911/2025091101246.pdf',
+                  'min_pages': 60,
+                  'tokens': ['BLACK SESAME', '2025', 'INTERIM REPORT'],
+                  'note': '2026年完整中期报告尚未发布时的最近完整中期报告',
+              },
+          ]
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', ' ', text or '').strip()
+
+          def extract_sample(reader: PdfReader) -> str:
+              n = len(reader.pages)
+              indices = list(range(min(12, n)))
+              if n > 20:
+                  indices += [n // 2, max(0, n - 3), n - 1]
+              parts = []
+              for i in sorted(set(indices)):
+                  try:
+                      parts.append(reader.pages[i].extract_text() or '')
+                  except Exception:
+                      pass
+              return compact('\n'.join(parts))
+
+          def download_bytes(url: str, referer: str = 'https://www1.hkexnews.hk/') -> tuple[bytes, str]:
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      r = session.get(url, headers={'Referer': referer}, timeout=(30, 300), allow_redirects=True)
+                      print('GET', attempt, r.status_code, len(r.content), r.url, flush=True)
+                      r.raise_for_status()
+                      return r.content, r.url
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 20))
+              raise RuntimeError(f'Failed to download {url}: {last!r}')
+
+          def validate_pdf(data: bytes, expected_tokens: list[str], min_pages: int, require_prospectus: bool = False) -> tuple[int, str]:
+              if b'%PDF-' not in data[:2048] or len(data) < 50000:
+                  raise RuntimeError(f'Invalid PDF payload: {len(data)} bytes')
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'Page count {pages} < {min_pages}')
+              sample = extract_sample(reader)
+              upper = sample.upper()
+              for token in expected_tokens:
+                  if token.upper() not in upper:
+                      raise RuntimeError(f'Missing identity token: {token}')
+              if require_prospectus and not any(k in upper for k in ['PROSPECTUS', 'GLOBAL OFFERING', '招股章程', '全球發售', '全球发售']):
+                  raise RuntimeError('Document does not look like a final prospectus/global offering document')
+              return pages, sample
+
+          def discover_prospectus_candidates() -> list[dict]:
+              candidates = []
+              seen = set()
+
+              def add(url: str, label: str, source: str):
+                  if not url:
+                      return
+                  url = urljoin(source, url)
+                  if not url.startswith('http') or url in seen:
+                      return
+                  seen.add(url)
+                  candidates.append({'url': url, 'label': compact(label), 'source': source})
+
+              search_urls = [
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&documentType=-1&from=20240725&lang=EN&market=SEHK&searchType=0&stockId=1000221013&t1code=-2&t2Gcode=-2&t2code=-2&to=20240810',
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&documentType=-1&from=20240725&lang=ZH&market=SEHK&searchType=0&stockId=1000221013&t1code=-2&t2Gcode=-2&t2code=-2&to=20240810',
+              ]
+
+              # Static HTML first.
+              for su in search_urls:
+                  try:
+                      r = session.get(su, timeout=(30, 120))
+                      soup = BeautifulSoup(r.text, 'lxml')
+                      for a in soup.find_all('a', href=True):
+                          text = compact(a.get_text(' ', strip=True))
+                          hay = text.upper()
+                          if any(k in hay for k in ['GLOBAL OFFERING', 'PROSPECTUS', '全球發售', '全球发售', '招股章程']):
+                              add(a['href'], text, r.url)
+                  except Exception as exc:
+                      print('STATIC_SEARCH_ERR', repr(exc), flush=True)
+
+              # Browser execution to expose dynamic/loaded entries.
+              if sync_playwright is not None:
+                  chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium')
+                  try:
+                      with sync_playwright() as p:
+                          browser = p.chromium.launch(headless=True, executable_path=chrome, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                          context = browser.new_context(user_agent=session.headers['User-Agent'], locale='en-HK', viewport={'width': 1440, 'height': 1000})
+                          for su in search_urls:
+                              page = context.new_page()
+                              try:
+                                  page.goto(su, wait_until='domcontentloaded', timeout=120000)
+                                  try:
+                                      page.wait_for_load_state('networkidle', timeout=30000)
+                                  except PlaywrightTimeout:
+                                      pass
+                                  page.wait_for_timeout(2500)
+                                  for sort_text in ['Oldest information', '最舊資料', '最旧资料']:
+                                      loc = page.get_by_text(sort_text, exact=False)
+                                      if loc.count():
+                                          try:
+                                              loc.first.click(timeout=7000)
+                                              page.wait_for_timeout(2500)
+                                          except Exception:
+                                              pass
+                                  for _ in range(4):
+                                      loc = page.get_by_text('LOAD MORE', exact=False)
+                                      if not loc.count():
+                                          break
+                                      try:
+                                          loc.first.click(timeout=7000)
+                                          page.wait_for_timeout(1800)
+                                      except Exception:
+                                          break
+                                  links = page.eval_on_selector_all('a', "els => els.map(e => ({text:(e.innerText||e.textContent||'').trim(), href:e.href}))")
+                                  (DIAG / ('title_search_' + ('zh' if 'lang=ZH' in su else 'en') + '.html')).write_text(page.content(), encoding='utf-8')
+                                  for item in links:
+                                      text = compact(item.get('text', ''))
+                                      hay = text.upper()
+                                      if any(k in hay for k in ['GLOBAL OFFERING', 'PROSPECTUS', '全球發售', '全球发售', '招股章程']):
+                                          add(item.get('href', ''), text, page.url)
+                              finally:
+                                  page.close()
+                          context.close()
+                          browser.close()
+                  except Exception as exc:
+                      print('BROWSER_SEARCH_ERR', repr(exc), flush=True)
+
+              # Search-engine fallback for official HKEX links.
+              queries = [
+                  'site:www1.hkexnews.hk/listedco/listconews/sehk/2024/0731 "BLACK SESAME" "GLOBAL OFFERING"',
+                  'site:www1.hkexnews.hk/listedco/listconews/sehk/2024/0731 "黑芝麻智能" "全球發售"',
+                  'site:www1.hkexnews.hk/listedco/listconews/sehk/2024 "Black Sesame International Holding Limited" prospectus',
+              ]
+              if DDGS is not None:
+                  for q in queries:
+                      try:
+                          for result in DDGS(timeout=20).text(q, region='wt-wt', safesearch='off', max_results=30):
+                              url = result.get('href') or result.get('url') or ''
+                              title = result.get('title') or ''
+                              body = result.get('body') or ''
+                              if 'hkexnews.hk' in url and any(k in (title + ' ' + body).upper() for k in ['GLOBAL OFFERING', 'PROSPECTUS', '全球發售', '全球发售', '招股章程']):
+                                  add(url, title, 'ddgs:' + q)
+                      except Exception as exc:
+                          print('DDGS_ERR', q, repr(exc), flush=True)
+
+              # Follow candidate HTML pages to PDF links.
+              expanded = list(candidates)
+              for item in list(candidates):
+                  url = item['url']
+                  if url.lower().endswith(('.htm', '.html')):
+                      try:
+                          r = session.get(url, timeout=(30, 120))
+                          soup = BeautifulSoup(r.text, 'lxml')
+                          for a in soup.find_all('a', href=True):
+                              href = urljoin(r.url, a['href'])
+                              text = compact(a.get_text(' ', strip=True))
+                              if '.pdf' in href.lower():
+                                  add(href, item['label'] + ' ' + text, r.url)
+                      except Exception as exc:
+                          print('FOLLOW_ERR', url, repr(exc), flush=True)
+
+              (DIAG / 'prospectus_candidates.json').write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+              return candidates
+
+          def select_prospectus() -> tuple[bytes, str, int]:
+              candidates = discover_prospectus_candidates()
+              # Prefer direct PDF links; try larger/likely listing docs before notices.
+              def candidate_score(x: dict) -> tuple[int, int]:
+                  u = x['url'].lower()
+                  label = x['label'].upper()
+                  score = 0
+                  if u.endswith('.pdf'):
+                      score += 20
+                  if 'GLOBAL OFFERING' in label or '全球發售' in label or '全球发售' in label:
+                      score += 15
+                  if 'FORMAL NOTICE' in label or '正式通告' in label:
+                      score -= 20
+                  if 'PROSPECTUS' in label or '招股章程' in label:
+                      score += 10
+                  return (score, len(label))
+
+              errors = []
+              for item in sorted(candidates, key=candidate_score, reverse=True):
+                  url = item['url']
+                  if not url.lower().endswith('.pdf'):
+                      continue
+                  try:
+                      data, final_url = download_bytes(url, item['source'])
+                      pages, sample = validate_pdf(
+                          data,
+                          ['BLACK SESAME', 'HOLDING LIMITED'],
+                          min_pages=250,
+                          require_prospectus=True,
+                      )
+                      print('PROSPECTUS_OK', pages, len(data), final_url, item['label'], flush=True)
+                      return data, final_url, pages
+                  except Exception as exc:
+                      errors.append({'candidate': item, 'error': repr(exc)})
+                      print('PROSPECTUS_REJECT', url, repr(exc), flush=True)
+
+              # Official HKEX application proof fallback only if the final prospectus cannot be discovered.
+              fallback_html = 'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0808/2024032201291.htm'
+              try:
+                  r = session.get(fallback_html, timeout=(30, 120))
+                  soup = BeautifulSoup(r.text, 'lxml')
+                  pdfs = []
+                  for a in soup.find_all('a', href=True):
+                      href = urljoin(r.url, a['href'])
+                      if href.lower().endswith('.pdf'):
+                          pdfs.append(href)
+                  # Multi-file application proof cannot be silently represented as the final prospectus.
+                  (DIAG / 'application_proof_links.json').write_text(json.dumps(pdfs, ensure_ascii=False, indent=2), encoding='utf-8')
+              except Exception as exc:
+                  errors.append({'fallback_html': fallback_html, 'error': repr(exc)})
+
+              (DIAG / 'prospectus_errors.json').write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding='utf-8')
+              raise RuntimeError('Unable to retrieve and validate the final official prospectus PDF')
+
+          manifest = []
+
+          # Prospectus first.
+          prospectus_data, prospectus_url, prospectus_pages = select_prospectus()
+          prospectus_name = '01_黑芝麻智能_2024年上市招股章程_最终版.pdf'
+          prospectus_path = PACKAGE / prospectus_name
+          prospectus_path.write_bytes(prospectus_data)
+          manifest.append({
+              '序号': 1,
+              '文件名': prospectus_name,
+              '报告类型': '上市招股章程',
+              '报告期间': '2024 IPO',
+              'PDF页数': prospectus_pages,
+              '文件大小（字节）': len(prospectus_data),
+              'SHA-256': hashlib.sha256(prospectus_data).hexdigest(),
+              '官方来源': prospectus_url,
+              '说明': '港交所最终全球发售/招股章程文件',
+          })
+
+          # Fixed official reports.
+          for spec in fixed_reports:
+              data, final_url = download_bytes(spec['url'])
+              pages, sample = validate_pdf(data, spec['tokens'], spec['min_pages'])
+              path = PACKAGE / spec['filename']
+              path.write_bytes(data)
+              # Render first page to ensure visual parseability; do not reject blank legal back pages.
+              doc = pymupdf.open(path)
+              pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(0.8, 0.8), alpha=False)
+              render_path = DIAG / f"{spec['seq']:02d}_first.png"
+              pix.save(str(render_path))
+              doc.close()
+              if render_path.stat().st_size < 2000:
+                  raise RuntimeError(f'First page render unexpectedly small: {path.name}')
+              manifest.append({
+                  '序号': spec['seq'],
+                  '文件名': spec['filename'],
+                  '报告类型': spec['kind'],
+                  '报告期间': spec['period'],
+                  'PDF页数': pages,
+                  '文件大小（字节）': len(data),
+                  'SHA-256': hashlib.sha256(data).hexdigest(),
+                  '官方来源': final_url,
+                  '说明': spec['note'],
+              })
+              print('REPORT_OK', spec['filename'], pages, len(data), flush=True)
+
+          manifest.sort(key=lambda x: x['序号'])
+          if len(manifest) != 5:
+              raise RuntimeError(f'Expected 5 PDFs, got {len(manifest)}')
+
+          csv_path = PACKAGE / '文件清单与校验值.csv'
+          with csv_path.open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          readme_lines = [
+              '黑芝麻智能国际控股有限公司（02533.HK）定期报告与招股文件资料包',
+              '打包日期：2026-09-14',
+              '',
+              '收录内容：',
+              '1. 2024年上市最终招股章程。',
+              '2. 2024年、2025年完整年度报告（公司上市后的全部年报）。',
+              '3. 2026年中期业绩公告：截至打包日最新的集团层面定期财务披露。',
+              '4. 2025年完整中期报告：因截至打包日港交所尚未发布2026年完整中期报告，作为最近完整中期报告补充。',
+              '',
+              '披露口径说明：黑芝麻智能为港股上市公司，通常不发布A股式第一季度、第三季度报告，因此以最新中期财务披露作为“最新季报”口径。',
+              '全部PDF来自港交所披露易。已检查PDF文件头、可解析性、公司名称、报告期间、实际页数及SHA-256。',
+              '压缩包已通过ZIP CRC完整性测试。',
+              '',
+          ]
+          for row in manifest:
+              readme_lines.append(f"{row['序号']}. {row['文件名']}｜{row['PDF页数']}页｜{row['说明']}")
+          (PACKAGE / 'README.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+
+          validation = {
+              'company': 'Black Sesame International Holding Limited',
+              'stock_code': '02533.HK',
+              'package_date': '2026-09-14',
+              'pdf_count': len(manifest),
+              'reports': manifest,
+          }
+          (PACKAGE / '验证记录.json').write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Validate exactly what will be uploaded by constructing a temporary ZIP.
+          test_zip = Path('diagnostics/black_sesame_package_test.zip')
+          with zipfile.ZipFile(test_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for p in sorted(PACKAGE.iterdir()):
+                  z.write(p, arcname=p.name)
+          with zipfile.ZipFile(test_zip, 'r') as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != 5:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={len(pdfs)}')
+          print('PACKAGE_OK', json.dumps({'pdf_count': 5, 'zip_crc_ok': True, 'test_zip_bytes': test_zip.stat().st_size, 'manifest': manifest}, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload verified report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: black-sesame-02533-reports
+          path: package/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
