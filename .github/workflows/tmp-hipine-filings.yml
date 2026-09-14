@@ -1,0 +1,309 @@
+name: Package Hipine filings
+
+on:
+  push:
+    branches:
+      - tmp-hipine-filings-20260914
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests pypdf
+      - name: Download, verify, and package filings
+        shell: bash
+        run: |
+          cat > /tmp/package_hipine.py <<'PY'
+          from __future__ import annotations
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import requests
+          from pypdf import PdfReader
+
+          ROOT = Path('Hipine_西普尼_全套定期报告_招股书_截至2026-09-14')
+          ANNUAL = ROOT / '01_年度报告'
+          PROSPECTUS = ROOT / '02_招股说明书及公开转让说明书'
+          LATEST = ROOT / '03_最新中期财务披露'
+          for p in (ANNUAL, PROSPECTUS, LATEST):
+              p.mkdir(parents=True, exist_ok=True)
+
+          S = requests.Session()
+          S.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept': '*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          rows: list[dict] = []
+          failures: list[str] = []
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def validate_pdf(path: Path) -> tuple[int, str]:
+              if path.stat().st_size < 10_000:
+                  raise RuntimeError(f'file too small: {path.stat().st_size} bytes')
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError('not a PDF header')
+              q = subprocess.run(['qpdf', '--check', str(path)], text=True, capture_output=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError('qpdf check failed: ' + (q.stderr or q.stdout)[-500:])
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < 1:
+                  raise RuntimeError('zero-page PDF')
+              return pages, q.stdout.strip() or q.stderr.strip()
+
+          def download_pdf(urls: list[str], dest: Path, meta: dict, required: bool = True) -> bool:
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              last = None
+              for url in urls:
+                  tmp = dest.with_suffix(dest.suffix + '.part')
+                  try:
+                      print(f'DOWNLOAD {dest.name} <- {url}', flush=True)
+                      with S.get(url, timeout=(25, 180), stream=True, allow_redirects=True) as r:
+                          r.raise_for_status()
+                          with tmp.open('wb') as f:
+                              for chunk in r.iter_content(1024 * 1024):
+                                  if chunk:
+                                      f.write(chunk)
+                      tmp.replace(dest)
+                      pages, check_note = validate_pdf(dest)
+                      digest = sha256(dest)
+                      rows.append({
+                          **meta,
+                          'filename': str(dest.relative_to(ROOT)),
+                          'source_url': url,
+                          'bytes': dest.stat().st_size,
+                          'pages': pages,
+                          'sha256': digest,
+                          'validation': 'PDF header + qpdf + pypdf OK',
+                      })
+                      print(f'OK {dest} pages={pages} size={dest.stat().st_size} sha256={digest}', flush=True)
+                      return True
+                  except Exception as e:
+                      last = e
+                      print(f'FAILED {url}: {e}', file=sys.stderr, flush=True)
+                      for p in (tmp, dest):
+                          try:
+                              p.unlink()
+                          except FileNotFoundError:
+                              pass
+              msg = f'{dest}: {last}'
+              failures.append(msg)
+              if required:
+                  print('REQUIRED DOWNLOAD FAILED: ' + msg, file=sys.stderr)
+              return False
+
+          def eastmoney_announcements(code: str) -> list[dict]:
+              endpoint = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+              all_items: list[dict] = []
+              for page in range(1, 16):
+                  params = {
+                      'sr': '-1',
+                      'page_size': '100',
+                      'page_index': str(page),
+                      'ann_type': 'A',
+                      'client_source': 'web',
+                      'stock_list': code,
+                  }
+                  r = S.get(endpoint, params=params, timeout=(20, 90))
+                  r.raise_for_status()
+                  payload = r.json()
+                  data = payload.get('data') or {}
+                  items = data.get('list') or []
+                  all_items.extend(items)
+                  if len(items) < 100:
+                      break
+              print(f'ANNOUNCEMENTS {code}: {len(all_items)}', flush=True)
+              for it in all_items:
+                  print(code, it.get('notice_date'), it.get('art_code'), it.get('title'), flush=True)
+              return all_items
+
+          def clean_title(x: str) -> str:
+              return re.sub(r'<[^>]+>', '', x or '').replace('&nbsp;', ' ').strip()
+
+          def notice_date(it: dict) -> str:
+              return str(it.get('notice_date') or '')[:10]
+
+          def art_pdf_urls(art_code: str) -> list[str]:
+              # The first URL is the canonical Eastmoney PDF mirror. Query-string variants are fallbacks.
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf?{int(time.time()*1000)}.pdf=',
+              ]
+
+          all_by_code = {code: eastmoney_announcements(code) for code in ('838948', '873888')}
+
+          # Select full annual reports, excluding summaries, reminders, board resolutions and audit-only documents.
+          annual_selected: list[tuple[str, int, dict]] = []
+          for code, items in all_by_code.items():
+              by_year: dict[int, list[dict]] = {}
+              for it in items:
+                  title = clean_title(it.get('title'))
+                  m = re.search(r'(20\d{2})\s*年\s*年度报告', title)
+                  if not m:
+                      continue
+                  if any(bad in title for bad in ('摘要', '提示性公告', '提前披露', '延期披露', '董事会', '监事会', '审议', '审核意见', '问询', '回复', '审计报告', '专项说明', '权益分派')):
+                      continue
+                  year = int(m.group(1))
+                  by_year.setdefault(year, []).append(it)
+              for year, candidates in by_year.items():
+                  def score(it: dict):
+                      t = clean_title(it.get('title'))
+                      revised = int(any(k in t for k in ('更正后', '修订版', '修订后')))
+                      return (revised, notice_date(it), str(it.get('art_code') or ''))
+                  chosen = sorted(candidates, key=score)[-1]
+                  annual_selected.append((code, year, chosen))
+
+          annual_selected.sort(key=lambda x: x[1])
+          print('SELECTED ANNUALS:', [(c, y, clean_title(i.get('title'))) for c, y, i in annual_selected], flush=True)
+          for code, year, it in annual_selected:
+              title = clean_title(it.get('title'))
+              art = str(it.get('art_code'))
+              suffix = '更正后' if any(k in title for k in ('更正后', '修订版', '修订后')) else '原披露版'
+              dest = ANNUAL / f'{year}_西普尼_年度报告_新三板{code}_{suffix}.pdf'
+              download_pdf(
+                  art_pdf_urls(art), dest,
+                  {'category': '年度报告', 'report_year': str(year), 'market_code': code, 'document_title': title, 'notice_date': notice_date(it)},
+                  required=False,
+              )
+
+          # Select one public transfer statement for each NEEQ listing, preferring the latest/revised full statement.
+          for code, items in all_by_code.items():
+              cands = []
+              for it in items:
+                  title = clean_title(it.get('title'))
+                  if '公开转让说明书' not in title:
+                      continue
+                  if any(bad in title for bad in ('反馈', '问询', '回复', '声明', '更正公告', '差异对照表', '审核意见')):
+                      continue
+                  cands.append(it)
+              if cands:
+                  def pscore(it: dict):
+                      t = clean_title(it.get('title'))
+                      return (int(any(k in t for k in ('更正后', '修订版', '申报稿'))), notice_date(it), str(it.get('art_code') or ''))
+                  it = sorted(cands, key=pscore)[-1]
+                  title = clean_title(it.get('title'))
+                  art = str(it.get('art_code'))
+                  listing_year = '2016' if code == '838948' else '2022'
+                  dest = PROSPECTUS / f'{listing_year}_西普尼_公开转让说明书_新三板{code}.pdf'
+                  download_pdf(
+                      art_pdf_urls(art), dest,
+                      {'category': '公开转让说明书', 'report_year': listing_year, 'market_code': code, 'document_title': title, 'notice_date': notice_date(it)},
+                      required=False,
+                  )
+              else:
+                  failures.append(f'No public transfer statement found via Eastmoney for {code}')
+
+          # HKEX / company IR originals. Chinese HKEX URL is attempted first where known.
+          download_pdf(
+              [
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0919/2025091900020_c.pdf',
+                  'https://www.hipine.com/data/uploadfile/ruanjie_cms801/20250919063635209.pdf',
+                  'https://www.kgi.com.hk/en/-/media/files/kgishk/pdf/ipoprospectus/hkipo_02583.pdf',
+              ],
+              PROSPECTUS / '2025_西普尼_港股全球发售招股章程_02583.pdf',
+              {'category': '招股说明书', 'report_year': '2025', 'market_code': 'HKEX 02583', 'document_title': 'GLOBAL OFFERING / 全球发售招股章程', 'notice_date': '2025-09-19'},
+              required=True,
+          )
+
+          download_pdf(
+              [
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0417/2026041700513_c.pdf',
+                  'https://www.hipine.com/data/uploadfile/ruanjie_cms801/20260417173114877.pdf',
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0417/2026041700513.pdf',
+              ],
+              ANNUAL / '2025_西普尼_年度报告_港股02583.pdf',
+              {'category': '年度报告', 'report_year': '2025', 'market_code': 'HKEX 02583', 'document_title': '2025 ANNUAL REPORT / 2025年度报告', 'notice_date': '2026-04-17'},
+              required=True,
+          )
+
+          # Keep the 2025 published interim report as a supplementary historical half-year report.
+          download_pdf(
+              ['https://www.hipine.com/data/uploadfile/ruanjie_cms801/20250930165031754.pdf'],
+              LATEST / '2025_西普尼_中期报告_港股02583.pdf',
+              {'category': '中期报告', 'report_year': '2025', 'market_code': 'HKEX 02583', 'document_title': 'INTERIM REPORT 2025', 'notice_date': '2025-09-30'},
+              required=False,
+          )
+
+          # As at 2026-09-14, this is the newest periodic financial disclosure; HK issuers do not necessarily publish Q1/Q3 reports.
+          download_pdf(
+              [
+                  'https://www.hipine.com/data/uploadfile/ruanjie_cms801/20260828214802264.pdf',
+                  'https://newsfile.futunn.com/public/NN-PersistNoticeAttachment/7781/20260828/12306549-0.PDF',
+              ],
+              LATEST / '2026_西普尼_中期业绩公告_截至2026-06-30_最新财务披露.pdf',
+              {'category': '最新中期财务披露', 'report_year': '2026', 'market_code': 'HKEX 02583', 'document_title': 'INTERIM RESULTS ANNOUNCEMENT FOR THE SIX MONTHS ENDED 30 JUNE 2026', 'notice_date': '2026-08-28'},
+              required=True,
+          )
+
+          # Write machine-readable and human-readable inventories.
+          rows.sort(key=lambda r: (r['category'], r['report_year'], r['filename']))
+          with (ROOT / '文件清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['category', 'report_year', 'market_code', 'document_title', 'notice_date', 'filename', 'pages', 'bytes', 'sha256', 'validation', 'source_url']
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              w.writerows(rows)
+
+          with (ROOT / 'SHA256SUMS.txt').open('w', encoding='utf-8') as f:
+              for r in sorted(rows, key=lambda x: x['filename']):
+                  f.write(f"{r['sha256']}  {r['filename']}\n")
+
+          downloaded_years = sorted({r['report_year'] for r in rows if r['category'] == '年度报告'})
+          readme = f'''# 西普尼定期报告与招股文件包\n\n公司：深圳西普尼精密科技股份有限公司（港股 02583；历史新三板代码 838948、873888）\n整理截止：2026-09-14\n\n## 内容口径\n- 年度报告：收录公告库中可核验的年度报告全文；排除摘要、提示性公告、董事会/监事会决议和单独审计说明。\n- 招股文件：收录两次新三板挂牌的公开转让说明书（如公告库可获取）及港股全球发售招股章程。\n- 最新财务披露：截至整理日，最新为 2026 年中期业绩公告（截至 2026-06-30）。港股发行人通常不按 A 股口径强制发布一季报/三季报。\n- 另附 2025 年中期报告，便于对照。\n\n## 已收录年度\n{', '.join(downloaded_years)}\n\n## 校验\n每份 PDF 均完成 PDF 文件头检查、qpdf 结构检查和 pypdf 页数读取；SHA-256 见 `SHA256SUMS.txt`，详细来源见 `文件清单.csv`。\n\n## 未成功项目（如有）\n{os.linesep.join('- ' + x for x in failures) if failures else '- 无'}\n'''
+          (ROOT / 'README.md').write_text(readme, encoding='utf-8')
+
+          if not any(r['category'] == '年度报告' and r['report_year'] == '2025' for r in rows):
+              raise SystemExit('Missing required 2025 annual report')
+          if not any(r['category'] == '招股说明书' for r in rows):
+              raise SystemExit('Missing required HK prospectus')
+          if not any(r['category'] == '最新中期财务披露' for r in rows):
+              raise SystemExit('Missing required latest interim results')
+
+          zip_path = Path('西普尼_所有年报_招股说明书_最新财务披露_截至2026-09-14.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+          with zipfile.ZipFile(zip_path, 'r') as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+          print(json.dumps({'zip': str(zip_path), 'zip_bytes': zip_path.stat().st_size, 'files': len(rows), 'annual_years': downloaded_years, 'failures': failures}, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/package_hipine.py | tee package.log
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hipine-filings-package
+          path: |
+            西普尼_所有年报_招股说明书_最新财务披露_截至2026-09-14.zip
+            package.log
+          if-no-files-found: error
+          retention-days: 3
