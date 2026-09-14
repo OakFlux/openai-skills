@@ -1,0 +1,399 @@
+name: chatgpt-temp-cmbc-broker-reports
+on:
+  push:
+    paths:
+      - '.github/workflows/chatgpt-temp-cmbc-broker-reports.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query, download, validate and package reports
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pypdf pymupdf pillow
+          python <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+
+          COMPANY = '民生银行'
+          STOCK_A = '600016'
+          STOCK_H = '01988'
+          CHECKED_AS_OF = '2026-09-14'
+          WORK = Path('cmbc_broker_reports_work')
+          ROOT = WORK / '民生银行_600016_01988_券商深度报告_完整PDF'
+          PDF_DIR = ROOT / 'PDF'
+          QA_DIR = WORK / '_qa'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          QA_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/600016.html',
+              'Accept': 'application/json,text/javascript,*/*;q=0.1',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          logs = []
+          def log(message):
+              message = str(message)
+              print(message, flush=True)
+              logs.append(message)
+
+          def parse_jsonp(text):
+              text = text.strip()
+              try:
+                  return json.loads(text)
+              except Exception:
+                  start = text.find('{')
+                  end = text.rfind('}')
+                  if start >= 0 and end > start:
+                      return json.loads(text[start:end + 1])
+                  raise
+
+          records = []
+          seen_info_codes = set()
+          raw_queries = []
+
+          windows = []
+          for year in range(2018, 2027):
+              end = CHECKED_AS_OF if year == 2026 else f'{year}-12-31'
+              windows.append((f'{year}-01-01', end))
+          windows.append(('2018-01-01', CHECKED_AS_OF))
+
+          for begin_time, end_time in windows:
+              for page_no in range(1, 8):
+                  params = {
+                      'cb': 'showData',
+                      'pageSize': 100,
+                      'pageNo': page_no,
+                      'qType': 0,
+                      'code': STOCK_A,
+                      'industryCode': '*',
+                      'industry': '*',
+                      'rating': '',
+                      'ratingChange': '',
+                      'beginTime': begin_time,
+                      'endTime': end_time,
+                      'fields': '',
+                      'orgCode': '',
+                      'rcode': '',
+                      '_': int(time.time() * 1000),
+                  }
+                  response = session.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=90)
+                  log(f'QUERY {begin_time} {end_time} page={page_no} status={response.status_code} bytes={len(response.content)} url={response.url}')
+                  raw_queries.append({'begin': begin_time, 'end': end_time, 'page': page_no, 'url': response.url, 'status': response.status_code, 'text': response.text})
+                  if response.status_code != 200:
+                      break
+                  try:
+                      payload = parse_jsonp(response.text)
+                  except Exception as exc:
+                      log(f'PARSE_ERROR {begin_time} {end_time} page={page_no} {exc!r}')
+                      break
+                  rows = payload.get('data') or []
+                  if isinstance(rows, dict):
+                      rows = rows.get('data') or rows.get('list') or []
+                  if not isinstance(rows, list):
+                      rows = []
+                  for record in rows:
+                      info_code = record.get('infoCode') or record.get('INFO_CODE')
+                      stock_name = str(record.get('stockName') or record.get('STOCK_NAME') or '')
+                      stock_code = str(record.get('stockCode') or record.get('STOCK_CODE') or '')
+                      if not info_code or info_code in seen_info_codes:
+                          continue
+                      if COMPANY not in stock_name and stock_code != STOCK_A:
+                          continue
+                      seen_info_codes.add(info_code)
+                      records.append(record)
+                      log('RECORD ' + json.dumps(record, ensure_ascii=False))
+                  total_page = int(payload.get('TotalPage') or payload.get('totalPage') or 1)
+                  if not rows or page_no >= total_page:
+                      break
+
+          (WORK / 'raw_queries.json').write_text(json.dumps(raw_queries, ensure_ascii=False, indent=2), encoding='utf-8')
+          (WORK / 'records.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          negative_terms = ['点评', '季报', '中报', '半年报', '年报', '业绩快报', '业绩预告', '快评', '跟踪报告', '事件点评']
+          positive_terms = ['深度', '首次覆盖', '首次', '价值重估', '投资价值', '公司研究', '专题', '转型', '困境反转', '基本面']
+          preferred_columns = {'002004001001', '002004001002', '002004001003'}
+
+          def parse_date(value):
+              text = str(value or '')[:10]
+              try:
+                  return datetime.strptime(text, '%Y-%m-%d')
+              except Exception:
+                  return datetime(2000, 1, 1)
+
+          def score_record(record):
+              title = str(record.get('title') or record.get('TITLE') or '')
+              pages = int(record.get('attachPages') or record.get('ATTACH_PAGES') or 0)
+              column = str(record.get('column') or record.get('COLUMN') or '')
+              date = parse_date(record.get('publishDate') or record.get('PUBLISH_DATE'))
+              score = pages * 2
+              score += max(0, date.year - 2018) * 8
+              score += date.month / 2
+              if column in preferred_columns:
+                  score += 35
+              for term in positive_terms:
+                  if term in title:
+                      score += 45
+              for term in negative_terms:
+                  if term in title:
+                      score -= 140
+              if pages >= 20:
+                  score += 35
+              if pages >= 30:
+                  score += 25
+              if pages < 12:
+                  score -= 500
+              return score
+
+          ranked = sorted(records, key=score_record, reverse=True)
+          (WORK / 'ranked_candidates.json').write_text(json.dumps([
+              {
+                  'score': score_record(record),
+                  'title': record.get('title'),
+                  'date': str(record.get('publishDate') or '')[:10],
+                  'institution': record.get('orgSName') or record.get('orgName'),
+                  'pages': record.get('attachPages'),
+                  'infoCode': record.get('infoCode'),
+                  'column': record.get('column'),
+              }
+              for record in ranked
+          ], ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def safe_filename(text):
+              text = re.sub(r'[\\/:*?"<>|]+', '_', text)
+              text = re.sub(r'\s+', '', text)
+              return text[:90]
+
+          selected = []
+          selected_orgs = set()
+          selected_titles = set()
+          probes = []
+
+          for record in ranked:
+              if len(selected) >= 3:
+                  break
+              title = str(record.get('title') or '')
+              pages_meta = int(record.get('attachPages') or 0)
+              info_code = str(record.get('infoCode') or '')
+              institution = str(record.get('orgSName') or record.get('orgName') or '券商')
+              date = str(record.get('publishDate') or '')[:10]
+              if pages_meta < 12:
+                  continue
+              if any(term in title for term in negative_terms):
+                  continue
+              title_key = re.sub(r'[\s，,：:（）()—\-]+', '', title)
+              if institution in selected_orgs or title_key in selected_titles:
+                  continue
+
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}.pdf',
+              ]
+              valid = None
+              tried = []
+              for url in urls:
+                  try:
+                      response = session.get(url, headers={'Referer': 'https://data.eastmoney.com/'}, timeout=240, allow_redirects=True)
+                      tried.append({'url': url, 'status': response.status_code, 'bytes': len(response.content), 'type': response.headers.get('content-type'), 'final': response.url})
+                      log(f'PDF_PROBE info={info_code} status={response.status_code} bytes={len(response.content)} type={response.headers.get("content-type")} url={response.url}')
+                      if response.status_code != 200 or not response.content.startswith(b'%PDF-') or len(response.content) < 80_000:
+                          continue
+                      reader = PdfReader(io.BytesIO(response.content), strict=False)
+                      actual_pages = len(reader.pages)
+                      sample_indices = sorted(set([0, min(1, actual_pages - 1), actual_pages // 2, max(0, actual_pages - 1)]))
+                      text = ''
+                      for index in sample_indices:
+                          try:
+                              text += '\n' + (reader.pages[index].extract_text() or '')
+                          except Exception:
+                              pass
+                      company_detected = COMPANY in text or STOCK_A in text or STOCK_H in text
+                      if not company_detected:
+                          continue
+                      valid = {
+                          'content': response.content,
+                          'url': response.url,
+                          'actual_pages': actual_pages,
+                          'company_detected': True,
+                      }
+                      break
+                  except Exception as exc:
+                      tried.append({'url': url, 'error': repr(exc)})
+                      log(f'PDF_ERROR info={info_code} url={url} error={exc!r}')
+
+              probes.append({
+                  'infoCode': info_code,
+                  'date': date,
+                  'institution': institution,
+                  'title': title,
+                  'metadata_pages': pages_meta,
+                  'score': score_record(record),
+                  'valid': bool(valid),
+                  'actual_pages': valid['actual_pages'] if valid else None,
+                  'tried': tried,
+              })
+              if not valid:
+                  continue
+
+              selected.append({
+                  'record': record,
+                  'content': valid['content'],
+                  'url': valid['url'],
+                  'actual_pages': valid['actual_pages'],
+              })
+              selected_orgs.add(institution)
+              selected_titles.add(title_key)
+              log(f'SELECTED {institution} {date} pages={valid["actual_pages"]} title={title}')
+
+          (WORK / 'pdf_probes.json').write_text(json.dumps(probes, ensure_ascii=False, indent=2), encoding='utf-8')
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} valid long-form reports found')
+
+          manifest = []
+          for index, item in enumerate(selected, 1):
+              record = item['record']
+              title = str(record.get('title') or '')
+              institution = str(record.get('orgSName') or record.get('orgName') or '券商')
+              date = str(record.get('publishDate') or '')[:10]
+              rating = str(record.get('emRatingName') or record.get('sRatingName') or '')
+              actual_pages = item['actual_pages']
+              filename = f'{date}_{safe_filename(institution)}_民生银行_{safe_filename(title)}_完整{actual_pages}页.pdf'
+              destination = PDF_DIR / filename
+              destination.write_bytes(item['content'])
+
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages != actual_pages:
+                  raise RuntimeError(f'Page count changed after save: {destination.name}')
+
+              sample_text = ''
+              for page_no in sorted(set([0, min(1, pages - 1), pages // 2, pages - 1])):
+                  try:
+                      sample_text += '\n' + (reader.pages[page_no].extract_text() or '')
+                  except Exception:
+                      pass
+              if COMPANY not in sample_text and STOCK_A not in sample_text and STOCK_H not in sample_text:
+                  raise RuntimeError(f'Company identity missing after save: {destination.name}')
+
+              document = pymupdf.open(str(destination))
+              if document.page_count != pages:
+                  raise RuntimeError(f'Renderer page count mismatch: {destination.name}')
+              render_checks = []
+              for page_no, tag in [(0, 'first'), (pages // 2, 'middle'), (pages - 1, 'last')]:
+                  pix = document.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+                  png_path = QA_DIR / f'{index:02d}_{tag}.png'
+                  pix.save(str(png_path))
+                  image = Image.open(png_path).convert('L').resize((64, 64))
+                  stddev = float(ImageStat.Stat(image).stddev[0])
+                  if stddev < 1.0:
+                      raise RuntimeError(f'Near-blank page: {destination.name}, page {page_no + 1}')
+                  render_checks.append({'page': page_no + 1, 'stddev': round(stddev, 4)})
+              document.close()
+
+              raw = destination.read_bytes()
+              manifest.append({
+                  'date': date,
+                  'institution': institution,
+                  'title': title,
+                  'stock_codes': ['600016.SH', '01988.HK'],
+                  'rating': rating,
+                  'kind': '完整原始PDF',
+                  'filename': f'PDF/{filename}',
+                  'source_url': item['url'],
+                  'info_code': record.get('infoCode'),
+                  'pages': pages,
+                  'size_bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'render_checks': render_checks,
+              })
+              log('VALID ' + json.dumps(manifest[-1], ensure_ascii=False))
+
+          if len({entry['sha256'] for entry in manifest}) != len(manifest):
+              raise RuntimeError('Duplicate report content detected')
+
+          readme = [
+              '# 民生银行（600016.SH／01988.HK）券商深度报告资料包',
+              '',
+              f'资料核对日期：{CHECKED_AS_OF}',
+              '',
+              f'本资料包收录 {len(manifest)} 份可公开取得的券商完整原始 PDF，优先选择公司深度、首次覆盖或长篇专题报告。',
+              '',
+              '| 日期 | 券商 | 报告题目 | 页数 | 评级 |',
+              '|---|---|---|---:|---|',
+          ]
+          for entry in manifest:
+              readme.append(f"| {entry['date']} | {entry['institution']} | {entry['title']} | {entry['pages']} | {entry['rating'] or '-'} |")
+          readme += [
+              '',
+              '校验说明：',
+              '- 已核验PDF文件头、民生银行名称或证券代码以及实际页数。',
+              '- 已使用独立解析器复核页数，并渲染检查每份报告的首、中、尾页。',
+              '- 已检查重复文件，并对ZIP执行CRC完整性校验。',
+              '- 详细来源与SHA-256校验值见 manifest.json 和 SHA256SUMS.txt。',
+          ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (ROOT / '文件说明.txt').write_text('\n'.join(line.replace('# ', '').replace('- ', '') for line in readme if not line.startswith('|')) + '\n', encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps({
+              'company': '中国民生银行股份有限公司',
+              'stock_codes': ['600016.SH', '01988.HK'],
+              'checked_as_of': CHECKED_AS_OF,
+              'pdf_count': len(manifest),
+              'files': manifest,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{entry['sha256']}  {entry['filename']}" for entry in manifest) + '\n', encoding='utf-8')
+          (WORK / 'run.log').write_text('\n'.join(logs) + '\n', encoding='utf-8')
+
+          zip_path = WORK / f'民生银行_600016_01988_券商深度报告_完整PDF_{len(manifest)}份.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_members)} vs {len(manifest)}')
+
+          zip_data = zip_path.read_bytes()
+          metadata = {
+              'filename': zip_path.name,
+              'size_bytes': len(zip_data),
+              'sha256': hashlib.sha256(zip_data).hexdigest(),
+              'pdf_count': len(manifest),
+              'reports': manifest,
+          }
+          (WORK / 'zip_metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL ' + json.dumps(metadata, ensure_ascii=False), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CMBC-600016-01988-Broker-Deep-Reports
+          path: |
+            cmbc_broker_reports_work/民生银行_600016_01988_券商深度报告_完整PDF_*份.zip
+            cmbc_broker_reports_work/zip_metadata.json
+            cmbc_broker_reports_work/ranked_candidates.json
+            cmbc_broker_reports_work/pdf_probes.json
+            cmbc_broker_reports_work/run.log
+            cmbc_broker_reports_work/_qa
+          retention-days: 1
+          compression-level: 0
