@@ -1,0 +1,370 @@
+name: chatgpt-temp-caocao-package
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-caocao-broker-reports-20260914
+    paths:
+      - .github/workflows/chatgpt-temp-caocao-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find public reports, build PDFs, validate and package
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pillow img2pdf pypdf pymupdf
+          python <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+
+          CHECKED_AS_OF = '2026-09-14'
+          WORK = Path('caocao_reports_work')
+          ROOT = WORK / '曹操出行_02643_券商深度报告_2份'
+          PDF_DIR = ROOT / 'PDF'
+          IMAGE_DIR = WORK / '_images'
+          QA_DIR = WORK / '_qa'
+          for directory in (PDF_DIR, IMAGE_DIR, QA_DIR):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          targets = [
+              {
+                  'title_key': '头部网约车平台，定制车生态赋能卡位Robotaxi',
+                  'expected_org': '浙商证券',
+                  'report_type': '公司深度报告',
+                  'detail_id_hint': 906799,
+              },
+              {
+                  'title_key': '科技重塑共享出行，打造服务口碑最好品牌',
+                  'expected_org': '东吴证券',
+                  'report_type': '海外公司深度／首次覆盖',
+                  'detail_id_hint': 919126,
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+          })
+
+          logs = []
+          def log(message):
+              message = str(message)
+              print(message, flush=True)
+              logs.append(message)
+
+          def compact(text):
+              return re.sub(r'[\s，,。；;：:“”"‘’（）()—\-_]+', '', str(text or '')).lower()
+
+          def safe_filename(text):
+              text = re.sub(r'[\\/:*?"<>|]+', '_', str(text))
+              text = re.sub(r'\s+', '', text)
+              return text[:110]
+
+          def search_report(target):
+              queries = [
+                  target['title_key'],
+                  f"曹操出行 {target['title_key']}",
+                  f"曹操出行 {target['expected_org']}",
+              ]
+              matches = []
+              for query in queries:
+                  for only_title in (1, 0):
+                      payload = {
+                          'device': 1,
+                          'hideTrader': 0,
+                          'onlyTitle': only_title,
+                          'order': 0,
+                          'page': 1,
+                          'pageSize': 100,
+                          'keyword': query,
+                          'pageCount': '',
+                          'dateRange': '',
+                          'startTime': '',
+                          'endTime': '',
+                          'typeIds': [],
+                          'industryIds': [],
+                          'opFrom': 1,
+                      }
+                      response = session.post('https://api.sdyanbao.com/api/file/search', json=payload, timeout=90)
+                      log(f'SEARCH query={query} onlyTitle={only_title} status={response.status_code} bytes={len(response.content)}')
+                      response.raise_for_status()
+                      obj = response.json()
+                      files = ((obj.get('data') or {}).get('files') or [])
+                      for item in files:
+                          item_blob = json.dumps(item, ensure_ascii=False)
+                          name = item.get('name') or ''
+                          organization = (item.get('organization') or {}).get('name') or ''
+                          stock = item.get('stock') or {}
+                          company_match = (
+                              '曹操出行' in item_blob
+                              or stock.get('code') == '02643'
+                              or stock.get('name') == '曹操出行'
+                              or '2643.HK' in item_blob
+                          )
+                          title_match = compact(target['title_key'])[:14] in compact(name)
+                          id_match = item.get('id') == target['detail_id_hint']
+                          if company_match and (title_match or id_match):
+                              matches.append(item)
+                      if matches:
+                          break
+                  if matches:
+                      break
+              if not matches:
+                  raise RuntimeError(f"No public metadata found for {target['title_key']}")
+              matches.sort(key=lambda item: (
+                  item.get('id') == target['detail_id_hint'],
+                  target['expected_org'] in ((item.get('organization') or {}).get('name') or ''),
+                  int(item.get('page_count') or 0),
+                  int(item.get('create_time') or 0),
+              ), reverse=True)
+              selected = matches[0]
+              log('SELECTED ' + json.dumps(selected, ensure_ascii=False))
+              return selected
+
+          selected = [search_report(target) for target in targets]
+          manifest = []
+
+          for report_no, (target, metadata) in enumerate(zip(targets, selected), 1):
+              title_full = metadata.get('name') or target['title_key']
+              title = title_full
+              title = re.sub(r'^曹操出行\s*[（(]?02643(?:\.HK)?[)）]?\s*', '', title)
+              title = re.sub(r'^曹操出行\s*[:：-]\s*', '', title)
+              organization = (metadata.get('organization') or {}).get('name') or target['expected_org']
+              publication_date = metadata.get('time_text') or ''
+              original_pages = int(metadata.get('page_count') or 0)
+              page_base = metadata.get('page_url') or ''
+              if not page_base:
+                  share_url = metadata.get('share_url') or ''
+                  page_base = share_url.rsplit('/', 1)[0] if share_url else ''
+              if not page_base:
+                  raise RuntimeError(f'No public page base for {title_full}')
+
+              report_image_dir = IMAGE_DIR / f'{report_no:02d}'
+              report_image_dir.mkdir(exist_ok=True)
+              page_paths = []
+              source_urls = []
+              source_hashes = []
+              page_dimensions = []
+
+              max_probe = original_pages if original_pages > 0 else 80
+              for page_index in range(max_probe):
+                  url = f'{page_base}/{page_index}.png'
+                  downloaded = None
+                  last_error = None
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={'Accept': 'image/*,*/*;q=0.8', 'Referer': 'https://www.sdyanbao.com/'},
+                              timeout=120,
+                              allow_redirects=True,
+                          )
+                          log(
+                              f'PAGE report={metadata.get("id")} page={page_index + 1} attempt={attempt} '
+                              f'status={response.status_code} bytes={len(response.content)} type={response.headers.get("content-type")}'
+                          )
+                          if response.status_code == 200 and len(response.content) > 15000:
+                              image = Image.open(io.BytesIO(response.content))
+                              image.load()
+                              if image.width >= 700 and image.height >= 950:
+                                  downloaded = (response.content, response.url, image.width, image.height)
+                                  break
+                              last_error = f'unexpected image size {image.size}'
+                          else:
+                              last_error = f'HTTP {response.status_code}, {len(response.content)} bytes'
+                      except Exception as exc:
+                          last_error = repr(exc)
+                      time.sleep(attempt * 0.4)
+
+                  if downloaded is None:
+                      log(f'PUBLIC_PAGE_END report={metadata.get("id")} next_page={page_index + 1} reason={last_error}')
+                      break
+
+                  data, final_url, width, height = downloaded
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in source_hashes:
+                      raise RuntimeError(f'Duplicate source page in {title_full}: page {page_index + 1}')
+                  source_hashes.append(digest)
+
+                  raw_path = report_image_dir / f'{page_index + 1:03d}.png'
+                  raw_path.write_bytes(data)
+                  with Image.open(raw_path) as image:
+                      jpg_path = report_image_dir / f'{page_index + 1:03d}.jpg'
+                      image.convert('RGB').save(jpg_path, 'JPEG', quality=93, optimize=False)
+                  page_paths.append(jpg_path)
+                  source_urls.append(final_url)
+                  page_dimensions.append({'page': page_index + 1, 'width': width, 'height': height})
+
+              included_pages = len(page_paths)
+              if included_pages == 0:
+                  raise RuntimeError(f'No public pages downloaded for {title_full}')
+              complete = original_pages > 0 and included_pages == original_pages
+              status_label = '完整版' if complete else f'公开试读{included_pages}页_原报告{original_pages}页'
+
+              filename = (
+                  f'{publication_date}_{safe_filename(organization)}_曹操出行_'
+                  f'{safe_filename(title)}_{status_label}.pdf'
+              )
+              pdf_path = PDF_DIR / filename
+              pdf_path.write_bytes(
+                  img2pdf.convert(
+                      [str(path) for path in page_paths],
+                      layout_fun=img2pdf.get_fixed_dpi_layout_fun((150, 150)),
+                  )
+              )
+
+              pdf_raw = pdf_path.read_bytes()
+              if not pdf_raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF header: {filename}')
+              actual_pages = len(PdfReader(str(pdf_path), strict=False).pages)
+              if actual_pages != included_pages:
+                  raise RuntimeError(f'PDF page count mismatch for {filename}: {actual_pages} != {included_pages}')
+
+              document = pymupdf.open(str(pdf_path))
+              render_checks = []
+              sample_points = [(0, 'first'), (actual_pages // 2, 'middle'), (actual_pages - 1, 'last')]
+              checked_pages = set()
+              for page_no, label in sample_points:
+                  if page_no in checked_pages:
+                      continue
+                  checked_pages.add(page_no)
+                  pixmap = document.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+                  output = QA_DIR / f'{report_no:02d}_{label}.png'
+                  pixmap.save(str(output))
+                  with Image.open(output) as image:
+                      stddev = float(ImageStat.Stat(image.convert('L').resize((64, 64))).stddev[0])
+                  if stddev < 1.0:
+                      raise RuntimeError(f'Near-blank rendered page: {filename} page {page_no + 1}')
+                  render_checks.append({'page': page_no + 1, 'stddev': round(stddev, 4)})
+              document.close()
+
+              entry = {
+                  'date': publication_date,
+                  'institution': organization,
+                  'title': title,
+                  'stock_code': '02643.HK',
+                  'report_type': target['report_type'],
+                  'detail_id': metadata.get('id'),
+                  'source_detail_url': f"https://www.sdyanbao.com/detail/{metadata.get('id')}",
+                  'public_page_base': page_base,
+                  'included_pages': included_pages,
+                  'original_pages': original_pages,
+                  'is_complete': complete,
+                  'access_status': status_label,
+                  'filename': f'PDF/{filename}',
+                  'size_bytes': len(pdf_raw),
+                  'sha256': hashlib.sha256(pdf_raw).hexdigest(),
+                  'page_dimensions': page_dimensions,
+                  'source_page_urls': source_urls,
+                  'render_checks': render_checks,
+              }
+              manifest.append(entry)
+              log('VALID ' + json.dumps(entry, ensure_ascii=False))
+
+          if len(manifest) != 2:
+              raise RuntimeError(f'Expected 2 reports, got {len(manifest)}')
+          if len({item['sha256'] for item in manifest}) != 2:
+              raise RuntimeError('Duplicate PDF content detected')
+
+          readme = [
+              '# 曹操出行（02643.HK）券商深度研究报告资料包',
+              '',
+              f'资料核对日期：{CHECKED_AS_OF}',
+              '',
+              '本资料包收录2份以曹操出行为主体的长篇公司深度或首次覆盖报告。',
+              '公开渠道可取得的页数与原报告页数可能不同；文件名、清单和 manifest 均据实标注“完整版”或“公开试读”，未将试读页标为完整报告。',
+              '',
+              '| 日期 | 券商 | 报告题目 | 类型 | 本包页数 | 原报告页数 | 状态 |',
+              '|---|---|---|---|---:|---:|---|',
+          ]
+          for item in manifest:
+              readme.append(
+                  f"| {item['date']} | {item['institution']} | {item['title']} | {item['report_type']} | "
+                  f"{item['included_pages']} | {item['original_pages']} | {item['access_status']} |"
+              )
+          readme += [
+              '',
+              '处理与校验说明：',
+              '- PDF由公开展示的高清逐页图片按原顺序合成。',
+              '- 未登录账户、未使用会员权限、未绕过验证码、付费墙或其他访问控制。',
+              '- 已检查页面尺寸、重复页、PDF文件头和实际页数。',
+              '- 已重新渲染检查首、中、尾页，并执行ZIP CRC完整性校验。',
+              '- 来源URL与SHA-256校验值见 manifest.json 和 SHA256SUMS.txt。',
+          ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (ROOT / '文件说明.txt').write_text(
+              '\n'.join(line.replace('# ', '').replace('- ', '') for line in readme if not line.startswith('|')) + '\n',
+              encoding='utf-8',
+          )
+          (ROOT / 'manifest.json').write_text(
+              json.dumps({
+                  'company': '曹操出行有限公司',
+                  'stock_code': '02643.HK',
+                  'checked_as_of': CHECKED_AS_OF,
+                  'pdf_count': 2,
+                  'files': manifest,
+              }, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{item['sha256']}  {item['filename']}" for item in manifest) + '\n',
+              encoding='utf-8',
+          )
+          (WORK / 'run.log').write_text('\n'.join(logs) + '\n', encoding='utf-8')
+
+          zip_path = WORK / '曹操出行_02643_券商深度报告_2份.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad_member = archive.testzip()
+              if bad_member:
+                  raise RuntimeError(f'ZIP CRC failure: {bad_member}')
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 2:
+                  raise RuntimeError(f'Expected 2 PDFs in ZIP, found {len(pdf_members)}')
+
+          zip_raw = zip_path.read_bytes()
+          metadata = {
+              'filename': zip_path.name,
+              'size_bytes': len(zip_raw),
+              'sha256': hashlib.sha256(zip_raw).hexdigest(),
+              'pdf_count': 2,
+              'reports': manifest,
+          }
+          (WORK / 'zip_metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL ' + json.dumps(metadata, ensure_ascii=False), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CaoCao-Mobility-Broker-Deep-Reports
+          path: |
+            caocao_reports_work/曹操出行_02643_券商深度报告_2份.zip
+            caocao_reports_work/zip_metadata.json
+            caocao_reports_work/run.log
+            caocao_reports_work/_qa
+          retention-days: 1
+          compression-level: 0
