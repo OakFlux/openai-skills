@@ -1,0 +1,151 @@
+name: Cirrus EastMoney Date Fetch
+
+on:
+  push:
+    branches:
+      - chatgpt-cirrus-fast-20260915
+    paths:
+      - .github/workflows/cirrus_eastmoney_dates.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+
+      - name: Find reports by exact publication dates and download PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cat > /tmp/fetch_dates.py <<'PY'
+          import json, re, hashlib, zipfile, time
+          from pathlib import Path
+          from datetime import datetime, timedelta
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('output')
+          S=requests.Session()
+          S.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+            'Referer':'https://data.eastmoney.com/report/',
+            'Accept':'application/json,text/javascript,*/*;q=0.9',
+          })
+          API='https://reportapi.eastmoney.com/report/list'
+
+          wanted=[
+            {'fragment':'全球私人航空领航者','date':'2026-04-07','org':'东吴证券','order':1},
+            {'fragment':'人群渗透提升','date':'2025-09-03','org':'西部证券','order':2},
+            {'fragment':'被低估的空中奢侈品','date':'2025-08-20','org':'浙商证券','order':3},
+            {'fragment':'被低估的全球通航飞机制造龙头','date':'2025-04-17','org':'华创证券','order':4},
+            {'fragment':'全球领先的私航飞机制造商','date':'2025-06-27','org':'海通国际','order':5},
+          ]
+          dates=set()
+          for w in wanted:
+            d=datetime.strptime(w['date'],'%Y-%m-%d')
+            for delta in [-2,-1,0,1,2]: dates.add((d+timedelta(days=delta)).strftime('%Y-%m-%d'))
+
+          rows_by_info={}
+          diagnostics=[]
+          for day in sorted(dates,reverse=True):
+            # Query a one-day interval. Try qType=0 and qType=1 because some mirrors classify HK reports differently.
+            next_day=(datetime.strptime(day,'%Y-%m-%d')+timedelta(days=1)).strftime('%Y-%m-%d')
+            for qtype in ['0','1']:
+              for page in range(1,31):
+                params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':day,'endTime':next_day,'pageNo':str(page),'fields':'','qType':qtype,
+                  'orgCode':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                }
+                r=S.get(API,params=params,timeout=30)
+                r.raise_for_status()
+                obj=r.json()
+                rows=obj.get('data') or []
+                if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or []
+                diagnostics.append({'day':day,'qType':qtype,'page':page,'rows':len(rows),'hits':obj.get('hits'),'totalPage':obj.get('TotalPage') or obj.get('totalPage')})
+                print('QUERY',day,qtype,page,'rows',len(rows),'hits',obj.get('hits'),'totalPage',obj.get('TotalPage') or obj.get('totalPage'))
+                for row in rows:
+                  info=str(row.get('infoCode') or row.get('encodeUrl') or '').strip()
+                  if info:
+                    title=str(row.get('title') or '')
+                    stock=str(row.get('stockName') or row.get('securityName') or '')
+                    if '西锐' in title or '西锐' in stock or any(w['fragment'] in title for w in wanted):
+                      rows_by_info[info]=row
+                      print('MATCH',json.dumps(row,ensure_ascii=False))
+                if len(rows)<100: break
+                time.sleep(0.1)
+          rows=list(rows_by_info.values())
+          (OUT/'日期检索结果.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'检索诊断.json').write_text(json.dumps(diagnostics,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL_MATCHES',len(rows))
+
+          selected=[]
+          for w in wanted:
+            candidates=[r for r in rows if w['fragment'] in str(r.get('title') or '')]
+            if not candidates: continue
+            exact=[r for r in candidates if w['org'] in str(r.get('orgSName') or r.get('orgName') or '')]
+            if exact: candidates=exact
+            row=sorted(candidates,key=lambda r:str(r.get('publishDate') or ''),reverse=True)[0]
+            info=str(row.get('infoCode') or row.get('encodeUrl')).strip()
+            pdf_urls=[f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf']
+            data=None; used=None
+            for u in pdf_urls:
+              rr=S.get(u,timeout=90,headers={'Referer':'https://data.eastmoney.com/'})
+              print('PDF',u,rr.status_code,len(rr.content),rr.headers.get('content-type'))
+              if rr.status_code==200 and rr.content.startswith(b'%PDF-') and len(rr.content)>50000:
+                data=rr.content; used=u; break
+            if data is None: continue
+            title=str(row.get('title') or w['fragment'])
+            org=str(row.get('orgSName') or row.get('orgName') or w['org'])
+            date=str(row.get('publishDate') or w['date'])[:10]
+            safe=re.sub(r'[\\/:*?"<>|]+','_',title).strip()
+            path=OUT/f"{w['order']:02d}_{org}_{safe}_{date}.pdf"
+            path.write_bytes(data)
+            reader=PdfReader(str(path))
+            pages=len(reader.pages)
+            if reader.is_encrypted or pages<10:
+              path.unlink(missing_ok=True); continue
+            rec={'filename':path.name,'title':title,'organization':org,'publish_date':date,'pages':pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'infoCode':info,'pdf_url':used,'rating':row.get('emRatingName'),'attachPages':row.get('attachPages'),'attachSize':row.get('attachSize')}
+            selected.append((path,rec))
+            print('SELECTED',json.dumps(rec,ensure_ascii=False))
+            if len(selected)>=3: break
+
+          # Always preserve diagnostics on failure so the artifact is inspectable.
+          if len(selected)<2:
+            (OUT/'ERROR.txt').write_text(f'Only found {len(selected)} complete PDFs.\n',encoding='utf-8')
+          else:
+            lines=['西锐（Cirrus Aircraft，02507.HK）券商深度报告资料包','', '包含文件：']
+            for i,(_,rec) in enumerate(selected,1): lines.append(f"{i}. {rec['organization']}：《{rec['title']}》，{rec['publish_date']}，{rec['pages']}页。")
+            lines += ['', '文件说明：','- PDF由东方财富公开研报API提供的infoCode对应公开PDF服务器直接下载。','- 保持原始PDF内容，未删页、改写或重排。','- 仅供个人研究与学习使用，请遵守原报告版权及免责声明。']
+            (OUT/'资料说明.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+            manifest=[rec for _,rec in selected]
+            (OUT/'文件清单及校验值.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+            zip_path=OUT/f'西锐_券商深度报告_{len(selected)}份.zip'
+            with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+              for p,_ in selected: z.write(p,p.name)
+              z.write(OUT/'资料说明.txt','资料说明.txt')
+              z.write(OUT/'文件清单及校验值.json','文件清单及校验值.json')
+            with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError('ZIP CRC error '+bad)
+            summary={'count':len(selected),'zip':zip_path.name,'zip_bytes':zip_path.stat().st_size,'zip_sha256':hashlib.sha256(zip_path.read_bytes()).hexdigest(),'reports':manifest}
+            (OUT/'BUILD_SUMMARY.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+            print('FINAL',json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+          python /tmp/fetch_dates.py
+          ls -lh output
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-eastmoney-date-results
+          path: output
+          retention-days: 1
