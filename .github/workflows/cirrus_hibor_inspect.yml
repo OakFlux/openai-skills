@@ -1,0 +1,136 @@
+name: Cirrus Hibor Inspect
+
+on:
+  push:
+    branches:
+      - chatgpt-cirrus-fast-20260915
+    paths:
+      - .github/workflows/cirrus_hibor_inspect.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml pillow
+
+      - name: Inspect public Hibor viewer resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/scripts out/assets
+          cat > /tmp/hibor_inspect.py <<'PY'
+          import io,json,re,hashlib
+          from pathlib import Path
+          from urllib.parse import urljoin,urlparse
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+
+          OUT=Path('out'); SCRIPTS=OUT/'scripts'; ASSETS=OUT/'assets'
+          S=requests.Session()
+          S.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          base='https://wap.hibor.com.cn/repinfodetail_5031267.html'
+          r=S.get(base,timeout=40); r.raise_for_status(); html=r.text
+          (OUT/'hibor.html').write_text(html,encoding='utf-8',errors='ignore')
+          soup=BeautifulSoup(html,'lxml')
+          result={'page':{'status':r.status_code,'bytes':len(r.content),'url':r.url},'links':[],'scripts':[],'contexts':[],'assets':[]}
+          for tag in soup.find_all(True):
+            for attr in ('href','src','data-src','data-url','onclick','action','value'):
+              v=tag.get(attr)
+              if not isinstance(v,str): continue
+              u=urljoin(r.url,v) if not v.lower().startswith('javascript:') else v
+              if any(k in (v+' '+u+' '+tag.get_text(' ',strip=True)).lower() for k in ['pdf','download','down','checkmd5file','repinfo','report','img','5031267','20260407161620544','open']):
+                result['links'].append({'tag':tag.name,'attr':attr,'value':v,'absolute':u,'text':tag.get_text(' ',strip=True)[:500]})
+          patterns=['20260407161620544','CheckMd5File','5031267','repinfodetail','download','down','pdf','pageindex','pagecount','totalpage','openreport','showreport','viewreport','iframe','免责声明','agree','login']
+          for pat in patterns:
+            for m in list(re.finditer(re.escape(pat),html,re.I))[:100]:
+              result['contexts'].append({'pattern':pat,'context':html[max(0,m.start()-1200):m.end()+2200]})
+
+          # Fetch same-site script files and inspect them.
+          script_urls=[]
+          for sc in soup.find_all('script',src=True):
+            u=urljoin(r.url,sc['src'])
+            if u not in script_urls: script_urls.append(u)
+          for i,u in enumerate(script_urls[:80]):
+            try:
+              rr=S.get(u,timeout=35,headers={'Referer':base}); data=rr.content
+              rec={'url':u,'status':rr.status_code,'bytes':len(data),'ct':rr.headers.get('content-type',''),'sha256':hashlib.sha256(data).hexdigest()}
+              result['scripts'].append(rec)
+              if rr.status_code==200 and len(data)<5_000_000:
+                text=rr.text
+                name=f'{i:03d}_{re.sub(r"[^A-Za-z0-9._-]+","_",urlparse(u).path.split("/")[-1] or "script")}'
+                (SCRIPTS/name).write_text(text,encoding='utf-8',errors='ignore')
+                hits=[]
+                for pat in patterns+['ajax','api','viewer','fileurl','imageurl','reportid','downurl']:
+                  for m in list(re.finditer(re.escape(pat),text,re.I))[:30]: hits.append({'pattern':pat,'context':text[max(0,m.start()-800):m.end()+1600]})
+                if hits: (SCRIPTS/(name+'.hits.json')).write_text(json.dumps(hits,ensure_ascii=False,indent=2),encoding='utf-8')
+            except Exception as e:
+              result['scripts'].append({'url':u,'error':repr(e)})
+
+          # Fetch all directly referenced public image/file resources.
+          urls=[]
+          for item in result['links']:
+            u=item['absolute']
+            if isinstance(u,str) and u.startswith('http') and any(k in u.lower() for k in ['checkmd5file','pdf','download','report','img']):
+              if u not in urls: urls.append(u)
+          # Also explicit image from indexed page.
+          explicit='https://huibobjb.hibor.com.cn/CheckMd5File/img/2026/4/20260407161620544.gif'
+          if explicit not in urls: urls.append(explicit)
+          for i,u in enumerate(urls[:120]):
+            try:
+              rr=S.get(u,timeout=40,allow_redirects=True,headers={'Referer':base})
+              data=rr.content; ct=rr.headers.get('content-type','').lower()
+              rec={'url':u,'final':rr.url,'status':rr.status_code,'bytes':len(data),'ct':ct,'head':data[:24].hex(),'sha256':hashlib.sha256(data).hexdigest()}
+              if rr.status_code==200 and len(data)>0:
+                ext='.bin'
+                if data.startswith(b'%PDF-'): ext='.pdf'
+                elif data.startswith((b'GIF87a',b'GIF89a')): ext='.gif'
+                elif data.startswith(b'\x89PNG'): ext='.png'
+                elif data[:3]==b'\xff\xd8\xff': ext='.jpg'
+                elif 'html' in ct or data.lstrip().startswith(b'<'): ext='.html'
+                path=ASSETS/f'{i:03d}{ext}'; path.write_bytes(data); rec['saved']=str(path)
+                if ext in ('.gif','.png','.jpg'):
+                  try:
+                    im=Image.open(io.BytesIO(data)); rec.update({'format':im.format,'width':im.width,'height':im.height,'frames':getattr(im,'n_frames',1)})
+                  except Exception as e: rec['image_error']=repr(e)
+              result['assets'].append(rec)
+              print('ASSET',json.dumps(rec,ensure_ascii=False))
+            except Exception as e:
+              result['assets'].append({'url':u,'error':repr(e)})
+
+          # Try only URL forms directly suggested by the public image path (no authentication bypass).
+          imgbase='https://huibobjb.hibor.com.cn/CheckMd5File/img/2026/4/'
+          stems=['20260407161620544']
+          for stem in stems:
+            variants=[]
+            for p in range(1,30):
+              variants += [f'{imgbase}{stem}_{p}.gif',f'{imgbase}{stem}-{p}.gif',f'{imgbase}{stem}/{p}.gif',f'{imgbase}{stem}{p:02d}.gif']
+            for u in variants:
+              try:
+                rr=S.get(u,timeout=12,headers={'Referer':base}); data=rr.content
+                good=rr.status_code==200 and len(data)>5000 and data.startswith((b'GIF87a',b'GIF89a',b'\x89PNG',b'\xff\xd8\xff'))
+                if good:
+                  name='variant_'+re.sub(r'[^0-9A-Za-z._-]+','_',u.rsplit('/',1)[-1]); (ASSETS/name).write_bytes(data)
+                  rec={'url':u,'status':rr.status_code,'bytes':len(data),'good':True,'sha256':hashlib.sha256(data).hexdigest()}
+                  result['assets'].append(rec); print('VARIANT',json.dumps(rec))
+              except Exception: pass
+
+          (OUT/'hibor_inspection.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY',json.dumps({'links':len(result['links']),'scripts':len(result['scripts']),'assets':len(result['assets'])},ensure_ascii=False))
+          PY
+          python /tmp/hibor_inspect.py
+          find out -type f -printf '%p\t%s bytes\n' | sort > out/inventory.txt
+
+      - name: Upload inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-hibor-inspection
+          path: out
+          retention-days: 1
