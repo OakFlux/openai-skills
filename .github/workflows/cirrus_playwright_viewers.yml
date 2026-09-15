@@ -1,0 +1,151 @@
+name: Cirrus Playwright Viewers
+
+on:
+  push:
+    branches:
+      - chatgpt-cirrus-fast-20260915
+    paths:
+      - .github/workflows/cirrus_playwright_viewers.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install Playwright
+        run: |
+          python -m pip install --quiet playwright requests pillow
+          python -m playwright install chromium
+
+      - name: Inspect and capture public report viewers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > /tmp/viewers.py <<'PY'
+          import asyncio, json, re, hashlib, io, os
+          from pathlib import Path
+          from urllib.parse import urlparse
+          from playwright.async_api import async_playwright
+          from PIL import Image
+
+          OUT=Path('out')
+          targets={
+            'gt_haitong_5278059':'https://www.fxbaogao.com/view?id=5278059',
+            'dw_5338338':'https://www.fxbaogao.com/view?id=5338338',
+            'xb_5048168':'https://www.fxbaogao.com/view?id=5048168',
+            'hibor_5031267':'https://wap.hibor.com.cn/repinfodetail_5031267.html',
+          }
+
+          async def inspect(context,name,url):
+            folder=OUT/name; folder.mkdir(parents=True,exist_ok=True)
+            page=await context.new_page()
+            responses=[]; saved=[]
+            async def on_response(resp):
+              try:
+                u=resp.url; ct=(resp.headers.get('content-type') or '').lower()
+                if any(k in u.lower() for k in ['report-image','checkmd5file','pdf','download','viewer','report','file']) or 'image/' in ct or 'application/pdf' in ct:
+                  rec={'url':u,'status':resp.status,'content_type':ct,'headers':dict(resp.headers)}
+                  responses.append(rec)
+                  if resp.status==200 and ('image/' in ct or 'application/pdf' in ct or any(k in u.lower() for k in ['report-image','checkmd5file'])):
+                    try:
+                      body=await resp.body()
+                      if len(body)>5000:
+                        ext='.bin'
+                        if body.startswith(b'%PDF-'): ext='.pdf'
+                        elif body.startswith(b'\x89PNG'): ext='.png'
+                        elif body[:3]==b'\xff\xd8\xff': ext='.jpg'
+                        elif body.startswith((b'GIF87a',b'GIF89a')): ext='.gif'
+                        elif body.startswith(b'RIFF') and b'WEBP' in body[:16]: ext='.webp'
+                        key=hashlib.sha256(body).hexdigest()
+                        path=folder/f'asset_{len(saved):04d}_{key[:12]}{ext}'
+                        path.write_bytes(body)
+                        meta={'url':u,'status':resp.status,'content_type':ct,'bytes':len(body),'sha256':key,'file':path.name}
+                        if ext in ['.png','.jpg','.gif','.webp']:
+                          try:
+                            im=Image.open(io.BytesIO(body)); meta.update({'width':im.width,'height':im.height,'format':im.format,'frames':getattr(im,'n_frames',1)})
+                          except Exception as e: meta['image_error']=repr(e)
+                        saved.append(meta)
+                    except Exception as e:
+                      rec['body_error']=repr(e)
+              except Exception:
+                pass
+            page.on('response',on_response)
+            console=[]
+            page.on('console',lambda msg: console.append({'type':msg.type,'text':msg.text[:2000]}))
+            try:
+              await page.goto(url,wait_until='domcontentloaded',timeout=60000)
+              await page.wait_for_timeout(8000)
+              # Accept publicly presented disclaimer if present; this is not authentication.
+              for text in ['我已阅读并同意','同意','确认','继续阅读','打开报告原文','点击免费查看完整报告']:
+                try:
+                  loc=page.get_by_text(text,exact=False)
+                  if await loc.count()>0:
+                    for i in range(min(await loc.count(),3)):
+                      try: await loc.nth(i).click(timeout=1500)
+                      except: pass
+                except: pass
+              await page.wait_for_timeout(4000)
+              # Scroll repeatedly to trigger all lazy-loaded pages.
+              last=0; stable=0
+              for step in range(100):
+                h=await page.evaluate('Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)')
+                await page.evaluate('(y)=>window.scrollTo(0,y)',min(h,step*1800+1800))
+                await page.mouse.wheel(0,1600)
+                await page.wait_for_timeout(700)
+                nh=await page.evaluate('Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)')
+                if nh==last: stable+=1
+                else: stable=0
+                last=nh
+                if stable>12 and step>20: break
+              await page.evaluate('window.scrollTo(0,document.body.scrollHeight)')
+              await page.wait_for_timeout(8000)
+              html=await page.content(); (folder/'dom.html').write_text(html,encoding='utf-8',errors='ignore')
+              await page.screenshot(path=str(folder/'fullpage.png'),full_page=True)
+              dominfo=await page.evaluate('''() => ({
+                title: document.title,
+                url: location.href,
+                height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+                images: [...document.images].map((x,i)=>({i,src:x.currentSrc||x.src,dataSrc:x.dataset?JSON.stringify(x.dataset):'',width:x.naturalWidth,height:x.naturalHeight,alt:x.alt})),
+                iframes: [...document.querySelectorAll('iframe')].map(x=>x.src),
+                anchors: [...document.querySelectorAll('a')].map(x=>({href:x.href,text:(x.innerText||'').trim().slice(0,300)})).filter(x=>/pdf|download|report|view|file|原文|完整/i.test(x.href+' '+x.text)),
+                scripts: [...document.scripts].map(x=>x.src).filter(Boolean),
+                bodyText: (document.body.innerText||'').slice(0,200000)
+              })''')
+              (folder/'dominfo.json').write_text(json.dumps(dominfo,ensure_ascii=False,indent=2),encoding='utf-8')
+            except Exception as e:
+              (folder/'error.txt').write_text(repr(e),encoding='utf-8')
+            await page.close()
+            # Deduplicate response records and saved assets metadata.
+            uniq=[]; seen=set()
+            for x in responses:
+              k=(x.get('url'),x.get('status'),x.get('content_type'))
+              if k not in seen: seen.add(k); uniq.append(x)
+            (folder/'responses.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+            (folder/'assets.json').write_text(json.dumps(saved,ensure_ascii=False,indent=2),encoding='utf-8')
+            (folder/'console.json').write_text(json.dumps(console,ensure_ascii=False,indent=2),encoding='utf-8')
+            print(name,'responses',len(uniq),'assets',len(saved))
+
+          async def main():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True,args=['--disable-dev-shm-usage','--no-sandbox'])
+              context=await browser.new_context(viewport={'width':1440,'height':1100},user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',locale='zh-CN')
+              for name,url in targets.items():
+                await inspect(context,name,url)
+              await browser.close()
+          asyncio.run(main())
+          PY
+          python /tmp/viewers.py
+          find out -type f -printf '%p\t%s bytes\n' | sort > out/inventory.txt
+
+      - name: Upload viewer capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-public-viewer-capture
+          path: out
+          retention-days: 1
