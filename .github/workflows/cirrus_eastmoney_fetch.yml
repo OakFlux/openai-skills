@@ -1,0 +1,177 @@
+name: Cirrus EastMoney Fetch
+
+on:
+  push:
+    branches:
+      - chatgpt-cirrus-fast-20260915
+    paths:
+      - .github/workflows/cirrus_eastmoney_fetch.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+
+      - name: Query public report API and download original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cat > /tmp/fetch_eastmoney.py <<'PY'
+          import json, re, hashlib, zipfile, time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('output')
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/',
+              'Accept':'application/json,text/javascript,*/*;q=0.9',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api='https://reportapi.eastmoney.com/report/list'
+          all_rows=[]
+          queries=[
+              {'keyword':'西锐'},
+              {'code':'02507'},
+              {'code':'2507'},
+          ]
+          for extra in queries:
+              for page in range(1,5):
+                  params={
+                      'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':'2024-01-01','endTime':'2030-12-31','pageNo':str(page),'fields':'',
+                      'qType':'0','orgCode':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                  }
+                  params.update(extra)
+                  r=s.get(api,params=params,timeout=30)
+                  print('API',extra,page,r.status_code,len(r.content),r.url)
+                  r.raise_for_status()
+                  text=r.text.strip()
+                  try:
+                      obj=r.json()
+                  except Exception:
+                      l=text.find('('); rr=text.rfind(')')
+                      if l<0 or rr<0: raise
+                      obj=json.loads(text[l+1:rr])
+                  rows=obj.get('data') or []
+                  if isinstance(rows,dict):
+                      rows=rows.get('data') or rows.get('list') or []
+                  print('ROWS',len(rows))
+                  all_rows.extend(rows)
+                  if len(rows)<100: break
+                  time.sleep(0.5)
+
+          # Deduplicate and retain only Cirrus reports.
+          dedup={}
+          for row in all_rows:
+              info=str(row.get('infoCode') or row.get('encodeUrl') or '').strip()
+              title=str(row.get('title') or '')
+              stock=str(row.get('stockName') or row.get('stockNameCode') or row.get('securityName') or '')
+              if info and ('西锐' in title or '西锐' in stock or '2507' in str(row)):
+                  dedup[info]=row
+          rows=list(dedup.values())
+          rows.sort(key=lambda x:str(x.get('publishDate') or ''),reverse=True)
+          (OUT/'API检索结果.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CIRRUS_ROWS',len(rows))
+          for row in rows:
+              print('REPORT',row.get('publishDate'),row.get('orgSName'),row.get('title'),row.get('infoCode'),row.get('attachPages'),row.get('attachSize'))
+
+          targets=[
+              {'contains':'全球私人航空领航者','org':'东吴证券','prefix':'01_东吴证券'},
+              {'contains':'人群渗透提升','org':'西部证券','prefix':'02_西部证券'},
+              {'contains':'被低估的空中奢侈品','org':'浙商证券','prefix':'03_浙商证券'},
+              {'contains':'被低估的全球通航飞机制造龙头','org':'华创证券','prefix':'04_华创证券'},
+              {'contains':'全球领先的私航飞机制造商','org':'海通国际','prefix':'05_海通国际'},
+          ]
+
+          selected=[]
+          for target in targets:
+              matches=[row for row in rows if target['contains'] in str(row.get('title') or '')]
+              if target.get('org'):
+                  exact=[row for row in matches if target['org'] in str(row.get('orgSName') or row.get('orgName') or '')]
+                  if exact: matches=exact
+              if not matches: continue
+              row=matches[0]
+              info=str(row.get('infoCode') or row.get('encodeUrl')).strip()
+              urls=[
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',
+              ]
+              data=None; used=None
+              for url in urls:
+                  rr=s.get(url,timeout=60,headers={'Referer':'https://data.eastmoney.com/'})
+                  print('PDF',url,rr.status_code,len(rr.content),rr.headers.get('content-type'))
+                  if rr.status_code==200 and rr.content.startswith(b'%PDF-') and len(rr.content)>50000:
+                      data=rr.content; used=url; break
+              if not data: continue
+              date=str(row.get('publishDate') or '')[:10]
+              title=str(row.get('title') or target['contains'])
+              org=str(row.get('orgSName') or row.get('orgName') or target['org'])
+              safe=re.sub(r'[\\/:*?"<>|]+','_',title).strip()
+              filename=f"{target['prefix']}_{safe}_{date}.pdf"
+              path=OUT/filename
+              path.write_bytes(data)
+              reader=PdfReader(str(path))
+              pages=len(reader.pages)
+              if reader.is_encrypted or pages<10:
+                  path.unlink(missing_ok=True)
+                  continue
+              rec={
+                  'filename':filename,'title':title,'organization':org,'publish_date':date,
+                  'pages':pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),
+                  'infoCode':info,'pdf_url':used,'rating':row.get('emRatingName'),
+                  'attachPages':row.get('attachPages'),'attachSize':row.get('attachSize'),
+              }
+              selected.append((path,rec))
+              print('SELECTED',json.dumps(rec,ensure_ascii=False))
+              if len(selected)>=3: break
+
+          if len(selected)<2:
+              raise RuntimeError(f'Only downloaded {len(selected)} valid full reports; need at least 2')
+
+          readme=['西锐（Cirrus Aircraft，02507.HK）券商深度报告资料包','', '包含文件：']
+          for i,(path,rec) in enumerate(selected,1):
+              readme.append(f"{i}. {rec['organization']}：《{rec['title']}》，{rec['publish_date']}，{rec['pages']}页。")
+          readme += ['', '文件说明：', '- PDF通过东方财富公开研报接口返回的infoCode，从其公开PDF服务器直接下载。', '- 文件保持原始PDF内容，未改写、删页或重排。', '- 仅供个人研究与学习使用，请遵守原报告版权和免责声明。']
+          (OUT/'资料说明.txt').write_text('\n'.join(readme)+'\n',encoding='utf-8')
+          manifest=[rec for _,rec in selected]
+          (OUT/'文件清单及校验值.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          count=len(selected)
+          zip_path=OUT/f'西锐_券商深度报告_{count}份.zip'
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+              for path,_ in selected:
+                  z.write(path,path.name)
+              z.write(OUT/'资料说明.txt','资料说明.txt')
+              z.write(OUT/'文件清单及校验值.json','文件清单及校验值.json')
+          with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError('ZIP CRC failed: '+bad)
+          summary={
+              'count':count,'zip':zip_path.name,'zip_bytes':zip_path.stat().st_size,
+              'zip_sha256':hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'reports':manifest,
+          }
+          (OUT/'BUILD_SUMMARY.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+          python /tmp/fetch_eastmoney.py
+          ls -lh output
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-eastmoney-package
+          path: output
+          retention-days: 1
