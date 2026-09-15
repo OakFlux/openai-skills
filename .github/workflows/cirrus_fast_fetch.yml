@@ -1,0 +1,175 @@
+name: Cirrus Fast Fetch
+
+on:
+  push:
+    branches:
+      - chatgpt-cirrus-fast-20260915
+    paths:
+      - .github/workflows/cirrus_fast_fetch.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pillow pypdf
+
+      - name: Fetch public report pages and build PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cat > /tmp/fetch_cirrus_reports.py <<'PY'
+          import io, json, hashlib, zipfile, os, re
+          from pathlib import Path
+          from datetime import datetime, timedelta
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          specs = [
+              {
+                  'id':'5338338', 'date':'2026-04-07', 'pages':28,
+                  'filename':'01_东吴证券_西锐_全球私人航空领航者_稀缺性资产价值重估_2026-04-07_28页.pdf',
+                  'title':'东吴证券：《西锐（02507.HK）：全球私人航空领航者，稀缺性资产价值重估》',
+                  'source':'https://www.fxbaogao.com/detail/5338338',
+              },
+              {
+                  'id':'5048168', 'date':'2025-09-03', 'pages':22,
+                  'filename':'02_西部证券_西锐首次覆盖_人群渗透提升_领航高端消费_2025-09-03_22页.pdf',
+                  'title':'西部证券：《西锐（2507.HK）首次覆盖报告：人群渗透提升，领航高端消费》',
+                  'source':'https://www.fxbaogao.com/detail/5048168',
+              },
+          ]
+
+          def try_url(url, referer):
+              try:
+                  r=session.get(url,timeout=10,allow_redirects=True,headers={'Referer':referer})
+                  data=r.content
+                  ctype=r.headers.get('content-type','').lower()
+                  valid=(r.status_code==200 and len(data)>10000 and (
+                      data.startswith(b'\x89PNG') or data[:3]==b'\xff\xd8\xff' or
+                      (data.startswith(b'RIFF') and b'WEBP' in data[:16]) or
+                      'image/' in ctype))
+                  if valid:
+                      im=Image.open(io.BytesIO(data)); im.load()
+                      if im.width < 500 or im.height < 700:
+                          return None
+                      return {'url':url,'bytes':data,'width':im.width,'height':im.height,'format':im.format}
+              except Exception:
+                  return None
+              return None
+
+          manifest=[]
+          pdf_paths=[]
+          for spec in specs:
+              rid=spec['id']; expected=spec['pages']; ref=spec['source']
+              base=datetime.strptime(spec['date'],'%Y-%m-%d')
+              dates=[(base+timedelta(days=d)).strftime('%Y/%m/%d') for d in range(-4,5)]
+              # Discover a valid prefix using page 1.
+              candidates=[]
+              for d in dates:
+                  for ext in ['png','jpg','jpeg']:
+                      candidates.append(f'https://public.fxbaogao.com/report-image/{d}/{rid}-1.{ext}')
+              prefix=None; first=None
+              with ThreadPoolExecutor(max_workers=24) as ex:
+                  futs={ex.submit(try_url,u,ref):u for u in candidates}
+                  for fut in as_completed(futs):
+                      res=fut.result()
+                      if res:
+                          first=res; prefix=res['url'].rsplit('-1.',1)[0]; ext=res['url'].rsplit('.',1)[-1]
+                          break
+              if not first:
+                  raise RuntimeError(f'Could not find public page 1 for {rid}')
+              # Fetch all pages. Test primary extension plus common alternatives.
+              def fetch_page(p):
+                  urls=[]
+                  primary=first['url'].rsplit('-1.',1)[0]
+                  primary_ext=first['url'].rsplit('.',1)[-1]
+                  urls.append(f'{primary}-{p}.{primary_ext}')
+                  for alt in ['png','jpg','jpeg']:
+                      u=f'{primary}-{p}.{alt}'
+                      if u not in urls: urls.append(u)
+                  for u in urls:
+                      res=try_url(u,ref)
+                      if res: return p,res
+                  return p,None
+              pages={1:first}
+              with ThreadPoolExecutor(max_workers=20) as ex:
+                  futs=[ex.submit(fetch_page,p) for p in range(2,expected+1)]
+                  for fut in as_completed(futs):
+                      p,res=fut.result()
+                      if res: pages[p]=res
+              missing=[p for p in range(1,expected+1) if p not in pages]
+              if missing:
+                  raise RuntimeError(f'{rid} missing pages: {missing}')
+
+              img_dir=OUT/f'pages_{rid}'; img_dir.mkdir(parents=True,exist_ok=True)
+              images=[]
+              page_records=[]
+              for p in range(1,expected+1):
+                  res=pages[p]
+                  im=Image.open(io.BytesIO(res['bytes'])).convert('RGB')
+                  # Keep source page exactly, but normalize metadata/orientation.
+                  img_path=img_dir/f'{p:03d}.jpg'
+                  im.save(img_path,'JPEG',quality=94,optimize=True)
+                  images.append(im.copy())
+                  page_records.append({'page':p,'url':res['url'],'source_bytes':len(res['bytes']),'width':im.width,'height':im.height})
+                  im.close()
+              pdf_path=OUT/spec['filename']
+              images[0].save(pdf_path,'PDF',resolution=150.0,save_all=True,append_images=images[1:])
+              for im in images: im.close()
+              reader=PdfReader(str(pdf_path))
+              if len(reader.pages)!=expected or reader.is_encrypted:
+                  raise RuntimeError(f'PDF validation failed for {rid}: pages={len(reader.pages)} encrypted={reader.is_encrypted}')
+              pdf_paths.append(pdf_path)
+              manifest.append({
+                  'id':rid,'title':spec['title'],'date':spec['date'],'expected_pages':expected,
+                  'actual_pages':len(reader.pages),'pdf_bytes':pdf_path.stat().st_size,
+                  'pdf_sha256':hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+                  'public_detail_page':spec['source'],'page_sources':page_records,
+                  'format_note':'由无需登录即可访问的公开逐页图像按原顺序合成为PDF；未改写报告正文。'
+              })
+
+          readme = '''西锐（Cirrus Aircraft，02507.HK）券商深度报告资料包\n\n本资料包包含：\n1. 东吴证券：《全球私人航空领航者，稀缺性资产价值重估》，2026-04-07，28页，首次覆盖/买入。\n2. 西部证券：《首次覆盖报告：人群渗透提升，领航高端消费》，2025-09-03，22页，首次覆盖/买入。\n\n文件说明：\n- 两份PDF均由公开、无需登录即可读取的逐页报告图像按原顺序合成。\n- 未补写、删改或重排报告正文；页数与公开资料标示页数一致。\n- 仅供个人研究与学习使用，请遵守原报告版权和免责声明。\n'''
+          (OUT/'资料说明.txt').write_text(readme,encoding='utf-8')
+          (OUT/'文件清单及校验值.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          zip_path=OUT/'西锐_券商深度报告_2份.zip'
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+              for p in pdf_paths+[OUT/'资料说明.txt',OUT/'文件清单及校验值.json']:
+                  z.write(p,p.name)
+          with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError('ZIP CRC failed: '+bad)
+          summary={
+              'zip':zip_path.name,'zip_bytes':zip_path.stat().st_size,
+              'zip_sha256':hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'reports':manifest,
+          }
+          (OUT/'BUILD_SUMMARY.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+          python /tmp/fetch_cirrus_reports.py
+          rm -rf output/pages_*
+          ls -lh output
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-final-package
+          path: output
+          retention-days: 1
