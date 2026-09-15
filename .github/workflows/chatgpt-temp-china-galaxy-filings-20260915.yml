@@ -1,0 +1,411 @@
+name: chatgpt-temp-china-galaxy-filings-20260915
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-china-galaxy-filings-20260915
+    paths:
+      - .github/workflows/chatgpt-temp-china-galaxy-filings-20260915.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download, validate and package official filings
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf pillow
+          python <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+
+          STOCK_ID = '87849'
+          AS_OF = '2026-09-15'
+          WORK = Path('china_galaxy_filings_work')
+          ROOT = WORK / '中国银河_601881_06881_2020-2025年报及2026最新定期报告'
+          PDF_DIR = ROOT / 'PDF'
+          QA_DIR = WORK / '_qa'
+          RAW_DIR = WORK / '_raw'
+          for directory in (PDF_DIR, QA_DIR, RAW_DIR):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh-TW;q=0.9,en;q=0.8',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/',
+          })
+
+          logs = []
+          def log(message):
+              message = str(message)
+              print(message, flush=True)
+              logs.append(message)
+
+          def fetch(url, *, params=None, timeout=120):
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      response = session.get(url, params=params, timeout=timeout, allow_redirects=True)
+                      log(f'GET attempt={attempt} status={response.status_code} bytes={len(response.content)} type={response.headers.get("content-type")} final={response.url}')
+                      if response.status_code == 200:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      log(f'GET_ERROR attempt={attempt} url={url} error={exc!r}')
+                  time.sleep(attempt * 1.5)
+              raise RuntimeError(f'Unable to fetch {url}: {last!r}')
+
+          def compact(text):
+              return re.sub(r'\s+', '', str(text or '')).replace('（', '(').replace('）', ')').lower()
+
+          # Search each release year separately in Chinese and English so long result sets do not truncate.
+          title_pages = []
+          for lang in ('ZH', 'EN'):
+              for release_year in range(2021, 2027):
+                  params = {
+                      'lang': lang,
+                      'category': '0',
+                      'market': 'SEHK',
+                      'stockId': STOCK_ID,
+                      'documentType': '-1',
+                      'searchType': '0',
+                      't1code': '-2',
+                      't2Gcode': '-2',
+                      't2code': '-2',
+                      'from': f'{release_year}0101',
+                      'to': AS_OF.replace('-', '') if release_year == 2026 else f'{release_year}1231',
+                  }
+                  response = fetch('https://www1.hkexnews.hk/search/titlesearch.xhtml', params=params, timeout=90)
+                  (RAW_DIR / f'titles_{lang}_{release_year}.html').write_bytes(response.content)
+                  title_pages.append((lang, release_year, response.url, response.text))
+
+          entries = []
+          seen = set()
+          for lang, release_year, base_url, html in title_pages:
+              soup = BeautifulSoup(html, 'html.parser')
+              for anchor in soup.find_all('a', href=True):
+                  href = urljoin(base_url, anchor.get('href'))
+                  if '.pdf' not in href.lower():
+                      continue
+                  text = ' '.join(anchor.get_text(' ', strip=True).split())
+                  row = anchor.find_parent('tr')
+                  context = ' '.join(row.get_text(' ', strip=True).split()) if row else text
+                  key = (lang, href)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  entries.append({
+                      'lang': lang,
+                      'release_year': release_year,
+                      'text': text,
+                      'context': context,
+                      'href': href,
+                  })
+
+          (WORK / 'title_entries.json').write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')
+          for entry in entries:
+              blob = compact(entry['text'] + ' ' + entry['context'])
+              if any(marker in blob for marker in ['年度报告', '年度報告', 'annualreport', '半年度报告', '半年度報告', '中期报告', '中期報告', 'firstquarterlyreport', '第一季度报告', '第一季度報告']):
+                  log('ENTRY ' + json.dumps(entry, ensure_ascii=False))
+
+          def annual_candidate_score(entry, report_year):
+              text = entry['text']
+              context = entry['context']
+              blob = compact(text + ' ' + context)
+              if str(report_year) not in blob:
+                  return None
+              if not any(marker in blob for marker in ['年度报告', '年度報告', 'annualreport']):
+                  return None
+              if any(bad in blob for bad in [
+                  '摘要', '業績公告', '业绩公告', 'annualresults', '董事會工作報告', '董事会工作报告',
+                  '可持續發展', '可持续发展', '社會責任', '社会责任', '環境、社會及管治', 'environmental,socialandgovernance',
+                  '代理人委任表格', '通函', 'workreportoftheboard', '英文版',
+              ]):
+                  return None
+              score = 0
+              if '中国银河' in text or '中國銀河' in text or 'chinagalaxy' in blob:
+                  score += 60
+              if '年度报告' in text:
+                  score += 50  # Prefer the A-share simplified-Chinese statutory report.
+              if '年度報告' in text:
+                  score += 35
+              if 'annualreport' in compact(text):
+                  score += 20
+              if any(tag in context for tag in ['海外監管公告', '海外监管公告']):
+                  score += 30
+              if entry['lang'] == 'ZH':
+                  score += 20
+              if entry['release_year'] == report_year + 1:
+                  score += 10
+              score -= min(len(text), 300) / 20
+              return score
+
+          selected = []
+          for year in range(2020, 2026):
+              ranked = []
+              for entry in entries:
+                  score = annual_candidate_score(entry, year)
+                  if score is not None:
+                      ranked.append((score, entry))
+              ranked.sort(key=lambda pair: pair[0], reverse=True)
+              if not ranked:
+                  raise RuntimeError(f'No annual report candidate found for {year}')
+              choice = ranked[0][1]
+              log(f'ANNUAL_SELECTED year={year} score={ranked[0][0]:.2f} ' + json.dumps(choice, ensure_ascii=False))
+              selected.append({
+                  'label': f'{year}年年度报告',
+                  'period': str(year),
+                  'kind': 'annual',
+                  'entry': choice,
+                  'filename': f'中国银河_601881_06881_{year}年年度报告.pdf',
+                  'min_pages': 80,
+              })
+
+          def choose_periodic(kind):
+              ranked = []
+              for entry in entries:
+                  if entry['release_year'] != 2026:
+                      continue
+                  text = entry['text']
+                  context = entry['context']
+                  blob = compact(text + ' ' + context)
+                  score = None
+                  if kind == 'q1':
+                      if any(marker in blob for marker in ['2026年第一季度报告', '2026年第一季度報告', '2026firstquarterlyreport', 'firstquarterlyreport']):
+                          if '摘要' not in blob:
+                              score = 100
+                              if entry['lang'] == 'ZH': score += 20
+                              if '中国银河' in text or '中國銀河' in text: score += 20
+                              if '季度报告' in text or '季度報告' in text: score += 15
+                  elif kind == 'h1':
+                      if any(marker in blob for marker in ['2026年半年度报告', '2026年半年度報告', '2026年中期报告', '2026年中期報告', 'interimreport2026']):
+                          if not any(bad in blob for bad in ['摘要', '中期業績公告', '中期业绩公告', 'interimresults']):
+                              score = 130
+                              if entry['lang'] == 'ZH': score += 20
+                              if '中国银河' in text or '中國銀河' in text: score += 20
+                              if any(tag in context for tag in ['海外監管公告', '海外监管公告']): score += 15
+                      elif any(marker in blob for marker in ['中期業績', '中期业绩', 'interimresults']):
+                          score = 40
+                          if entry['lang'] == 'ZH': score += 10
+                  if score is not None:
+                      score -= min(len(text), 300) / 20
+                      ranked.append((score, entry))
+              ranked.sort(key=lambda pair: pair[0], reverse=True)
+              if not ranked:
+                  raise RuntimeError(f'No 2026 periodic report candidate found for {kind}')
+              log(f'PERIODIC_SELECTED kind={kind} score={ranked[0][0]:.2f} ' + json.dumps(ranked[0][1], ensure_ascii=False))
+              return ranked[0][1]
+
+          q1_choice = choose_periodic('q1')
+          h1_choice = choose_periodic('h1')
+          selected.extend([
+              {
+                  'label': '2026年第一季度报告',
+                  'period': '2026Q1',
+                  'kind': 'q1',
+                  'entry': q1_choice,
+                  'filename': '中国银河_601881_06881_2026年第一季度报告.pdf',
+                  'min_pages': 8,
+              },
+              {
+                  'label': '2026年半年度报告（最新定期报告）',
+                  'period': '2026H1',
+                  'kind': 'h1',
+                  'entry': h1_choice,
+                  'filename': '中国银河_601881_06881_2026年半年度报告_最新定期报告.pdf',
+                  'min_pages': 30,
+              },
+          ])
+
+          def download_pdf(url):
+              response = fetch(url, timeout=240)
+              data = response.content
+              if not data.startswith(b'%PDF-') or len(data) < 40_000:
+                  raise RuntimeError(f'Invalid PDF: {url}, bytes={len(data)}, type={response.headers.get("content-type")}')
+              return data, response.url
+
+          def extract_sample_text(path, pages):
+              chunks = []
+              indices = list(range(min(14, pages)))
+              for idx in (pages // 2, max(0, pages - 2)):
+                  if idx not in indices:
+                      indices.append(idx)
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  for idx in indices:
+                      try:
+                          chunks.append(reader.pages[idx].extract_text() or '')
+                      except Exception:
+                          pass
+              except Exception as exc:
+                  log(f'PYPDF_TEXT_ERROR {path.name} {exc!r}')
+              try:
+                  document = pymupdf.open(str(path))
+                  for idx in indices:
+                      try:
+                          chunks.append(document.load_page(idx).get_text('text') or '')
+                      except Exception:
+                          pass
+                  document.close()
+              except Exception as exc:
+                  log(f'PYMUPDF_TEXT_ERROR {path.name} {exc!r}')
+              return re.sub(r'\s+', '', '\n'.join(chunks)).upper()
+
+          def render_checks(path, pages, stem):
+              document = pymupdf.open(str(path))
+              if document.page_count != pages:
+                  raise RuntimeError(f'Page count mismatch: {path.name}: pypdf={pages}, pymupdf={document.page_count}')
+              checks = []
+              sample = [(0, 'first'), (pages // 2, 'middle'), (pages - 1, 'last')]
+              seen_pages = set()
+              for page_no, tag in sample:
+                  if page_no in seen_pages:
+                      continue
+                  seen_pages.add(page_no)
+                  pix = document.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(1.25, 1.25), alpha=False)
+                  output = QA_DIR / f'{stem}_{tag}.png'
+                  pix.save(str(output))
+                  with Image.open(output) as image:
+                      stddev = float(ImageStat.Stat(image.convert('L').resize((64, 64))).stddev[0])
+                  if stddev < 1.0:
+                      raise RuntimeError(f'Near-blank rendered page: {path.name}, page {page_no + 1}')
+                  checks.append({'page': page_no + 1, 'stddev': round(stddev, 4)})
+              document.close()
+              return checks
+
+          identity_markers = ['中国银河', '中國銀河', 'CHINAGALAXY', '601881', '06881']
+          manifest = []
+          for index, item in enumerate(selected, 1):
+              data, final_url = download_pdf(item['entry']['href'])
+              destination = PDF_DIR / item['filename']
+              destination.write_bytes(data)
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f"{item['label']}: page count {pages} < {item['min_pages']}")
+              sample_text = extract_sample_text(destination, pages)
+              if not any(marker.upper() in sample_text for marker in identity_markers):
+                  # Some scanned/embedded-font Chinese PDFs extract poorly; title-search context is still official,
+                  # so fail only when neither text nor official title/context identifies the issuer.
+                  official_blob = compact(item['entry']['text'] + ' ' + item['entry']['context'])
+                  if not any(marker.lower() in official_blob for marker in ['中国银河', '中國銀河', 'chinagalaxy', '601881', '06881']):
+                      raise RuntimeError(f"{item['label']}: company identity not detected")
+                  log(f'WARNING text extraction did not expose company identity for {item["label"]}; official HKEX title context did')
+              checks = render_checks(destination, pages, f'{index:02d}_{item["period"]}')
+              sha256 = hashlib.sha256(data).hexdigest()
+              record = {
+                  'label': item['label'],
+                  'period': item['period'],
+                  'type': item['kind'],
+                  'filename': f"PDF/{item['filename']}",
+                  'source_title': item['entry']['text'],
+                  'source_context': item['entry']['context'],
+                  'source_url': final_url,
+                  'pages': pages,
+                  'size_bytes': len(data),
+                  'sha256': sha256,
+                  'render_checks': checks,
+              }
+              manifest.append(record)
+              log('VALID ' + json.dumps(record, ensure_ascii=False))
+
+          annual_periods = [record['period'] for record in manifest if record['type'] == 'annual']
+          if annual_periods != ['2020', '2021', '2022', '2023', '2024', '2025']:
+              raise RuntimeError(f'Annual coverage mismatch: {annual_periods}')
+          if len(manifest) != 8:
+              raise RuntimeError(f'Expected 8 PDFs, got {len(manifest)}')
+          if len({record['sha256'] for record in manifest}) != len(manifest):
+              raise RuntimeError('Duplicate PDF content detected')
+
+          readme = [
+              '# 中国银河证券（601881.SH／06881.HK）官方财务报告资料包',
+              '',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '本资料包包含：',
+              '- 2020—2025 年全部年度报告；',
+              '- 2026 年第一季度报告；',
+              '- 2026 年半年度报告（截至核对日最新定期财务报告）。',
+              '',
+              '口径说明：用户要求“最新季报”。严格按报告名称，最新季度报告为2026年第一季度报告；按最新定期财务披露口径，2026年半年度报告更新，因此两份均予收录。',
+              '',
+              '| 序号 | 报告 | 页数 | 大小（字节） |',
+              '|---:|---|---:|---:|',
+          ]
+          for idx, record in enumerate(manifest, 1):
+              readme.append(f"| {idx} | {record['label']} | {record['pages']} | {record['size_bytes']} |")
+          readme += [
+              '',
+              '全部文件来自香港交易所披露易的中国银河证券官方披露。已核验PDF文件头、报告页数，并渲染检查首、中、尾页。',
+              '详细来源URL、页数、文件大小和SHA-256校验值见 manifest.json 与 SHA256SUMS.txt。',
+          ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (ROOT / '文件说明.txt').write_text('\n'.join(line.replace('# ', '').replace('- ', '') for line in readme if not line.startswith('|')) + '\n', encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps({
+              'company': '中国银河证券股份有限公司',
+              'stock_codes': ['601881.SH', '06881.HK'],
+              'checked_as_of': AS_OF,
+              'pdf_count': len(manifest),
+              'latest_periodic_report': '2026年半年度报告',
+              'latest_strict_quarterly_report': '2026年第一季度报告',
+              'files': manifest,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{record['sha256']}  {record['filename']}" for record in manifest) + '\n', encoding='utf-8')
+          (WORK / 'run.log').write_text('\n'.join(logs) + '\n', encoding='utf-8')
+
+          zip_path = WORK / '中国银河_601881_06881_2020-2025年报及2026最新定期报告.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT.name) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 8:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_members)}')
+
+          zip_data = zip_path.read_bytes()
+          metadata = {
+              'filename': zip_path.name,
+              'size_bytes': len(zip_data),
+              'sha256': hashlib.sha256(zip_data).hexdigest(),
+              'pdf_count': 8,
+              'reports': manifest,
+          }
+          (WORK / 'zip_metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL ' + json.dumps(metadata, ensure_ascii=False), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: China-Galaxy-Official-Filings
+          path: |
+            china_galaxy_filings_work/中国银河_601881_06881_2020-2025年报及2026最新定期报告.zip
+            china_galaxy_filings_work/zip_metadata.json
+            china_galaxy_filings_work/run.log
+            china_galaxy_filings_work/title_entries.json
+            china_galaxy_filings_work/_qa
+          retention-days: 1
+          compression-level: 0
