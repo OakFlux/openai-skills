@@ -1,0 +1,348 @@
+name: Build Bank of Chongqing official reports archive
+on:
+  push:
+    branches:
+      - tmp-bank-chongqing-reports-20260915
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet 'httpx[http2]' pypdf pymupdf fonttools
+      - name: Download, validate and package official HKEX reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pdfs work/renders
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import io
+          import json
+          import re
+          import shutil
+          import zipfile
+          from pathlib import Path
+
+          import httpx
+          import pymupdf
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          PDFDIR = Path('work/pdfs')
+          RENDERDIR = Path('work/renders')
+          for directory in (OUT, PDFDIR, RENDERDIR):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          ENDPOINT = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          STOCK_ID = '95898'
+          STOCK_CODE = '01963'
+          USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          TITLE_PAGE = f'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId={STOCK_ID}'
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(value or '')
+              value = value.replace('\u3000', ' ')
+              return re.sub(r'\s+', ' ', value).strip()
+
+          def norm(value: str) -> str:
+              return clean_title(value).upper().replace(' ', '')
+
+          records = []
+          diagnostics = []
+          headers = {
+              'User-Agent': USER_AGENT,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': TITLE_PAGE,
+          }
+          with httpx.Client(http2=True, timeout=120, follow_redirects=True, headers=headers) as client:
+              for language in ['zh', 'EN']:
+                  params = {
+                      'sortDir': '0',
+                      'sortByOptions': 'DateTime',
+                      'category': '0',
+                      'market': 'SEHK',
+                      'stockId': STOCK_ID,
+                      'documentType': '-1',
+                      'fromDate': '20200101',
+                      'toDate': '20260915',
+                      'title': '',
+                      'searchType': '1',
+                      't1code': '-2',
+                      't2Gcode': '-2',
+                      't2code': '-2',
+                      'rowRange': '2000',
+                      'lang': language,
+                  }
+                  response = client.get(ENDPOINT, params=params)
+                  response.raise_for_status()
+                  outer = response.json()
+                  inner = json.loads(outer['result']) if isinstance(outer, dict) and isinstance(outer.get('result'), str) else outer.get('result', outer)
+                  if not isinstance(inner, list):
+                      raise RuntimeError(f'Unexpected HKEX response for {language}: {type(inner).__name__}')
+                  diagnostics.append({'language': language, 'status': response.status_code, 'count': len(inner), 'url': str(response.url)})
+                  for raw in inner:
+                      if not isinstance(raw, dict):
+                          continue
+                      code = str(raw.get('STOCK_CODE') or '').zfill(5)
+                      if code != STOCK_CODE:
+                          continue
+                      link = str(raw.get('FILE_LINK') or '').strip()
+                      title = clean_title(str(raw.get('TITLE') or ''))
+                      if not link or not title:
+                          continue
+                      if link.startswith('/'):
+                          url = 'https://www1.hkexnews.hk' + link
+                      else:
+                          url = 'https://www1.hkexnews.hk/' + link.lstrip('/')
+                      records.append({
+                          'language': language,
+                          'title': title,
+                          'url': url,
+                          'date_time': str(raw.get('DATE_TIME') or ''),
+                          'file_info': str(raw.get('FILE_INFO') or ''),
+                          'file_type': str(raw.get('FILE_TYPE') or ''),
+                          'stock_code': code,
+                      })
+
+              # Dedupe exact title/url/language records.
+              unique = []
+              seen = set()
+              for record in records:
+                  key = (record['language'], record['title'], record['url'])
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  unique.append(record)
+              records = unique
+
+              (OUT / 'hkex_query_diagnostics.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+              (OUT / 'hkex_all_records.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+              def choose(candidates: list[dict], exact_zh: tuple[str, ...] = (), exact_en: tuple[str, ...] = ()) -> dict:
+                  if not candidates:
+                      raise RuntimeError('No matching official HKEX record')
+                  def score(record: dict) -> tuple:
+                      title_n = norm(record['title'])
+                      language_score = 2 if record['language'] == 'zh' else 1
+                      exact_score = 0
+                      if record['language'] == 'zh' and any(norm(x) == title_n for x in exact_zh):
+                          exact_score = 3
+                      if record['language'] == 'EN' and any(norm(x) == title_n for x in exact_en):
+                          exact_score = 3
+                      pdf_score = 1 if record['url'].lower().endswith('.pdf') else 0
+                      return (exact_score, language_score, pdf_score, record['date_time'])
+                  return sorted(candidates, key=score, reverse=True)[0]
+
+              selection = []
+              excluded = ('摘要', '補充', '补充', '更正', '可持續', '可持续', 'SUSTAINABILITY', 'ESG', 'RESULTS', '業績', '业绩', 'ANNOUNCEMENT')
+              for year in range(2020, 2026):
+                  matches = []
+                  for record in records:
+                      title = record['title']
+                      title_u = title.upper()
+                      if str(year) not in title:
+                          continue
+                      if any(term.upper() in title_u for term in excluded):
+                          continue
+                      annual = ('ANNUAL REPORT' in title_u) or any(term in title for term in ['年度報告', '年度报告', '年報', '年报'])
+                      if annual and record['url'].lower().endswith('.pdf'):
+                          matches.append(record)
+                  chosen = choose(
+                      matches,
+                      exact_zh=(f'{year}年度報告', f'{year}年度报告', f'{year}年報', f'{year}年报'),
+                      exact_en=(f'{year} ANNUAL REPORT',),
+                  )
+                  selection.append({
+                      'kind': '年度报告',
+                      'period': str(year),
+                      'filename': f'{year}_Bank_of_Chongqing_Annual_Report.pdf',
+                      'record': chosen,
+                      'min_pages': 100,
+                  })
+
+              q1_matches = []
+              interim_matches = []
+              for record in records:
+                  title = record['title']
+                  title_u = title.upper()
+                  if not record['url'].lower().endswith('.pdf'):
+                      continue
+                  if '2026' in title and (
+                      'FIRST QUARTERLY REPORT' in title_u
+                      or 'FIRST QUARTER OF 2026' in title_u
+                      or '第一季度報告' in title
+                      or '第一季度报告' in title
+                  ):
+                      q1_matches.append(record)
+                  if '2026' in title and (
+                      title_u == '2026 INTERIM REPORT'
+                      or '2026 INTERIM REPORT' in title_u
+                      or '2026年中期報告' in title
+                      or '2026年中期报告' in title
+                      or '二零二六年中期報告' in title
+                      or '二零二六年中期报告' in title
+                  ) and not any(term in title_u for term in ['RESULTS', 'ANNOUNCEMENT', '業績', '业绩']):
+                      interim_matches.append(record)
+
+              q1 = choose(
+                  q1_matches,
+                  exact_zh=('2026年第一季度報告', '2026年第一季度报告'),
+                  exact_en=('FIRST QUARTERLY REPORT FOR 2026',),
+              )
+              interim = choose(
+                  interim_matches,
+                  exact_zh=('2026年中期報告', '2026年中期报告', '二零二六年中期報告'),
+                  exact_en=('2026 INTERIM REPORT',),
+              )
+              selection.extend([
+                  {
+                      'kind': '第一季度报告',
+                      'period': '2026Q1',
+                      'filename': '2026Q1_Bank_of_Chongqing_Quarterly_Report.pdf',
+                      'record': q1,
+                      'min_pages': 5,
+                  },
+                  {
+                      'kind': '半年度报告',
+                      'period': '2026H1',
+                      'filename': '2026H1_Bank_of_Chongqing_Interim_Report.pdf',
+                      'record': interim,
+                      'min_pages': 50,
+                  },
+              ])
+
+              (OUT / 'selected_records.json').write_text(json.dumps(selection, ensure_ascii=False, indent=2), encoding='utf-8')
+
+              manifest = []
+              for index, spec in enumerate(selection, 1):
+                  record = spec['record']
+                  response = client.get(record['url'], headers={'Referer': TITLE_PAGE, 'Accept': 'application/pdf,*/*;q=0.8'}, timeout=600)
+                  response.raise_for_status()
+                  data = response.content
+                  if b'%PDF-' not in data[:2048] or len(data) < 80_000:
+                      raise RuntimeError(f'Invalid PDF payload for {record["title"]}: {len(data)} bytes')
+                  destination = PDFDIR / f'{index:02d}_{spec["filename"]}'
+                  destination.write_bytes(data)
+
+                  reader = PdfReader(io.BytesIO(data), strict=False)
+                  pages = len(reader.pages)
+                  if pages < spec['min_pages']:
+                      raise RuntimeError(f'Unexpected page count for {record["title"]}: {pages} < {spec["min_pages"]}')
+
+                  sample_indices = sorted(set(list(range(min(12, pages))) + [max(0, pages // 2), max(0, pages - 2)]))
+                  text_parts = []
+                  for page_index in sample_indices:
+                      try:
+                          text_parts.append(reader.pages[page_index].extract_text() or '')
+                      except Exception:
+                          pass
+                  sample_text = re.sub(r'\s+', ' ', '\n'.join(text_parts)).upper()
+                  identity_ok = any(token in sample_text for token in ['BANK OF CHONGQING', '重庆银行', '重慶銀行', '01963', '601963'])
+
+                  document = pymupdf.open(destination)
+                  first_pix = document[0].get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  render_path = RENDERDIR / f'{index:02d}_first.png'
+                  first_pix.save(str(render_path))
+                  if render_path.stat().st_size < 3000:
+                      raise RuntimeError(f'First-page render failed: {destination.name}')
+                  if not identity_ok:
+                      fitz_text = ''
+                      for page_index in range(min(8, len(document))):
+                          fitz_text += '\n' + (document[page_index].get_text('text') or '')
+                      fitz_text = re.sub(r'\s+', ' ', fitz_text).upper()
+                      identity_ok = any(token in fitz_text for token in ['BANK OF CHONGQING', '重庆银行', '重慶銀行', '01963', '601963'])
+                  document.close()
+
+                  if not identity_ok:
+                      # The record itself is official and filtered to stock code 01963; retain a warning rather than discard a valid PDF whose fonts block text extraction.
+                      identity_status = '官方港交所记录已核对；PDF字体导致文本身份词未提取'
+                  else:
+                      identity_status = '通过'
+
+                  manifest.append({
+                      '序号': index,
+                      '文件名': destination.name,
+                      '报告类型': spec['kind'],
+                      '报告期间': spec['period'],
+                      '港交所标题': record['title'],
+                      '披露时间': record['date_time'],
+                      '语言': record['language'],
+                      'PDF页数': pages,
+                      '文件大小（字节）': len(data),
+                      'SHA-256': hashlib.sha256(data).hexdigest(),
+                      '公司身份核验': identity_status,
+                      '官方来源': str(response.url),
+                  })
+                  print('VERIFIED', destination.name, pages, len(data), record['title'], flush=True)
+
+          manifest_path = PDFDIR / '文件清单与校验值.csv'
+          with manifest_path.open('w', encoding='utf-8-sig', newline='') as file:
+              writer = csv.DictWriter(file, fieldnames=list(manifest[0].keys()))
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          readme_lines = [
+              '重庆银行股份有限公司（601963.SH / 01963.HK）定期报告资料包',
+              '打包日期：2026-09-15',
+              '',
+              '收录内容：',
+              '1. 2020—2025年完整年度报告，共6份。',
+              '2. 2026年第一季度报告：严格意义上的最新季度报告。',
+              '3. 2026年半年度报告：截至打包日最新完整定期财务报告。',
+              '',
+              '全部PDF来自港交所披露易官方记录，股票代码01963。',
+              '已检查PDF文件头、可解析性、实际页数、首页渲染、SHA-256及ZIP CRC。',
+              '',
+          ]
+          for row in manifest:
+              readme_lines.append(f"{row['序号']}. {row['文件名']} | {row['PDF页数']}页 | {row['披露时间']} | {row['官方来源']}")
+          (PDFDIR / 'README.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (PDFDIR / '验证记录.json').write_text(json.dumps({'company': 'Bank of Chongqing Co., Ltd.', 'stock_codes': ['601963.SH', '01963.HK'], 'package_date': '2026-09-15', 'reports': manifest}, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def build_zip(path: Path, pdf_names: list[str]) -> dict:
+              support = ['README.txt', '文件清单与校验值.csv', '验证记录.json']
+              with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                  for name in pdf_names:
+                      archive.write(PDFDIR / name, arcname=name)
+                  for name in support:
+                      archive.write(PDFDIR / name, arcname=name)
+              with zipfile.ZipFile(path, 'r') as archive:
+                  bad = archive.testzip()
+                  pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if bad is not None:
+                      raise RuntimeError(f'ZIP CRC failure in {path}: {bad}')
+                  if len(pdfs) != len(pdf_names):
+                      raise RuntimeError(f'Unexpected PDF count in {path}: {len(pdfs)}')
+              return {'name': path.name, 'bytes': path.stat().st_size, 'pdf_count': len(pdf_names), 'crc_ok': True}
+
+          pdf_names = [row['文件名'] for row in manifest]
+          complete = build_zip(OUT / 'CQBankReports.zip', pdf_names)
+          part1 = build_zip(OUT / 'CQBank_2020_2022.zip', pdf_names[:3])
+          part2 = build_zip(OUT / 'CQBank_2023_2026.zip', pdf_names[3:])
+
+          result = {
+              'ok': True,
+              'complete': complete,
+              'part1': part1,
+              'part2': part2,
+              'total_pages': sum(int(row['PDF页数']) for row in manifest),
+              'reports': manifest,
+          }
+          (OUT / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PACKAGE_OK', json.dumps(result, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload verified archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: bank-chongqing-verified-reports
+          path: output/*
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
