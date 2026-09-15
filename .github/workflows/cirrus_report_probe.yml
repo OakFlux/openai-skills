@@ -1,0 +1,217 @@
+name: Cirrus Report Probe
+
+on:
+  push:
+    branches:
+      - chatgpt-cirrus-reports-20260915
+    paths:
+      - .github/workflows/cirrus_report_probe.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml pillow pypdf
+
+      - name: Probe public report sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pages out/candidates out/fx_images
+          cat > /tmp/probe_sources.py <<'PY'
+          import json, re, hashlib, mimetypes
+          from pathlib import Path
+          from urllib.parse import urljoin, quote
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT = Path('out')
+          PAGES = OUT / 'pages'
+          CANDS = OUT / 'candidates'
+          FXIMG = OUT / 'fx_images'
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': '*/*',
+          })
+          records = []
+
+          def safe_name(s):
+              return re.sub(r'[^0-9A-Za-z._-]+', '_', s)[:180]
+
+          def fetch(url, name, referer=None, save_dir=PAGES, timeout=45):
+              rec = {'name': name, 'url': url}
+              try:
+                  headers = {'Referer': referer} if referer else {}
+                  r = session.get(url, timeout=timeout, allow_redirects=True, headers=headers)
+                  rec.update({
+                      'status': r.status_code,
+                      'final_url': r.url,
+                      'content_type': r.headers.get('content-type',''),
+                      'content_disposition': r.headers.get('content-disposition',''),
+                      'bytes': len(r.content),
+                      'sha256': hashlib.sha256(r.content).hexdigest(),
+                      'head_hex': r.content[:24].hex(),
+                  })
+                  print('FETCH', json.dumps(rec, ensure_ascii=False))
+                  ct = rec['content_type'].lower()
+                  ext = '.bin'
+                  if r.content.startswith(b'%PDF-') or 'application/pdf' in ct:
+                      ext = '.pdf'
+                  elif 'html' in ct or r.content.lstrip().startswith((b'<!doctype', b'<html', b'<?xml')):
+                      ext = '.html'
+                  elif r.content.startswith(b'\x89PNG') or 'image/png' in ct:
+                      ext = '.png'
+                  elif r.content[:3] == b'\xff\xd8\xff' or 'image/jpeg' in ct:
+                      ext = '.jpg'
+                  elif r.content.startswith(b'RIFF') and b'WEBP' in r.content[:16] or 'image/webp' in ct:
+                      ext = '.webp'
+                  save_dir.mkdir(parents=True, exist_ok=True)
+                  path = save_dir / (safe_name(name) + ext)
+                  path.write_bytes(r.content)
+                  rec['saved_path'] = str(path)
+                  records.append(rec)
+                  return r
+              except Exception as e:
+                  rec['error'] = repr(e)
+                  records.append(rec)
+                  print('ERROR', json.dumps(rec, ensure_ascii=False))
+                  return None
+
+          pages = {
+              'fx_dongwu_5338338': 'https://www.fxbaogao.com/detail/5338338',
+              'fx_xibu_5048168': 'https://www.fxbaogao.com/detail/5048168',
+              'fx_huachuang_mid_5023910': 'https://www.fxbaogao.com/detail/5023910',
+              'sdy_huachuang_872732': 'https://www.sdyanbao.com/detail/872732',
+              'sdy_zheshang_909900': 'https://www.sdyanbao.com/detail/909900',
+              'nxny_dongwu_6257316': 'https://www.nxny.com/report/view_6257316.html',
+              'hibor_dongwu_5031267': 'https://wap.hibor.com.cn/repinfodetail_5031267.html',
+              'vzkoo_zheshang': 'https://www.vzkoo.com/document/202508208ffbbc2730955b6f322a3cbe.html',
+              'baogaobox_haitong': 'https://www.baogaobox.com/insights/250629000012458.html',
+              'baogaobox_dongwu': 'https://www.baogaobox.com/insights/260408000026787.html',
+              'sucai_huachuang': 'https://299sucai.com/hybg/10766/',
+              'sucai_haitong': 'https://299sucai.com/hybg/11464/',
+              'sucai_guosen': 'https://299sucai.com/hybg/13218/',
+          }
+
+          responses = {}
+          for name, url in pages.items():
+              responses[name] = fetch(url, name)
+
+          candidate_urls = []
+          def add_candidate(src, raw, base):
+              if not raw or not isinstance(raw, str):
+                  return
+              raw = raw.strip().replace('\\/','/')
+              if raw.startswith('//'):
+                  raw = 'https:' + raw
+              if raw.startswith(('http://','https://','/','./','../')):
+                  u = urljoin(base, raw)
+                  key = (src, u)
+                  if key not in candidate_urls:
+                      candidate_urls.append(key)
+
+          keywords = ['pdf','download','down','file','report-image','reportimage','document','attachment','preview','original','source','resource','oss','cos','cdn','api','openreport','readreport']
+          for name, r in responses.items():
+              if not r:
+                  continue
+              ct = r.headers.get('content-type','').lower()
+              if 'html' not in ct and not r.content.lstrip().startswith((b'<!doctype', b'<html')):
+                  continue
+              text = r.text
+              soup = BeautifulSoup(text, 'lxml')
+              parsed = {'title': soup.title.get_text(' ', strip=True) if soup.title else '', 'links': [], 'scripts': [], 'contexts': []}
+              for tag in soup.find_all(True):
+                  for attr in ['href','src','data-src','data-original','data-url','data-file','data-pdf','content','value']:
+                      v = tag.get(attr)
+                      if isinstance(v, str):
+                          u = urljoin(r.url, v)
+                          if any(k in (u + ' ' + (tag.get_text(' ', strip=True) or '')).lower() for k in keywords):
+                              parsed['links'].append({'tag': tag.name, 'attr': attr, 'value': v, 'absolute': u, 'text': tag.get_text(' ', strip=True)[:300]})
+                              add_candidate(name, v, r.url)
+              # All URL-like strings in HTML/JS.
+              for m in re.finditer(r'''(?P<q>["'])(?P<u>(?:https?:)?//[^"']+|/[^"']+)(?P=q)''', text):
+                  u = m.group('u')
+                  if any(k in u.lower() for k in keywords + ['5338338','5048168','5023910','872732','909900','6257316','5031267']):
+                      parsed['scripts'].append(u[:2000])
+                      add_candidate(name, u, r.url)
+              for pat in ['5338338','5048168','5023910','872732','909900','6257316','5031267','download','pdf','report-image','fileUrl','pdfUrl','downUrl','sourceUrl','__NEXT_DATA__','nuxt','oss','cos']:
+                  for m in list(re.finditer(re.escape(pat), text, re.I))[:80]:
+                      parsed['contexts'].append({'pattern': pat, 'context': text[max(0,m.start()-800):m.end()+1600]})
+              (OUT / f'{safe_name(name)}_parsed.json').write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('PARSED', name, 'links', len(parsed['links']), 'scripts', len(parsed['scripts']), 'contexts', len(parsed['contexts']))
+
+          # Probe extracted candidate URLs conservatively.
+          seen = set()
+          for idx, (src, u) in enumerate(candidate_urls):
+              if u in seen:
+                  continue
+              seen.add(u)
+              if len(u) > 1800:
+                  continue
+              low = u.lower()
+              if not any(k in low for k in keywords):
+                  continue
+              fetch(u, f'cand_{idx:04d}_{src}', referer=pages.get(src), save_dir=CANDS, timeout=35)
+              if len(seen) >= 220:
+                  break
+
+          # Public fxbaogao page-image patterns. Probe date window and extensions.
+          fx_specs = [
+              ('5338338','2026-04-07',40),
+              ('5048168','2025-09-03',45),
+              ('5023910','2025-08-27',15),
+          ]
+          from datetime import datetime, timedelta
+          for rid, ds, max_page in fx_specs:
+              base_date = datetime.strptime(ds, '%Y-%m-%d')
+              found_pages = {}
+              for delta in range(-3, 4):
+                  d = base_date + timedelta(days=delta)
+                  dpath = d.strftime('%Y/%m/%d')
+                  for p in range(1, max_page + 1):
+                      if p in found_pages:
+                          continue
+                      variants = [
+                          f'https://public.fxbaogao.com/report-image/{dpath}/{rid}-{p}.png',
+                          f'https://public.fxbaogao.com/report-image/{dpath}/{rid}-{p}.jpg',
+                          f'https://public.fxbaogao.com/report-image/{dpath}/{rid}-{p}.jpeg',
+                          f'https://public.fxbaogao.com/report-image/{dpath}/{rid}-{p}.png?x-oss-process=image/format,webp',
+                      ]
+                      for vi, u in enumerate(variants):
+                          try:
+                              rr = session.get(u, timeout=25, allow_redirects=True, headers={'Referer': f'https://www.fxbaogao.com/detail/{rid}'})
+                              ct = rr.headers.get('content-type','').lower()
+                              good = rr.status_code == 200 and len(rr.content) > 12000 and (rr.content.startswith(b'\x89PNG') or rr.content[:3] == b'\xff\xd8\xff' or (rr.content.startswith(b'RIFF') and b'WEBP' in rr.content[:16]) or 'image/' in ct)
+                              print('FXIMG', rid, dpath, p, vi, rr.status_code, len(rr.content), ct, 'GOOD' if good else '')
+                              if good:
+                                  ext = '.png' if rr.content.startswith(b'\x89PNG') else '.jpg' if rr.content[:3] == b'\xff\xd8\xff' else '.webp'
+                                  folder = FXIMG / rid
+                                  folder.mkdir(parents=True, exist_ok=True)
+                                  (folder / f'{p:03d}{ext}').write_bytes(rr.content)
+                                  found_pages[p] = {'url': u, 'date': dpath, 'bytes': len(rr.content), 'content_type': ct, 'ext': ext}
+                                  break
+                          except Exception as e:
+                              print('FXIMG_ERR', rid, dpath, p, repr(e))
+              (FXIMG / rid / 'manifest.json').write_text(json.dumps(found_pages, ensure_ascii=False, indent=2), encoding='utf-8') if (FXIMG / rid).exists() else None
+              print('FXSUMMARY', rid, sorted(found_pages))
+
+          # Probe report-page image patterns observed on sdyanbao/vzkoo/hibor by extracting image srcs and sequential suffixes.
+          (OUT / 'candidate_urls.json').write_text(json.dumps([{'source':s,'url':u} for s,u in candidate_urls], ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'records.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+          python /tmp/probe_sources.py
+          find out -type f -printf '%p\t%s bytes\n' | sort > out/file_inventory.txt
+
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-report-probe
+          path: out
+          retention-days: 1
