@@ -1,0 +1,263 @@
+name: Build Yunji 02670 broker research reports package 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/yunji-02670-broker-reports-package-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Download report pages, rebuild PDFs, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import subprocess
+          import tempfile
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '云迹_02670_券商深度报告_3份_20260919'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+          work = Path('_report_pages')
+          work.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'id': '5357306',
+                  'date_path': '2026/04/16',
+                  'date': '2026-04-16',
+                  'institution': '国泰海通证券',
+                  'title': '云迹（2670.HK）首次覆盖报告：技术筑基，场景放量，全球化启航',
+                  'pages': 18,
+                  'filename': '01_国泰海通证券_云迹2670HK_首次覆盖_技术筑基场景放量全球化启航_2026-04-16_18页.pdf',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5357306',
+              },
+              {
+                  'id': '5312314',
+                  'date_path': '2026/03/22',
+                  'date': '2026-03-22',
+                  'institution': '兴证国际证券',
+                  'title': '云迹：中国酒店机器人龙头，发力智能体应用',
+                  'pages': 5,
+                  'filename': '02_兴证国际证券_云迹2670HK_中国酒店机器人龙头发力智能体应用_2026-03-22_5页.pdf',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5312314',
+              },
+              {
+                  'id': '5274246',
+                  'date_path': '2026/02/25',
+                  'date': '2026-02-25',
+                  'institution': '建银国际证券',
+                  'title': '云迹科技（2670.HK）：领先的机器人服务AI赋能技术企业',
+                  'pages': 3,
+                  'filename': '03_建银国际证券_云迹科技2670HK_领先的机器人服务AI赋能技术企业_2026-02-25_3页.pdf',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5274246',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def candidate_urls(report: dict, page_no: int) -> list[str]:
+              rel = f"report-image/{report['date_path']}/{report['id']}-{page_no}.png"
+              bases = [
+                  f'https://public.fxbaogao.com/{rel}',
+                  f'https://www.fxbaogao.com/{rel}',
+              ]
+              urls: list[str] = []
+              for base in bases:
+                  urls.extend([
+                      base,
+                      base + '?x-oss-process=image%2Fformat%2Cpng',
+                      base + '?x-oss-process=image%2Fformat%2Cwebp',
+                  ])
+              return urls
+
+          def download_page(report: dict, page_no: int, destination: Path) -> dict:
+              errors: list[str] = []
+              headers = {'Referer': report['detail_url']}
+              for url in candidate_urls(report, page_no):
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, headers=headers, timeout=(20, 120), allow_redirects=True)
+                          print('FETCH', report['id'], page_no, 'attempt', attempt, 'status', r.status_code, url, 'final', r.url, flush=True)
+                          if r.status_code != 200:
+                              raise RuntimeError(f'HTTP {r.status_code}')
+                          data = r.content
+                          if len(data) < 20_000:
+                              raise RuntimeError(f'image response too small: {len(data)} bytes')
+                          with Image.open(io.BytesIO(data)) as image:
+                              image.load()
+                              width, height = image.size
+                              fmt = image.format or 'unknown'
+                              if width < 700 or height < 900:
+                                  raise RuntimeError(f'image dimensions too small: {width}x{height}')
+                              rgb = image.convert('RGB')
+                              rgb.save(destination, format='JPEG', quality=97, subsampling=0, optimize=True)
+                          return {
+                              'page': page_no,
+                              'source_url': str(r.url),
+                              'source_bytes': len(data),
+                              'source_format': fmt,
+                              'width': width,
+                              'height': height,
+                              'normalized_sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
+                          }
+                      except Exception as exc:
+                          errors.append(f'{url} attempt {attempt}: {exc!r}')
+                          destination.unlink(missing_ok=True)
+                          time.sleep(attempt * 1.5)
+              raise RuntimeError(f"failed to download report {report['id']} page {page_no}: {errors}")
+
+          def validate_pdf(pdf_path: Path, expected_pages: int) -> list[int]:
+              reader = PdfReader(str(pdf_path), strict=False)
+              if reader.is_encrypted:
+                  raise RuntimeError(f'encrypted output PDF: {pdf_path.name}')
+              actual_pages = len(reader.pages)
+              if actual_pages != expected_pages:
+                  raise RuntimeError(f'page count mismatch for {pdf_path.name}: {actual_pages} != {expected_pages}')
+              check = subprocess.run(['qpdf', '--check', str(pdf_path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {pdf_path.name}: {check.stderr[-2000:]}')
+              sample_pages = sorted(set([1, max(1, expected_pages // 2), expected_pages]))
+              with tempfile.TemporaryDirectory(prefix='render-check-') as td:
+                  temp_dir = Path(td)
+                  for page_no in sample_pages:
+                      prefix = temp_dir / f'p{page_no}'
+                      run = subprocess.run(
+                          ['pdftoppm', '-f', str(page_no), '-l', str(page_no), '-singlefile', '-r', '72', '-png', str(pdf_path), str(prefix)],
+                          capture_output=True,
+                          text=True,
+                          timeout=180,
+                      )
+                      if run.returncode != 0:
+                          raise RuntimeError(f'pdftoppm failed for {pdf_path.name} page {page_no}: {run.stderr[-1500:]}')
+                      image_path = prefix.with_suffix('.png')
+                      if not image_path.exists() or image_path.stat().st_size < 5_000:
+                          raise RuntimeError(f'rendered page missing/too small for {pdf_path.name} page {page_no}')
+                      with Image.open(image_path) as image:
+                          image.verify()
+              return sample_pages
+
+          records: list[dict] = []
+          all_pdf_hashes: set[str] = set()
+          for report in reports:
+              page_dir = work / report['id']
+              page_dir.mkdir(parents=True, exist_ok=True)
+              page_records: list[dict] = []
+              page_files: list[Path] = []
+              for page_no in range(1, report['pages'] + 1):
+                  page_file = page_dir / f'{page_no:03d}.jpg'
+                  page_records.append(download_page(report, page_no, page_file))
+                  page_files.append(page_file)
+
+              normalized_hashes = [row['normalized_sha256'] for row in page_records]
+              if len(set(normalized_hashes)) != len(normalized_hashes):
+                  raise RuntimeError(f"duplicate report pages detected in report {report['id']}")
+
+              pdf_path = out / report['filename']
+              with pdf_path.open('wb') as fh:
+                  fh.write(img2pdf.convert([str(path) for path in page_files]))
+
+              rendered_pages = validate_pdf(pdf_path, report['pages'])
+              pdf_data = pdf_path.read_bytes()
+              pdf_sha = hashlib.sha256(pdf_data).hexdigest()
+              if pdf_sha in all_pdf_hashes:
+                  raise RuntimeError(f'duplicate PDF detected: {pdf_path.name}')
+              all_pdf_hashes.add(pdf_sha)
+              record = {
+                  'filename': report['filename'],
+                  'institution': report['institution'],
+                  'title': report['title'],
+                  'report_date': report['date'],
+                  'pages': report['pages'],
+                  'detail_page': report['detail_url'],
+                  'public_page_image_sources': [row['source_url'] for row in page_records],
+                  'render_checked_pages': rendered_pages,
+                  'bytes': len(pdf_data),
+                  'sha256': pdf_sha,
+              }
+              records.append(record)
+              print('VALIDATED_REPORT', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme_lines = [
+              '云迹（02670.HK / 2670.HK）券商研究报告资料包',
+              '整理日期：2026-09-19',
+              '',
+              '本包收录3份针对云迹的公司研究/首次覆盖报告：',
+          ]
+          for index, rec in enumerate(records, 1):
+              readme_lines.extend([
+                  f"{index}. {rec['institution']}｜{rec['title']}",
+                  f"   日期：{rec['report_date']}；页数：{rec['pages']}；文件：{rec['filename']}",
+                  f"   报告展示页：{rec['detail_page']}",
+                  f"   SHA-256：{rec['sha256']}",
+                  '',
+              ])
+          readme_lines.extend([
+              '来源及处理说明：',
+              '1. 报告页面来自发现报告公开展示页；页面提供“点击免费查看完整报告”，但未公开稳定的原始PDF直链。',
+              '2. 本资料包按公开展示的完整逐页图像重建为PDF，未绕过付费墙、登录限制或访问控制。',
+              '3. 重建PDF保持原有页序与完整页数；文件名标明机构、标题、报告日期和页数。',
+              '4. 报告著作权及相关权益归原研究机构和作者所有，仅供个人研究与学习使用。',
+              '',
+              '完整性核验：逐页图像格式与尺寸检查、页面去重、PDF页数检查、qpdf结构检查、首/中/末页抽样渲染、ZIP CRC及SHA-256校验。',
+          ])
+          (out / '00_文件清单与来源说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{row['sha256']}  {row['filename']}\n" for row in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'PDF count mismatch in ZIP: {len(pdfs)}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDF_COUNT', len(pdfs), 'SHA256', zip_sha, flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: yunji-02670-broker-reports-final
+          path: 云迹_02670_券商深度报告_3份_20260919.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
