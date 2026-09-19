@@ -1,0 +1,273 @@
+name: Build AUX Electric broker reports package 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/aux-electric-broker-reports-package-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF and image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf img2pdf
+
+      - name: Download public report pages, assemble and validate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '奥克斯电气_02580_券商深度报告_3份'
+          root = Path(PACKAGE)
+          root.mkdir(exist_ok=True)
+          work = Path('_work')
+          work.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'priority': 1,
+                  'broker': '财通证券',
+                  'title': '奥克斯电气（02580）：网批重构渠道效率，掘金新兴市场空调红利',
+                  'date': '2026-05-29',
+                  'source_date_path': '2026/05/31',
+                  'doc_id': '5454573',
+                  'expected_pages': 27,
+                  'filename': '01_财通证券_奥克斯电气_网批重构渠道效率掘金新兴市场空调红利_2026-05-29_27页.pdf',
+              },
+              {
+                  'priority': 2,
+                  'broker': '国盛证券',
+                  'title': '奥克斯电气（02580.HK）：内外兼修，渠道运作高效',
+                  'date': '2026-04-16',
+                  'source_date_path': '2026/04/16',
+                  'doc_id': '5357558',
+                  'expected_pages': None,
+                  'filename': '02_国盛证券_奥克斯电气_内外兼修渠道运作高效_2026-04-16.pdf',
+              },
+              {
+                  'priority': 3,
+                  'broker': '华西证券',
+                  'title': '奥克斯电气（02580）：加码AI空调，推进全球化布局',
+                  'date': '2026-06-04',
+                  'source_date_path': '2026/06/04',
+                  'doc_id': '5463740',
+                  'expected_pages': None,
+                  'filename': '03_华西证券_奥克斯电气_加码AI空调推进全球化布局_2026-06-04.pdf',
+              },
+              {
+                  'priority': 4,
+                  'broker': '国联民生证券',
+                  'title': '奥克斯电气（2580.HK）动态跟踪：经营静待复苏，股息率颇具吸引力',
+                  'date': '2026-04-15',
+                  'source_date_path': '2026/04/15',
+                  'doc_id': '5353793',
+                  'expected_pages': None,
+                  'filename': '04_国联民生证券_奥克斯电气_经营静待复苏股息率颇具吸引力_2026-04-15.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Cache-Control': 'no-cache',
+          })
+
+          def get_page(report: dict, page_no: int) -> tuple[bytes, str] | None:
+              base = f"https://public.fxbaogao.com/report-image/{report['source_date_path']}/{report['doc_id']}-{page_no}.png"
+              urls = [base, base + '?x-oss-process=image/format,webp']
+              headers = {'Referer': f"https://www.fxbaogao.com/detail/{report['doc_id']}"}
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, headers=headers, timeout=(20, 120), allow_redirects=True)
+                          ctype = (r.headers.get('content-type') or '').lower()
+                          print('PAGE', report['doc_id'], page_no, 'attempt', attempt, 'status', r.status_code, 'type', ctype, 'bytes', len(r.content), url, flush=True)
+                          if r.status_code in (403, 429, 500, 502, 503, 504):
+                              time.sleep(attempt * 2)
+                              continue
+                          if r.status_code != 200 or not ctype.startswith('image/') or len(r.content) < 20_000:
+                              break
+                          try:
+                              with Image.open(io.BytesIO(r.content)) as im:
+                                  im.load()
+                                  width, height = im.size
+                                  if width < 700 or height < 900:
+                                      print('REJECT_DIM', report['doc_id'], page_no, width, height, flush=True)
+                                      break
+                          except Exception as exc:
+                              print('REJECT_IMAGE', report['doc_id'], page_no, repr(exc), flush=True)
+                              break
+                          return r.content, url
+                      except Exception as exc:
+                          print('PAGE_ERR', report['doc_id'], page_no, attempt, repr(exc), flush=True)
+                          time.sleep(attempt * 2)
+              return None
+
+          candidates: list[dict] = []
+          for report in reports:
+              page_dir = work / report['doc_id']
+              page_dir.mkdir(exist_ok=True)
+              page_paths: list[Path] = []
+              page_hashes: set[str] = set()
+              source_urls: list[str] = []
+              misses = 0
+
+              for page_no in range(1, 81):
+                  result = get_page(report, page_no)
+                  if result is None:
+                      misses += 1
+                      if page_no == 1 or misses >= 2:
+                          break
+                      continue
+                  misses = 0
+                  data, final_url = result
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in page_hashes:
+                      print('DUPLICATE_PAGE_STOP', report['doc_id'], page_no, digest, flush=True)
+                      break
+                  page_hashes.add(digest)
+
+                  with Image.open(io.BytesIO(data)) as im:
+                      im.load()
+                      rgb = im.convert('RGB')
+                      png_path = page_dir / f'{page_no:03d}.png'
+                      rgb.save(png_path, format='PNG', optimize=True)
+                  page_paths.append(png_path)
+                  source_urls.append(final_url)
+                  time.sleep(0.10)
+
+              page_count = len(page_paths)
+              print('DISCOVERED_PAGE_COUNT', report['doc_id'], page_count, flush=True)
+              if page_count < 8:
+                  print('SKIP_TOO_SHORT', report['doc_id'], page_count, flush=True)
+                  continue
+              if report['expected_pages'] and page_count != report['expected_pages']:
+                  raise RuntimeError(f"Page count mismatch for {report['doc_id']}: expected {report['expected_pages']}, got {page_count}")
+
+              pdf_name = report['filename']
+              if report['expected_pages'] is None:
+                  stem = Path(pdf_name).stem
+                  pdf_name = f'{stem}_{page_count}页.pdf'
+              pdf_path = root / pdf_name
+              layout_fun = img2pdf.get_layout_fun((img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297)))
+              with pdf_path.open('wb') as fh:
+                  fh.write(img2pdf.convert([str(p) for p in page_paths], layout_fun=layout_fun))
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              if len(reader.pages) != page_count:
+                  raise RuntimeError(f'PDF page count mismatch for {pdf_path}: {len(reader.pages)} vs {page_count}')
+              q = subprocess.run(['qpdf', '--check', str(pdf_path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {pdf_path}: {q.stderr[-2000:]}')
+
+              preview_base = work / f"preview_{report['doc_id']}"
+              pr = subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-r', '90', '-png', str(pdf_path), str(preview_base)], capture_output=True, text=True)
+              if pr.returncode != 0 or not preview_base.with_suffix('.png').exists():
+                  raise RuntimeError(f'Cover render failed for {pdf_path}: {pr.stderr[-1000:]}')
+
+              pdf_bytes = pdf_path.read_bytes()
+              candidate = {
+                  **report,
+                  'filename': pdf_name,
+                  'page_count': page_count,
+                  'bytes': len(pdf_bytes),
+                  'sha256': hashlib.sha256(pdf_bytes).hexdigest(),
+                  'source_detail_url': f"https://www.fxbaogao.com/detail/{report['doc_id']}",
+                  'source_image_pattern': f"https://public.fxbaogao.com/report-image/{report['source_date_path']}/{report['doc_id']-{{page}}.png",
+                  'first_source_url': source_urls[0],
+                  'pdf_path': str(pdf_path),
+              }
+              candidates.append(candidate)
+
+          if len(candidates) < 3:
+              raise RuntimeError(f'Only {len(candidates)} complete reports were assembled')
+
+          selected = sorted(candidates, key=lambda x: x['priority'])[:3]
+          selected_paths = {Path(x['pdf_path']).name for x in selected}
+          for candidate in candidates:
+              p = Path(candidate['pdf_path'])
+              if p.name not in selected_paths:
+                  p.unlink(missing_ok=True)
+
+          records = []
+          for item in selected:
+              clean = {k: v for k, v in item.items() if k not in ('priority', 'source_date_path', 'doc_id', 'expected_pages', 'pdf_path')}
+              clean['assembly_note'] = '由公开可访问的逐页报告原图按页序合成为完整PDF；未绕过登录、付费或访问控制。'
+              records.append(clean)
+
+          readme = [
+              '奥克斯电气股份有限公司（02580.HK）券商深度报告',
+              '整理日期：2026-09-19',
+              '',
+              '本压缩包收录3份公开可访问的券商公司研究/首次覆盖报告。',
+              '文件由公开报告页面提供的逐页原图按原页序合成为完整PDF，不是证券公司官网下载的矢量原始PDF；未绕过登录、付费或访问控制。',
+              '每份文件均已完成图片解码、页序连续性、PDF页数、qpdf结构检查及首页渲染检查。',
+              '',
+              '文件清单：',
+          ]
+          for idx, rec in enumerate(records, 1):
+              readme.extend([
+                  f"{idx}. {rec['broker']}：《{rec['title']}》",
+                  f"   日期：{rec['date']}；页数：{rec['page_count']}；文件：{rec['filename']}",
+                  f"   来源页面：{rec['source_detail_url']}",
+                  f"   SHA-256：{rec['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '使用说明：研报仅供个人研究与资料查阅，版权归原作者及发布机构所有。',
+              '如需带可复制文字层的原始版本，应以证券公司官网、Wind、同花顺iFinD等授权数据库版本为准。',
+          ])
+          (root / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(root.iterdir()):
+                  zf.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+
+          print('SELECTED_RECORDS', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: aux-electric-02580-broker-reports-final
+          path: 奥克斯电气_02580_券商深度报告_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
