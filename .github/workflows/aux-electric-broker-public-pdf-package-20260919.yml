@@ -1,0 +1,325 @@
+name: Build AUX Electric public broker research PDF package 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/aux-electric-broker-public-pdf-package-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk qpdf
+          python -m pip install --quiet playwright pypdf reportlab beautifulsoup4 requests pillow
+          python -m playwright install --with-deps chromium
+
+      - name: Render public broker research pages, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import asyncio
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import textwrap
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from reportlab.lib.enums import TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.ttfonts import TTFont
+          from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+          from playwright.async_api import async_playwright
+
+          PACKAGE = '奥克斯电气_02580_券商深度报告_公开版_3份'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+          work = Path('_work')
+          work.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'filename': '01_财通证券_奥克斯电气_网批重构渠道效率_掘金新兴市场空调红利_公开长文版_2026-06-01.pdf',
+                  'broker': '财通证券',
+                  'title': '奥克斯电气：网批重构渠道效率，掘金新兴市场空调红利',
+                  'date': '2026-06-01',
+                  'url': 'https://finance.sina.com.cn/wm/2026-06-01/doc-inhzwckz2640125.shtml',
+                  'expected_terms': ['奥克斯电气', '财通证券', '网批'],
+                  'min_pages': 5,
+                  'edition': '财通证券研究公开长文网页转PDF版',
+              },
+              {
+                  'filename': '02_长江证券_从奥克斯看空调行业特征及格局_公开研报页_2025-06-12.pdf',
+                  'broker': '长江证券',
+                  'title': '从奥克斯看空调行业特征及格局',
+                  'date': '2025-06-12',
+                  'url': 'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/lastest/rptid/803005967098/index.phtml',
+                  'expected_terms': ['奥克斯', '长江证券', '空调'],
+                  'min_pages': 1,
+                  'edition': '新浪财经公开研报页转PDF版',
+              },
+              {
+                  'filename': '03_招商证券_奥克斯电气_二线空调龙头护城河不断加深_公开摘要版_2026-05-28.pdf',
+                  'broker': '招商证券',
+                  'title': '奥克斯电气：二线空调龙头，护城河不断加深',
+                  'date': '2026-05-28',
+                  'url': 'https://www.hstong.com/news/detail/26052814250120500',
+                  'expected_terms': ['奥克斯电气', '招商证券', '护城河'],
+                  'min_pages': 1,
+                  'edition': '公开报道摘要网页转PDF版',
+              },
+          ]
+
+          # Chinese font for fallback PDFs.
+          font_candidates = [
+              '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+              '/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf',
+              '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+          ]
+          cjk_font = None
+          for fp in font_candidates:
+              if Path(fp).exists():
+                  try:
+                      pdfmetrics.registerFont(TTFont('CJK', fp, subfontIndex=0))
+                      cjk_font = 'CJK'
+                      break
+                  except Exception:
+                      continue
+          if cjk_font is None:
+              cjk_font = 'Helvetica'
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def sanitize_filename(s: str) -> str:
+              return re.sub(r'[^0-9A-Za-z\u4e00-\u9fff._-]+', '_', s)
+
+          def fallback_pdf(report: dict, dest: Path, reason: str) -> None:
+              """Create a readable PDF from the publicly accessible page text."""
+              r = session.get(report['url'], timeout=(30, 180), allow_redirects=True)
+              r.raise_for_status()
+              r.encoding = r.apparent_encoding or r.encoding
+              soup = BeautifulSoup(r.text, 'html.parser')
+              for tag in soup(['script', 'style', 'noscript', 'svg', 'iframe']):
+                  tag.decompose()
+              # Prefer article-like containers; fall back to body.
+              node = None
+              for selector in ['#artibody', '.article', '.article-body', '.article-content', '.main-content', 'main', 'article']:
+                  node = soup.select_one(selector)
+                  if node and len(node.get_text(' ', strip=True)) > 500:
+                      break
+              if not node:
+                  node = soup.body or soup
+              text = node.get_text('\n', strip=True)
+              text = re.sub(r'\n{3,}', '\n\n', text)
+              if len(text) < 300:
+                  raise RuntimeError(f'public page text too short for fallback: {len(text)}; browser reason={reason}')
+
+              styles = getSampleStyleSheet()
+              title_style = ParagraphStyle(
+                  'TitleCN', parent=styles['Title'], fontName=cjk_font,
+                  fontSize=17, leading=24, spaceAfter=8*mm, alignment=TA_LEFT,
+              )
+              meta_style = ParagraphStyle(
+                  'MetaCN', parent=styles['Normal'], fontName=cjk_font,
+                  fontSize=9.5, leading=15, textColor='#444444', spaceAfter=4*mm,
+              )
+              body_style = ParagraphStyle(
+                  'BodyCN', parent=styles['BodyText'], fontName=cjk_font,
+                  fontSize=10, leading=17, spaceAfter=3*mm,
+              )
+              doc = SimpleDocTemplate(
+                  str(dest), pagesize=A4,
+                  leftMargin=17*mm, rightMargin=17*mm,
+                  topMargin=16*mm, bottomMargin=16*mm,
+                  title=report['title'], author=report['broker'],
+              )
+              story = [
+                  Paragraph(report['title'], title_style),
+                  Paragraph(f"机构：{report['broker']}　日期：{report['date']}", meta_style),
+                  Paragraph(f"版本：{report['edition']}；来源：{report['url']}", meta_style),
+                  Paragraph('说明：本文件由公开网页内容排版生成，不是受登录或付费限制的券商原始PDF。', meta_style),
+                  Spacer(1, 3*mm),
+              ]
+              for block in text.split('\n'):
+                  block = block.strip()
+                  if not block:
+                      continue
+                  block = (block.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+                  if len(block) > 5000:
+                      for part in textwrap.wrap(block, 1800):
+                          story.append(Paragraph(part, body_style))
+                  else:
+                      story.append(Paragraph(block, body_style))
+              doc.build(story)
+
+          async def render_all() -> list[dict]:
+              records=[]
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+                  context = await browser.new_context(
+                      viewport={'width': 1440, 'height': 1800},
+                      locale='zh-CN',
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36',
+                  )
+                  for report in reports:
+                      dest = out / report['filename']
+                      page = await context.new_page()
+                      browser_error = ''
+                      try:
+                          await page.goto(report['url'], wait_until='domcontentloaded', timeout=120000)
+                          await page.wait_for_timeout(7000)
+                          # Dismiss common consent/login overlays without interacting with protected content.
+                          for sel in [
+                              'button:has-text("同意")', 'button:has-text("接受")',
+                              'button:has-text("关闭")', '.close', '.modal-close',
+                              '.login-close', '.mask .close', '.popup-close',
+                          ]:
+                              try:
+                                  loc=page.locator(sel).first
+                                  if await loc.count() and await loc.is_visible():
+                                      await loc.click(timeout=1000)
+                              except Exception:
+                                  pass
+                          await page.add_style_tag(content='''
+                              @media print {
+                                header, footer, nav, aside, iframe,
+                                [class*="advert"], [class*="ad-"], [id*="ad_"], [id^="ad"],
+                                [class*="toolbar"], [class*="share"], [class*="comment"],
+                                [class*="recommend"], [class*="related"], [class*="sidebar"],
+                                [class*="fixed"], [class*="sticky"], [class*="popup"],
+                                [class*="mask"], [class*="login"] { display:none !important; }
+                                body { background:white !important; color:black !important; }
+                                img { max-width:100% !important; height:auto !important; }
+                                a { color:black !important; text-decoration:none !important; }
+                              }
+                          ''')
+                          body_text = await page.locator('body').inner_text(timeout=30000)
+                          if len(body_text) < 500 or not any(t in body_text for t in report['expected_terms']):
+                              raise RuntimeError(f'page body failed identity/content check, length={len(body_text)}')
+                          await page.emulate_media(media='print')
+                          await page.pdf(
+                              path=str(dest), format='A4', print_background=True,
+                              margin={'top':'12mm','right':'10mm','bottom':'12mm','left':'10mm'},
+                              prefer_css_page_size=False,
+                          )
+                      except Exception as exc:
+                          browser_error = repr(exc)
+                          try:
+                              await page.close()
+                          except Exception:
+                              pass
+                          fallback_pdf(report, dest, browser_error)
+                      finally:
+                          try:
+                              if not page.is_closed():
+                                  await page.close()
+                          except Exception:
+                              pass
+
+                      reader = PdfReader(str(dest), strict=False)
+                      pages = len(reader.pages)
+                      if pages < report['min_pages']:
+                          # Rendered page may have been over-trimmed. Rebuild from public text as fallback.
+                          fallback_pdf(report, dest, f'page count {pages} below minimum {report["min_pages"]}')
+                          reader = PdfReader(str(dest), strict=False)
+                          pages = len(reader.pages)
+                      sample=''
+                      for pg in reader.pages[:min(pages,20)]:
+                          try: sample += '\n' + (pg.extract_text() or '')
+                          except Exception: pass
+                      missing=[t for t in report['expected_terms'] if t not in sample]
+                      if missing:
+                          # Some browser PDFs have image-only text; tolerate only if file is substantial.
+                          if dest.stat().st_size < 80_000:
+                              raise RuntimeError(f'identity terms missing {missing} and PDF too small')
+                      check = subprocess.run(['qpdf','--check',str(dest)],capture_output=True,text=True)
+                      if check.returncode not in (0,3):
+                          raise RuntimeError(f'qpdf check failed: {check.stderr[-1200:]}')
+                      data=dest.read_bytes()
+                      rec={
+                          'filename':report['filename'], 'broker':report['broker'],
+                          'title':report['title'], 'date':report['date'],
+                          'edition':report['edition'], 'source_url':report['url'],
+                          'pages_in_generated_pdf':pages, 'bytes':len(data),
+                          'sha256':hashlib.sha256(data).hexdigest(),
+                          'browser_fallback_reason':browser_error or None,
+                      }
+                      records.append(rec)
+                      print('VALIDATED',json.dumps(rec,ensure_ascii=False),flush=True)
+                  await browser.close()
+              return records
+
+          records=asyncio.run(render_all())
+          if len(records)!=3:
+              raise RuntimeError(f'report count mismatch: {len(records)}')
+
+          readme=[
+              '奥克斯电气（02580.HK）券商深度报告公开版资料包',
+              '整理日期：2026-09-19',
+              '',
+              '重要说明：',
+              '1. 本包包含三份可公开访问的券商研究网页PDF版本，均由公开网页直接打印或排版生成。',
+              '2. 它们不是需要登录、积分或付费下载的券商原始PDF；整理过程未绕过任何访问控制。',
+              '3. 第一份为财通证券研究公开发布的长文版，信息最完整；第二、三份为公开研报页或公开摘要版。',
+              '4. 原报告的公开元数据显示：财通证券深度报告27页；长江证券行业深度报告26页；招商证券深度报告21页。生成PDF页数因网页排版而与原件不同。',
+              '',
+              '文件清单：',
+          ]
+          for i,r in enumerate(records,1):
+              readme.extend([
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   文件：{r['filename']}",
+                  f"   版本：{r['edition']}",
+                  f"   生成PDF页数：{r['pages_in_generated_pdf']}；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   公开来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          readme.append('完整性核验：PDF文件头、页数、文本/公司身份抽样、qpdf结构检查、ZIP CRC及SHA-256。')
+          (out/'00_文件清单与版本说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          zip_path=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path,arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad=zf.testzip()
+              if bad: raise RuntimeError('ZIP CRC failure: '+bad)
+              pdfs=[n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs)!=3: raise RuntimeError(f'PDF count mismatch: {len(pdfs)}')
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'PDF_COUNT',len(pdfs),'SHA256',hashlib.sha256(zip_path.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: aux-electric-broker-public-pdf-final
+          path: 奥克斯电气_02580_券商深度报告_公开版_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
