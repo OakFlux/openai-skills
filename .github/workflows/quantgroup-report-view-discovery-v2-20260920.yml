@@ -1,0 +1,134 @@
+name: Discover QuantGroup public report viewer pages 20260920
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-report-view-discovery-v2-20260920.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml playwright
+          python -m playwright install chromium
+
+      - name: Discover report IDs and viewer assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python - <<'PY'
+          from __future__ import annotations
+          import asyncio, json, re
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, parse_qs
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          OUT=Path('out')
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+          })
+
+          org='https://www.fxbaogao.com/archives/organization/%E7%9B%88%E7%AB%8B%E8%AF%81%E5%88%B8'
+          queue=[org]
+          seen=set(); matches=[]; pages=[]
+          while queue and len(seen)<20:
+            u=queue.pop(0)
+            if u in seen: continue
+            seen.add(u)
+            try:
+              r=s.get(u,timeout=(20,90),allow_redirects=True)
+              pages.append({'input':u,'status':r.status_code,'final':r.url,'bytes':len(r.content)})
+              fn=OUT/f'org_{len(seen):02d}.html'; fn.write_bytes(r.content)
+              soup=BeautifulSoup(r.content,'lxml')
+              for a in soup.find_all('a',href=True):
+                text=a.get_text(' ',strip=True)
+                href=urljoin(r.url,a['href'])
+                if ('AI战略发展赋能线上消费基本盘' in text or '智能硬件打开增长新范式' in text or '量化派' in text) and '/detail/' in href:
+                  matches.append({'text':text,'href':href})
+                if ('archives/organization' in href and ('page=' in href or re.search(r'/page/\d+',href))) or (href.startswith(org) and href!=org):
+                  if href not in seen and href not in queue: queue.append(href)
+              # explicitly probe common page parameters even if pagination is JS-hidden
+              if len(seen)==1:
+                for n in range(2,16):
+                  for cand in (f'{org}?page={n}',f'{org}?p={n}',f'{org}/{n}',f'{org}/page/{n}'):
+                    if cand not in seen and cand not in queue: queue.append(cand)
+            except Exception as e:
+              pages.append({'input':u,'error':repr(e)})
+          (OUT/'organization_discovery.json').write_text(json.dumps({'pages':pages,'matches':matches},ensure_ascii=False,indent=2),encoding='utf-8')
+
+          ids={'fosun':'5553065'}
+          for m in matches:
+            mm=re.search(r'/detail/(\d+)',m['href'])
+            if mm: ids.setdefault('yingli',mm.group(1))
+          (OUT/'report_ids.json').write_text(json.dumps(ids,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          async def probe_viewers():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True,args=['--disable-blink-features=AutomationControlled'])
+              for key,rid in ids.items():
+                context=await browser.new_context(
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+                  locale='zh-CN',viewport={'width':1440,'height':1000}
+                )
+                page=await context.new_page()
+                events=[]
+                async def on_response(resp):
+                  try: h=await resp.all_headers()
+                  except Exception: h={}
+                  u=resp.url; ct=h.get('content-type','')
+                  if any(x in (u+' '+ct).lower() for x in ('report-image','pdf','download','preview','page','image','document')):
+                    events.append({'url':u,'status':resp.status,'content_type':ct,'length':h.get('content-length')})
+                page.on('response',on_response)
+                url=f'https://www.fxbaogao.com/view?id={rid}'
+                rec={'key':key,'id':rid,'input_url':url}
+                try:
+                  await page.goto(url,wait_until='domcontentloaded',timeout=90000)
+                  await page.wait_for_timeout(5000)
+                  for _ in range(18):
+                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    await page.wait_for_timeout(1200)
+                  await page.evaluate('window.scrollTo(0,0)')
+                  await page.wait_for_timeout(1000)
+                  data=await page.evaluate('''() => ({
+                    title:document.title,
+                    url:location.href,
+                    text:document.body?document.body.innerText.slice(0,50000):'',
+                    images:Array.from(document.images).map(x=>({src:x.currentSrc||x.src,alt:x.alt,width:x.naturalWidth,height:x.naturalHeight})).filter(x=>x.src),
+                    iframes:Array.from(document.querySelectorAll('iframe')).map(x=>x.src),
+                    links:Array.from(document.querySelectorAll('a')).map(x=>({text:(x.innerText||x.textContent||'').trim(),href:x.href})).filter(x=>x.href),
+                    html:document.documentElement.outerHTML.slice(0,1000000),
+                    bodyHeight:document.body?document.body.scrollHeight:0
+                  })''')
+                  rec.update(data)
+                  rec['events']=events
+                  await page.screenshot(path=str(OUT/f'{key}_view.png'),full_page=True)
+                except Exception as e:
+                  rec['error']=repr(e); rec['events']=events
+                (OUT/f'{key}_view.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),encoding='utf-8')
+                await context.close()
+              await browser.close()
+          asyncio.run(probe_viewers())
+          PY
+
+          grep -RInE "report-image|\.pdf|download|pageCount|page_count|totalPage|total_page|5553065|AI战略发展" out > out/grep_hits.txt || true
+          find out -maxdepth 1 -type f -printf '%f %s\n' | sort > out/file_sizes.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-report-view-discovery-v2
+          path: out
+          retention-days: 7
+          compression-level: 6
