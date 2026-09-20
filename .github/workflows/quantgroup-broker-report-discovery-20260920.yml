@@ -1,0 +1,181 @@
+name: Discover QuantGroup broker report files 20260920
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-broker-report-discovery-20260920.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml playwright
+          python -m playwright install chromium
+
+      - name: Probe public report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p discovery
+          python - <<'PY'
+          from __future__ import annotations
+          import asyncio, html, json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          OUT=Path('discovery')
+          targets=[
+            ('yingli_microbell','https://www.microbell.com/repinfodetail_5329571.html'),
+            ('fosun_fxbaogao','https://www.fxbaogao.com/detail/5553065'),
+            ('fosun_stockstar','https://4g.stockstar.com/detail/IG2026072200022430'),
+            ('yingli_stockstar','https://finance.stockstar.com/IG2026081700023502.shtml'),
+          ]
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+            'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          all_candidates=[]
+          for key,url in targets:
+            rec={'key':key,'url':url}
+            try:
+              r=s.get(url,timeout=(30,120),allow_redirects=True)
+              rec.update(status=r.status_code,final_url=r.url,content_type=r.headers.get('content-type'),bytes=len(r.content),headers=dict(r.headers))
+              (OUT/f'{key}.html').write_bytes(r.content)
+              text=r.text
+              soup=BeautifulSoup(text,'lxml')
+              rec['title']=soup.title.get_text(' ',strip=True) if soup.title else ''
+              links=[]
+              for tag in soup.find_all(True):
+                for attr in ('href','src','data','data-src','data-url','download-url','file','poster'):
+                  val=tag.get(attr)
+                  if val:
+                    try: links.append(urljoin(r.url,html.unescape(str(val))))
+                    except Exception: pass
+              for m in re.finditer(r'https?://[^\s"\'<>]+',text): links.append(html.unescape(m.group(0)).replace('\\/','/'))
+              interesting=[]
+              for u in sorted(set(links)):
+                low=u.lower()
+                if any(x in low for x in ('.pdf','pdf','download','report','repinfo','file','attachment','preview','view','image','img','page')):
+                  interesting.append(u)
+              rec['interesting_links']=interesting[:2000]
+              rec['scripts']=[urljoin(r.url,x.get('src')) for x in soup.find_all('script',src=True)]
+              all_candidates += [(key,u) for u in interesting]
+            except Exception as e:
+              rec['error']=repr(e)
+            (OUT/f'{key}_requests.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          async def browser_probe():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True,args=['--disable-blink-features=AutomationControlled'])
+              for key,url in targets[:2]:
+                context=await browser.new_context(
+                  user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+                  locale='zh-CN', accept_downloads=True, viewport={'width':1440,'height':1000}
+                )
+                page=await context.new_page()
+                events=[]
+                async def on_response(resp):
+                  try:
+                    ct=(await resp.all_headers()).get('content-type','')
+                  except Exception: ct=''
+                  u=resp.url
+                  if any(x in (u+' '+ct).lower() for x in ('pdf','download','report','repinfo','attachment','preview','image','img','page')):
+                    events.append({'url':u,'status':resp.status,'content_type':ct})
+                page.on('response',on_response)
+                try:
+                  await page.goto(url,wait_until='domcontentloaded',timeout=90000)
+                  await page.wait_for_timeout(8000)
+                  await page.screenshot(path=str(OUT/f'{key}_page.png'),full_page=True)
+                  info=await page.evaluate('''() => ({
+                    title: document.title,
+                    url: location.href,
+                    text: document.body ? document.body.innerText.slice(0,30000) : '',
+                    links: Array.from(document.querySelectorAll('a')).map(a => ({text:(a.innerText||a.textContent||'').trim(),href:a.href,download:a.download})).filter(x=>x.text||x.href),
+                    buttons: Array.from(document.querySelectorAll('button,[role=button],input[type=button],input[type=submit]')).map(b=>({text:(b.innerText||b.value||b.textContent||'').trim(),outer:b.outerHTML.slice(0,1000)})),
+                    iframes: Array.from(document.querySelectorAll('iframe')).map(x=>x.src),
+                    images: Array.from(document.images).map(x=>({src:x.currentSrc||x.src,alt:x.alt,width:x.naturalWidth,height:x.naturalHeight})).filter(x=>x.src),
+                    scripts: Array.from(document.scripts).map(x=>x.src).filter(Boolean),
+                    html: document.documentElement.outerHTML.slice(0,500000)
+                  })''')
+                  info['network_events']=events
+                  (OUT/f'{key}_browser.json').write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
+
+                  # Click public viewer/open links first, and capture resulting URL/download.
+                  selectors=['text=打开报告原文','text=点击浏览报告原文','text=下载报告','text=免费查看完整报告','text=查看完整报告']
+                  clicks=[]
+                  for sel in selectors:
+                    try:
+                      loc=page.locator(sel).first
+                      if await loc.count():
+                        before=page.url
+                        async with page.expect_download(timeout=5000) as di:
+                          await loc.click(timeout=5000)
+                        dl=await di.value
+                        suggested=dl.suggested_filename
+                        dest=OUT/f'{key}_download_{suggested}'
+                        await dl.save_as(str(dest))
+                        clicks.append({'selector':sel,'type':'download','suggested':suggested,'path':str(dest)})
+                    except Exception as e:
+                      try:
+                        loc=page.locator(sel).first
+                        if await loc.count():
+                          before=page.url
+                          await loc.click(timeout=5000)
+                          await page.wait_for_timeout(5000)
+                          clicks.append({'selector':sel,'type':'navigation_or_modal','before':before,'after':page.url})
+                          await page.screenshot(path=str(OUT/f'{key}_{re.sub("[^a-zA-Z0-9]+","_",sel)}.png'),full_page=True)
+                      except Exception as e2:
+                        clicks.append({'selector':sel,'error1':repr(e),'error2':repr(e2)})
+                  (OUT/f'{key}_clicks.json').write_text(json.dumps(clicks,ensure_ascii=False,indent=2),encoding='utf-8')
+                  (OUT/f'{key}_network.json').write_text(json.dumps(events,ensure_ascii=False,indent=2),encoding='utf-8')
+                except Exception as e:
+                  (OUT/f'{key}_browser_error.txt').write_text(repr(e),encoding='utf-8')
+                await context.close()
+              await browser.close()
+          asyncio.run(browser_probe())
+
+          # Probe all plausible direct URLs without sending credentials or bypassing access controls.
+          probed=[]
+          seen=set()
+          for key,u in all_candidates:
+            if u in seen: continue
+            seen.add(u)
+            if len(probed)>=300: break
+            low=u.lower()
+            if not any(x in low for x in ('.pdf','download','attachment','file','preview','report','repinfo')): continue
+            try:
+              r=s.get(u,timeout=(15,60),allow_redirects=True,stream=True,headers={'Referer':dict(targets).get(key,'')})
+              head=next(r.iter_content(16),b'')
+              probed.append({'key':key,'url':u,'status':r.status_code,'final':r.url,'content_type':r.headers.get('content-type'),'length':r.headers.get('content-length'),'head_hex':head.hex()})
+              if r.status_code==200 and head.startswith(b'%PDF'):
+                data=head+b''.join(r.iter_content(1024*1024))
+                (OUT/f'direct_{len(probed):03d}.pdf').write_bytes(data)
+            except Exception as e:
+              probed.append({'key':key,'url':u,'error':repr(e)})
+          (OUT/'candidate_probe.json').write_text(json.dumps(probed,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+          find discovery -maxdepth 1 -type f -printf '%f %s\n' | sort > discovery/file_sizes.txt
+          grep -RInE "https?[^[:space:]\"']+\.pdf|download|pdfUrl|pdf_url|fileUrl|file_url|reportId|repId|attachment|page[0-9]+" discovery > discovery/grep_hits.txt || true
+
+      - name: Upload discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-broker-report-discovery
+          path: discovery
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
