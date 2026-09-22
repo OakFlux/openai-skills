@@ -1,0 +1,291 @@
+name: Galaxis Broker Reports Package
+
+on:
+  push:
+    branches:
+      - chatgpt-galaxis-broker-20260922
+    paths:
+      - .github/workflows/galaxis_broker_reports_20260922.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pillow pypdf
+
+      - name: Download public reader pages and build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cat > /tmp/build_galaxis_broker.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlsplit, urlunsplit
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          SESSION = requests.Session()
+          SESSION.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          REPORTS = [
+              {
+                  'id': '5491473',
+                  'institution': '国泰海通证券',
+                  'date': '2026-06-23',
+                  'title': '首次覆盖：自研筑牢技术壁垒，场内物流机器人龙头乘风扩容',
+                  'filename': '01_国泰海通证券_凯乐士科技首次覆盖_自研筑牢技术壁垒_2026-06-23.pdf',
+                  'known_pages': 15,
+                  'min_pages': 10,
+              },
+              {
+                  'id': '5693196',
+                  'institution': '国联民生证券',
+                  'date': '2026-09-12',
+                  'title': '首次覆盖报告：产品矩阵持续完善，海外业务驱动盈利拐点',
+                  'filename': '02_国联民生证券_凯乐士科技首次覆盖_产品矩阵持续完善_2026-09-12.pdf',
+                  'known_pages': None,
+                  'min_pages': 10,
+              },
+              {
+                  'id': '5669575',
+                  'institution': '信达证券',
+                  'date': '2026-09-03',
+                  'title': '凯乐士科技：订单储备充足，加速拓展海外市场',
+                  'filename': '03_信达证券_凯乐士科技_订单储备充足加速拓展海外市场_2026-09-03.pdf',
+                  'known_pages': None,
+                  'min_pages': 3,
+              },
+          ]
+
+          def get(url, *, referer=None, timeout=60, acceptable=(200,)):
+              last = None
+              headers = {'Referer': referer} if referer else {}
+              for attempt in range(4):
+                  try:
+                      r = SESSION.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      if r.status_code in acceptable:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code} for {url}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(2 ** attempt)
+              raise RuntimeError(f'Failed to fetch {url}: {last}')
+
+          def find_page1(detail_html, detail_url, report_id):
+              soup = BeautifulSoup(detail_html, 'html.parser')
+              candidates = []
+              for tag in soup.find_all(True):
+                  for attr in ('src', 'data-src', 'data-original', 'href', 'content'):
+                      value = tag.get(attr)
+                      if isinstance(value, str) and 'report-image' in value and f'{report_id}-1.' in value:
+                          candidates.append(urljoin(detail_url, value))
+              candidates += re.findall(
+                  rf'https?://[^\"\'<>\s]+/report-image/[^\"\'<>\s]+/{report_id}-1\.(?:png|jpg|jpeg|webp)(?:\?[^\"\'<>\s]*)?',
+                  detail_html,
+                  re.I,
+              )
+              if not candidates:
+                  raise RuntimeError(f'No public page-1 image found for report {report_id}')
+              # Prefer the source PNG/JPEG rather than transformed WebP query.
+              candidates.sort(key=lambda u: ('x-oss-process' in u, len(u)))
+              return candidates[0]
+
+          def strip_query(url):
+              parts = urlsplit(url)
+              return urlunsplit((parts.scheme, parts.netloc, parts.path, '', ''))
+
+          def discover_declared_pages(html):
+              patterns = [
+                  r'(?:共|总计|总页数|页数)\s*[:：]?\s*(\d{1,3})\s*页',
+                  r'(?:pageCount|totalPages|totalPage|fCount)\s*[=:]\s*["\']?(\d{1,3})',
+                  r'"(?:pageCount|totalPages|totalPage|fCount)"\s*:\s*(\d{1,3})',
+              ]
+              values = []
+              for pat in patterns:
+                  values.extend(int(x) for x in re.findall(pat, html, re.I))
+              values = [x for x in values if 1 <= x <= 200]
+              return max(values) if values else None
+
+          def fetch_image(url, detail_url):
+              variants = [strip_query(url), url]
+              if '?' not in strip_query(url):
+                  variants.append(strip_query(url) + '?x-oss-process=image/format,webp')
+              seen = set()
+              for candidate in variants:
+                  if candidate in seen:
+                      continue
+                  seen.add(candidate)
+                  try:
+                      r = SESSION.get(candidate, headers={'Referer': detail_url}, timeout=45, allow_redirects=True)
+                  except Exception:
+                      continue
+                  data = r.content
+                  if r.status_code != 200 or len(data) < 12000:
+                      continue
+                  try:
+                      im = Image.open(io.BytesIO(data))
+                      im.load()
+                  except Exception:
+                      continue
+                  if im.width < 500 or im.height < 650:
+                      im.close()
+                      continue
+                  return candidate, data, im
+              return None
+
+          manifest = []
+          pdf_paths = []
+          for spec in REPORTS:
+              rid = spec['id']
+              detail_url = f'https://www.fxbaogao.com/detail/{rid}'
+              detail = get(detail_url, timeout=60)
+              detail_html = detail.text
+              page1_url = find_page1(detail_html, detail.url, rid)
+              declared_pages = discover_declared_pages(detail_html)
+
+              view_url = f'https://www.fxbaogao.com/view?id={rid}'
+              try:
+                  view = get(view_url, timeout=60)
+                  view_html = view.text
+                  declared_pages = discover_declared_pages(view_html) or declared_pages
+              except Exception:
+                  view_html = ''
+
+              clean_page1 = strip_query(page1_url)
+              m = re.search(rf'^(.*{rid}-)1\.(png|jpg|jpeg|webp)$', clean_page1, re.I)
+              if not m:
+                  raise RuntimeError(f'Unexpected page-1 URL for {rid}: {page1_url}')
+              prefix, ext = m.group(1), m.group(2)
+
+              max_pages = spec['known_pages'] or declared_pages or 80
+              # If no declared count exists, stop at the first unavailable page.
+              images = []
+              page_records = []
+              for page_no in range(1, max_pages + 1):
+                  url = f'{prefix}{page_no}.{ext}'
+                  result = fetch_image(url, detail_url)
+                  if result is None:
+                      if spec['known_pages'] or declared_pages:
+                          raise RuntimeError(f'Missing declared page {page_no} for report {rid}')
+                      break
+                  used_url, data, im = result
+                  rgba = im.convert('RGBA')
+                  bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+                  bg.alpha_composite(rgba)
+                  rgb = bg.convert('RGB')
+                  images.append(rgb.copy())
+                  page_records.append({
+                      'page': page_no,
+                      'url': used_url,
+                      'source_bytes': len(data),
+                      'width': im.width,
+                      'height': im.height,
+                      'source_sha256': hashlib.sha256(data).hexdigest(),
+                  })
+                  im.close(); rgba.close(); bg.close(); rgb.close()
+
+              # For an unknown count, check that the next page is genuinely unavailable.
+              if not (spec['known_pages'] or declared_pages) and images:
+                  next_url = f'{prefix}{len(images)+1}.{ext}'
+                  if fetch_image(next_url, detail_url) is not None:
+                      raise RuntimeError(f'Report {rid} exceeded safety page cap')
+
+              if len(images) < spec['min_pages']:
+                  raise RuntimeError(f'Insufficient public reader pages for {rid}: {len(images)}')
+              if spec['known_pages'] and len(images) != spec['known_pages']:
+                  raise RuntimeError(f'Unexpected page count for {rid}: {len(images)} != {spec["known_pages"]}')
+
+              pdf_path = OUT / spec['filename']
+              images[0].save(pdf_path, 'PDF', resolution=150.0, save_all=True, append_images=images[1:])
+              for im in images:
+                  im.close()
+              reader = PdfReader(str(pdf_path))
+              if reader.is_encrypted or len(reader.pages) != len(page_records):
+                  raise RuntimeError(f'PDF validation failed for {rid}')
+
+              complete = bool(spec['known_pages'] and len(page_records) == spec['known_pages'])
+              if declared_pages and len(page_records) == declared_pages:
+                  complete = True
+              rec = {
+                  **spec,
+                  'source_detail_page': detail_url,
+                  'source_view_page': view_url,
+                  'declared_pages': declared_pages,
+                  'downloaded_pages': len(page_records),
+                  'complete_public_reader_copy': complete,
+                  'pdf_bytes': pdf_path.stat().st_size,
+                  'pdf_sha256': hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+                  'page_records': page_records,
+                  'note': '由来源平台免登录公开阅读页按原顺序合成为PDF；未抓取任何需要登录、会员或付费权限的资源。',
+              }
+              manifest.append(rec)
+              pdf_paths.append(pdf_path)
+              print('VALIDATED', json.dumps({k: rec[k] for k in ('id','institution','title','declared_pages','downloaded_pages','complete_public_reader_copy','pdf_bytes','pdf_sha256')}, ensure_ascii=False))
+
+          note_lines = [
+              '凯乐士科技（02729.HK）券商研究报告资料包',
+              '',
+              '包含文件：',
+          ]
+          for idx, rec in enumerate(manifest, 1):
+              status = '完整公开阅读版' if rec['complete_public_reader_copy'] else '公开阅读版'
+              note_lines.append(f"{idx}. {rec['institution']}：《{rec['title']}》，{rec['date']}，{rec['downloaded_pages']}页（{status}）。")
+          note_lines += [
+              '',
+              '文件说明：',
+              '- PDF均由来源平台免登录公开阅读页面的原始图像按顺序合成，未改写、补写、裁剪或重排正文。',
+              '- 未请求或下载任何需要登录、会员、付费或其他授权的受限资源。',
+              '- 资料仅供个人研究与学习使用，请遵守原报告版权和免责声明。',
+          ]
+          (OUT / '资料说明.txt').write_text('\n'.join(note_lines) + '\n', encoding='utf-8')
+          (OUT / '文件清单及校验值.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = OUT / '凯乐士科技_券商研究报告_3份.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for path in pdf_paths:
+                  z.write(path, path.name)
+              z.write(OUT / '资料说明.txt', '资料说明.txt')
+              z.write(OUT / '文件清单及校验值.json', '文件清单及校验值.json')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed at {bad}')
+          summary = {
+              'zip': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'reports': [{k: r[k] for k in ('id','institution','title','date','declared_pages','downloaded_pages','complete_public_reader_copy','pdf_bytes','pdf_sha256')} for r in manifest],
+          }
+          (OUT / 'BUILD_SUMMARY.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_galaxis_broker.py
+          ls -lh output
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: galaxis-broker-reports-package
+          path: |
+            output/凯乐士科技_券商研究报告_3份.zip
+            output/BUILD_SUMMARY.json
+          retention-days: 1
