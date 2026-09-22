@@ -1,0 +1,139 @@
+name: Download United Laboratories report from ValueList 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/united-labs-valuelist-download-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet playwright requests beautifulsoup4 pypdf
+          python -m playwright install --with-deps chromium
+
+      - name: Inspect and trigger free download
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > /tmp/run.py <<'PY'
+          from __future__ import annotations
+          import asyncio, json, re, hashlib, subprocess
+          from pathlib import Path
+          from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+          from pypdf import PdfReader
+
+          OUT=Path('out')
+          URL='https://www.valuelist.cn/775361.html'
+
+          async def main():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True)
+              ctx=await browser.new_context(
+                viewport={'width':1440,'height':1200},
+                locale='zh-CN',
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+                accept_downloads=True,
+              )
+              page=await ctx.new_page()
+              net=[]; api=[]
+              async def on_response(r):
+                item={'status':r.status,'url':r.url,'type':r.request.resource_type,'content_type':r.headers.get('content-type','')}
+                net.append(item)
+                if r.request.resource_type in ('xhr','fetch') or any(k in r.url.lower() for k in ('download','pdf','ajax','api')):
+                  try:
+                    body=await r.body()
+                    item['body_bytes']=len(body)
+                    try:item['body_text']=body.decode('utf-8','replace')[:300000]
+                    except:item['body_hex']=body[:1000].hex()
+                  except Exception as e:item['body_error']=repr(e)
+                  api.append(item)
+              page.on('response',on_response)
+              rec={'input_url':URL}
+              try:
+                resp=await page.goto(URL,wait_until='domcontentloaded',timeout=90000)
+                rec['status']=resp.status if resp else None
+                await page.wait_for_timeout(10000)
+                rec['final_url']=page.url; rec['title']=await page.title()
+                rec['body']=(await page.locator('body').inner_text())[:120000]
+                rec['links']=await page.locator('a').evaluate_all("els=>els.map(e=>({href:e.href,text:(e.innerText||e.textContent||'').trim(),target:e.target||'',download:e.download||'',onclick:e.getAttribute('onclick')||''})).filter(x=>x.href||x.onclick)")
+                rec['buttons']=await page.locator('button,[role=button],input[type=button],input[type=submit]').evaluate_all("els=>els.map(e=>({text:(e.innerText||e.value||e.textContent||'').trim(),onclick:e.getAttribute('onclick')||'',cls:e.className||''}))")
+                rec['forms']=await page.locator('form').evaluate_all("els=>els.map(e=>({action:e.action,method:e.method,html:e.outerHTML.slice(0,10000)}))")
+                rec['cookies']=await ctx.cookies()
+                rec['local_storage']=await page.evaluate("Object.fromEntries(Object.entries(localStorage))")
+                (OUT/'page.html').write_text(await page.content(),encoding='utf-8')
+                await page.screenshot(path=str(OUT/'before.png'),full_page=True)
+
+                # try all visible download-like controls
+                candidates=[]
+                for pat in ['立即下载','免费下载','下载研报','下载','免费获取']:
+                  loc=page.get_by_text(re.compile('^'+re.escape(pat)+'$'))
+                  for i in range(await loc.count()):
+                    el=loc.nth(i)
+                    try:
+                      if await el.is_visible(): candidates.append((pat,i,el))
+                    except:pass
+                click_results=[]
+                for pat,i,el in candidates[:10]:
+                  cr={'text':pat,'index':i}
+                  try:
+                    async with page.expect_download(timeout=12000) as di:
+                      await el.click(timeout=15000)
+                    dl=await di.value
+                    fname=dl.suggested_filename or f'download_{len(click_results)}.bin'
+                    dest=OUT/fname
+                    await dl.save_as(str(dest))
+                    cr.update({'download':dest.name,'url':dl.url,'failure':await dl.failure(),'bytes':dest.stat().st_size})
+                  except PWTimeout:
+                    await page.wait_for_timeout(4000)
+                    cr.update({'after_url':page.url,'body_tail':(await page.locator('body').inner_text())[-8000:]})
+                  except Exception as e:cr['error']=repr(e)
+                  click_results.append(cr)
+                rec['click_results']=click_results
+                await page.screenshot(path=str(OUT/'after.png'),full_page=True)
+              except Exception as e:
+                rec['error']=repr(e)
+                try:await page.screenshot(path=str(OUT/'error.png'),full_page=True)
+                except:pass
+              rec['network']=net; rec['api']=api
+              (OUT/'result.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),encoding='utf-8')
+              await browser.close()
+
+          asyncio.run(main())
+
+          # Validate any PDF downloads
+          vals=[]
+          for f in OUT.iterdir():
+            if f.is_file() and f.read_bytes()[:5]==b'%PDF-':
+              try:
+                pages=len(PdfReader(str(f),strict=False).pages)
+                subprocess.run(['qpdf','--check',str(f)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                sha=hashlib.sha256(f.read_bytes()).hexdigest()
+                vals.append({'file':f.name,'bytes':f.stat().st_size,'pages':pages,'sha256':sha,'qpdf':'ok'})
+              except Exception as e:vals.append({'file':f.name,'error':repr(e)})
+          (OUT/'pdf_validation.json').write_text(json.dumps(vals,ensure_ascii=False,indent=2),encoding='utf-8')
+          print((OUT/'result.json').read_text())
+          print((OUT/'pdf_validation.json').read_text())
+          PY
+          python /tmp/run.py
+          grep -RInE 'https?[^[:space:]"'\''<>]+\.pdf|download|免费下载|立即下载|fileUrl|pdfUrl|ajax|api' out > out/grep_hits.txt || true
+          find out -maxdepth 1 -type f -printf '%f %s bytes\n' | sort > out/file_sizes.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: united-labs-valuelist-download
+          path: out
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
