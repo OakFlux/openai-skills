@@ -1,0 +1,117 @@
+name: Fetch United Laboratories reports from Eastmoney 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/united-labs-eastmoney-reports-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Query report API and download matches
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pdfs out/previews
+          python - <<'PY'
+          from __future__ import annotations
+          import json,re,hashlib,subprocess,time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('out'); PDFDIR=OUT/'pdfs'; PREV=OUT/'previews'
+          s=requests.Session();s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Referer':'https://data.eastmoney.com/'})
+          variants=['03933','3933','03933.HK','HK03933']
+          records=[]; raw={}
+          for code in variants:
+            allrows=[]
+            for page in range(1,6):
+              params={
+                'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                'beginTime':'2020-01-01','endTime':'2030-12-31','pageNo':str(page),'fields':'',
+                'qType':'0','orgCode':'','code':code,'rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)
+              }
+              try:
+                r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(20,90))
+                text=r.text
+                # JSONP or JSON
+                m=re.search(r'^\s*[\w$]+\((.*)\)\s*;?\s*$',text,re.S)
+                if m:text=m.group(1)
+                d=json.loads(text)
+                rows=d.get('data') or d.get('result',{}).get('data') or []
+                if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or []
+                if not isinstance(rows,list): rows=[]
+                allrows.extend(rows)
+                if len(rows)<100: break
+              except Exception as e:
+                allrows.append({'_error':repr(e),'_code':code,'_page':page})
+                break
+            raw[code]=allrows
+            records.extend(allrows)
+          (OUT/'api_raw.json').write_text(json.dumps(raw,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # deduplicate and filter United Laboratories
+          uniq={}
+          for row in records:
+            if not isinstance(row,dict): continue
+            blob=json.dumps(row,ensure_ascii=False)
+            if '联邦制药' not in blob and '03933' not in blob and '3933' not in blob and 'UNITED LAB' not in blob.upper(): continue
+            info=row.get('infoCode') or row.get('infocode') or row.get('info_code') or row.get('INFOCODE')
+            key=info or (row.get('title'),row.get('publishDate'),row.get('orgSName'))
+            uniq[str(key)]=row
+          rows=list(uniq.values())
+          (OUT/'matched_records.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          vals=[]
+          for i,row in enumerate(rows,1):
+            info=row.get('infoCode') or row.get('infocode') or row.get('info_code') or row.get('INFOCODE')
+            if not info: continue
+            title=str(row.get('title') or row.get('reportName') or 'report')
+            org=str(row.get('orgSName') or row.get('orgName') or 'broker')
+            date=str(row.get('publishDate') or row.get('publishDateStr') or row.get('date') or '')[:10]
+            urls=[f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?{int(time.time())}']
+            data=None; used=None
+            for u in urls:
+              try:
+                r=s.get(u,timeout=(30,180),allow_redirects=True)
+                if r.status_code==200 and r.content[:5]==b'%PDF-' and len(r.content)>30000:
+                  data=r.content; used=r.url; break
+              except Exception: pass
+            if data is None: continue
+            safe=re.sub(r'[^0-9A-Za-z\u4e00-\u9fff._-]+','_',f'{date}_{org}_{title}')[:180]
+            f=PDFDIR/f'{safe}.pdf';f.write_bytes(data)
+            try:
+              reader=PdfReader(str(f),strict=False); pages=len(reader.pages); first=(reader.pages[0].extract_text() or '')
+              subprocess.run(['qpdf','--check',str(f)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              if '联邦制药' not in first and '03933' not in first and '3933' not in first:
+                identity='metadata_only'
+              else:identity='first_page_verified'
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(f),str(PREV/f.stem)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              vals.append({'file':f.name,'url':used,'pages':pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'identity':identity,'record':row})
+            except Exception as e:
+              vals.append({'file':f.name,'url':used,'error':repr(e),'record':row})
+          (OUT/'validation.json').write_text(json.dumps(vals,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'matched':rows,'validation':vals},ensure_ascii=False,indent=2))
+          PY
+          find out -type f -printf '%P %s bytes\n' | sort > out/file_sizes.txt
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: united-labs-eastmoney-reports
+          path: out
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 6
