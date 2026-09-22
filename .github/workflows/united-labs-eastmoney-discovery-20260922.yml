@@ -1,0 +1,133 @@
+name: Discover United Laboratories Eastmoney reports 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/united-labs-eastmoney-discovery-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query Eastmoney report API and verify PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pdfs
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from pathlib import Path
+          import requests
+
+          OUT=Path('out')
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Referer':'https://data.eastmoney.com/'})
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          calls=[]; records=[]
+
+          def query(params):
+            try:
+              r=s.get(endpoint,params=params,timeout=(20,90))
+              rec={'url':r.url,'status':r.status_code,'bytes':len(r.content),'text_head':r.text[:500]}
+              try:
+                data=r.json(); rec['json_type']=type(data).__name__
+                # common shapes
+                if isinstance(data,dict):
+                  arr=data.get('data') or data.get('result') or data.get('reports') or []
+                  if isinstance(arr,dict): arr=arr.get('data') or arr.get('list') or arr.get('items') or []
+                  if not isinstance(arr,list): arr=[]
+                  rec['count']=len(arr); records.extend(arr)
+                  rec['top_keys']=list(data.keys())[:30]
+                elif isinstance(data,list): records.extend(data); rec['count']=len(data)
+              except Exception as e: rec['json_error']=repr(e)
+              calls.append(rec)
+            except Exception as e:
+              calls.append({'params':params,'error':repr(e)})
+            time.sleep(1.1)
+
+          base={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','fields':'','qType':'0','orgCode':'','rcode':''}
+          for code in ['03933','3933','HK03933','03933.HK','*','']:
+            p=base|{'beginTime':'2025-01-01','endTime':'2026-12-31','pageNo':'1','p':'1','pageNum':'1','pageNumber':'1','code':code}
+            query(p)
+
+          # Narrow date windows across all stocks. Fetch several pages in case code filters fail for HK stocks.
+          windows=[('2025-07-10','2025-07-31'),('2025-09-01','2025-09-30'),('2026-01-01','2026-12-31')]
+          for begin,end in windows:
+            for page in range(1,16):
+              before=len(records)
+              p=base|{'beginTime':begin,'endTime':end,'pageNo':str(page),'p':str(page),'pageNum':str(page),'pageNumber':str(page),'code':'*'}
+              query(p)
+              # stop after two pages with no added records
+              if len(records)==before and page>=2: break
+
+          # list2 fallback
+          for code in ['03933','3933','*']:
+            try:
+              u='https://reportapi.eastmoney.com/report/list2'
+              payload={'pageNo':1,'pageSize':100,'code':code,'qType':0,'beginTime':'2025-01-01','endTime':'2026-12-31'}
+              r=s.post(u,json=payload,timeout=(20,90)); calls.append({'url':r.url,'method':'POST','status':r.status_code,'bytes':len(r.content),'text_head':r.text[:500]})
+              try:
+                d=r.json(); arr=d.get('data',[]) if isinstance(d,dict) else []
+                if isinstance(arr,dict): arr=arr.get('list') or arr.get('data') or []
+                if isinstance(arr,list): records.extend(arr)
+              except: pass
+            except Exception as e: calls.append({'list2_error':repr(e),'code':code})
+            time.sleep(1.1)
+
+          # de-duplicate and filter
+          dedup={}
+          for r in records:
+            if not isinstance(r,dict): continue
+            key=str(r.get('infoCode') or r.get('encodeUrl') or r.get('title') or r)
+            dedup[key]=r
+          allrecs=list(dedup.values())
+          keywords=['联邦制药','United Laboratories','03933','3933.HK','三靶点战略联姻诺和诺德','创新药初结硕果','抗生素龙头企业','GLP-1三靶携手MNC','代谢管线全面推进']
+          matches=[]
+          for r in allrecs:
+            txt=json.dumps(r,ensure_ascii=False)
+            if any(k.lower() in txt.lower() for k in keywords): matches.append(r)
+          OUT.joinpath('calls.json').write_text(json.dumps(calls,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('all_records.json').write_text(json.dumps(allrecs,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          verified=[]
+          for i,r in enumerate(matches,1):
+            info=str(r.get('infoCode') or r.get('infocode') or r.get('encodeUrl') or '')
+            m=re.search(r'AP\d+',info)
+            if m: info=m.group(0)
+            candidates=[]
+            if info:
+              candidates += [f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf', f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf']
+            for field in ('attachUrl','pdfUrl','url','fileUrl','downloadUrl'):
+              v=r.get(field)
+              if isinstance(v,str) and v.startswith('http'): candidates.append(v)
+            for u in dict.fromkeys(candidates):
+              try:
+                rr=s.get(u,timeout=(30,180),allow_redirects=True)
+                ok=rr.status_code==200 and rr.content[:5]==b'%PDF-' and len(rr.content)>30000
+                row={'record':r,'candidate':u,'status':rr.status_code,'bytes':len(rr.content),'content_type':rr.headers.get('content-type',''),'is_pdf':ok,'final_url':rr.url}
+                verified.append(row)
+                if ok:
+                  title=str(r.get('title') or r.get('reportName') or r.get('name') or info)
+                  fn=re.sub(r'[^0-9A-Za-z\u4e00-\u9fff._-]+','_',title)[:120]+'.pdf'
+                  OUT.joinpath('pdfs',fn).write_bytes(rr.content)
+                  break
+              except Exception as e: verified.append({'record':r,'candidate':u,'error':repr(e)})
+              time.sleep(.7)
+          OUT.joinpath('verified.json').write_text(json.dumps(verified,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'calls':calls,'record_count':len(allrecs),'matches':matches,'verified':verified},ensure_ascii=False,indent=2))
+          PY
+          find out -type f -printf '%p %s bytes\n' | sort > out/file_sizes.txt
+      - name: Upload discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: united-labs-eastmoney-discovery
+          path: out
+          retention-days: 7
+          if-no-files-found: error
