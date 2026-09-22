@@ -1,0 +1,355 @@
+name: Build Manycore 00068 filings package 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/manycore-00068-filings-package-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF and parsing tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf pillow
+
+      - name: Discover official filings, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '群核科技_00068_港股_招股说明书_2025年度资料_2026中期业绩'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www.hkexnews.hk/',
+          })
+
+          def fetch_html(url: str) -> str:
+              errors = []
+              for attempt in range(1, 6):
+                  try:
+                      r = session.get(url, timeout=(30, 180), allow_redirects=True)
+                      print('TITLE_PAGE', attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      r.raise_for_status()
+                      text = r.text
+                      if '00068' not in text or len(text) < 20000:
+                          raise RuntimeError(f'unexpected title page, bytes={len(r.content)}')
+                      return text
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'failed to fetch title page {url}: {errors}')
+
+          def parse_title_page(lang: str) -> list[dict]:
+              url = (
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&documentType=-1'
+                  f'&from=20260201&lang={lang}&market=SEHK&searchType=0&stockId=1000299467'
+                  '&t1code=-2&t2Gcode=-2&t2code=-2&to=20260922'
+              )
+              html = fetch_html(url)
+              Path(f'title-page-{lang}.html').write_text(html, encoding='utf-8')
+              soup = BeautifulSoup(html, 'html.parser')
+              rows: list[dict] = []
+              for a in soup.find_all('a', href=True):
+                  href = a.get('href', '').strip()
+                  if '.pdf' not in href.lower():
+                      continue
+                  tr = a.find_parent('tr')
+                  context = tr.get_text(' ', strip=True) if tr else a.parent.get_text(' ', strip=True)
+                  item = {
+                      'lang': lang,
+                      'title': a.get_text(' ', strip=True),
+                      'context': re.sub(r'\s+', ' ', context),
+                      'url': urljoin(url, href),
+                  }
+                  rows.append(item)
+                  print('PDF_LINK', json.dumps(item, ensure_ascii=False), flush=True)
+              if not rows:
+                  raise RuntimeError(f'no PDF links parsed for lang={lang}')
+              return rows
+
+          en_rows = parse_title_page('EN')
+          zh_rows = parse_title_page('ZH')
+
+          def norm(value: str) -> str:
+              return re.sub(r'[\s\-—–_：:（）()／/]+', '', value).lower()
+
+          def choose(rows: list[dict], predicate, label: str) -> dict:
+              matches = [r for r in rows if predicate(r, norm(r['title']), norm(r['context']))]
+              print('MATCHES', label, json.dumps(matches, ensure_ascii=False, indent=2), flush=True)
+              if len(matches) != 1:
+                  raise RuntimeError(f'{label}: expected exactly one match, found {len(matches)}')
+              return matches[0]
+
+          en_prospectus = choose(
+              en_rows,
+              lambda r, t, c: 'globaloffering' in t and '09042026' in c and ('listingdocuments' in c or 'offerforsubscription' in c) and ('7mb' in c or '6mb' in c or '8mb' in c),
+              'English prospectus',
+          )
+          zh_prospectus = choose(
+              zh_rows,
+              lambda r, t, c: '全球發售' in r['title'] and ('09/04/2026' in r['context'] or '2026年4月9日' in r['context']) and ('上市文件' in r['context'] or '發售以供認購' in r['context']) and ('7MB' in r['context'] or '6MB' in r['context'] or '8MB' in r['context']),
+              'Chinese prospectus',
+          )
+          en_exemption = choose(
+              en_rows,
+              lambda r, t, c: 'exemptionunderrule13.46(2)' in t and '2025annualreport' in t,
+              'English annual-report exemption',
+          )
+          zh_exemption = choose(
+              zh_rows,
+              lambda r, t, c: '13.46(2)' in r['title'] and ('年度報告' in r['title'] or '年報' in r['title']) and '豁免' in r['title'],
+              'Chinese annual-report exemption',
+          )
+          en_interim = choose(
+              en_rows,
+              lambda r, t, c: 'interimresultsannouncementforthesixmonthsendedjune30,2026'.replace(',', '') in t.replace(',', '') or ('interimresultsannouncement' in t and 'sixmonthsendedjune30,2026'.replace(',', '') in t.replace(',', '')),
+              'English interim results',
+          )
+          zh_interim = choose(
+              zh_rows,
+              lambda r, t, c: '2026年6月30日' in r['title'] and '中期業績公告' in r['title'],
+              'Chinese interim results',
+          )
+
+          selections = [
+              {
+                  'filename': '01_群核科技_00068_最终招股说明书_中文版_2026-04-09.pdf',
+                  'title': '群核科技最终招股说明书（中文版）',
+                  'date': '2026-04-09',
+                  'type': 'prospectus',
+                  'url': zh_prospectus['url'],
+                  'min_bytes': 4_000_000,
+                  'min_pages': 400,
+              },
+              {
+                  'filename': '02_Manycore_Tech_00068_Final_Prospectus_English_2026-04-09.pdf',
+                  'title': 'Manycore Tech final prospectus (English)',
+                  'date': '2026-04-09',
+                  'type': 'prospectus',
+                  'url': en_prospectus['url'],
+                  'min_bytes': 4_000_000,
+                  'min_pages': 400,
+              },
+              {
+                  'filename': '03_群核科技_00068_2025年度报告豁免公告_中文版_2026-04-30.pdf',
+                  'title': '关于2025年年度报告的豁免公告（中文版）',
+                  'date': '2026-04-30',
+                  'type': 'annual_report_exemption',
+                  'url': zh_exemption['url'],
+                  'min_bytes': 40_000,
+                  'min_pages': 2,
+              },
+              {
+                  'filename': '04_Manycore_Tech_00068_2025_Annual_Report_Exemption_English_2026-04-30.pdf',
+                  'title': 'Exemption regarding the 2025 annual report (English)',
+                  'date': '2026-04-30',
+                  'type': 'annual_report_exemption',
+                  'url': en_exemption['url'],
+                  'min_bytes': 40_000,
+                  'min_pages': 2,
+              },
+              {
+                  'filename': '05_群核科技_00068_2026年中期业绩公告_中文版_2026-08-27.pdf',
+                  'title': '截至2026年6月30日止六个月中期业绩公告（中文版）',
+                  'date': '2026-08-27',
+                  'type': 'interim_results',
+                  'url': zh_interim['url'],
+                  'min_bytes': 100_000,
+                  'min_pages': 15,
+              },
+              {
+                  'filename': '06_Manycore_Tech_00068_2026_Interim_Results_English_2026-08-27.pdf',
+                  'title': 'Interim results announcement for the six months ended June 30, 2026 (English)',
+                  'date': '2026-08-27',
+                  'type': 'interim_results',
+                  'url': en_interim['url'],
+                  'min_bytes': 100_000,
+                  'min_pages': 15,
+              },
+          ]
+
+          def url_variants(url: str) -> list[str]:
+              vals = [url]
+              if 'www1.hkexnews.hk' in url:
+                  vals.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  vals.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              return list(dict.fromkeys(vals))
+
+          def download_pdf(url: str, dest: Path, min_bytes: int) -> str:
+              errors = []
+              for candidate in url_variants(url):
+                  for attempt in range(1, 5):
+                      tmp = dest.with_suffix(dest.suffix + '.part')
+                      try:
+                          with session.get(candidate, timeout=(30, 420), allow_redirects=True, stream=True) as r:
+                              print('DOWNLOAD', dest.name, attempt, r.status_code, candidate, 'final', r.url, flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in r.iter_content(chunk_size=1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          data_head = tmp.read_bytes()[:8]
+                          size = tmp.stat().st_size
+                          if size < min_bytes or not data_head.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF response size={size} head={data_head!r}')
+                          tmp.replace(dest)
+                          return str(r.url)
+                      except Exception as exc:
+                          errors.append(f'{candidate} attempt {attempt}: {exc!r}')
+                          tmp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {dest.name}: {errors}')
+
+          def render_check(pdf_path: Path, pages: int) -> list[int]:
+              sample_pages = sorted(set([1, max(1, pages // 2), pages]))
+              with tempfile.TemporaryDirectory(prefix='render-check-') as td:
+                  temp_dir = Path(td)
+                  for page_no in sample_pages:
+                      prefix = temp_dir / f'p{page_no}'
+                      run = subprocess.run(
+                          ['pdftoppm', '-f', str(page_no), '-l', str(page_no), '-singlefile', '-r', '72', '-png', str(pdf_path), str(prefix)],
+                          capture_output=True,
+                          text=True,
+                          timeout=180,
+                      )
+                      if run.returncode != 0:
+                          raise RuntimeError(f'pdftoppm failed: {pdf_path.name} page {page_no}: {run.stderr[-1500:]}')
+                      image_path = prefix.with_suffix('.png')
+                      if not image_path.exists() or image_path.stat().st_size < 3000:
+                          raise RuntimeError(f'rendered image missing or too small: {pdf_path.name} page {page_no}')
+                      with Image.open(image_path) as image:
+                          image.verify()
+                      with Image.open(image_path) as image:
+                          width, height = image.size
+                      if width < 300 or height < 300:
+                          raise RuntimeError(f'render dimensions too small: {width}x{height}')
+              return sample_pages
+
+          records = []
+          seen_hashes = set()
+          for item in selections:
+              dest = out / item['filename']
+              final_url = download_pdf(item['url'], dest, item['min_bytes'])
+              reader = PdfReader(str(dest), strict=False)
+              if reader.is_encrypted:
+                  raise RuntimeError(f'encrypted PDF not accepted: {dest.name}')
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f'page count too small for {dest.name}: {pages}')
+              sample_text = ''
+              for page in reader.pages[:min(20, pages)]:
+                  try:
+                      sample_text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              lower = sample_text.lower()
+              if not any(term in lower for term in ('00068', 'manycore', '群核科技', '群核')):
+                  raise RuntimeError(f'company identity could not be verified: {dest.name}')
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {dest.name}: {check.stderr[-2000:]}')
+              rendered_pages = render_check(dest, pages)
+              data = dest.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in seen_hashes:
+                  raise RuntimeError(f'duplicate PDF detected: {dest.name}')
+              seen_hashes.add(sha)
+              record = {
+                  'filename': item['filename'],
+                  'title': item['title'],
+                  'document_type': item['type'],
+                  'disclosure_date': item['date'],
+                  'source': '香港交易所披露易（HKEXnews）',
+                  'source_url': final_url,
+                  'pages': pages,
+                  'render_checked_pages': rendered_pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              'Manycore Tech Inc.（群核科技，00068.HK）港股披露文件资料包',
+              '整理日期：2026-09-22',
+              '',
+              '收录范围：最终招股说明书、上市后全部年度报告相关文件，以及截至整理日最新阶段性财务报告。',
+              '公司于2026年4月17日在香港联交所主板上市。',
+              '公司依据香港上市规则第13.46(2)条注4获豁免另行编制、刊发及寄发截至2025年12月31日止年度的独立年度报告。2025年度财务资料及企业管治资料已载入2026年4月9日的最终招股说明书。因此，本包以“最终招股说明书 + 年报豁免公告”完整记录2025年度披露口径。',
+              '截至2026年9月22日，港交所披露页尚未出现完整《2026年中期报告》；最新财务披露为2026年8月27日发布的截至2026年6月30日止六个月中期业绩公告。本包按其真实文件类型收录，不将其误标为季度报告或完整中期报告。',
+              '上述三类文件均收录中英文港交所官方PDF原件。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(records, 1):
+              readme.extend([
+                  f"{i}. {rec['title']}",
+                  f"   文件：{rec['filename']}",
+                  f"   披露日期：{rec['disclosure_date']}；页数：{rec['pages']}；大小：{rec['bytes']/1048576:.2f} MB",
+                  f"   抽样渲染核验页：{', '.join(str(x) for x in rec['render_checked_pages'])}",
+                  f"   来源：{rec['source_url']}",
+                  f"   SHA-256：{rec['sha256']}",
+                  '',
+              ])
+          readme.append('完整性核验：PDF文件头、证券代码及公司身份、实际页数、非加密状态、qpdf结构检查、首/中/末页抽样渲染、文件去重、ZIP CRC及SHA-256校验。')
+          (out / '00_文件清单与披露口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 6:
+                  raise RuntimeError(f'PDF count mismatch: {len(pdfs)}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDF_COUNT', len(pdfs), 'SHA256', zip_sha, flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: manycore-00068-filings-final
+          path: 群核科技_00068_港股_招股说明书_2025年度资料_2026中期业绩.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
