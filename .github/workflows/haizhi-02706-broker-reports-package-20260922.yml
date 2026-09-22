@@ -1,0 +1,341 @@
+name: Build Haizhi Technology broker report package 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/haizhi-02706-broker-reports-package-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils fonts-noto-cjk fonts-noto-color-emoji
+          python -m pip install --quiet requests pypdf playwright pillow img2pdf
+          python -m playwright install --with-deps chromium
+
+      - name: Download, capture, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import asyncio
+          import hashlib
+          import io
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from playwright.async_api import async_playwright
+          from pypdf import PdfReader
+
+          PACKAGE = '海致科技集团_02706_券商深度报告_3份'
+          root = Path(PACKAGE)
+          root.mkdir(exist_ok=True)
+          preview_dir = root / '首页预览'
+          preview_dir.mkdir(exist_ok=True)
+          work = Path('_work')
+          work.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'order': 1,
+                  'broker': '招银国际',
+                  'date': '2026-04-21',
+                  'title': 'Leading graph-based enterprise AI solution provider in China',
+                  'title_cn': '中国领先的图技术企业级AI解决方案提供商',
+                  'type': '首次覆盖 / Initiation',
+                  'rating': 'BUY',
+                  'target_price': 'HK$84.50',
+                  'source_page': 'https://www.cmbi.com.hk/article/12957.html?lang=en',
+                  'source_pdf': 'https://www.cmbi.com.hk/upload/202604/20260421326177.pdf',
+                  'access': '券商官网官方完整版',
+                  'expected_pages': 27,
+                  'filename': '01_招银国际_海致科技集团_中国领先的图技术企业级AI解决方案提供商_2026-04-21_官方完整版_27页.pdf',
+              },
+              {
+                  'order': 2,
+                  'broker': '国泰海通证券',
+                  'date': '2026-05-12',
+                  'title': 'Harness探索者：图模融合破局，构筑产业AI操作系统',
+                  'title_cn': 'Harness探索者：图模融合破局，构筑产业AI操作系统',
+                  'type': '首次覆盖',
+                  'rating': '增持',
+                  'target_price': 'HK$97.47',
+                  'source_page': 'https://gmg.9fzt.com/report/HKSE/02706/831885797376.html',
+                  'fallback_page': 'https://www.fxbaogao.com/detail/5410235',
+                  'access': '公开研报页面/预览内容整理版（非22页券商原始PDF）',
+                  'original_pages': 22,
+                  'filename': '02_国泰海通证券_海致科技集团_Harness探索者_图模融合破局_2026-05-12_公开研报页面版.pdf',
+              },
+              {
+                  'order': 3,
+                  'broker': '国盛证券',
+                  'date': '2026-07-20',
+                  'title': '图模融合先锋，产业级AI Harness打开成长空间',
+                  'title_cn': '图模融合先锋，产业级AI Harness打开成长空间',
+                  'type': '首次覆盖深度报告',
+                  'rating': '买入',
+                  'target_price': '未在公开页面统一披露',
+                  'source_page': 'https://www.vzkoo.com/read/1120377702120001609e8d375d49.html',
+                  'fallback_page': 'https://www.51pdf.cn/report/view_5930856.html',
+                  'access': '公开精读/预览页面整理版（非券商原始PDF）',
+                  'filename': '03_国盛证券_海致科技集团_图模融合先锋_产业级AI_Harness打开成长空间_2026-07-20_公开精读版.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def download_pdf(url: str, dest: Path) -> dict:
+              last = None
+              for attempt in range(5):
+                  for verify in (True, False):
+                      try:
+                          r = session.get(url, timeout=(30, 180), allow_redirects=True, verify=verify)
+                          last = {'status': r.status_code, 'final_url': r.url, 'content_type': r.headers.get('content-type',''), 'bytes': len(r.content), 'verify_tls': verify}
+                          if r.status_code == 200 and r.content[:5] == b'%PDF-' and len(r.content) > 100_000:
+                              dest.write_bytes(r.content)
+                              return last
+                      except Exception as e:
+                          last = {'error': repr(e), 'verify_tls': verify}
+                  time.sleep(2 + attempt)
+              raise RuntimeError(f'Failed to download {url}: {last}')
+
+          async def scroll_and_expand(page):
+              # Dismiss common dialogs and expand article text when public controls exist.
+              for txt in ['同意', '接受', '我知道了', '关闭', '展开全文', '阅读全文', '查看更多', '继续阅读']:
+                  try:
+                      loc = page.get_by_text(txt, exact=True).first
+                      if await loc.is_visible(timeout=800):
+                          await loc.click(timeout=1500)
+                          await page.wait_for_timeout(500)
+                  except Exception:
+                      pass
+              try:
+                  await page.evaluate('''async () => {
+                    for (let y = 0; y < document.body.scrollHeight; y += 800) {
+                      window.scrollTo(0, y); await new Promise(r => setTimeout(r, 180));
+                    }
+                    window.scrollTo(0, 0);
+                  }''')
+              except Exception:
+                  pass
+              await page.wait_for_timeout(2500)
+
+          async def collect_large_images(page):
+              try:
+                  imgs = await page.locator('img').evaluate_all('''els => els.map((e, i) => ({
+                    i, src: e.currentSrc || e.src || e.getAttribute('data-src') || e.getAttribute('data-original') || '',
+                    alt: e.alt || '', w: e.naturalWidth || 0, h: e.naturalHeight || 0,
+                    rectW: e.getBoundingClientRect().width || 0, rectH: e.getBoundingClientRect().height || 0
+                  })).filter(x => x.src)''')
+              except Exception:
+                  return []
+              out=[]
+              seen=set()
+              for x in imgs:
+                  src=x.get('src','')
+                  low=(src+' '+x.get('alt','')).lower()
+                  if src in seen or src.startswith('data:image/svg'):
+                      continue
+                  seen.add(src)
+                  if any(k in low for k in ['logo','avatar','icon','qrcode','qr-code','banner','advert','emoji']):
+                      continue
+                  if x.get('w',0) >= 700 and x.get('h',0) >= 850:
+                      out.append(x)
+              return out[:40]
+
+          def normalize_image_bytes(data: bytes) -> bytes | None:
+              try:
+                  im=Image.open(io.BytesIO(data))
+                  if im.width < 600 or im.height < 700:
+                      return None
+                  if im.mode in ('RGBA','LA'):
+                      bg=Image.new('RGB', im.size, 'white')
+                      alpha=im.getchannel('A') if 'A' in im.getbands() else None
+                      bg.paste(im, mask=alpha)
+                      im=bg
+                  elif im.mode!='RGB':
+                      im=im.convert('RGB')
+                  out=io.BytesIO(); im.save(out,format='JPEG',quality=94,optimize=True)
+                  return out.getvalue()
+              except Exception:
+                  return None
+
+          async def capture_public_page(rec: dict, dest: Path) -> dict:
+              urls=[rec['source_page']]
+              if rec.get('fallback_page'): urls.append(rec['fallback_page'])
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True)
+                  ctx=await browser.new_context(
+                      viewport={'width': 1440, 'height': 1100},
+                      locale='zh-CN',
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+                      extra_http_headers={'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+                  )
+                  errors=[]
+                  for idx,url in enumerate(urls):
+                      page=await ctx.new_page()
+                      try:
+                          resp=await page.goto(url,wait_until='domcontentloaded',timeout=120000)
+                          await page.wait_for_timeout(5000)
+                          await scroll_and_expand(page)
+                          title=await page.title()
+                          body=(await page.locator('body').inner_text())[:120000]
+                          if ('海致科技' not in body and 'Haizhi' not in body and '2706' not in body):
+                              raise RuntimeError('target company identity not found in public page')
+
+                          # Prefer publicly visible high-resolution report pages if the page exposes them.
+                          images=await collect_large_images(page)
+                          cookies={c['name']:c['value'] for c in await ctx.cookies()}
+                          jpgs=[]
+                          for n,img in enumerate(images,1):
+                              src=img['src']
+                              try:
+                                  rr=requests.get(src,headers={'User-Agent':session.headers['User-Agent'],'Referer':url},cookies=cookies,timeout=(20,90),verify=False)
+                                  if rr.status_code==200:
+                                      norm=normalize_image_bytes(rr.content)
+                                      if norm:
+                                          fp=work/f"{rec['order']:02d}_{idx}_{n:02d}.jpg"
+                                          fp.write_bytes(norm); jpgs.append(fp)
+                              except Exception:
+                                  pass
+                          if len(jpgs) >= 2:
+                              dest.write_bytes(img2pdf.convert([str(x) for x in jpgs]))
+                              meta={'capture_mode':'public_preview_images','source_used':url,'page_title':title,'image_count':len(jpgs),'public_page_status':resp.status if resp else None}
+                              await page.close(); await browser.close(); return meta
+
+                          # Fallback: print the substantive public research/article page to PDF.
+                          await page.add_style_tag(content='''
+                            @page { size: A4; margin: 14mm 12mm; }
+                            header, nav, footer, aside, [class*="cookie"], [class*="modal"], [class*="popup"],
+                            [class*="advert"], [class*="banner"], [class*="toolbar"], [class*="fixed"],
+                            button, input, textarea { display: none !important; }
+                            body { font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif !important; line-height: 1.55 !important; }
+                            img { max-width: 100% !important; height: auto !important; break-inside: avoid !important; }
+                            article, main, [class*="content"], [class*="article"], [class*="report"] { max-width: 100% !important; }
+                          ''')
+                          await page.pdf(path=str(dest),format='A4',print_background=True,prefer_css_page_size=True,margin={'top':'12mm','bottom':'12mm','left':'10mm','right':'10mm'})
+                          meta={'capture_mode':'public_page_print','source_used':url,'page_title':title,'visible_large_images':len(images),'public_page_status':resp.status if resp else None}
+                          await page.close(); await browser.close(); return meta
+                      except Exception as e:
+                          errors.append({'url':url,'error':repr(e)})
+                          await page.close()
+                  await browser.close()
+                  raise RuntimeError(f'Unable to capture public report page: {errors}')
+
+          manifest=[]
+          # Official CMBI report
+          r0=reports[0]
+          p0=root/r0['filename']
+          dl=download_pdf(r0['source_pdf'],p0)
+          rec0=dict(r0); rec0['download']=dl; rec0['capture_mode']='official_pdf'
+          manifest.append(rec0)
+
+          # Public report pages / previews
+          async def build_public():
+              metas=[]
+              for rec in reports[1:]:
+                  dest=root/rec['filename']
+                  meta=await capture_public_page(rec,dest)
+                  metas.append(meta)
+              return metas
+          metas=asyncio.run(build_public())
+          for rec,meta in zip(reports[1:],metas):
+              row=dict(rec); row.update(meta); manifest.append(row)
+
+          # Validate, render first pages and compute checksums
+          for row in manifest:
+              pdf=root/row['filename']
+              if not pdf.exists() or pdf.stat().st_size < 30_000 or pdf.read_bytes()[:5] != b'%PDF-':
+                  raise RuntimeError(f'Invalid PDF file: {pdf}')
+              reader=PdfReader(str(pdf),strict=False)
+              pages=len(reader.pages)
+              if row.get('expected_pages') and pages != row['expected_pages']:
+                  raise RuntimeError(f'Page mismatch {pdf.name}: expected {row["expected_pages"]}, got {pages}')
+              if pages < 1:
+                  raise RuntimeError(f'No pages in {pdf.name}')
+              first_text=(reader.pages[0].extract_text() or '')[:10000]
+              if row['capture_mode']=='official_pdf' and ('Haizhi' not in first_text or '2706' not in first_text):
+                  raise RuntimeError('Official PDF identity check failed')
+              subprocess.run(['qpdf','--check',str(pdf)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              out_prefix=preview_dir/pdf.stem
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','130','-singlefile',str(pdf),str(out_prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              png=Path(str(out_prefix)+'.png')
+              if not png.exists() or png.stat().st_size<10_000:
+                  raise RuntimeError(f'First-page render failed: {pdf.name}')
+              row['actual_pages']=pages
+              row['bytes']=pdf.stat().st_size
+              row['sha256']=hashlib.sha256(pdf.read_bytes()).hexdigest()
+              row['preview_file']=str(Path('首页预览')/png.name)
+              row['validation']=['PDF header','page count','qpdf structure','first-page render']
+
+          lines=[
+              '海致科技集团（02706.HK）券商深度报告资料包',
+              '整理日期：2026-09-22',
+              '',
+              '本包包含1份券商官网官方完整版，以及2份公开研报页面/公开预览内容整理版。',
+              '后两份原始券商PDF的公开下载页面设有登录或下载权限，本包没有绕过访问控制。',
+              '',
+              '文件清单：',
+          ]
+          for i,r in enumerate(manifest,1):
+              lines += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   日期：{r['date']}；类型：{r['type']}；评级：{r['rating']}；目标价：{r['target_price']}",
+                  f"   收录形式：{r['access']}；本包PDF页数：{r['actual_pages']}页",
+                  f"   文件：{r['filename']}",
+                  f"   来源页面：{r['source_page']}",
+              ]
+              if r.get('source_pdf'): lines.append(f"   券商官方PDF：{r['source_pdf']}")
+              if r.get('original_pages'): lines.append(f"   原始研报公开索引页数：{r['original_pages']}页")
+              lines += [f"   SHA-256：{r['sha256']}",'']
+          lines += [
+              '说明：评级、估值和目标价均对应报告发布时点，不代表当前投资建议。',
+              '校验：所有PDF均完成文件头、页数、qpdf结构和首页渲染检查；ZIP完成CRC测试。',
+          ]
+          (root/'00_文件清单与说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in manifest),encoding='utf-8')
+
+          zpath=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file(): z.write(p,arcname=f'{PACKAGE}/{p.relative_to(root)}')
+          with zipfile.ZipFile(zpath) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError('ZIP CRC failure: '+bad)
+              pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs)!=3: raise RuntimeError(f'Expected 3 PDFs, got {len(pdfs)}')
+          print('FINAL_ZIP',zpath,zpath.stat().st_size,'SHA256',hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: haizhi-02706-broker-reports-final
+          path: 海致科技集团_02706_券商深度报告_3份.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
