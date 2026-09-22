@@ -38,5 +38,11 @@ if old_note not in text:
     raise SystemExit('Legacy presentation note marker not found')
 text = text.replace(old_note, new_note, 1)
 
+old_qpdf = '    return p.returncode == 0, msg[-1200:]\n'
+new_qpdf = '    return p.returncode in (0, 3), msg[-1200:]\n'
+if old_qpdf not in text:
+    raise SystemExit('qpdf status marker not found')
+text = text.replace(old_qpdf, new_qpdf, 1)
+
 path.write_text(text, encoding='utf-8')
-print('Patched package build to use surviving official 2006-2011 annual-result files')
+print('Patched package build to use surviving 2006-2011 annual-result files and accept qpdf warning status')
