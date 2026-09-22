@@ -1,0 +1,430 @@
+name: Build Sun Art Retail 06808 filings package 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sunart-06808-filings-package-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Install PDF and parsing tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf pillow
+
+      - name: Discover official filings, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '高鑫零售_06808_2020-2025年报_招股说明书_最新中期报告_20260922'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www.hkexnews.hk/',
+          })
+
+          def fetch_html(url: str) -> str:
+              errors: list[str] = []
+              for attempt in range(1, 6):
+                  try:
+                      response = session.get(url, timeout=(30, 180), allow_redirects=True)
+                      print('TITLE_PAGE', attempt, response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                      response.raise_for_status()
+                      text = response.text
+                      if '06808' not in text or len(text) < 15000:
+                          raise RuntimeError(f'unexpected title page, bytes={len(response.content)}')
+                      return text
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'failed to fetch title page {url}: {errors}')
+
+          def parse_release_datetime(context: str) -> datetime:
+              match = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', context)
+              if not match:
+                  raise RuntimeError(f'release date not found in context: {context}')
+              return datetime.strptime(f'{match.group(1)} {match.group(2)}', '%d/%m/%Y %H:%M')
+
+          def title_search(lang: str, start: str, end: str, tag: str) -> list[dict]:
+              url = (
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&documentType=-1'
+                  f'&from={start}&lang={lang}&market=SEHK&searchType=0&stockId=64061'
+                  f'&t1code=-2&t2Gcode=-2&t2code=-2&to={end}'
+              )
+              html = fetch_html(url)
+              Path(f'title-page-{tag}-{lang}.html').write_text(html, encoding='utf-8')
+              soup = BeautifulSoup(html, 'html.parser')
+              rows: list[dict] = []
+              seen: set[str] = set()
+              for anchor in soup.find_all('a', href=True):
+                  href = anchor.get('href', '').strip()
+                  if '.pdf' not in href.lower():
+                      continue
+                  absolute = urljoin(url, href)
+                  if absolute in seen:
+                      continue
+                  seen.add(absolute)
+                  tr = anchor.find_parent('tr')
+                  context = tr.get_text(' ', strip=True) if tr else anchor.parent.get_text(' ', strip=True)
+                  context = re.sub(r'\s+', ' ', context)
+                  release_dt = parse_release_datetime(context)
+                  item = {
+                      'lang': lang,
+                      'title': anchor.get_text(' ', strip=True),
+                      'context': context,
+                      'url': absolute,
+                      'release_datetime': release_dt,
+                      'release_date': release_dt.strftime('%Y-%m-%d'),
+                  }
+                  rows.append(item)
+                  print('PDF_LINK', tag, json.dumps({k: v for k, v in item.items() if k != 'release_datetime'}, ensure_ascii=False), flush=True)
+              if not rows:
+                  raise RuntimeError(f'no PDF links parsed for tag={tag}, lang={lang}')
+              return rows
+
+          def choose_single(rows: list[dict], predicate, label: str) -> dict:
+              matches = [row for row in rows if predicate(row)]
+              print('MATCHES', label, json.dumps([{k: v for k, v in row.items() if k != 'release_datetime'} for row in matches], ensure_ascii=False, indent=2), flush=True)
+              if len(matches) != 1:
+                  raise RuntimeError(f'{label}: expected exactly one match, found {len(matches)}')
+              return matches[0]
+
+          # Original IPO final prospectus, issued in 2011.
+          prospectus_en_rows = title_search('EN', '20110101', '20111231', 'prospectus')
+          prospectus_zh_rows = title_search('ZH', '20110101', '20111231', 'prospectus')
+          prospectus_en = choose_single(
+              prospectus_en_rows,
+              lambda row: row['title'].strip().upper() == 'GLOBAL OFFERING'
+              and 'Listing Documents' in row['context']
+              and 'Offer for Subscription' in row['context'],
+              'English final prospectus',
+          )
+          prospectus_zh = choose_single(
+              prospectus_zh_rows,
+              lambda row: row['title'].strip() == '全球發售'
+              and '上市文件' in row['context']
+              and '發售以供認購' in row['context'],
+              'Chinese final prospectus',
+          )
+
+          # Annual reports released in calendar years 2020 through 2025.
+          annual_pairs: list[tuple[int, dict, dict]] = []
+          for year in range(2020, 2026):
+              en_rows = title_search('EN', f'{year}0101', f'{year}1231', f'annual-{year}')
+              zh_rows = title_search('ZH', f'{year}0101', f'{year}1231', f'annual-{year}')
+              en_report = choose_single(
+                  en_rows,
+                  lambda row: 'annual report' in row['title'].lower()
+                  and 'Financial Statements/ESG Information' in row['context']
+                  and '[Annual Report' in row['context'],
+                  f'English annual report released in {year}',
+              )
+              zh_report = choose_single(
+                  zh_rows,
+                  lambda row: ('年度報告' in row['title'] or '年報' in row['title'])
+                  and '財務報表' in row['context']
+                  and ('[年報' in row['context'] or '年度報告' in row['context']),
+                  f'Chinese annual report released in {year}',
+              )
+              annual_pairs.append((year, en_report, zh_report))
+
+          # The latest complete interim/half-year report available as of 2026-09-22.
+          interim_en_rows = title_search('EN', '20250101', '20260922', 'latest-interim')
+          interim_zh_rows = title_search('ZH', '20250101', '20260922', 'latest-interim')
+          interim_en_candidates = [
+              row for row in interim_en_rows
+              if 'interim report' in row['title'].lower()
+              and 'Interim/Half-Year Report' in row['context']
+          ]
+          interim_zh_candidates = [
+              row for row in interim_zh_rows
+              if '中期報告' in row['title']
+              and '中期/半年度報告' in row['context']
+          ]
+          if not interim_en_candidates or not interim_zh_candidates:
+              raise RuntimeError('latest interim report candidates not found')
+          interim_en = max(interim_en_candidates, key=lambda row: row['release_datetime'])
+          interim_zh = max(interim_zh_candidates, key=lambda row: row['release_datetime'])
+          print('LATEST_INTERIM_EN', json.dumps({k: v for k, v in interim_en.items() if k != 'release_datetime'}, ensure_ascii=False), flush=True)
+          print('LATEST_INTERIM_ZH', json.dumps({k: v for k, v in interim_zh.items() if k != 'release_datetime'}, ensure_ascii=False), flush=True)
+
+          selections: list[dict] = [
+              {
+                  'filename': f"01_高鑫零售_06808_最终招股说明书_中文版_{prospectus_zh['release_date']}.pdf",
+                  'title': '高鑫零售最终招股说明书（中文版）',
+                  'date': prospectus_zh['release_date'],
+                  'type': 'prospectus',
+                  'url': prospectus_zh['url'],
+                  'min_bytes': 3_000_000,
+                  'min_pages': 300,
+              },
+              {
+                  'filename': f"02_Sun_Art_Retail_06808_Final_Prospectus_English_{prospectus_en['release_date']}.pdf",
+                  'title': 'Sun Art Retail final prospectus (English)',
+                  'date': prospectus_en['release_date'],
+                  'type': 'prospectus',
+                  'url': prospectus_en['url'],
+                  'min_bytes': 3_000_000,
+                  'min_pages': 300,
+              },
+          ]
+
+          index = 3
+          for release_year, en_report, zh_report in annual_pairs:
+              fiscal_period = f'{release_year - 1}-{release_year}'
+              selections.extend([
+                  {
+                      'filename': f'{index:02d}_高鑫零售_06808_{release_year}年报_{fiscal_period}财年_中文版.pdf',
+                      'title': f'高鑫零售{release_year}年发布年度报告（{fiscal_period}财年，中文版）',
+                      'date': zh_report['release_date'],
+                      'type': 'annual_report',
+                      'url': zh_report['url'],
+                      'min_bytes': 500_000,
+                      'min_pages': 80,
+                  },
+                  {
+                      'filename': f'{index + 1:02d}_Sun_Art_Retail_06808_{release_year}_Annual_Report_FY{fiscal_period}_English.pdf',
+                      'title': f'Sun Art Retail annual report released in {release_year} (FY{fiscal_period}, English)',
+                      'date': en_report['release_date'],
+                      'type': 'annual_report',
+                      'url': en_report['url'],
+                      'min_bytes': 500_000,
+                      'min_pages': 80,
+                  },
+              ])
+              index += 2
+
+          selections.extend([
+              {
+                  'filename': f"{index:02d}_高鑫零售_06808_最新中期报告_中文版_{interim_zh['release_date']}.pdf",
+                  'title': f"高鑫零售最新中期报告（中文版）：{interim_zh['title']}",
+                  'date': interim_zh['release_date'],
+                  'type': 'latest_interim_report',
+                  'url': interim_zh['url'],
+                  'min_bytes': 300_000,
+                  'min_pages': 30,
+              },
+              {
+                  'filename': f"{index + 1:02d}_Sun_Art_Retail_06808_Latest_Interim_Report_English_{interim_en['release_date']}.pdf",
+                  'title': f"Sun Art Retail latest interim report (English): {interim_en['title']}",
+                  'date': interim_en['release_date'],
+                  'type': 'latest_interim_report',
+                  'url': interim_en['url'],
+                  'min_bytes': 300_000,
+                  'min_pages': 30,
+              },
+          ])
+
+          def url_variants(url: str) -> list[str]:
+              variants = [url]
+              if 'www1.hkexnews.hk' in url:
+                  variants.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  variants.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              return list(dict.fromkeys(variants))
+
+          def download_pdf(url: str, destination: Path, min_bytes: int) -> str:
+              errors: list[str] = []
+              for candidate in url_variants(url):
+                  for attempt in range(1, 5):
+                      temporary = destination.with_suffix(destination.suffix + '.part')
+                      try:
+                          with session.get(candidate, timeout=(30, 420), allow_redirects=True, stream=True) as response:
+                              print('DOWNLOAD', destination.name, attempt, response.status_code, candidate, 'final', response.url, flush=True)
+                              response.raise_for_status()
+                              final_url = str(response.url)
+                              with temporary.open('wb') as file_handle:
+                                  for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                      if chunk:
+                                          file_handle.write(chunk)
+                          size = temporary.stat().st_size
+                          with temporary.open('rb') as file_handle:
+                              head = file_handle.read(8)
+                          if size < min_bytes or not head.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF response size={size} head={head!r}')
+                          temporary.replace(destination)
+                          return final_url
+                      except Exception as exc:
+                          errors.append(f'{candidate} attempt {attempt}: {exc!r}')
+                          temporary.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {destination.name}: {errors}')
+
+          def render_check(pdf_path: Path, page_count: int) -> list[int]:
+              sample_pages = sorted(set([1, max(1, page_count // 2), page_count]))
+              with tempfile.TemporaryDirectory(prefix='render-check-') as temporary_directory:
+                  temp_dir = Path(temporary_directory)
+                  for page_number in sample_pages:
+                      prefix = temp_dir / f'p{page_number}'
+                      run = subprocess.run(
+                          [
+                              'pdftoppm', '-f', str(page_number), '-l', str(page_number),
+                              '-singlefile', '-r', '72', '-png', str(pdf_path), str(prefix)
+                          ],
+                          capture_output=True,
+                          text=True,
+                          timeout=240,
+                      )
+                      if run.returncode != 0:
+                          raise RuntimeError(f'pdftoppm failed: {pdf_path.name} page {page_number}: {run.stderr[-1500:]}')
+                      image_path = prefix.with_suffix('.png')
+                      if not image_path.exists() or image_path.stat().st_size < 3000:
+                          raise RuntimeError(f'rendered image missing or too small: {pdf_path.name} page {page_number}')
+                      with Image.open(image_path) as image:
+                          image.verify()
+                      with Image.open(image_path) as image:
+                          width, height = image.size
+                      if width < 300 or height < 300:
+                          raise RuntimeError(f'render dimensions too small: {width}x{height}')
+              return sample_pages
+
+          def extract_identity_text(pdf_path: Path, reader: PdfReader) -> str:
+              sample_text = ''
+              for page in reader.pages[:min(25, len(reader.pages))]:
+                  try:
+                      sample_text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              if len(sample_text.strip()) < 100:
+                  run = subprocess.run(
+                      ['pdftotext', '-f', '1', '-l', str(min(25, len(reader.pages))), str(pdf_path), '-'],
+                      capture_output=True,
+                      text=True,
+                      timeout=240,
+                  )
+                  if run.returncode == 0:
+                      sample_text += '\n' + run.stdout
+              return sample_text
+
+          records: list[dict] = []
+          seen_hashes: set[str] = set()
+          for item in selections:
+              destination = out / item['filename']
+              final_url = download_pdf(item['url'], destination, item['min_bytes'])
+              reader = PdfReader(str(destination), strict=False)
+              if reader.is_encrypted:
+                  raise RuntimeError(f'encrypted PDF not accepted: {destination.name}')
+              page_count = len(reader.pages)
+              if page_count < item['min_pages']:
+                  raise RuntimeError(f'page count too small for {destination.name}: {page_count}')
+
+              identity_text = extract_identity_text(destination, reader).lower()
+              identity_ok = any(term in identity_text for term in ('06808', 'sun art retail', '高鑫零售', '高鑫'))
+              if not identity_ok:
+                  raise RuntimeError(f'company identity could not be verified: {destination.name}')
+
+              qpdf_check = subprocess.run(['qpdf', '--check', str(destination)], capture_output=True, text=True)
+              if qpdf_check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {destination.name}: {qpdf_check.stderr[-2000:]}')
+
+              rendered_pages = render_check(destination, page_count)
+              data = destination.read_bytes()
+              sha256 = hashlib.sha256(data).hexdigest()
+              if sha256 in seen_hashes:
+                  raise RuntimeError(f'duplicate PDF detected: {destination.name}')
+              seen_hashes.add(sha256)
+              record = {
+                  'filename': item['filename'],
+                  'title': item['title'],
+                  'document_type': item['type'],
+                  'disclosure_date': item['date'],
+                  'source': '香港交易所披露易（HKEXnews）',
+                  'source_url': final_url,
+                  'pages': page_count,
+                  'render_checked_pages': rendered_pages,
+                  'bytes': len(data),
+                  'sha256': sha256,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '高鑫零售有限公司（Sun Art Retail Group Limited，06808.HK）官方披露文件资料包',
+              '整理日期：2026-09-22',
+              '',
+              '收录范围：',
+              '1. 2011年上市时的最终招股说明书，中英文官方PDF。',
+              '2. 2020年至2025年各日历年度发布的完整年度报告，中英文官方PDF；对应财年为2019/2020至2024/2025。',
+              '3. 截至整理日港交所最新完整中期/半年度报告，中英文官方PDF。',
+              '',
+              '披露口径说明：',
+              '高鑫零售的财政年度截至每年3月31日，因此“2020年报”在本包中指2020年发布、覆盖2019/2020财年的年度报告，依此类推。',
+              '香港主板公司通常不按A股口径强制发布第一季度及第三季度报告。本包将截至整理日最新完整中期报告作为“最新季报”口径收录，并保留港交所原始文件类型。',
+              '公司已于2026年7月发布2025/2026年度报告，但用户指定的年度范围为2020年至2025年，因此该2026年发布的年度报告未纳入本包。',
+              '',
+              '文件清单：',
+          ]
+          for number, record in enumerate(records, 1):
+              readme.extend([
+                  f"{number}. {record['title']}",
+                  f"   文件：{record['filename']}",
+                  f"   披露日期：{record['disclosure_date']}；页数：{record['pages']}；大小：{record['bytes'] / 1048576:.2f} MB",
+                  f"   抽样渲染核验页：{', '.join(str(value) for value in record['render_checked_pages'])}",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          readme.append('完整性核验：PDF文件头、公司及证券代码身份、实际页数、非加密状态、qpdf结构检查、首/中/末页抽样渲染、文件去重、ZIP CRC及SHA-256校验。')
+
+          (out / '00_文件清单与披露口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{record['sha256']}  {record['filename']}\n" for record in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad_member = archive.testzip()
+              if bad_member:
+                  raise RuntimeError('ZIP CRC failure: ' + bad_member)
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 16:
+                  raise RuntimeError(f'PDF count mismatch: {len(pdf_members)}')
+
+          zip_sha256 = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDF_COUNT', len(pdf_members), 'SHA256', zip_sha256, flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunart-06808-filings-final
+          path: 高鑫零售_06808_2020-2025年报_招股说明书_最新中期报告_20260922.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
