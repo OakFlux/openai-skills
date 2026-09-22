@@ -1,0 +1,343 @@
+name: Build Seyond 02665 filings package 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seyond-02665-filings-package-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF and parsing tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils fonts-noto-cjk
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Discover, download, validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '图达通_02665_全部年报_上市文件及最新中期业绩'
+          root = Path(PACKAGE)
+          annual_dir = root / '01_年度报告'
+          listing_dir = root / '02_上市文件_招股说明书等'
+          latest_dir = root / '03_最新阶段性财务报告'
+          for d in (annual_dir, listing_dir, latest_dir):
+              d.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Cache-Control': 'no-cache',
+          })
+
+          title_pages = [
+              ('EN', 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=1000281906'),
+              ('ZH', 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=ZH&market=SEHK&stockId=1000281906'),
+              ('TC', 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=TC&market=SEHK&stockId=1000281906'),
+          ]
+
+          discovered: list[dict] = []
+          discovery_log: list[dict] = []
+          for lang, page_url in title_pages:
+              try:
+                  r = session.get(page_url, timeout=(30, 120), allow_redirects=True)
+                  r.raise_for_status()
+                  raw = r.content
+                  text = raw.decode('utf-8', errors='replace')
+                  soup = BeautifulSoup(text, 'lxml')
+                  matches = 0
+                  for a in soup.find_all('a', href=True):
+                      title = ' '.join(a.get_text(' ', strip=True).split())
+                      href = urljoin(r.url, a['href'])
+                      low = title.lower()
+                      if not href.lower().endswith(('.pdf', '.htm', '.html')):
+                          continue
+                      kind = None
+                      if re.search(r'annual report|年度報告|年度报告|年報|年报', title, re.I):
+                          if '2025' in title:
+                              kind = 'annual'
+                      elif re.search(r'interim results announcement|interim report|中期業績|中期业绩|中期報告|中期报告', title, re.I):
+                          if '2026' in title or 'june 30, 2026' in low or '30 june 2026' in low:
+                              kind = 'latest'
+                      elif re.search(r'de-spac transaction circular|de-spac circular|交易通函|上市文件', title, re.I):
+                          kind = 'despac'
+                      elif re.search(r'phip|post hearing information pack|聆訊後資料集|聆讯后资料集', title, re.I):
+                          kind = 'phip'
+                      elif re.search(r'application proof|申請版本|申请版本', title, re.I):
+                          kind = 'application'
+                      if kind:
+                          discovered.append({'kind': kind, 'title': title, 'url': href, 'lang': lang, 'source_page': page_url})
+                          matches += 1
+                  discovery_log.append({'lang': lang, 'url': page_url, 'status': r.status_code, 'bytes': len(raw), 'matches': matches})
+              except Exception as exc:
+                  discovery_log.append({'lang': lang, 'url': page_url, 'error': repr(exc)})
+
+          # Authoritative English fallbacks obtained from HKEX title-search links.
+          fallbacks = [
+              {
+                  'kind': 'annual',
+                  'title': '2025 Annual Report',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0427/2026042700628.pdf',
+                  'lang': 'EN',
+                  'source_page': title_pages[0][1],
+              },
+              {
+                  'kind': 'despac',
+                  'title': 'Republished De-SPAC Transaction Circular - final listing document',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/1210/2025121000303.pdf',
+                  'lang': 'EN',
+                  'source_page': title_pages[0][1],
+              },
+              {
+                  'kind': 'phip',
+                  'title': 'PHIP - Post Hearing Information Pack',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/1210/sehk25111200016.pdf',
+                  'lang': 'EN',
+                  'source_page': title_pages[0][1],
+              },
+              {
+                  'kind': 'application',
+                  'title': 'Application Proof - first submission',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/1210/sehk25082600106.pdf',
+                  'lang': 'EN',
+                  'source_page': title_pages[0][1],
+              },
+          ]
+          discovered.extend(fallbacks)
+
+          # Remove duplicate URL entries while retaining the best available title.
+          unique_by_url: dict[str, dict] = {}
+          for item in discovered:
+              u = item['url'].replace('www.hkexnews.hk', 'www1.hkexnews.hk')
+              item['url'] = u
+              old = unique_by_url.get(u)
+              if old is None or len(item['title']) > len(old['title']):
+                  unique_by_url[u] = item
+          candidates = list(unique_by_url.values())
+
+          # Prefer a full interim report over an interim-results announcement. If none is
+          # discoverable, the latest official results announcement is retained.
+          latest_candidates = [x for x in candidates if x['kind'] == 'latest']
+          if latest_candidates:
+              latest_candidates.sort(key=lambda x: (0 if re.search(r'interim report|中期報告|中期报告', x['title'], re.I) else 1, x['lang']))
+              selected_latest_urls = {x['url'] for x in latest_candidates}
+          else:
+              selected_latest_urls = set()
+
+          def classify_filename(item: dict, pages: int, sample: str) -> tuple[Path, str]:
+              lang = item.get('lang', 'UNK')
+              lang_label = {'EN': '英文版', 'ZH': '中文版', 'TC': '中文版'}.get(lang, lang)
+              kind = item['kind']
+              if kind == 'annual':
+                  return annual_dir, f'01_图达通_02665_2025年年度报告_{lang_label}.pdf'
+              if kind == 'despac':
+                  return listing_dir, f'01_图达通_02665_De-SPAC交易通函暨最终上市文件_{lang_label}_2025-12-10.pdf'
+              if kind == 'phip':
+                  return listing_dir, f'02_图达通_02665_PHIP聆讯后资料集_{lang_label}_2025-11-12.pdf'
+              if kind == 'application':
+                  return listing_dir, f'03_图达通_02665_上市申请版本_{lang_label}_2025-08-26.pdf'
+              if kind == 'latest':
+                  if re.search(r'interim report|中期報告|中期报告', item['title'], re.I):
+                      return latest_dir, f'01_图达通_02665_2026年中期报告_{lang_label}.pdf'
+                  return latest_dir, f'01_图达通_02665_2026年中期业绩公告_{lang_label}_2026-08-20.pdf'
+              raise ValueError(kind)
+
+          def variants(url: str) -> list[str]:
+              vals = [url]
+              if 'www1.hkexnews.hk' in url:
+                  vals.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  vals.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              return list(dict.fromkeys(vals))
+
+          def download(urls: list[str], tmp: Path) -> str:
+              errors = []
+              for u in urls:
+                  for attempt in range(1, 5):
+                      try:
+                          with session.get(u, timeout=(30, 300), allow_redirects=True, stream=True, headers={'Referer': 'https://www1.hkexnews.hk/'}) as r:
+                              print('DOWNLOAD', u, 'status', r.status_code, 'attempt', attempt, 'final', r.url, flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in r.iter_content(1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          with tmp.open('rb') as fh:
+                              head = fh.read(8)
+                          if tmp.stat().st_size < 30_000 or not head.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF response size={tmp.stat().st_size} head={head!r}')
+                          return r.url
+                      except Exception as exc:
+                          errors.append(f'{u} attempt {attempt}: {exc!r}')
+                          tmp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError('; '.join(errors))
+
+          records: list[dict] = []
+          seen_hashes: set[str] = set()
+          failures: list[dict] = []
+          for idx, item in enumerate(candidates, 1):
+              # Only one latest document family is required; keep language variants if available.
+              if item['kind'] == 'latest' and item['url'] not in selected_latest_urls:
+                  continue
+              tmp = Path(f'_download_{idx:02d}.pdf')
+              try:
+                  final_url = download(variants(item['url']), tmp)
+                  reader = PdfReader(str(tmp), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 1:
+                      raise RuntimeError('zero-page PDF')
+                  sample = ''
+                  for p in reader.pages[:min(12, pages)]:
+                      try:
+                          sample += '\n' + (p.extract_text() or '')
+                      except Exception:
+                          pass
+                  identity = sample.lower()
+                  if not any(k in identity for k in ('seyond', '圖達通', '图达通', '2665', '02665')):
+                      raise RuntimeError('company identity not found in first pages')
+                  kind = item['kind']
+                  if kind == 'annual' and not re.search(r'annual report|年度報告|年度报告', sample, re.I):
+                      raise RuntimeError('annual-report identity not found')
+                  if kind == 'latest' and not re.search(r'interim|中期', sample, re.I):
+                      raise RuntimeError('interim-report identity not found')
+                  if kind in ('despac', 'phip', 'application') and pages < 300:
+                      raise RuntimeError(f'listing document too short: {pages} pages')
+
+                  q = subprocess.run(['qpdf', '--check', str(tmp)], capture_output=True, text=True)
+                  if q.returncode not in (0, 3):
+                      raise RuntimeError('qpdf check failed: ' + q.stderr[-1200:])
+                  sha = hashlib.sha256(tmp.read_bytes()).hexdigest()
+                  if sha in seen_hashes:
+                      print('DUPLICATE_HASH_SKIP', item['title'], item['url'], flush=True)
+                      tmp.unlink(missing_ok=True)
+                      continue
+                  seen_hashes.add(sha)
+                  dest_dir, filename = classify_filename(item, pages, sample)
+                  dest = dest_dir / filename
+                  # Avoid filename collisions if the title page labels a second Chinese variant similarly.
+                  if dest.exists():
+                      dest = dest.with_name(dest.stem + f'_{idx}' + dest.suffix)
+                  tmp.replace(dest)
+
+                  preview = dest.with_name(dest.stem + '_首页预览.png')
+                  subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-r', '110', '-png', str(dest), str(preview.with_suffix(''))], check=True)
+                  if not preview.exists() or preview.stat().st_size < 10_000:
+                      raise RuntimeError('preview rendering failed')
+
+                  rec = {
+                      'category': kind,
+                      'title': item['title'],
+                      'language': item['lang'],
+                      'filename': str(dest.relative_to(root)),
+                      'source_url': final_url,
+                      'source_index': item['source_page'],
+                      'pages': pages,
+                      'bytes': dest.stat().st_size,
+                      'sha256': sha,
+                  }
+                  records.append(rec)
+                  print('VALIDATED', json.dumps(rec, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  failures.append({'item': item, 'error': repr(exc)})
+                  tmp.unlink(missing_ok=True)
+                  print('FAIL', json.dumps({'item': item, 'error': repr(exc)}, ensure_ascii=False), flush=True)
+
+          # Minimum completeness: one annual report, final listing document, latest interim results.
+          kinds = {r['category'] for r in records}
+          missing = {'annual', 'despac', 'latest'} - kinds
+          if missing:
+              raise RuntimeError(f'missing required document categories: {sorted(missing)}; failures={failures}')
+
+          # Preserve application-stage listing documents when successfully found, but do not
+          # require them because the final De-SPAC circular is the legally operative listing document.
+          records.sort(key=lambda r: r['filename'])
+          readme = [
+              '图达通（Seyond Holdings Ltd.，02665.HK）官方披露文件包',
+              '整理日期：2026-09-22',
+              '',
+              '收录范围：上市后全部完整年度报告、最终上市文件及相关申请阶段文件，以及截至整理日最新阶段性财务报告。',
+              '图达通于2025-12-10通过De-SPAC交易在香港联交所上市，因此截至整理日，上市主体发布的完整年度报告只有2025年年度报告。',
+              '公司采用De-SPAC方式上市，没有传统IPO全球发售招股章程；最终De-SPAC交易通函明确同时构成图达通的上市文件，本包将其作为“招股说明书等效文件”收录。',
+              '为便于追溯，本包还保留成功下载的PHIP（聆讯后资料集）和上市申请版本。',
+              '香港主板公司通常不按A股口径发布第一、第三季度财务报告。截至2026-09-22，最新完整财务披露为2026-08-20发布的截至2026-06-30止六个月中期业绩公告；若完整中期报告已在港交所标题页上线，程序会优先收录完整中期报告。',
+              '',
+              '文件清单：',
+          ]
+          category_names = {
+              'annual': '年度报告',
+              'despac': '最终De-SPAC交易通函暨上市文件',
+              'phip': 'PHIP聆讯后资料集',
+              'application': '上市申请版本',
+              'latest': '最新阶段性财务报告',
+          }
+          for i, r in enumerate(records, 1):
+              readme.extend([
+                  f"{i}. {category_names.get(r['category'], r['category'])} - {r['title']}",
+                  f"   文件：{r['filename']}",
+                  f"   语言：{r['language']}；页数：{r['pages']}；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   官方来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '核验方式：PDF文件头、公司身份、文件类型关键词、实际页数、qpdf结构检查、首页渲染、ZIP CRC及SHA-256。',
+              '说明：仅收录公开可访问的港交所官方原件；没有绕过登录、付费或其他访问控制。',
+          ])
+          (root / '00_文件清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'discovery_log.json').write_text(json.dumps({'title_pages': discovery_log, 'failures': failures}, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, arcname=str(Path(PACKAGE) / p.relative_to(root)))
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) < 3:
+                  raise RuntimeError(f'PDF count too small: {len(pdfs)}')
+          digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDF_COUNT', len(pdfs), 'SHA256', digest, flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: seyond-02665-filings-final
+          path: 图达通_02665_全部年报_上市文件及最新中期业绩.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
