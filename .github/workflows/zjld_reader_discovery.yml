@@ -1,0 +1,132 @@
+name: ZJLD Reader Discovery
+
+on:
+  push:
+    branches:
+      - chatgpt-zjld-broker-20260922
+    paths:
+      - .github/workflows/zjld_reader_discovery.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install Playwright
+        run: |
+          python -m pip install --quiet playwright requests
+          python -m playwright install --with-deps chromium
+
+      - name: Capture public reader network
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > /tmp/discover_reader.py <<'PY'
+          import asyncio, hashlib, json, re
+          from pathlib import Path
+          from urllib.parse import quote
+          from playwright.async_api import async_playwright
+
+          OUT=Path('out')
+          report_ids=['116652','128486','144022','177723','112813']
+
+          async def main():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True)
+              context=await browser.new_context(
+                viewport={'width':1440,'height':1100},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+                locale='zh-CN'
+              )
+              all_summary={}
+              for rid in report_ids:
+                report_dir=OUT/rid; report_dir.mkdir(parents=True,exist_ok=True)
+                page=await context.new_page()
+                events=[]; bodies=[]
+                async def on_response(resp):
+                  try:
+                    req=resp.request
+                    ct=(resp.headers.get('content-type') or '').lower()
+                    url=resp.url
+                    rec={'url':url,'status':resp.status,'content_type':ct,'resource_type':req.resource_type,'method':req.method}
+                    events.append(rec)
+                    useful=(('image/' in ct or 'application/pdf' in ct or 'json' in ct or 'javascript' in ct or 'text/' in ct) and any(k in url.lower() for k in ['sgpjbg','view.aspx','bookread','pdf','image','page','upload','oss','file','report','doc']))
+                    if useful:
+                      try:
+                        body=await resp.body()
+                        if body and len(body)<20_000_000:
+                          sha=hashlib.sha256(body).hexdigest()
+                          ext='.bin'
+                          if 'pdf' in ct or body.startswith(b'%PDF-'): ext='.pdf'
+                          elif 'png' in ct or body.startswith(b'\x89PNG'): ext='.png'
+                          elif 'jpeg' in ct or body[:3]==b'\xff\xd8\xff': ext='.jpg'
+                          elif 'webp' in ct or (body.startswith(b'RIFF') and b'WEBP' in body[:16]): ext='.webp'
+                          elif 'json' in ct: ext='.json'
+                          elif 'html' in ct or body.lstrip().startswith(b'<'): ext='.html'
+                          elif 'javascript' in ct: ext='.js'
+                          # save only all pdf/json/html/js and up to 8 images per report
+                          existing_images=sum(1 for x in bodies if x.get('kind')=='image')
+                          kind='image' if ext in ('.png','.jpg','.webp') else 'other'
+                          save=(kind!='image' or existing_images<8)
+                          filename=None
+                          if save:
+                            filename=f'{len(bodies):04d}_{sha[:12]}{ext}'
+                            (report_dir/filename).write_bytes(body)
+                          bodies.append({'url':url,'status':resp.status,'content_type':ct,'bytes':len(body),'sha256':sha,'file':filename,'kind':kind})
+                      except Exception as e:
+                        rec['body_error']=repr(e)
+                  except Exception:
+                    pass
+                page.on('response',on_response)
+                detail=f'https://www.sgpjbg.com/baogao/{rid}.html'
+                view=f'https://www.sgpjbg.com/sgpjbg/View.aspx?id={rid}'
+                book='https://www.sgpjbg.com/BookRead.aspx?bhtype=2&url='+quote('http://www.sgpjbg.com/sgpjbg/View.aspx?id='+rid,safe='')
+                results=[]
+                for label,url in [('detail',detail),('view',view),('book',book)]:
+                  try:
+                    resp=await page.goto(url,wait_until='domcontentloaded',timeout=45000)
+                    await page.wait_for_timeout(8000)
+                    title=await page.title()
+                    html=await page.content()
+                    (report_dir/f'{label}.html').write_text(html,encoding='utf-8')
+                    await page.screenshot(path=str(report_dir/f'{label}.png'),full_page=True)
+                    frames=[{'url':f.url,'name':f.name} for f in page.frames]
+                    imgs=await page.locator('img').evaluate_all("els => els.map(e => ({src:e.src, currentSrc:e.currentSrc, alt:e.alt, width:e.naturalWidth, height:e.naturalHeight}))")
+                    iframes=await page.locator('iframe').evaluate_all("els => els.map(e => ({src:e.src, name:e.name, id:e.id}))")
+                    results.append({'label':label,'url':url,'status':resp.status if resp else None,'final_url':page.url,'title':title,'frames':frames,'images':imgs,'iframes':iframes,'html_bytes':len(html.encode())})
+                  except Exception as e:
+                    results.append({'label':label,'url':url,'error':repr(e),'final_url':page.url})
+                # Collect inline candidate URLs from saved HTML and network events
+                candidate_urls=[]
+                patterns=['.pdf','.png','.jpg','.jpeg','.webp','view.aspx','bookread','page','image','file','oss','upload']
+                for rec in events:
+                  if any(k in rec['url'].lower() for k in patterns): candidate_urls.append(rec['url'])
+                for htmlfile in report_dir.glob('*.html'):
+                  text=htmlfile.read_text(encoding='utf-8',errors='ignore')
+                  for m in re.finditer(r'https?://[^\"\'<>\s]+',text,re.I):
+                    u=m.group(0)
+                    if any(k in u.lower() for k in patterns): candidate_urls.append(u)
+                candidate_urls=list(dict.fromkeys(candidate_urls))
+                summary={'report_id':rid,'navigation':results,'responses':events,'saved_bodies':bodies,'candidate_urls':candidate_urls}
+                (report_dir/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+                all_summary[rid]={'nav':results,'response_count':len(events),'saved_count':len(bodies),'candidate_count':len(candidate_urls),'image_count':sum(1 for x in bodies if x.get('kind')=='image')}
+                print('REPORT',rid,json.dumps(all_summary[rid],ensure_ascii=False))
+                await page.close()
+              (OUT/'all_summary.json').write_text(json.dumps(all_summary,ensure_ascii=False,indent=2),encoding='utf-8')
+              await browser.close()
+          asyncio.run(main())
+          PY
+          python /tmp/discover_reader.py
+          find out -maxdepth 2 -type f -printf '%P %s\n' | sort | head -300
+
+      - name: Upload reader discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: zjld-reader-discovery
+          path: out
+          retention-days: 1
