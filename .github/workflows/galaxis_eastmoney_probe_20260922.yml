@@ -1,0 +1,137 @@
+name: Galaxis EastMoney Probe
+
+on:
+  push:
+    branches:
+      - chatgpt-galaxis-broker-20260922
+    paths:
+      - .github/workflows/galaxis_eastmoney_probe_20260922.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+
+      - name: Search exact dates and download candidate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > /tmp/probe.py <<'PY'
+          import hashlib, json, re, time
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('out')
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+            'Referer':'https://data.eastmoney.com/report/',
+            'Accept':'application/json,text/javascript,*/*;q=0.9',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+          api='https://reportapi.eastmoney.com/report/list'
+          anchors=['2026-06-23','2026-09-03','2026-09-12']
+          allrows=[]; requests_log=[]
+          for anchor in anchors:
+            d=datetime.strptime(anchor,'%Y-%m-%d')
+            begin=(d-timedelta(days=3)).strftime('%Y-%m-%d')
+            end=(d+timedelta(days=4)).strftime('%Y-%m-%d')
+            for qtype in ['0','1']:
+              for page in range(1,12):
+                params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':begin,'endTime':end,'pageNo':str(page),'fields':'','qType':qtype,
+                  'orgCode':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                }
+                try:
+                  r=s.get(api,params=params,timeout=45)
+                  rec={'anchor':anchor,'qType':qtype,'page':page,'status':r.status_code,'bytes':len(r.content),'url':r.url}
+                  requests_log.append(rec)
+                  r.raise_for_status(); obj=r.json()
+                except Exception as e:
+                  rec['error']=repr(e); print('APIERR',json.dumps(rec,ensure_ascii=False)); break
+                rows=obj.get('data') or []
+                if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or []
+                print('API',anchor,qtype,page,'rows',len(rows),'hits',obj.get('hits'),'TotalPage',obj.get('TotalPage') or obj.get('totalPage'))
+                allrows.extend(rows)
+                total=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+                if page>=total or not rows: break
+                time.sleep(.2)
+
+          # Try stock-report POST endpoint with common HK code variants.
+          list2='https://reportapi.eastmoney.com/report/list2'
+          for code in ['02729','2729','HK02729','116.02729','02729.HK','凯乐士科技','凯乐士']:
+            body={'pageSize':100,'pageNo':1,'p':1,'pageNum':1,'pageNumber':1,
+                  'beginTime':'2026-01-01','endTime':'2026-09-22','code':code,'industryCode':'*',
+                  'rating':None,'ratingChange':None,'orgCode':None,'rcode':''}
+            try:
+              r=s.post(list2,json=body,headers={'Content-Type':'application/json'},timeout=45)
+              obj=r.json(); rows=obj.get('data') or []
+              print('LIST2',code,r.status_code,'rows',len(rows),'hits',obj.get('hits'))
+              allrows.extend(rows)
+              requests_log.append({'endpoint':'list2','code':code,'status':r.status_code,'bytes':len(r.content),'rows':len(rows)})
+            except Exception as e:
+              requests_log.append({'endpoint':'list2','code':code,'error':repr(e)})
+
+          # Dedupe and retain plausible matches.
+          dedup={}
+          for row in allrows:
+            key=str(row.get('infoCode') or row.get('encodeUrl') or '')
+            if key: dedup[key]=row
+          rows=list(dedup.values())
+          phrases=['凯乐士','自研筑牢技术壁垒','产品矩阵持续完善','订单储备充足','海外业务驱动盈利拐点','场内物流机器人龙头']
+          matches=[]
+          for row in rows:
+            blob=' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode','orgSName','orgName','researcher'])
+            if any(p in blob for p in phrases): matches.append(row)
+          matches.sort(key=lambda x:str(x.get('publishDate') or ''),reverse=True)
+          (OUT/'all_matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'requests_log.json').write_text(json.dumps(requests_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCHES',len(matches))
+          pdf_records=[]
+          for i,row in enumerate(matches,1):
+            info=str(row.get('infoCode') or '').strip()
+            print('MATCH',json.dumps({k:row.get(k) for k in ['publishDate','orgSName','stockName','stockCode','title','infoCode','attachPages','attachSize']},ensure_ascii=False))
+            if not info: continue
+            candidates=[
+              f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',
+              f'https://pdf.dfcfw.com/pdf/{info}_1.pdf',
+            ]
+            for url in candidates:
+              try:
+                rr=s.get(url,headers={'Referer':'https://data.eastmoney.com/'},timeout=90,allow_redirects=True)
+                print('PDFTRY',url,rr.status_code,len(rr.content),rr.headers.get('content-type'))
+                if rr.status_code==200 and rr.content.startswith(b'%PDF-') and len(rr.content)>50000:
+                  path=OUT/f'{i:02d}_{info}.pdf'; path.write_bytes(rr.content)
+                  reader=PdfReader(str(path))
+                  if reader.is_encrypted:
+                    try: reader.decrypt('')
+                    except Exception: pass
+                  pages=len(reader.pages)
+                  rec={'filename':path.name,'url':url,'pages':pages,'bytes':len(rr.content),'sha256':hashlib.sha256(rr.content).hexdigest(),'row':row}
+                  pdf_records.append(rec); print('PDFOK',json.dumps({k:rec[k] for k in ['filename','url','pages','bytes','sha256']},ensure_ascii=False)); break
+              except Exception as e:
+                print('PDFERR',url,repr(e))
+          (OUT/'pdf_records.json').write_text(json.dumps(pdf_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('DONE PDFs',len(pdf_records))
+          PY
+          python /tmp/probe.py
+          find out -maxdepth 1 -type f -printf '%f %s\n' | sort
+
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: galaxis-eastmoney-probe
+          path: out
+          retention-days: 1
