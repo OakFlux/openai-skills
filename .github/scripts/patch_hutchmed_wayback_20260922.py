@@ -3,6 +3,9 @@ from pathlib import Path
 path = Path('.github/scripts/hutchmed_package_20260922.py')
 text = path.read_text(encoding='utf-8')
 
+if 'from io import BytesIO' not in text:
+    text = text.replace('import hashlib\n', 'import hashlib\nfrom io import BytesIO\n', 1)
+
 marker = '\n\ndef pdf_info(path: Path) -> tuple[int, str]:\n'
 helper = r'''
 
@@ -50,5 +53,12 @@ new = '''        for candidate in (archived,):
 if old not in text:
     raise SystemExit('Legacy loop marker not found')
 text = text.replace(old, new, 1)
+
+old_reader = '                candidate_reader = PdfReader(candidate_data)\n'
+new_reader = '                candidate_reader = PdfReader(BytesIO(candidate_data))\n'
+if old_reader not in text:
+    raise SystemExit('Archived PDF reader marker not found')
+text = text.replace(old_reader, new_reader, 1)
+
 path.write_text(text, encoding='utf-8')
-print('Patched legacy Wayback download path')
+print('Patched legacy Wayback download and in-memory PDF parsing')
