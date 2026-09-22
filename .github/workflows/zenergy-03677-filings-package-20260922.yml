@@ -1,0 +1,458 @@
+name: Build Zenergy 03677 filings package 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zenergy-03677-filings-package-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF and parsing tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Discover, download, validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from dataclasses import dataclass, asdict
+          from datetime import date
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK_ID = '1000255774'
+          STOCK_CODE = '03677'
+          PACKAGE = '正力新能_03677_全部年报_招股说明书及最新中期报告'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(exist_ok=True)
+          PREVIEW = OUT / '首页预览'
+          PREVIEW.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Cache-Control': 'no-cache',
+              'Pragma': 'no-cache',
+          })
+
+          @dataclass
+          class Candidate:
+              lang: str
+              title: str
+              context: str
+              url: str
+              release_date: str
+              doc_type: str = ''
+
+          def clean_text(value: str) -> str:
+              return re.sub(r'\s+', ' ', html.unescape(value or '')).strip()
+
+          def date_from_text(text: str, url: str) -> str:
+              m = re.search(r'(\d{2})/(\d{2})/(\d{4})', text)
+              if m:
+                  return f'{m.group(3)}-{m.group(2)}-{m.group(1)}'
+              m = re.search(r'/((?:20)\d{2})/(\d{4})/', url)
+              if m:
+                  return f'{m.group(1)}-{m.group(2)[:2]}-{m.group(2)[2:]}'
+              return ''
+
+          def fetch_title_page(lang: str) -> tuple[str, str]:
+              variants = [lang]
+              if lang == 'ZH':
+                  variants += ['TC', 'CH']
+              errors = []
+              for lv in variants:
+                  url = f'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang={lv}&market=SEHK&stockId={STOCK_ID}&_={int(time.time())}'
+                  try:
+                      r = session.get(url, timeout=(30, 180), allow_redirects=True)
+                      errors.append(f'{url}: {r.status_code}, {len(r.content)} bytes')
+                      if r.status_code == 200 and STOCK_CODE in r.text and len(r.content) > 15000:
+                          return r.text, r.url
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError('title page fetch failed: ' + ' | '.join(errors))
+
+          def parse_candidates(page_html: str, base_url: str, lang: str) -> list[Candidate]:
+              soup = BeautifulSoup(page_html, 'lxml')
+              rows: list[Candidate] = []
+              seen: set[str] = set()
+              for a in soup.find_all('a', href=True):
+                  href = html.unescape(a.get('href', '')).replace('\\/', '/')
+                  if '.pdf' not in href.lower():
+                      continue
+                  url = urljoin(base_url, href)
+                  if '/listedco/listconews/sehk/' not in url.lower():
+                      continue
+                  container = a.find_parent('tr')
+                  if container is None:
+                      container = a.parent
+                      for _ in range(5):
+                          if container is None:
+                              break
+                          txt = clean_text(container.get_text(' ', strip=True))
+                          if STOCK_CODE in txt and len(txt) > 80:
+                              break
+                          container = container.parent
+                  context = clean_text(container.get_text(' ', strip=True) if container else a.get_text(' ', strip=True))
+                  title = clean_text(a.get_text(' ', strip=True))
+                  if not title:
+                      title = Path(urlparse(url).path).name
+                  if url in seen:
+                      continue
+                  seen.add(url)
+                  rows.append(Candidate(
+                      lang=lang,
+                      title=title,
+                      context=context,
+                      url=url,
+                      release_date=date_from_text(context, url),
+                  ))
+              return rows
+
+          pages = {}
+          all_candidates: list[Candidate] = []
+          en_html, en_url = fetch_title_page('EN')
+          pages['EN'] = {'url': en_url, 'bytes': len(en_html.encode('utf-8'))}
+          all_candidates += parse_candidates(en_html, en_url, 'EN')
+          try:
+              zh_html, zh_url = fetch_title_page('ZH')
+              pages['ZH'] = {'url': zh_url, 'bytes': len(zh_html.encode('utf-8'))}
+              all_candidates += parse_candidates(zh_html, zh_url, 'ZH')
+          except Exception as exc:
+              pages['ZH_error'] = repr(exc)
+
+          # Stable official fallbacks for the English annual report and final prospectus.
+          known = [
+              Candidate('EN', '2025 ANNUAL REPORT', 'Financial Statements/ESG Information - Annual Report', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0423/2026042302898.pdf', '2026-04-23', 'annual'),
+              Candidate('EN', 'GLOBAL OFFERING', 'Listing Documents - Offer for Subscription', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0403/2025040300013.pdf', '2025-04-03', 'prospectus'),
+          ]
+          existing_urls = {c.url for c in all_candidates}
+          for c in known:
+              if c.url not in existing_urls:
+                  all_candidates.append(c)
+
+          def classify(c: Candidate) -> str:
+              s = clean_text(c.title + ' ' + c.context).lower()
+              compact = re.sub(r'\s+', '', s)
+              if ('2025 annual report' in s or '2025年度報告' in compact or '2025年報' in compact) and not any(x in s for x in ('esg', 'environmental', 'annual results', 'results announcement')) and not any(x in compact for x in ('環境、社會及管治', '環境社會及管治')):
+                  return 'annual'
+              if (('listing documents' in s or '上市文件' in compact or '發售以供認購' in compact) and ('global offering' in s or '全球發售' in compact)) or '招股章程' in compact or 'prospectus' in s:
+                  if not any(x in s for x in ('formal notice', 'allotment results')) and not any(x in compact for x in ('正式通告', '分配結果')):
+                      return 'prospectus'
+              if ('2026 interim report' in s or 'interim report 2026' in s or '2026年中期報告' in compact or '2026中期報告' in compact) and not any(x in s for x in ('results announcement', 'interim results')) and '中期業績' not in compact:
+                  return 'interim_report'
+              if ('2026' in s or '2026' in compact) and (('interim results' in s and 'six months ended' in s) or '中期業績' in compact or '截至2026年6月30日止六個月' in compact or '截至2026年6月30日止六个月' in compact):
+                  return 'interim_results'
+              return ''
+
+          selected: list[Candidate] = []
+          for c in all_candidates:
+              typ = c.doc_type or classify(c)
+              if typ:
+                  c.doc_type = typ
+                  selected.append(c)
+
+          # Deduplicate by URL and keep the latest/fullest candidates.
+          uniq: dict[str, Candidate] = {}
+          for c in selected:
+              uniq[c.url] = c
+          selected = list(uniq.values())
+
+          # Retain all annual reports found (currently the 2025 report), the final prospectus,
+          # the latest 2026 interim report if issued, and the 2026 interim results announcement.
+          def key(c: Candidate):
+              return (c.doc_type, c.lang, c.release_date, c.url)
+          selected.sort(key=key)
+
+          # Prefer one document per type/language. Annual reports may span multiple years, so keep all years.
+          final_selection: list[Candidate] = []
+          for typ in ('annual', 'prospectus', 'interim_report', 'interim_results'):
+              for lang in ('ZH', 'EN'):
+                  arr = [c for c in selected if c.doc_type == typ and c.lang == lang]
+                  if not arr:
+                      continue
+                  if typ == 'annual':
+                      years_seen = set()
+                      for c in sorted(arr, key=lambda x: (x.release_date, x.url)):
+                          m = re.search(r'20\d{2}', c.title + ' ' + c.context)
+                          yr = m.group(0) if m else c.release_date[:4]
+                          if yr in years_seen:
+                              continue
+                          years_seen.add(yr)
+                          final_selection.append(c)
+                  else:
+                      final_selection.append(sorted(arr, key=lambda x: (x.release_date, x.url))[-1])
+
+          # Ensure English fallback records are selected.
+          for c in known:
+              if not any(x.url == c.url for x in final_selection):
+                  final_selection.append(c)
+
+          # Find Chinese counterparts when the Chinese title page is unavailable or incomplete.
+          def candidate_counterparts(en_url: str) -> list[str]:
+              m = re.search(r'/(20\d{2}/\d{4}/)(\d+)(?:_c)?\.pdf$', en_url)
+              if not m:
+                  return []
+              prefix, num = m.group(1), m.group(2)
+              width = len(num)
+              n = int(num)
+              vals = []
+              for delta in (1, 0, 2, -1, 3, -2, 4, -3):
+                  if n + delta < 0:
+                      continue
+                  vals.append(f'https://www1.hkexnews.hk/listedco/listconews/sehk/{prefix}{n+delta:0{width}d}_c.pdf')
+              return vals
+
+          def quick_pdf_identity(url: str, typ: str) -> bool:
+              try:
+                  r = session.get(url, timeout=(20, 120), allow_redirects=True)
+                  if r.status_code != 200 or len(r.content) < 50_000 or not r.content.startswith(b'%PDF-'):
+                      return False
+                  tmp = Path('probe.pdf')
+                  tmp.write_bytes(r.content)
+                  reader = PdfReader(str(tmp), strict=False)
+                  pages = len(reader.pages)
+                  if typ == 'prospectus' and pages < 400:
+                      return False
+                  if typ == 'annual' and pages < 80:
+                      return False
+                  if typ == 'interim_report' and pages < 20:
+                      return False
+                  if typ == 'interim_results' and pages < 8:
+                      return False
+                  txt = ''
+                  for p in reader.pages[:min(15, pages)]:
+                      try:
+                          txt += '\n' + (p.extract_text() or '')
+                      except Exception:
+                          pass
+                  low = txt.lower()
+                  if not any(t in low for t in ('正力新能', 'zenergy', '3677', '03677')):
+                      return False
+                  if typ == 'prospectus' and not any(t in low for t in ('全球發售', '全球发售', '招股章程', 'global offering')):
+                      return False
+                  if typ == 'annual' and not any(t in low for t in ('年度報告', '年度报告', 'annual report')):
+                      return False
+                  if typ.startswith('interim') and not any(t in low for t in ('中期報告', '中期报告', '中期業績', '中期业绩', 'interim report', 'interim results')):
+                      return False
+                  return True
+              except Exception:
+                  return False
+              finally:
+                  Path('probe.pdf').unlink(missing_ok=True)
+
+          for en in [c for c in list(final_selection) if c.lang == 'EN']:
+              if any(c.lang == 'ZH' and c.doc_type == en.doc_type for c in final_selection):
+                  continue
+              for u in candidate_counterparts(en.url):
+                  if quick_pdf_identity(u, en.doc_type):
+                      final_selection.append(Candidate('ZH', en.title, en.context, u, en.release_date, en.doc_type))
+                      break
+
+          # A complete package must contain at least one annual report, one prospectus, and the latest 2026 interim financial disclosure.
+          types = {c.doc_type for c in final_selection}
+          if 'annual' not in types or 'prospectus' not in types or not ({'interim_report', 'interim_results'} & types):
+              debug = {
+                  'pages': pages,
+                  'candidate_count': len(all_candidates),
+                  'classified': [asdict(c) for c in selected],
+                  'final_selection': [asdict(c) for c in final_selection],
+              }
+              Path('discovery_debug.json').write_text(json.dumps(debug, ensure_ascii=False, indent=2), encoding='utf-8')
+              raise RuntimeError('required document types not found: ' + repr(types))
+
+          order_map = {'annual': 1, 'prospectus': 2, 'interim_report': 3, 'interim_results': 4}
+          lang_order = {'ZH': 0, 'EN': 1}
+          final_selection.sort(key=lambda c: (order_map[c.doc_type], c.release_date, lang_order.get(c.lang, 9)))
+
+          def variants(url: str) -> list[str]:
+              vals = [url]
+              if 'www1.hkexnews.hk' in url:
+                  vals.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  vals.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              return list(dict.fromkeys(vals))
+
+          def download_pdf(url: str, dest: Path, min_bytes: int) -> str:
+              errs = []
+              for u in variants(url):
+                  for attempt in range(1, 5):
+                      tmp = dest.with_suffix(dest.suffix + '.part')
+                      try:
+                          with session.get(u, timeout=(30, 300), allow_redirects=True, stream=True) as r:
+                              print('DOWNLOAD', dest.name, 'attempt', attempt, 'status', r.status_code, u, 'final', r.url, flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in r.iter_content(1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          if tmp.stat().st_size < min_bytes or not tmp.read_bytes()[:8].startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF response: {tmp.stat().st_size} bytes')
+                          tmp.replace(dest)
+                          return str(r.url)
+                      except Exception as exc:
+                          errs.append(f'{u} attempt {attempt}: {exc!r}')
+                          tmp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {dest.name}: {errs}')
+
+          def output_name(i: int, c: Candidate) -> str:
+              d = c.release_date or 'date-unknown'
+              if c.doc_type == 'annual':
+                  return f'{i:02d}_正力新能_03677_2025年年度报告_中文版_{d}.pdf' if c.lang == 'ZH' else f'{i:02d}_ZENERGY_03677_2025_Annual_Report_English_{d}.pdf'
+              if c.doc_type == 'prospectus':
+                  return f'{i:02d}_正力新能_03677_招股章程_中文版_{d}.pdf' if c.lang == 'ZH' else f'{i:02d}_ZENERGY_03677_Prospectus_English_{d}.pdf'
+              if c.doc_type == 'interim_report':
+                  return f'{i:02d}_正力新能_03677_2026年中期报告_中文版_{d}.pdf' if c.lang == 'ZH' else f'{i:02d}_ZENERGY_03677_2026_Interim_Report_English_{d}.pdf'
+              return f'{i:02d}_正力新能_03677_2026年中期业绩公告_中文版_{d}.pdf' if c.lang == 'ZH' else f'{i:02d}_ZENERGY_03677_2026_Interim_Results_English_{d}.pdf'
+
+          min_pages = {'annual': 80, 'prospectus': 400, 'interim_report': 20, 'interim_results': 8}
+          min_bytes = {'annual': 500_000, 'prospectus': 3_000_000, 'interim_report': 200_000, 'interim_results': 80_000}
+          records = []
+          seen_sha = set()
+
+          for i, c in enumerate(final_selection, 1):
+              filename = output_name(i, c)
+              dest = OUT / filename
+              final_url = download_pdf(c.url, dest, min_bytes[c.doc_type])
+              reader = PdfReader(str(dest), strict=False)
+              page_count = len(reader.pages)
+              if page_count < min_pages[c.doc_type]:
+                  raise RuntimeError(f'page count too small for {dest.name}: {page_count}')
+
+              sample = ''
+              for p in reader.pages[:min(20, page_count)]:
+                  try:
+                      sample += '\n' + (p.extract_text() or '')
+                  except Exception:
+                      pass
+              low = sample.lower()
+              if not any(t in low for t in ('正力新能', 'zenergy', '3677', '03677')):
+                  raise RuntimeError(f'company identity not verified in {dest.name}')
+              if c.doc_type == 'annual' and not any(t in low for t in ('年度報告', '年度报告', 'annual report')):
+                  raise RuntimeError(f'annual report identity not verified in {dest.name}')
+              if c.doc_type == 'prospectus' and not any(t in low for t in ('全球發售', '全球发售', '招股章程', 'global offering')):
+                  raise RuntimeError(f'prospectus identity not verified in {dest.name}')
+              if c.doc_type.startswith('interim') and not any(t in low for t in ('中期報告', '中期报告', '中期業績', '中期业绩', 'interim report', 'interim results')):
+                  raise RuntimeError(f'interim document identity not verified in {dest.name}')
+
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {dest.name}: {check.stderr[-1500:]}')
+
+              preview_base = PREVIEW / dest.stem
+              render = subprocess.run([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '100', str(dest), str(preview_base)
+              ], capture_output=True, text=True)
+              if render.returncode != 0 or not preview_base.with_suffix('.png').exists():
+                  raise RuntimeError(f'first-page render failed for {dest.name}: {render.stderr[-1500:]}')
+
+              data = dest.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in seen_sha:
+                  raise RuntimeError(f'duplicate PDF detected: {dest.name}')
+              seen_sha.add(sha)
+              rec = {
+                  'filename': filename,
+                  'document_type': c.doc_type,
+                  'language': 'Chinese' if c.lang == 'ZH' else 'English',
+                  'title_on_hkex': c.title,
+                  'release_date': c.release_date,
+                  'source': '香港交易所披露易',
+                  'source_url': final_url,
+                  'pages': page_count,
+                  'bytes': len(data),
+                  'sha256': sha,
+              }
+              records.append(rec)
+              print('VALIDATED', json.dumps(rec, ensure_ascii=False), flush=True)
+
+          readme = [
+              '江苏正力新能电池技术股份有限公司（03677.HK）官方披露文件',
+              '整理日期：2026-09-22',
+              '',
+              '收录范围：上市后全部完整年度报告、最终招股章程，以及截至整理日最新中期财务披露。',
+              '公司于2025-04-14在香港联交所上市。截至整理日，上市后完整年度报告仅有2025年年度报告。',
+              '公司曾获豁免无须另行刊发2024年年度报告，2024年度历史财务资料已载于2025年招股章程，因此不存在可单独收录的2024年年度报告。',
+              '香港主板发行人通常不按A股口径强制披露第一季度和第三季度报告；本包以截至2026年6月30日止六个月的最新中期报告或中期业绩公告对应“最新季报”。',
+              '文件均为香港交易所披露易官方PDF原件；如同一文件同时提供中英文，本包同时收录。',
+              '',
+              '文件清单：',
+          ]
+          type_cn = {
+              'annual': '年度报告',
+              'prospectus': '招股章程',
+              'interim_report': '中期报告',
+              'interim_results': '中期业绩公告',
+          }
+          for i, r in enumerate(records, 1):
+              readme += [
+                  f"{i}. {type_cn[r['document_type']]}（{r['language']}）",
+                  f"   文件：{r['filename']}",
+                  f"   披露日期：{r['release_date']}；页数：{r['pages']}；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ]
+          readme.append('完整性核验：PDF文件头、公司身份、文件类型、实际页数、qpdf结构检查、首页渲染、ZIP CRC及SHA-256。')
+          (OUT / '00_文件清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+          (OUT / 'discovery_summary.json').write_text(json.dumps({
+              'title_pages': pages,
+              'candidate_count': len(all_candidates),
+              'classified_count': len(selected),
+              'selected': [asdict(c) for c in final_selection],
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for p in sorted(OUT.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, arcname=f'{PACKAGE}/{p.relative_to(OUT)}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) < 3:
+                  raise RuntimeError(f'PDF count too small: {len(pdfs)}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDF_COUNT', len(pdfs), 'SHA256', zip_sha, flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenergy-03677-filings-final
+          path: 正力新能_03677_全部年报_招股说明书及最新中期报告.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
