@@ -1,0 +1,293 @@
+name: Build JST Group 06687 filings package 20260922
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jst-group-06687-filings-package-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Discover, download, validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlsplit, urlunsplit
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK_ID = '1000277318'
+          PACKAGE = '聚水潭_06687_全部年报_招股说明书及最新中期报告'
+          out = Path(PACKAGE)
+          work = Path('_work')
+          previews = out / '首页预览'
+          out.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+          previews.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Cache-Control': 'no-cache',
+              'Pragma': 'no-cache',
+          })
+
+          def normalize_text(s: str) -> str:
+              return re.sub(r'\s+', ' ', s or '').strip()
+
+          def title_pages() -> list[tuple[str, str]]:
+              rows: list[tuple[str, str]] = []
+              for lang in ('EN', 'ZH'):
+                  url = f'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang={lang}&market=SEHK&stockId={STOCK_ID}'
+                  r = session.get(url, timeout=(30, 120), allow_redirects=True)
+                  print('TITLE_PAGE', lang, r.status_code, r.url, len(r.content), flush=True)
+                  r.raise_for_status()
+                  text = r.content.decode('utf-8', errors='replace')
+                  (work / f'titles_{lang}.html').write_text(text, encoding='utf-8')
+                  soup = BeautifulSoup(text, 'lxml')
+                  for a in soup.find_all('a', href=True):
+                      title = normalize_text(a.get_text(' ', strip=True))
+                      href = urljoin(r.url, a['href'])
+                      if '/listedco/listconews/sehk/' not in href.lower():
+                          continue
+                      if '.pdf' not in href.lower():
+                          continue
+                      rows.append((title, href))
+              # Remove exact duplicate title/url pairs while preserving order.
+              dedup=[]; seen=set()
+              for row in rows:
+                  if row not in seen:
+                      seen.add(row); dedup.append(row)
+              (work / 'discovered_links.json').write_text(json.dumps(
+                  [{'title': t, 'url': u} for t,u in dedup], ensure_ascii=False, indent=2
+              ), encoding='utf-8')
+              print('DISCOVERED_PDF_LINKS', len(dedup), flush=True)
+              for t,u in dedup:
+                  print('LINK', t, u, flush=True)
+              return dedup
+
+          links = title_pages()
+
+          def url_variants(url: str) -> list[str]:
+              vals=[url]
+              if 'www1.hkexnews.hk' in url:
+                  vals.append(url.replace('www1.hkexnews.hk','www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  vals.append(url.replace('www.hkexnews.hk','www1.hkexnews.hk'))
+              # Strip fragments only; preserve query if any.
+              cleaned=[]
+              for v in vals:
+                  p=urlsplit(v)
+                  cleaned.append(urlunsplit((p.scheme,p.netloc,p.path,p.query,'')))
+              return list(dict.fromkeys(cleaned))
+
+          def language_score(title: str, url: str, lang: str) -> int:
+              chinese = bool(re.search(r'[\u4e00-\u9fff]', title)) or url.lower().endswith('_c.pdf')
+              return 10 if ((lang == 'CN' and chinese) or (lang == 'EN' and not chinese)) else 0
+
+          def kind_match(kind: str, title: str, url: str) -> bool:
+              low = title.lower()
+              compact = re.sub(r'\s+', '', low)
+              path = url.lower()
+              if kind == 'annual':
+                  return (
+                      ('2025' in low and ('annual report' in low or 'annualreport' in compact))
+                      or ('2025' in title and ('年報' in title or '年度報告' in title))
+                      or ('二零二五' in title and ('年報' in title or '年度報告' in title))
+                  )
+              if kind == 'prospectus':
+                  return ('global offering' in low or '全球發售' in title)
+              if kind == 'interim':
+                  return (
+                      ('2026' in low and 'interim report' in low)
+                      or ('2026' in title and '中期報告' in title)
+                      or ('二零二六' in title and '中期報告' in title)
+                  )
+              return False
+
+          thresholds = {
+              'annual': {'min_bytes': 1_000_000, 'min_pages': 100},
+              'prospectus': {'min_bytes': 3_000_000, 'min_pages': 400},
+              'interim': {'min_bytes': 500_000, 'min_pages': 40},
+          }
+
+          def fetch_candidate(url: str, dest: Path, min_bytes: int) -> str:
+              errors=[]
+              for variant in url_variants(url):
+                  for attempt in range(1,4):
+                      tmp=dest.with_suffix(dest.suffix+'.part')
+                      try:
+                          with session.get(variant, timeout=(30,300), allow_redirects=True, stream=True,
+                                           headers={'Referer':'https://www1.hkexnews.hk/'}) as r:
+                              print('DOWNLOAD', dest.name, 'attempt', attempt, 'status', r.status_code, variant, 'final', r.url, flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in r.iter_content(chunk_size=1024*1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          size=tmp.stat().st_size
+                          head=tmp.read_bytes()[:8]
+                          if size < min_bytes or not head.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF response size={size}, head={head!r}')
+                          tmp.replace(dest)
+                          return str(r.url)
+                      except Exception as exc:
+                          errors.append(f'{variant} attempt {attempt}: {exc!r}')
+                          tmp.unlink(missing_ok=True)
+                          time.sleep(attempt*2)
+              raise RuntimeError('; '.join(errors))
+
+          def sample_text(reader: PdfReader, limit: int = 20) -> str:
+              text=''
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              return text
+
+          def choose_document(kind: str, lang: str) -> dict:
+              cands=[(t,u) for t,u in links if kind_match(kind,t,u)]
+              # Useful fallbacks based on known official dates if title text extraction is sparse.
+              date_frag = {'annual':'/2026/0427/','prospectus':'/2025/1013/','interim':'/2026/0910/'}[kind]
+              for t,u in links:
+                  if date_frag in u and (t,u) not in cands:
+                      cands.append((t,u))
+              cands.sort(key=lambda x:(language_score(x[0],x[1],lang), len(x[0])), reverse=True)
+              print('CANDIDATES', kind, lang, json.dumps(cands, ensure_ascii=False), flush=True)
+              valid=[]
+              for idx,(title,url) in enumerate(cands,1):
+                  tmp=work/f'{kind}_{lang}_{idx}.pdf'
+                  try:
+                      final_url=fetch_candidate(url,tmp,thresholds[kind]['min_bytes'])
+                      reader=PdfReader(str(tmp), strict=False)
+                      pages=len(reader.pages)
+                      if pages < thresholds[kind]['min_pages']:
+                          raise RuntimeError(f'page count too small: {pages}')
+                      text=sample_text(reader)
+                      identity=any(term.lower() in text.lower() for term in ('JST Group','聚水潭','6687'))
+                      if not identity:
+                          raise RuntimeError('company identity not found in sampled text')
+                      q=subprocess.run(['qpdf','--check',str(tmp)],capture_output=True,text=True)
+                      if q.returncode not in (0,3):
+                          raise RuntimeError('qpdf failed: '+q.stderr[-1000:])
+                      valid.append({
+                          'title_on_index':title,'source_url':final_url,'candidate_url':url,
+                          'path':tmp,'pages':pages,'bytes':tmp.stat().st_size,
+                          'lang_score':language_score(title,url,lang),
+                      })
+                  except Exception as exc:
+                      print('CANDIDATE_FAIL', kind, lang, title, url, repr(exc), flush=True)
+                      tmp.unlink(missing_ok=True)
+              if not valid:
+                  raise RuntimeError(f'no valid document found for {kind} {lang}')
+              # Prefer correct language, then most pages/bytes. This also separates the large prospectus from formal notice.
+              valid.sort(key=lambda r:(r['lang_score'],r['pages'],r['bytes']),reverse=True)
+              chosen=valid[0]
+              for other in valid[1:]:
+                  other['path'].unlink(missing_ok=True)
+              print('CHOSEN', kind, lang, json.dumps({k:str(v) if k=='path' else v for k,v in chosen.items()},ensure_ascii=False),flush=True)
+              return chosen
+
+          specs=[
+              ('annual','CN','01_聚水潭_06687_2025年年度报告_中文版.pdf','聚水潭2025年年度报告（中文版）','2026-04-27'),
+              ('annual','EN','02_JST_Group_06687_2025_Annual_Report_English.pdf','JST Group 2025 Annual Report (English)','2026-04-27'),
+              ('prospectus','CN','03_聚水潭_06687_招股章程_中文版_2025-10-13.pdf','聚水潭招股章程（中文版）','2025-10-13'),
+              ('prospectus','EN','04_JST_Group_06687_Prospectus_English_2025-10-13.pdf','JST Group Prospectus (English)','2025-10-13'),
+              ('interim','CN','05_聚水潭_06687_2026年中期报告_中文版.pdf','聚水潭2026年中期报告（中文版）','2026-09-10'),
+              ('interim','EN','06_JST_Group_06687_2026_Interim_Report_English.pdf','JST Group 2026 Interim Report (English)','2026-09-10'),
+          ]
+
+          records=[]; seen_hashes=set()
+          for kind,lang,filename,title,disclosure_date in specs:
+              chosen=choose_document(kind,lang)
+              dest=out/filename
+              chosen['path'].replace(dest)
+              data=dest.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+              if sha in seen_hashes:
+                  raise RuntimeError('duplicate PDF detected: '+filename)
+              seen_hashes.add(sha)
+              preview=previews/(dest.stem+'_首页.png')
+              pp=subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','110',str(dest),str(preview.with_suffix(''))],capture_output=True,text=True)
+              if pp.returncode != 0 or not preview.exists():
+                  raise RuntimeError('preview render failed for '+filename+': '+pp.stderr[-1000:])
+              records.append({
+                  'filename':filename,'title':title,'kind':kind,'language':lang,
+                  'disclosure_date':disclosure_date,'source':'香港交易所披露易',
+                  'source_url':chosen['source_url'],'index_title':chosen['title_on_index'],
+                  'pages':chosen['pages'],'bytes':len(data),'sha256':sha,
+                  'preview':str(preview.relative_to(out)),
+              })
+
+          readme=[
+              '聚水潭集团股份有限公司（06687.HK）港股官方披露文件',
+              '整理日期：2026-09-22','',
+              '收录范围：上市后全部完整年度报告、最终招股章程，以及截至整理日最新完整阶段性财务报告。',
+              '聚水潭于2025-10-21在香港联交所主板上市，因此截至整理日，上市后完整年度报告只有2025年年度报告。',
+              '香港主板公司通常不按A股口径强制发布第一、第三季度报告；截至整理日，最新完整阶段性财务报告为2026年中期报告（截至2026-06-30止六个月）。',
+              '为便于检索与交叉核对，本包同时收录中文及英文官方原件。','',
+              '文件清单：'
+          ]
+          for i,r in enumerate(records,1):
+              readme.extend([
+                  f"{i}. {r['title']}",
+                  f"   文件：{r['filename']}",
+                  f"   披露日期：{r['disclosure_date']}；页数：{r['pages']}；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   港交所来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",'',
+              ])
+          readme.append('完整性核验：PDF文件头、公司身份、实际页数、qpdf结构检查、首页渲染、ZIP CRC及SHA-256。')
+          (out/'00_文件清单与核验说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          zip_path=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as zf:
+              for p in sorted(out.rglob('*')):
+                  if p.is_file():
+                      zf.write(p,arcname=f'{PACKAGE}/{p.relative_to(out)}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad=zf.testzip()
+              if bad: raise RuntimeError('ZIP CRC failure: '+bad)
+              pdfs=[n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs)!=6: raise RuntimeError(f'PDF count mismatch: {len(pdfs)}')
+          zip_sha=hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'PDF_COUNT',len(pdfs),'SHA256',zip_sha,flush=True)
+          print('FINAL_MANIFEST',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jst-group-06687-filings-final
+          path: 聚水潭_06687_全部年报_招股说明书及最新中期报告.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
