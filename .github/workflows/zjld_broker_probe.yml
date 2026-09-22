@@ -1,0 +1,133 @@
+name: ZJLD Broker Report Probe
+
+on:
+  push:
+    branches:
+      - chatgpt-zjld-broker-20260922
+    paths:
+      - .github/workflows/zjld_broker_probe.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+
+      - name: Inspect report pages and public assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > /tmp/zjld_probe.py <<'PY'
+          import hashlib, json, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT=Path('out')
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+          pages={
+            'sgp_citic_112813':'https://www.sgpjbg.com/baogao/112813.html',
+            'sgp_fangzheng_1275610':'https://www.sgpjbg.com/bgdown/1275610.html',
+            'sgp_label':'https://www.sgpjbg.com/labels/yidukejiesgbaogao.html',
+            'fh_tianfeng_1471805':'https://www.fhyanbao.com/rpview/1471805',
+            'max_huachuang':'https://max.book118.com/html/2023/0720/8101062076005112.shtm',
+            'max_zheshang':'https://max.book118.com/html/2025/0627/8134130125007103.shtm',
+            'fx_xingzheng_3892918':'https://www.fxbaogao.com/detail/3892918',
+            'sdy_fangzheng_933412':'https://www.sdyanbao.com/detail/933412',
+            'sina_fangzheng':'https://finance.sina.com.cn/stock/stockzmt/2023-08-19/doc-imzhtzvx4541365.shtml',
+            'sohu_dongwu':'https://www.sohu.com/a/843240162_121123903',
+          }
+          records=[]
+          found_urls=[]
+          def fetch(url, name, referer=None):
+              try:
+                  h={'Referer':referer} if referer else {}
+                  r=s.get(url,timeout=45,allow_redirects=True,headers=h)
+                  rec={'name':name,'url':url,'final':r.url,'status':r.status_code,'bytes':len(r.content),'ct':r.headers.get('content-type',''),'head':repr(r.content[:32]),'sha256':hashlib.sha256(r.content).hexdigest()}
+                  records.append(rec); print('FETCH',json.dumps(rec,ensure_ascii=False))
+                  return r
+              except Exception as e:
+                  rec={'name':name,'url':url,'error':repr(e)}; records.append(rec); print('ERROR',json.dumps(rec,ensure_ascii=False)); return None
+          for name,url in pages.items():
+              r=fetch(url,name)
+              if not r: continue
+              ext='.html' if ('html' in r.headers.get('content-type','').lower() or r.content.lstrip().startswith(b'<')) else '.bin'
+              (OUT/(name+ext)).write_bytes(r.content)
+              if ext!='.html': continue
+              text=r.text
+              soup=BeautifulSoup(text,'lxml')
+              info={'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'urls':[], 'forms':[], 'contexts':[]}
+              for form in soup.find_all('form'):
+                  info['forms'].append({'action':urljoin(r.url,form.get('action','')),'method':form.get('method'),'inputs':[{'name':x.get('name'),'id':x.get('id'),'type':x.get('type'),'value':(x.get('value') or '')[:300]} for x in form.find_all('input')]})
+              candidates=[]
+              for tag in soup.find_all(True):
+                  for attr in ('href','src','data-src','data-url','data-file','data-download','content','value'):
+                      v=tag.get(attr)
+                      if isinstance(v,str) and v.strip():
+                          u=urljoin(r.url,v.strip())
+                          if any(k in (u+' '+tag.get_text(' ',strip=True)).lower() for k in ['.pdf','download','down','file','preview','report','baogao','attachment','oss','112813','1275610','1471805','3892918','933412','8101062076005112','8134130125007103']):
+                              candidates.append({'tag':tag.name,'attr':attr,'url':u,'text':tag.get_text(' ',strip=True)[:200]})
+              # regex URLs and quoted paths
+              pats=[r'https?://[^\"\'<>\s]+', r'[\"\']([^\"\']+\.pdf(?:\?[^\"\']*)?)[\"\']', r'[\"\']([^\"\']*(?:download|preview|attachment|report)[^\"\']*)[\"\']']
+              for pat in pats:
+                  try:
+                      for m in re.finditer(pat,text,re.I):
+                          v=m.group(1) if m.lastindex else m.group(0)
+                          if len(v)<2000:
+                              candidates.append({'tag':'regex','attr':'','url':urljoin(r.url,v),'text':''})
+                  except Exception as e:
+                      print('REGEX_ERR',name,pat,repr(e))
+              # dedupe and filter useful
+              ded=[]; seen=set()
+              for c in candidates:
+                  u=c['url']
+                  if u in seen: continue
+                  seen.add(u)
+                  if any(k in u.lower() for k in ['.pdf','download','down','file','preview','report','baogao','attachment','oss','112813','1275610','1471805','3892918','933412','8101062076005112','8134130125007103']):
+                      ded.append(c); found_urls.append({'source':name,**c})
+              info['urls']=ded[:1000]
+              for pat in ['pdf','download','fileurl','downurl','preview','report-image','oss','112813','1275610','1471805','3892918','933412']:
+                  for m in list(re.finditer(pat,text,re.I))[:40]:
+                      info['contexts'].append({'pat':pat,'ctx':text[max(0,m.start()-500):m.end()+1000]})
+              (OUT/(name+'_parsed.json')).write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('PARSED',name,'urls',len(ded),'forms',len(info['forms']))
+
+          # Probe discovered likely PDF / download endpoints without authentication.
+          checked=[]
+          for i,item in enumerate(found_urls):
+              u=item['url']
+              if i>800: break
+              if not ('.pdf' in u.lower() or any(x in u.lower() for x in ['/download','/down','download?','down?','file/','attachment'])):
+                  continue
+              if any(x in u.lower() for x in ['javascript:','mailto:']): continue
+              r=fetch(u,f'candidate_{len(checked):03d}',referer=pages.get(item['source']))
+              if not r: continue
+              checked.append({'source':item['source'],'url':u,'final':r.url,'status':r.status_code,'bytes':len(r.content),'ct':r.headers.get('content-type',''),'head':repr(r.content[:16]),'is_pdf':r.content.startswith(b'%PDF-')})
+              if r.content.startswith(b'%PDF-') and len(r.content)>50000:
+                  (OUT/f'candidate_{len(checked):03d}.pdf').write_bytes(r.content)
+          (OUT/'records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'found_urls.json').write_text(json.dumps(found_urls,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'checked.json').write_text(json.dumps(checked,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('DONE found_urls',len(found_urls),'checked',len(checked))
+          PY
+          python /tmp/zjld_probe.py
+          find out -maxdepth 1 -type f -printf '%f %s\n' | sort
+
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zjld-broker-probe
+          path: out
+          retention-days: 1
