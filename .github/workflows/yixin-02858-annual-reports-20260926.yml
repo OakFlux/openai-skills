@@ -1,0 +1,357 @@
+name: Build Yixin Group 2020-2025 annual reports package 20260926
+
+on:
+  push:
+    paths:
+      - '.github/workflows/yixin-02858-annual-reports-20260926.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF and parsing tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils fonts-noto-cjk
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Query HKEX, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '易鑫集团_02858_2020-2025年报及最新阶段性财务报告'
+          ROOT = Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREVIEW = ROOT / '首页预览'
+          PREVIEW.mkdir(exist_ok=True)
+
+          ENDPOINT = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          HKEX_BASE = 'https://www1.hkexnews.hk/'
+          STOCK_ID = '166831'
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=166831',
+          })
+
+          def hkex_query(lang: str) -> list[dict[str, Any]]:
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': '20200101',
+                  'toDate': '20260926',
+                  'title': '',
+                  'searchType': '1',
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'rowRange': '2000',
+                  'lang': lang,
+              }
+              headers = {'Accept': 'application/json,text/plain,*/*'}
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = session.get(ENDPOINT, params=params, headers=headers, timeout=(30, 120))
+                      last = (r.status_code, r.url, r.text[:300])
+                      r.raise_for_status()
+                      outer = r.json()
+                      data = outer.get('result', outer)
+                      if isinstance(data, str):
+                          data = json.loads(data)
+
+                      records: list[dict[str, Any]] = []
+                      def walk(x: Any) -> None:
+                          if isinstance(x, dict):
+                              if any(k in x for k in ('FILE_LINK', 'fileLink', 'FILE_PATH')) and any(k in x for k in ('TITLE', 'title')):
+                                  records.append(x)
+                              for v in x.values():
+                                  walk(v)
+                          elif isinstance(x, list):
+                              for v in x:
+                                  walk(v)
+                      walk(data)
+                      if records:
+                          for rec in records:
+                              rec['_query_lang'] = lang
+                          return records
+                  except Exception as exc:
+                      last = repr(exc)
+                  time.sleep(2 + attempt)
+              raise RuntimeError(f'HKEX query failed for lang={lang}: {last}')
+
+          records = hkex_query('zh') + hkex_query('EN')
+
+          def get_field(rec: dict[str, Any], *names: str) -> str:
+              for name in names:
+                  v = rec.get(name)
+                  if v is not None:
+                      return str(v)
+              return ''
+
+          normalized = []
+          seen = set()
+          for rec in records:
+              title = get_field(rec, 'TITLE', 'title').strip()
+              link = get_field(rec, 'FILE_LINK', 'fileLink', 'FILE_PATH').strip()
+              if not link:
+                  continue
+              if link.startswith('//'):
+                  link = 'https:' + link
+              elif link.startswith('/'):
+                  link = urljoin(HKEX_BASE, link)
+              elif not link.startswith('http'):
+                  link = urljoin(HKEX_BASE, link)
+              key = (title, link)
+              if key in seen:
+                  continue
+              seen.add(key)
+              normalized.append({
+                  'title': title,
+                  'link': link,
+                  'date_time': get_field(rec, 'DATE_TIME', 'dateTime', 'DATE', 'releaseDate'),
+                  'stock_code': get_field(rec, 'STOCK_CODE', 'stockCode'),
+                  'stock_name': get_field(rec, 'STOCK_NAME', 'stockName'),
+                  'file_info': get_field(rec, 'FILE_INFO', 'fileInfo'),
+                  'lang': rec.get('_query_lang', ''),
+                  'raw': rec,
+              })
+
+          (ROOT / 'hkex_query_records.json').write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          chinese_digits = {'0':'零','1':'一','2':'二','3':'三','4':'四','5':'五','6':'六','7':'七','8':'八','9':'九'}
+          def year_cn(year: int) -> str:
+              return ''.join(chinese_digits[d] for d in str(year))
+
+          def annual_score(rec: dict[str, Any], year: int) -> int:
+              t = rec['title'].lower()
+              if not any(k in t for k in ('annual report', '年報', '年报', '年度報告', '年度报告')):
+                  return -10_000
+              if any(k in t for k in ('results', '業績', '业绩', 'notice', '通告', 'esg', 'environmental', 'sustainability', '環境', '环境')):
+                  return -10_000
+              if str(year) not in t and year_cn(year) not in rec['title']:
+                  return -10_000
+              score = 0
+              if rec['lang'] == 'zh': score += 100
+              if t in (f'{year} annual report'.lower(), f'{year}年報'.lower(), f'{year}年报'.lower(), f'{year_cn(year)}年年報'.lower(), f'{year_cn(year)}年年报'.lower()): score += 40
+              if rec['link'].lower().endswith('.pdf'): score += 10
+              score -= len(rec['title']) // 20
+              return score
+
+          selected: list[dict[str, Any]] = []
+          for y in range(2020, 2026):
+              candidates = [(annual_score(r, y), r) for r in normalized]
+              candidates = [x for x in candidates if x[0] > -1000]
+              if not candidates:
+                  raise RuntimeError(f'No annual report found for {y}. Matching titles: {[r["title"] for r in normalized if str(y) in r["title"] or year_cn(y) in r["title"]][:30]}')
+              candidates.sort(key=lambda x: x[0], reverse=True)
+              rec = dict(candidates[0][1])
+              rec['document_kind'] = 'annual_report'
+              rec['reporting_period'] = str(y)
+              rec['display_name'] = f'{y}年年度报告'
+              selected.append(rec)
+
+          def interim_score(rec: dict[str, Any]) -> int:
+              t = rec['title'].lower()
+              if not any(k in t for k in ('interim report', '中期報告', '中期报告')):
+                  return -10_000
+              if any(k in t for k in ('results', '業績', '业绩', 'notice', '通告')):
+                  return -10_000
+              if '2026' not in t and year_cn(2026) not in rec['title']:
+                  return -10_000
+              score = 100 if rec['lang'] == 'zh' else 0
+              if rec['link'].lower().endswith('.pdf'): score += 10
+              return score
+
+          interim_candidates = [(interim_score(r), r) for r in normalized]
+          interim_candidates = [x for x in interim_candidates if x[0] > -1000]
+          if interim_candidates:
+              interim_candidates.sort(key=lambda x: x[0], reverse=True)
+              rec = dict(interim_candidates[0][1])
+              rec['document_kind'] = 'interim_report'
+              rec['reporting_period'] = '截至2026年6月30日止六个月'
+              rec['display_name'] = '2026年中期报告'
+              selected.append(rec)
+          else:
+              # Fallback to preliminary interim results if the full report was not yet filed.
+              def interim_results_score(rec: dict[str, Any]) -> int:
+                  t = rec['title'].lower()
+                  if not any(k in t for k in ('interim results', '中期業績', '中期业绩')):
+                      return -10_000
+                  if '2026' not in t and 'june 30, 2026' not in t and '2026年6月30日' not in rec['title']:
+                      return -10_000
+                  return 100 if rec['lang'] == 'zh' else 0
+              cands = [(interim_results_score(r), r) for r in normalized]
+              cands = [x for x in cands if x[0] > -1000]
+              if not cands:
+                  raise RuntimeError('Neither 2026 interim report nor preliminary interim results were found')
+              cands.sort(key=lambda x: x[0], reverse=True)
+              rec = dict(cands[0][1])
+              rec['document_kind'] = 'interim_results'
+              rec['reporting_period'] = '截至2026年6月30日止六个月'
+              rec['display_name'] = '2026年中期业绩公告'
+              selected.append(rec)
+
+          # Include the latest true quarterly disclosure as a supplement, because HK issuers often use business updates rather than full quarterly reports.
+          def q1_score(rec: dict[str, Any]) -> int:
+              t = rec['title'].lower()
+              if not any(k in t for k in ('first quarter', '第一季度', '一季度')):
+                  return -10_000
+              if '2026' not in t and year_cn(2026) not in rec['title']:
+                  return -10_000
+              if not any(k in t for k in ('business update', '業務更新', '业务更新')):
+                  return -10_000
+              return 100 if rec['lang'] == 'zh' else 0
+          q1_candidates = [(q1_score(r), r) for r in normalized]
+          q1_candidates = [x for x in q1_candidates if x[0] > -1000]
+          if q1_candidates:
+              q1_candidates.sort(key=lambda x: x[0], reverse=True)
+              rec = dict(q1_candidates[0][1])
+              rec['document_kind'] = 'quarterly_business_update'
+              rec['reporting_period'] = '2026年第一季度'
+              rec['display_name'] = '2026年第一季度未经审核业务更新'
+              selected.append(rec)
+
+          # Deduplicate links while preserving order.
+          deduped = []
+          used_links = set()
+          for r in selected:
+              if r['link'] in used_links:
+                  continue
+              used_links.add(r['link'])
+              deduped.append(r)
+          selected = deduped
+
+          def fetch_pdf(url: str) -> tuple[bytes, dict[str, Any]]:
+              last: Any = None
+              for attempt in range(6):
+                  try:
+                      r = session.get(url, timeout=(30, 240), allow_redirects=True, headers={'Accept':'application/pdf,*/*;q=0.8'})
+                      last = {'status': r.status_code, 'final_url': r.url, 'content_type': r.headers.get('content-type',''), 'bytes': len(r.content)}
+                      if r.status_code == 200 and r.content[:5] == b'%PDF-' and len(r.content) > 20_000:
+                          return r.content, last
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(2 + attempt)
+              raise RuntimeError(f'Failed to download {url}: {last}')
+
+          manifest = []
+          for idx, rec in enumerate(selected, 1):
+              data, download_meta = fetch_pdf(rec['link'])
+              safe_title = re.sub(r'[\\/:*?"<>|]+', '_', rec['display_name'])
+              filename = f'{idx:02d}_{safe_title}_港交所官方原件.pdf'
+              dest = ROOT / filename
+              dest.write_bytes(data)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              sample_text = ''
+              for p in reader.pages[:min(12, pages)]:
+                  try:
+                      sample_text += '\n' + (p.extract_text() or '')
+                  except Exception:
+                      pass
+              identity_ok = any(k.lower() in sample_text.lower() for k in ('yixin', '易鑫', '02858', '2858'))
+              # Some image-heavy covers may have little text; qpdf and page count remain hard checks.
+              subprocess.run(['qpdf', '--check', str(dest)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview_prefix = PREVIEW / dest.stem
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(dest),str(preview_prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview_file = Path(str(preview_prefix)+'.png')
+              if not preview_file.exists() or preview_file.stat().st_size < 5_000:
+                  raise RuntimeError(f'Preview render failed: {dest.name}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  'file': filename,
+                  'title': rec['title'],
+                  'display_name': rec['display_name'],
+                  'document_kind': rec['document_kind'],
+                  'reporting_period': rec['reporting_period'],
+                  'release_time': rec['date_time'],
+                  'official_url': rec['link'],
+                  'query_language': rec['lang'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'identity_text_check': identity_ok,
+                  'download': download_meta,
+                  'preview_file': str(Path('首页预览') / preview_file.name),
+                  'validation': ['PDF header', 'page count', 'qpdf structure', 'first-page render', 'company/ticker text sample when extractable'],
+              })
+
+          readme = [
+              '易鑫集团有限公司（02858.HK）2020—2025年年度报告及最新阶段性财务报告',
+              '整理日期：2026-09-26',
+              '',
+              '收录范围：',
+              '1. 2020—2025年度报告，各年度一份，均为港交所官方PDF原件。',
+              '2. 最新完整阶段性财务报告：优先收录2026年中期报告；若尚未发布，则收录2026年中期业绩公告。',
+              '3. 补充收录2026年第一季度未经审核业务更新（如港交所存在该文件），用于对应通常所说的“最新季报”。',
+              '',
+              '文件清单：',
+          ]
+          for i, m in enumerate(manifest, 1):
+              readme += [
+                  f'{i}. {m["display_name"]}',
+                  f'   港交所标题：{m["title"]}',
+                  f'   披露时间：{m["release_time"]}',
+                  f'   页数：{m["pages"]}页；文件大小：{m["bytes"]}字节',
+                  f'   官方来源：{m["official_url"]}',
+                  f'   SHA-256：{m["sha256"]}',
+                  '',
+              ]
+          readme += [
+              '说明：香港上市公司通常以中期报告及自愿业务更新代替A股口径的一季报、三季报。本资料包同时保留最新中期报告和最近一期真正的季度业务更新，以避免口径歧义。',
+              '校验：PDF文件头、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{m["sha256"]}  {m["file"]}\n' for m in manifest), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, arcname=f'{PACKAGE}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_count = len([n for n in zf.namelist() if n.lower().endswith('.pdf')])
+              if pdf_count < 7:
+                  raise RuntimeError(f'Expected at least 7 PDFs, got {pdf_count}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('SELECTED_RECORDS', json.dumps(selected, ensure_ascii=False, indent=2))
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'SHA256', zip_sha)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: yixin-02858-2020-2025-annual-reports-final
+          path: 易鑫集团_02858_2020-2025年报及最新阶段性财务报告.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
