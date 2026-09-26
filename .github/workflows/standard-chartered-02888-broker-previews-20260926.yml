@@ -1,0 +1,323 @@
+name: Build Standard Chartered broker deep report preview package 20260926
+
+on:
+  push:
+    paths:
+      - '.github/workflows/standard-chartered-02888-broker-previews-20260926.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf
+
+      - name: Search public report index, download previews and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '渣打集团_02888_券商深度报告_公开预览版_3份'
+          root = Path(PACKAGE)
+          root.mkdir(exist_ok=True)
+          previews = root / '首页预览'
+          previews.mkdir(exist_ok=True)
+          work = Path('_work_sc')
+          work.mkdir(exist_ok=True)
+
+          targets = [
+              {
+                  'broker': '华泰证券',
+                  'title': '渣打集团（2888.HK）：网络根基厚，财富动能强',
+                  'date': '2025-05-12',
+                  'rating': '增持（维持）',
+                  'target_price': '137.46港元',
+                  'analysts': '沈娟、贺雅亭、蒲葭依、李润凌',
+                  'expected_total_pages': 28,
+                  'searches': ['渣打集团 网络根基厚 财富动能强', '网络根基厚 财富动能强', '渣打集团'],
+                  'required_terms': ['渣打', '网络根基厚', '财富动能强'],
+                  'filename': '01_华泰证券_渣打集团_网络根基厚财富动能强_公开预览版_2025-05-12.pdf',
+              },
+              {
+                  'broker': '中信建投',
+                  'title': '渣打集团（02888.HK）：聚焦跨境大客户，交易银行+金融市场双轮驱动',
+                  'date': '2025-06-03',
+                  'rating': '买入',
+                  'target_price': '169港元',
+                  'analysts': '以报告原页为准',
+                  'expected_total_pages': None,
+                  'searches': ['渣打集团 聚焦跨境大客户 交易银行 金融市场 双轮驱动', '聚焦跨境大客户 交易银行 金融市场', '渣打集团'],
+                  'required_terms': ['渣打', '聚焦跨境大客户', '交易银行', '金融市场'],
+                  'filename': '02_中信建投_渣打集团_聚焦跨境大客户交易银行金融市场双轮驱动_公开预览版_2025-06-03.pdf',
+              },
+              {
+                  'broker': '申万宏源',
+                  'title': '渣打集团（02888.HK）：盈利回升路径清晰，股东回报继续领军',
+                  'date': '2025-12-30',
+                  'rating': '以报告原页为准',
+                  'target_price': '以报告原页为准',
+                  'analysts': '以报告原页为准',
+                  'expected_total_pages': 26,
+                  'searches': ['渣打集团 盈利回升路径清晰 股东回报继续领军', '盈利回升路径清晰 股东回报继续领军', '渣打集团'],
+                  'required_terms': ['渣打', '盈利回升路径清晰', '股东回报继续领军'],
+                  'filename': '03_申万宏源_渣打集团_盈利回升路径清晰股东回报继续领军_公开预览版_2025-12-30.pdf',
+              },
+          ]
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = s.post(url, json=payload, timeout=(20, 90))
+                      last = (r.status_code, r.text[:300])
+                      if r.status_code == 200:
+                          return r.json()
+                  except Exception as exc:
+                      last = repr(exc)
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def collect_records(obj: Any) -> list[dict[str, Any]]:
+              found: list[dict[str, Any]] = []
+              def walk(x: Any) -> None:
+                  if isinstance(x, dict):
+                      if isinstance(x.get('id'), int) and isinstance(x.get('name'), str):
+                          found.append(x)
+                      for v in x.values():
+                          walk(v)
+                  elif isinstance(x, list):
+                      for v in x:
+                          walk(v)
+              walk(obj)
+              unique = {}
+              for r in found:
+                  unique[r['id']] = r
+              return list(unique.values())
+
+          def norm(text: str) -> str:
+              return re.sub(r'[\s（）()：:，,+＋&＆·—\-_/]+', '', text or '').lower()
+
+          search_log: dict[str, Any] = {}
+          broad_records: dict[int, dict[str, Any]] = {}
+
+          def run_search(keyword: str) -> list[dict[str, Any]]:
+              if keyword in search_log:
+                  return collect_records(search_log[keyword])
+              payload = {
+                  'device': 1,
+                  'hideTrader': 0,
+                  'onlyTitle': 1,
+                  'order': 0,
+                  'page': 1,
+                  'pageSize': 100,
+                  'keyword': keyword,
+                  'pageCount': 0,
+                  'dateRange': 0,
+                  'startTime': '',
+                  'endTime': '',
+                  'typeIds': '',
+                  'industryIds': '',
+              }
+              response = post_json('https://api.sdyanbao.com/api/file/search', payload)
+              search_log[keyword] = response
+              recs = collect_records(response)
+              for r in recs:
+                  broad_records[r['id']] = r
+              return recs
+
+          # Warm broad search once.
+          run_search('渣打集团')
+
+          selected: list[tuple[dict[str, Any], dict[str, Any]]] = []
+          used_ids: set[int] = set()
+          for target in targets:
+              candidates: dict[int, dict[str, Any]] = dict(broad_records)
+              for q in target['searches']:
+                  for r in run_search(q):
+                      candidates[r['id']] = r
+              scored = []
+              for r in candidates.values():
+                  n = norm(r.get('name', ''))
+                  score = 0
+                  for term in target['required_terms']:
+                      if norm(term) in n:
+                          score += 10
+                  if norm(target['broker']) in n:
+                      score += 5
+                  if target['date'].replace('-', '') in re.sub(r'\D', '', str(r)):
+                      score += 1
+                  scored.append((score, r))
+              scored.sort(key=lambda x: (x[0], x[1].get('id', 0)), reverse=True)
+              chosen = None
+              minimum = 10 * max(2, len(target['required_terms']) - 1)
+              for score, r in scored:
+                  if score >= minimum and r['id'] not in used_ids:
+                      chosen = r
+                      break
+              if not chosen:
+                  print('TARGET_NOT_FOUND', target['title'])
+                  continue
+              detail = post_json('https://api.sdyanbao.com/api/file/detail', {'id': chosen['id']})
+              data = detail.get('data') if isinstance(detail, dict) else None
+              if not isinstance(data, dict) or not data.get('page_url') or not data.get('page_count'):
+                  print('DETAIL_INVALID', target['title'], detail)
+                  continue
+              used_ids.add(chosen['id'])
+              selected.append((target, data))
+
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} matching deep reports were found; need at least 2')
+
+          def fetch_image(url: str) -> bytes:
+              last = None
+              headers = {'Referer': 'https://www.sdyanbao.com/', 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'}
+              for attempt in range(6):
+                  try:
+                      r = s.get(url, headers=headers, timeout=(20, 90), allow_redirects=True)
+                      last = (r.status_code, len(r.content), r.headers.get('content-type'))
+                      if r.status_code == 200 and len(r.content) > 15000:
+                          with Image.open(BytesIO(r.content)) as im:
+                              im.verify()
+                          return r.content
+                  except Exception as exc:
+                      last = repr(exc)
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'image failed {url}: {last}')
+
+          manifest = []
+          for idx, (target, data) in enumerate(selected, 1):
+              total_pages = int(data['page_count'])
+              preview_pages = min(10, total_pages)
+              page_url = str(data['page_url']).rstrip('/')
+              wdir = work / f'r{idx}'
+              wdir.mkdir(exist_ok=True)
+              page_files = []
+              for pno in range(preview_pages):
+                  raw = fetch_image(f'{page_url}/{pno}.png')
+                  src = wdir / f'{pno:02d}_src.png'
+                  src.write_bytes(raw)
+                  with Image.open(src) as im:
+                      rgba = im.convert('RGBA')
+                      canvas = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+                      canvas.alpha_composite(rgba)
+                      rgb = canvas.convert('RGB')
+                      out_img = wdir / f'{pno:02d}.jpg'
+                      rgb.save(out_img, 'JPEG', quality=95, subsampling=0)
+                      page_files.append(out_img)
+
+              pdf_path = root / target['filename']
+              opened = [Image.open(p).convert('RGB') for p in page_files]
+              try:
+                  opened[0].save(pdf_path, save_all=True, append_images=opened[1:], resolution=150.0, quality=95)
+              finally:
+                  for im in opened:
+                      im.close()
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != preview_pages:
+                  raise RuntimeError(f'PDF page mismatch {pdf_path.name}: {actual_pages} vs {preview_pages}')
+              subprocess.run(['qpdf', '--check', str(pdf_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = previews / pdf_path.stem
+              subprocess.run(['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '120', '-singlefile', str(pdf_path), str(prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview_file = Path(str(prefix) + '.png')
+              if not preview_file.exists() or preview_file.stat().st_size < 20000:
+                  raise RuntimeError(f'Preview render failed: {pdf_path.name}')
+              sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+              source_id = int(data['id'])
+              rec = {
+                  **target,
+                  'source_report_id': source_id,
+                  'source_name': data.get('name'),
+                  'source_page': f'https://www.sdyanbao.com/detail/{source_id}',
+                  'page_image_base': page_url,
+                  'original_total_pages': total_pages,
+                  'public_preview_pages': preview_pages,
+                  'pdf_file': pdf_path.name,
+                  'actual_pdf_pages': actual_pages,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha,
+                  'preview_file': str(Path('首页预览') / preview_file.name),
+                  'validation': ['all public preview images downloaded', 'image integrity', 'white background compositing', 'PDF page count', 'qpdf structure', 'first-page render'],
+              }
+              manifest.append(rec)
+
+          readme = [
+              '渣打集团（02888.HK）券商深度报告公开预览资料包',
+              '整理日期：2026-09-26',
+              '',
+              f'本包收录{len(manifest)}份公司深度/首次覆盖类券商报告的公开预览原页。',
+              '完整原始PDF需要相关研报平台账户或下载权限，本包未绕过任何登录、会员或付费访问控制。',
+              '每份PDF均明确标注为“公开预览版”，不能视为完整券商原始PDF。',
+              '',
+          ]
+          for i, r in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   日期：{r['date']}；评级：{r['rating']}；目标价：{r['target_price']}",
+                  f"   分析师：{r['analysts']}",
+                  f"   原报告：{r['original_total_pages']}页；本PDF：公开预览前{r['public_preview_pages']}页",
+                  f"   来源页面：{r['source_page']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ]
+          readme += [
+              '报告内容及版权归原券商与作者所有，仅供研究参考，不构成投资建议。',
+              '核验项目：预览图片完整性、透明背景白底校正、PDF页数、PDF结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (root / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'search_api_results.json').write_text(json.dumps(search_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['pdf_file']}\n" for r in manifest), encoding='utf-8')
+
+          zpath = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{PACKAGE}/{p.relative_to(root)}')
+          with zipfile.ZipFile(zpath) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_count = len([n for n in z.namelist() if n.lower().endswith('.pdf')])
+              if pdf_count != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(manifest)}')
+          print('FINAL_ZIP', zpath, zpath.stat().st_size, hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: standard-chartered-02888-broker-deep-reports-public-previews
+          path: 渣打集团_02888_券商深度报告_公开预览版_3份.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
