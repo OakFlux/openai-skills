@@ -1,0 +1,358 @@
+name: Unisound Official Filings Package
+
+on:
+  push:
+    branches:
+      - chatgpt-unisound-filings-20260927
+    paths:
+      - .github/workflows/unisound_filings_20260927.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+
+      - name: Download, validate, and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/verification
+          cat > /tmp/build_unisound.py <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          VERIFY = OUT / 'verification'
+          SESSION = requests.Session()
+          SESSION.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def fetch(url, *, headers=None, timeout=120):
+              last = None
+              merged = dict(SESSION.headers)
+              if headers:
+                  merged.update(headers)
+              for attempt in range(5):
+                  try:
+                      r = SESSION.get(url, headers=merged, timeout=timeout, allow_redirects=True)
+                      print('FETCH', r.status_code, len(r.content), r.url)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}: {url}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(12, 2 ** attempt))
+              raise RuntimeError(f'Failed to fetch {url}: {last}')
+
+          def normalize_pdf_candidate(url):
+              if not url:
+                  return None
+              url = url.strip()
+              if url.lower().endswith('.pdf.jpg') or url.lower().endswith('.pdf.jpeg') or url.lower().endswith('.pdf.png'):
+                  url = url.rsplit('.', 1)[0]
+              return url
+
+          def collect_pdf_candidates(page_url, keyword=None):
+              r = fetch(page_url, timeout=60)
+              soup = BeautifulSoup(r.text, 'html.parser')
+              candidates = []
+              for tag in soup.find_all(True):
+                  text = ' '.join(tag.get_text(' ', strip=True).split())
+                  if keyword and keyword.lower() not in (text + ' ' + str(tag)).lower():
+                      pass
+                  for attr in ('href', 'src', 'data-src', 'data-original', 'data-url', 'data-file'):
+                      value = tag.get(attr)
+                      if not isinstance(value, str) or not value.strip():
+                          continue
+                      u = normalize_pdf_candidate(urljoin(r.url, value.strip()))
+                      if u and '.pdf' in u.lower():
+                          candidates.append(u)
+              for raw in re.findall(r'https?://[^\"\'<>\s]+\.PDF(?:\.jpg|\.jpeg|\.png)?(?:\?[^\"\'<>\s]*)?', r.text, re.I):
+                  candidates.append(normalize_pdf_candidate(raw))
+              out = []
+              seen = set()
+              for u in candidates:
+                  if u and u not in seen:
+                      out.append(u)
+                      seen.add(u)
+              print('PAGE_CANDIDATES', page_url, json.dumps(out, ensure_ascii=False, indent=2))
+              return out
+
+          def parse_json_response(r):
+              text = r.text.strip()
+              try:
+                  return r.json()
+              except Exception:
+                  left = text.find('(')
+                  right = text.rfind(')')
+                  if left >= 0 and right > left:
+                      return json.loads(text[left + 1:right])
+                  raise
+
+          def collect_row_dicts(obj, out):
+              if isinstance(obj, str):
+                  try:
+                      collect_row_dicts(json.loads(obj), out)
+                  except Exception:
+                      return
+              elif isinstance(obj, list):
+                  for item in obj:
+                      collect_row_dicts(item, out)
+              elif isinstance(obj, dict):
+                  keys = {str(k).upper() for k in obj.keys()}
+                  if 'TITLE' in keys and ('FILE_LINK' in keys or 'FILELINK' in keys):
+                      out.append(obj)
+                  for value in obj.values():
+                      collect_row_dicts(value, out)
+
+          def hkex_rows(from_date, to_date):
+              api = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              all_rows = []
+              for lang in ('en', 'zh'):
+                  params = {
+                      'sortDir': '1',
+                      'sortByOptions': 'DateTime',
+                      'category': '0',
+                      'market': 'SEHK',
+                      'stockId': '1000262960',
+                      'documentType': '-1',
+                      'fromDate': from_date,
+                      'toDate': to_date,
+                      'title': '',
+                      'searchType': '1',
+                      't1code': '-2',
+                      't2Gcode': '-2',
+                      't2code': '-2',
+                      'rowRange': '2000',
+                      'lang': lang,
+                  }
+                  headers = {
+                      'Accept': 'application/json, text/javascript, */*; q=0.01',
+                      'Referer': f'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang={lang.upper()}&market=SEHK&stockId=1000262960',
+                      'X-Requested-With': 'XMLHttpRequest',
+                  }
+                  r = SESSION.get(api, params=params, headers=headers, timeout=90)
+                  print('HKEX_QUERY', lang, r.status_code, len(r.content), r.url)
+                  r.raise_for_status()
+                  obj = parse_json_response(r)
+                  rows = []
+                  collect_row_dicts(obj, rows)
+                  print('HKEX_ROWS', lang, len(rows))
+                  all_rows.extend(rows)
+              dedup = {}
+              for row in all_rows:
+                  link = row.get('FILE_LINK') or row.get('fileLink') or row.get('FILELINK') or row.get('href') or ''
+                  title = row.get('TITLE') or row.get('title') or ''
+                  if link:
+                      dedup[(link, title)] = row
+              return list(dedup.values())
+
+          def row_title(row):
+              return str(row.get('TITLE') or row.get('title') or '')
+
+          def row_link(row):
+              value = row.get('FILE_LINK') or row.get('fileLink') or row.get('FILELINK') or row.get('href') or ''
+              return urljoin('https://www1.hkexnews.hk/', value)
+
+          def choose_hkex_url(rows, include_terms, exclude_terms=()):
+              matches = []
+              for row in rows:
+                  title = row_title(row)
+                  upper = title.upper()
+                  if not any(term.upper() in upper for term in include_terms):
+                      continue
+                  if any(term.upper() in upper for term in exclude_terms):
+                      continue
+                  link = row_link(row)
+                  if '.pdf' not in link.lower():
+                      continue
+                  date = str(row.get('DATE_TIME') or row.get('dateTime') or '')
+                  lang_penalty = 0 if ('_c.pdf' in link.lower() or '中期' in title or '年報' in title or '全球發售' in title) else 1
+                  matches.append((lang_penalty, date, link, title))
+              matches.sort(key=lambda x: (x[0], x[1]))
+              print('HKEX_MATCHES', json.dumps(matches, ensure_ascii=False, indent=2))
+              return matches[0][2] if matches else None
+
+          def validate_and_save(filename, title, category, candidate_urls, min_pages, required_terms):
+              errors = []
+              for url in candidate_urls:
+                  if not url:
+                      continue
+                  try:
+                      r = fetch(url, headers={'Referer': 'https://www.hkexnews.hk/'}, timeout=180)
+                      data = r.content
+                      if not data.startswith(b'%PDF-'):
+                          raise RuntimeError(f'not a PDF, head={data[:32]!r}')
+                      if len(data) < 50000:
+                          raise RuntimeError(f'PDF too small: {len(data)} bytes')
+                      path = OUT / filename
+                      path.write_bytes(data)
+                      reader = PdfReader(str(path))
+                      if reader.is_encrypted:
+                          result = reader.decrypt('')
+                          if not result:
+                              raise RuntimeError('password-protected PDF')
+                      pages = len(reader.pages)
+                      if pages < min_pages:
+                          raise RuntimeError(f'unexpected page count: {pages}')
+                      text_chunks = []
+                      for idx in range(min(3, pages)):
+                          try:
+                              text_chunks.append(reader.pages[idx].extract_text() or '')
+                          except Exception:
+                              pass
+                      text = ' '.join(text_chunks).upper()
+                      if required_terms and not any(term.upper() in text for term in required_terms):
+                          raise RuntimeError(f'identity validation failed; first pages do not contain any of {required_terms}')
+
+                      doc = fitz.open(str(path))
+                      pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                      render_path = VERIFY / (path.stem + '_page1.png')
+                      pix.save(str(render_path))
+                      doc.close()
+
+                      rec = {
+                          'filename': filename,
+                          'title': title,
+                          'category': category,
+                          'source_url': url,
+                          'final_url': r.url,
+                          'pages': pages,
+                          'bytes': len(data),
+                          'sha256': hashlib.sha256(data).hexdigest(),
+                          'first_page_render': render_path.name,
+                      }
+                      print('VALIDATED', json.dumps(rec, ensure_ascii=False))
+                      return path, rec
+                  except Exception as exc:
+                      errors.append({'url': url, 'error': repr(exc)})
+                      print('CANDIDATE_FAILED', url, repr(exc))
+                      try:
+                          (OUT / filename).unlink(missing_ok=True)
+                      except Exception:
+                          pass
+              raise RuntimeError(f'No valid PDF candidate for {category}: {json.dumps(errors, ensure_ascii=False)}')
+
+          # Discover all official HKEX documents for the issuer since listing.
+          rows_all = hkex_rows('20250601', '20260927')
+          (OUT / 'HKEX检索结果.json').write_text(json.dumps(rows_all, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          annual_url = choose_hkex_url(rows_all, ['2025 ANNUAL REPORT', '2025年報', '2025年度報告'], ['RESULTS'])
+          interim_url = choose_hkex_url(rows_all, ['2026 INTERIM REPORT', '2026年中期報告', '中期報告2026'], ['RESULTS', '業績', '业绩'])
+          prospectus_url = choose_hkex_url(rows_all, ['GLOBAL OFFERING', '全球發售'], ['FORMAL NOTICE', '正式通告'])
+
+          listing_candidates = collect_pdf_candidates('https://ir.unisound.com/prospectus/index.html?lang=en')
+          report_candidates = collect_pdf_candidates('https://ir.unisound.com/report/index.html?lang=en')
+          announcement_candidates = collect_pdf_candidates('https://ir.unisound.com/announcement/index.html?lang=en')
+
+          prospectus_candidates = [
+              prospectus_url,
+              *listing_candidates,
+              'https://ir.unisound.com/uploads/ir-docs/iis/9678/uploads/iis/2025/11719671-0.PDF',
+          ]
+          annual_candidates = [
+              annual_url,
+              'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0429/2026042906218.pdf',
+              *report_candidates,
+              'https://ir.unisound.com/uploads/ir-docs/iis/9678/uploads/iis/2026/12137283-0.PDF',
+          ]
+          interim_candidates = [
+              interim_url,
+              *announcement_candidates,
+              *report_candidates,
+          ]
+
+          docs = []
+          docs.append(validate_and_save(
+              '01_云知声_2025年年度报告.pdf',
+              '云知声智能科技股份有限公司 - 2025年年度报告',
+              '年度报告',
+              annual_candidates,
+              min_pages=80,
+              required_terms=['UNISOUND', '雲知聲', '云知声'],
+          ))
+          docs.append(validate_and_save(
+              '02_云知声_最终版招股说明书_2025-06-20.pdf',
+              '云知声智能科技股份有限公司 - 全球发售（最终版招股说明书）',
+              '招股说明书',
+              prospectus_candidates,
+              min_pages=300,
+              required_terms=['UNISOUND', '雲知聲', '云知声'],
+          ))
+          docs.append(validate_and_save(
+              '03_云知声_2026年中期报告_最新定期财报.pdf',
+              '云知声智能科技股份有限公司 - 2026年中期报告',
+              '最新定期财报',
+              interim_candidates,
+              min_pages=30,
+              required_terms=['UNISOUND', '雲知聲', '云知声'],
+          ))
+
+          manifest = [rec for _, rec in docs]
+          note = '''云知声智能科技股份有限公司（09678.HK）官方披露文件资料包
+
+文件范围：
+1. 2025年年度报告。公司于2025年6月30日在香港联交所主板上市；截至2026年9月27日，上市后正式年度报告仅此一份。
+2. 2025年6月20日最终版招股说明书（全球发售）。未重复收录申请版本或聆讯后资料集。
+3. 2026年中期报告，为截至2026年9月27日最新正式定期财务报告。
+
+说明：
+- 香港主板发行人通常披露年度报告和中期报告，并不强制发布季度报告，因此以2026年中期报告对应“最新季报/最新定期财报”。
+- 文件从香港交易所披露易或云知声官方投资者关系网站下载，来源URL、实际页数、文件大小和SHA-256校验值均记录在清单中。
+- PDF已完成文件头、页数、加密状态、公司名称及首页渲染检查。
+- 仅供个人研究与学习使用，请遵守原始文件的版权及免责声明。
+'''
+          (OUT / '资料说明.txt').write_text(note, encoding='utf-8')
+          (OUT / '文件清单及校验值.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = OUT / '云知声_全部年报_招股说明书_最新定期财报.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for path, _ in docs:
+                  z.write(path, path.name)
+              z.write(OUT / '资料说明.txt', '资料说明.txt')
+              z.write(OUT / '文件清单及校验值.json', '文件清单及校验值.json')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC validation failed at {bad}')
+
+          summary = {
+              'zip': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'reports': manifest,
+          }
+          (OUT / 'BUILD_SUMMARY.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_unisound.py
+          ls -lh output
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: unisound-official-filings-package
+          path: |
+            output/云知声_全部年报_招股说明书_最新定期财报.zip
+            output/BUILD_SUMMARY.json
+            output/verification/*.png
+          retention-days: 1
