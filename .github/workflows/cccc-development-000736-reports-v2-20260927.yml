@@ -1,0 +1,279 @@
+name: Build CCCC Development 000736 reports package v2 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cccc-development-000736-reports-v2-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Download and validate official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '中交发展_000736_2020-2025年报及2026年中期报告_巨潮官方原件'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+          cn_tz = timezone(timedelta(hours=8))
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(re.sub(r'<[^>]+>', '', value or ''))
+              return re.sub(r'\s+', '', value).replace('：', ':')
+
+          def date_from_ms(value: Any) -> str:
+              n = int(value)
+              if n > 10_000_000_000:
+                  n //= 1000
+              return datetime.fromtimestamp(n, tz=cn_tz).strftime('%Y-%m-%d')
+
+          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          headers = {
+              'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=000736&orgId=gssz0000736',
+              'Origin': 'https://www.cninfo.com.cn',
+              'X-Requested-With': 'XMLHttpRequest',
+              'Accept': 'application/json, text/javascript, */*; q=0.01',
+          }
+          categories = [
+              'category_ndbg_szsh',
+              'category_bndbg_szsh',
+              'category_yjdbg_szsh',
+              'category_sjdbg_szsh',
+          ]
+          date_ranges = ['2020-01-01~2022-12-31', '2023-01-01~2026-09-27']
+          announcements: list[dict[str, Any]] = []
+          seen: set[str] = set()
+
+          for category in categories:
+              for se_date in date_ranges:
+                  for page in range(1, 8):
+                      form = {
+                          'pageNum': str(page),
+                          'pageSize': '30',
+                          'column': 'szse',
+                          'tabName': 'fulltext',
+                          'plate': 'sz',
+                          'stock': '',
+                          'searchkey': '000736',
+                          'secid': '',
+                          'category': category,
+                          'trade': '',
+                          'seDate': se_date,
+                          'sortName': 'time',
+                          'sortType': 'desc',
+                          'isHLtitle': 'true',
+                      }
+                      r = session.post(endpoint, data=form, headers=headers, timeout=(25, 90))
+                      r.raise_for_status()
+                      payload = r.json()
+                      items = payload.get('announcements') or []
+                      print('CNINFO', category, se_date, 'page', page, 'items', len(items), flush=True)
+                      for item in items:
+                          if str(item.get('secCode') or '') != '000736':
+                              continue
+                          adjunct = str(item.get('adjunctUrl') or '')
+                          if not adjunct or adjunct in seen:
+                              continue
+                          seen.add(adjunct)
+                          announcements.append({
+                              'title': clean_title(str(item.get('announcementTitle') or '')),
+                              'raw_title': str(item.get('announcementTitle') or ''),
+                              'date': date_from_ms(item.get('announcementTime')),
+                              'timestamp': int(item.get('announcementTime') or 0),
+                              'url': 'https://static.cninfo.com.cn/' + adjunct.lstrip('/'),
+                              'sec_name': clean_title(str(item.get('secName') or '')),
+                          })
+                      if not payload.get('hasMore') or not items:
+                          break
+
+          print('ANNOUNCEMENT_COUNT', len(announcements), flush=True)
+          for a in sorted(announcements, key=lambda x: x['timestamp'], reverse=True):
+              print('ANN', json.dumps(a, ensure_ascii=False), flush=True)
+
+          excluded = ('摘要', '审计报告', '社会责任', 'ESG', '英文版', '取消', '更正公告', '关于')
+          def valid_full_report(title: str) -> bool:
+              return not any(x in title for x in excluded)
+
+          selected: list[dict[str, Any]] = []
+          for year in range(2020, 2026):
+              phrase = f'{year}年年度报告'
+              candidates = [a for a in announcements if phrase in a['title'] and valid_full_report(a['title'])]
+              candidates.sort(key=lambda x: x['timestamp'], reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'未找到{year}年完整年度报告')
+              item = dict(candidates[0])
+              item.update({'report_period': phrase, 'year': year})
+              selected.append(item)
+
+          periodic_terms = ('2026年第三季度报告', '2026年三季度报告', '2026年半年度报告', '2026年第一季度报告', '2026年一季度报告')
+          periodic = [a for a in announcements if valid_full_report(a['title']) and any(x in a['title'] for x in periodic_terms)]
+          periodic.sort(key=lambda x: x['timestamp'], reverse=True)
+          if not periodic:
+              raise RuntimeError('未找到2026年最新定期报告')
+          latest = dict(periodic[0])
+          if '第三季度' in latest['title'] or '三季度' in latest['title']:
+              latest_period = '2026年第三季度报告'
+          elif '半年度' in latest['title']:
+              latest_period = '2026年半年度报告'
+          else:
+              latest_period = '2026年第一季度报告'
+          latest.update({'report_period': latest_period, 'year': 2026})
+          selected.append(latest)
+
+          def download_pdf(url: str, dest: Path) -> str:
+              errs = []
+              for host_url in [url, url.replace('static.cninfo.com.cn', 'www.cninfo.com.cn')]:
+                  for attempt in range(1, 5):
+                      tmp = dest.with_suffix('.pdf.part')
+                      try:
+                          with session.get(
+                              host_url,
+                              headers={'Referer': 'https://www.cninfo.com.cn/', 'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},
+                              timeout=(30, 300), allow_redirects=True, stream=True,
+                          ) as r:
+                              print('DOWNLOAD', dest.name, 'attempt', attempt, 'status', r.status_code, host_url, 'final', r.url, flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in r.iter_content(1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                              final_url = r.url
+                          size = tmp.stat().st_size
+                          with tmp.open('rb') as fh:
+                              head = fh.read(8)
+                          if size < 150_000 or not head.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF size={size}, head={head!r}')
+                          tmp.replace(dest)
+                          return final_url
+                      except Exception as exc:
+                          errs.append(f'{host_url} attempt {attempt}: {exc!r}')
+                          tmp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {dest.name}: {errs}')
+
+          records: list[dict[str, Any]] = []
+          hashes: set[str] = set()
+          for idx, item in enumerate(selected, 1):
+              filename = f"{idx:02d}_中交发展_000736_{item['report_period']}.pdf"
+              dest = out / filename
+              final_url = download_pdf(item['url'], dest)
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < 20:
+                  raise RuntimeError(f'页数异常：{filename}仅{pages}页')
+
+              sample = ''
+              for page in reader.pages[:min(16, pages)]:
+                  try:
+                      sample += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', sample)
+              if '000736' not in compact or not any(name in compact for name in ('中交地产', '中交城市发展控股集团', '中交发展')):
+                  raise RuntimeError(f'公司身份核验失败：{filename}')
+              if str(item['year']) not in compact or not any(term in compact for term in ('年度报告', '半年度报告', '一季度报告', '第一季度报告', '三季度报告', '第三季度报告')):
+                  raise RuntimeError(f'报告期间核验失败：{filename}')
+
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf结构检查失败：{filename}\n{check.stderr[-1200:]}')
+
+              data = dest.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in hashes:
+                  raise RuntimeError(f'重复PDF：{filename}')
+              hashes.add(sha)
+              record = {
+                  'filename': filename,
+                  'company_current_name': '中交城市发展控股集团股份有限公司',
+                  'former_name': '中交地产股份有限公司',
+                  'stock_short_name': '中交发展',
+                  'stock_code': '000736.SZ',
+                  'report_period': item['report_period'],
+                  'announcement_title': item['raw_title'],
+                  'disclosure_date': item['date'],
+                  'source': '巨潮资讯网官方披露原件',
+                  'source_url': final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'报告数量异常：{len(records)}')
+
+          readme = [
+              '中交发展（000736.SZ）2020—2025年年度报告及最新定期报告',
+              '整理日期：2026-09-27',
+              '',
+              '公司说明：证券代码000736保持不变。公司原名“中交地产股份有限公司”，2026年更名为“中交城市发展控股集团股份有限公司”，证券简称变更为“中交发展”。早期报告封面因此仍使用“中交地产”。',
+              '',
+              '收录范围：2020—2025年完整年度报告各1份，以及截至整理日最新的2026年定期报告。当前最新文件为2026年半年度报告。未使用年报摘要、业绩预告、审计专项报告或公告说明替代完整报告。',
+              '',
+              '全部PDF均取自巨潮资讯网官方披露地址，并完成文件头、证券代码、公司名称、报告期间、实际页数、qpdf结构及SHA-256核验。',
+              '',
+              '文件清单：',
+          ]
+          for i, r in enumerate(records, 1):
+              readme.extend([
+                  f"{i}. {r['report_period']}",
+                  f"   文件：{r['filename']}",
+                  f"   披露日期：{r['disclosure_date']}；页数：{r['pages']}；大小：{r['bytes']/1048576:.2f} MiB",
+                  f"   来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          (out / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          total = sum((out / r['filename']).stat().st_size for r in records)
+          print('FINAL_PACKAGE', PACKAGE, 'PDF_COUNT', len(records), 'TOTAL_BYTES', total, flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload package directory as ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cccc-development-000736-reports-final-v2
+          path: 中交发展_000736_2020-2025年报及2026年中期报告_巨潮官方原件/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
