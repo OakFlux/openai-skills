@@ -1,0 +1,309 @@
+name: Build Greentown China broker research package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/greentown-03900-broker-reports-package-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils fonts-noto-cjk
+          python -m pip install --quiet playwright requests pillow pypdf
+          python -m playwright install --with-deps chromium
+
+      - name: Capture public report previews and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import asyncio, hashlib, json, re, subprocess, time, zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+          from playwright.async_api import async_playwright
+
+          PACKAGE = '绿城中国_03900_券商深度报告_3份'
+          root = Path(PACKAGE)
+          root.mkdir(exist_ok=True)
+          previews = root / '首页预览'
+          previews.mkdir(exist_ok=True)
+          work = Path('_greentown_work')
+          work.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def download_image(url: str, referer: str) -> bytes:
+              last = None
+              for attempt in range(6):
+                  try:
+                      r = session.get(url, headers={'Referer': referer, 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'}, timeout=(20, 90), allow_redirects=True)
+                      last = (r.status_code, len(r.content), r.headers.get('content-type'))
+                      if r.status_code == 200 and len(r.content) > 10000:
+                          with Image.open(BytesIO(r.content)) as im:
+                              im.verify()
+                          return r.content
+                  except Exception as exc:
+                      last = repr(exc)
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'Image download failed {url}: {last}')
+
+          def images_to_pdf(images: list[Path], output: Path) -> None:
+              opened = [Image.open(p).convert('RGB') for p in images]
+              try:
+                  opened[0].save(output, save_all=True, append_images=opened[1:], resolution=150.0, quality=95)
+              finally:
+                  for im in opened:
+                      im.close()
+
+          async def capture_sdy_preview(browser) -> dict[str, Any]:
+              source_page = 'https://www.sdyanbao.com/detail/906687'
+              page = await browser.new_page(viewport={'width': 1440, 'height': 1200}, locale='zh-CN')
+              network_urls: list[str] = []
+              api_payloads: list[str] = []
+
+              async def handle_response(resp):
+                  u = resp.url
+                  if 'oss.sdyanbao.com' in u or '/api/file/detail' in u:
+                      network_urls.append(u)
+                  if '/api/file/detail' in u:
+                      try:
+                          txt = await resp.text()
+                          api_payloads.append(txt)
+                      except Exception:
+                          pass
+              page.on('response', handle_response)
+              await page.goto(source_page, wait_until='domcontentloaded', timeout=120000)
+              await page.wait_for_timeout(8000)
+              for _ in range(12):
+                  await page.evaluate('window.scrollBy(0, Math.max(window.innerHeight, 1000))')
+                  await page.wait_for_timeout(700)
+              html = await page.content()
+              body = await page.locator('body').inner_text()
+              dom_urls = await page.locator('img').evaluate_all("els => els.map(e => e.currentSrc || e.src || e.getAttribute('data-src') || '').filter(Boolean)")
+              await page.screenshot(path=str(work/'sdy_page.png'), full_page=True)
+              await page.close()
+
+              candidates = list(network_urls) + list(dom_urls)
+              for txt in api_payloads + [html]:
+                  candidates += re.findall(r'https?://[^\\\"\'<> ]+', txt)
+              candidates = [u.replace('\\/','/').replace('&amp;','&') for u in candidates]
+
+              bases = []
+              for u in candidates:
+                  m = re.search(r'(https?://[^\s\"\'<>]+?/page/[^\s\"\'<>]+?)(?:/\d+\.png(?:\?.*)?$|[\"\'<>\s])', u)
+                  if m:
+                      bases.append(m.group(1).rstrip('/'))
+                  elif 'oss.sdyanbao.com/page/' in u:
+                      m2 = re.match(r'(https?://oss\.sdyanbao\.com/page/\d{4}/\d{1,2}/\d{1,2}/[^/?#]+)', u)
+                      if m2:
+                          bases.append(m2.group(1).rstrip('/'))
+              # JSON fields are easier to parse separately.
+              for txt in api_payloads:
+                  try:
+                      obj = json.loads(txt)
+                      data = obj.get('data') or {}
+                      if data.get('page_url'):
+                          bases.append(str(data['page_url']).rstrip('/'))
+                  except Exception:
+                      pass
+              bases = list(dict.fromkeys(bases))
+              if not bases:
+                  # Known report-page data can also appear HTML-escaped.
+                  m = re.search(r'page_url[\\\"\':= ]+(https?:[^\\\"\']+)', html)
+                  if m:
+                      bases.append(m.group(1).replace('\\/','/').rstrip('/'))
+              if not bases:
+                  raise RuntimeError('Could not discover Sdyanbao public preview image base')
+
+              base = bases[0]
+              rdir = work/'sdy_images'; rdir.mkdir(exist_ok=True)
+              image_paths: list[Path] = []
+              for i in range(10):
+                  raw = download_image(f'{base}/{i}.png', source_page)
+                  src = rdir/f'{i:02d}_src.png'; src.write_bytes(raw)
+                  with Image.open(src) as im:
+                      rgba = im.convert('RGBA')
+                      canvas = Image.new('RGBA', rgba.size, (255,255,255,255))
+                      canvas.alpha_composite(rgba)
+                      out = rdir/f'{i:02d}.jpg'
+                      canvas.convert('RGB').save(out, 'JPEG', quality=95, subsampling=0)
+                      image_paths.append(out)
+              pdf = root/'01_申万宏源_绿城中国_好房子引领者理顺机制再出发_公开预览前10页_2025-08-14.pdf'
+              images_to_pdf(image_paths, pdf)
+              return {
+                  'broker': '申万宏源',
+                  'title': '绿城中国（03900.HK）：好房子引领者，理顺机制再出发',
+                  'date': '2025-08-14',
+                  'type': '首次覆盖/公司深度',
+                  'rating': '买入（首次）',
+                  'analysts': '袁豪、曹曼',
+                  'original_pages': 31,
+                  'included_pages': 10,
+                  'file_kind': '券商报告公开预览原页',
+                  'source_page': source_page,
+                  'page_image_base': base,
+                  'pdf_file': pdf.name,
+              }
+
+          async def print_public_page(browser, *, url: str, output: Path, wait_ms: int = 7000) -> None:
+              page = await browser.new_page(viewport={'width': 1440, 'height': 1100}, locale='zh-CN')
+              await page.goto(url, wait_until='domcontentloaded', timeout=120000)
+              await page.wait_for_timeout(wait_ms)
+              for _ in range(10):
+                  await page.evaluate('window.scrollBy(0, Math.max(window.innerHeight, 1000))')
+                  await page.wait_for_timeout(300)
+              await page.evaluate("""
+                  () => {
+                    for (const el of document.querySelectorAll('header, footer, nav, .advertisement, .ad, .popup, .modal, .sidebar, .fixed, [class*=float], [class*=share]')) {
+                      try { el.style.display = 'none'; } catch (e) {}
+                    }
+                    document.body.style.background = 'white';
+                  }
+              """)
+              await page.emulate_media(media='screen')
+              await page.pdf(path=str(output), format='A4', print_background=True, margin={'top':'12mm','right':'10mm','bottom':'12mm','left':'10mm'})
+              await page.close()
+
+          async def main() -> list[dict[str, Any]]:
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  reports: list[dict[str, Any]] = []
+                  reports.append(await capture_sdy_preview(browser))
+
+                  # 广发证券原报告公开下载受限，收录公开长篇解读页面。
+                  guangfa_url = 'https://www.baogaobox.com/insights/260520000027553.html'
+                  guangfa_pdf = root/'02_广发证券_绿城中国_用品质铸就穿越周期的力量_公开深度解读版_2026-05-12.pdf'
+                  try:
+                      await print_public_page(browser, url=guangfa_url, output=guangfa_pdf)
+                      reports.append({
+                          'broker': '广发证券',
+                          'title': '绿城中国（03900.HK）：用品质铸就，穿越周期的力量',
+                          'date': '2026-05-12',
+                          'type': '首次覆盖/公司深度',
+                          'rating': '买入（首次）',
+                          'target_price': '14.20港元',
+                          'original_pages': 51,
+                          'included_pages': None,
+                          'file_kind': '公开长篇解读页面PDF，不是券商原始51页PDF',
+                          'source_page': guangfa_url,
+                          'pdf_file': guangfa_pdf.name,
+                      })
+                  except Exception as exc:
+                      print('GUANGFA_CAPTURE_FAILED', repr(exc))
+
+                  # 第一上海公开研报页面，内容覆盖核心论点、盈利预测和目标价。
+                  first_url = 'https://gmg.9fzt.com/report/HKSE/03900/800631919576.html'
+                  first_pdf = root/'03_第一上海证券_绿城中国_跻身第一梯队的品质标杆房企_公开研报页面版_2025-05-13.pdf'
+                  try:
+                      await print_public_page(browser, url=first_url, output=first_pdf)
+                      reports.append({
+                          'broker': '第一上海证券',
+                          'title': '绿城中国（03900.HK）：跻身第一梯队的品质标杆房企',
+                          'date': '2025-05-13',
+                          'type': '首次覆盖/公司研究',
+                          'rating': '买入（首次）',
+                          'target_price': '11.80港元',
+                          'included_pages': None,
+                          'file_kind': '公开研报页面PDF，不是券商原始PDF',
+                          'source_page': first_url,
+                          'pdf_file': first_pdf.name,
+                      })
+                  except Exception as exc:
+                      print('FIRST_SHANGHAI_CAPTURE_FAILED', repr(exc))
+
+                  await browser.close()
+                  return reports
+
+          reports = asyncio.run(main())
+          if len(reports) < 2:
+              raise RuntimeError(f'Only {len(reports)} usable reports captured; at least 2 required')
+
+          # Validate every PDF and render the first page.
+          for rec in reports:
+              pdf = root/rec['pdf_file']
+              if not pdf.exists() or pdf.stat().st_size < 30000:
+                  raise RuntimeError(f'Invalid PDF size: {pdf}')
+              reader = PdfReader(str(pdf), strict=False)
+              pages = len(reader.pages)
+              if pages < 1:
+                  raise RuntimeError(f'No PDF pages: {pdf}')
+              subprocess.run(['qpdf','--check',str(pdf)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = previews/pdf.stem
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(pdf),str(prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix)+'.png')
+              if not preview.exists() or preview.stat().st_size < 10000:
+                  raise RuntimeError(f'Preview render failed: {pdf}')
+              rec['actual_pdf_pages'] = pages
+              rec['bytes'] = pdf.stat().st_size
+              rec['sha256'] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+              rec['preview_file'] = str(Path('首页预览')/preview.name)
+              rec['validation'] = ['PDF file header and structure', 'page count', 'first-page render']
+
+          lines = [
+              '绿城中国（03900.HK）券商深度报告资料包',
+              '整理日期：2026-09-27',
+              '',
+              '本包优先收录公开可访问资料，未绕过登录、会员或付费权限。',
+              '其中申万宏源文件为原报告公开预览前10页；广发证券和第一上海文件为公开研报页面或长篇解读版，并非券商完整原始PDF。',
+              '',
+          ]
+          for i, r in enumerate(reports, 1):
+              lines += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   日期：{r['date']}；类型：{r['type']}；评级：{r['rating']}",
+                  f"   文件性质：{r['file_kind']}",
+                  f"   本PDF页数：{r['actual_pdf_pages']}页" + (f"；原报告：{r['original_pages']}页" if r.get('original_pages') else ''),
+                  f"   来源：{r['source_page']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ]
+          lines += ['报告版权归原券商、作者及来源平台所有，仅供研究参考，不构成投资建议。']
+          (root/'00_文件清单与说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (root/'manifest.json').write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['pdf_file']}\n" for r in reports), encoding='utf-8')
+
+          zpath = Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for f in sorted(root.rglob('*')):
+                  if f.is_file():
+                      z.write(f, arcname=f'{PACKAGE}/{f.relative_to(root)}')
+          with zipfile.ZipFile(zpath) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: '+bad)
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(reports):
+                  raise RuntimeError(f'PDF count mismatch: {len(pdfs)} vs {len(reports)}')
+          print('FINAL_ZIP', zpath, zpath.stat().st_size, hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print(json.dumps(reports, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: greentown-03900-broker-reports-final
+          path: 绿城中国_03900_券商深度报告_3份.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
