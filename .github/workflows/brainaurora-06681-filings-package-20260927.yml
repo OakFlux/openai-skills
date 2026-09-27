@@ -1,0 +1,313 @@
+name: Build BrainAurora 06681 filings package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/brainaurora-06681-filings-package-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF and parsing tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Discover official HKEX documents, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from dataclasses import dataclass
+          from pathlib import Path
+          from typing import Iterable
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '脑动极光_06681_全部年报_招股说明书及最新阶段性财务报告'
+          root = Path(PACKAGE)
+          root.mkdir(exist_ok=True)
+          previews = root / '首页预览'
+          previews.mkdir(exist_ok=True)
+          raw_dir = Path('_brainaurora_raw')
+          raw_dir.mkdir(exist_ok=True)
+
+          BASE_SEARCH = 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=1000240904&lang={lang}'
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Cache-Control': 'no-cache',
+          })
+
+          @dataclass
+          class LinkRec:
+              lang: str
+              title: str
+              href: str
+              context: str
+
+          def fetch(url: str, referer: str | None = None, min_bytes: int = 1) -> bytes:
+              headers = {'Referer': referer} if referer else {}
+              last = None
+              for attempt in range(6):
+                  try:
+                      r = session.get(url, headers=headers, timeout=(30, 240), allow_redirects=True)
+                      last = (r.status_code, r.url, r.headers.get('content-type'), len(r.content))
+                      if r.status_code == 200 and len(r.content) >= min_bytes:
+                          return r.content
+                  except Exception as exc:
+                      last = repr(exc)
+                  time.sleep(2 + attempt)
+              raise RuntimeError(f'failed to fetch {url}: {last}')
+
+          def normalize(s: str) -> str:
+              return re.sub(r'\s+', ' ', s or '').strip()
+
+          links: list[LinkRec] = []
+          search_pages = {}
+          for lang in ('EN', 'ZH'):
+              url = BASE_SEARCH.format(lang=lang)
+              content = fetch(url, min_bytes=1000)
+              html = content.decode('utf-8', 'replace')
+              (raw_dir / f'titles_{lang}.html').write_text(html, encoding='utf-8')
+              search_pages[lang] = url
+              soup = BeautifulSoup(html, 'lxml')
+              for a in soup.find_all('a', href=True):
+                  href = urljoin(url, a['href'])
+                  if '/listedco/listconews/sehk/' not in href or '.pdf' not in href.lower():
+                      continue
+                  title = normalize(a.get_text(' ', strip=True))
+                  node = a
+                  context = title
+                  for _ in range(7):
+                      node = node.parent
+                      if node is None:
+                          break
+                      text = normalize(node.get_text(' ', strip=True))
+                      if len(text) >= len(title) and len(text) <= 1500:
+                          context = text
+                      if re.search(r'\b\d{2}/\d{2}/\d{4}\b', text):
+                          context = text
+                          break
+                  links.append(LinkRec(lang=lang, title=title, href=href, context=context))
+
+          if not links:
+              raise RuntimeError('No HKEX PDF links were parsed from title-search pages')
+
+          (raw_dir / 'all_links.json').write_text(
+              json.dumps([r.__dict__ for r in links], ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          def has_any(text: str, patterns: Iterable[str]) -> bool:
+              low = text.lower()
+              return any(re.search(p, low, flags=re.I) for p in patterns)
+
+          def candidate_links(lang: str, kind: str) -> list[LinkRec]:
+              rows = [r for r in links if r.lang == lang]
+              out = []
+              for r in rows:
+                  txt = f'{r.title} {r.context}'
+                  if kind == 'annual_2025':
+                      ok = has_any(txt, [r'2025\s*annual\s*report', r'2025.*年度報告', r'2025.*年報'])
+                  elif kind == 'annual_2024':
+                      ok = has_any(txt, [r'2024\s*annual\s*report', r'2024.*年度報告', r'2024.*年報'])
+                  elif kind == 'prospectus':
+                      ok = has_any(txt, [r'global\s*offering', r'全球發售', r'全球发售']) and ('30/12/2024' in txt or '/2024/1230/' in r.href)
+                  elif kind == 'interim_2026_full':
+                      ok = has_any(txt, [r'2026\s*interim\s*report', r'2026.*中期報告']) and not has_any(txt, [r'results', r'業績', r'业绩'])
+                  elif kind == 'interim_2026_results':
+                      ok = has_any(txt, [r'interim\s*results.*june\s*30,?\s*2026', r'2026.*中期業績', r'截至.*2026.*六月.*中期業績'])
+                  else:
+                      ok = False
+                  if ok:
+                      out.append(r)
+              return out
+
+          def pdf_info(data: bytes) -> tuple[int, str]:
+              tmp = raw_dir / '_probe.pdf'
+              tmp.write_bytes(data)
+              reader = PdfReader(str(tmp), strict=False)
+              pages = len(reader.pages)
+              text = ''
+              for page in reader.pages[:3]:
+                  try:
+                      text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              return pages, text
+
+          def select_pdf(lang: str, kind: str, min_pages: int) -> tuple[LinkRec, bytes, int, str]:
+              candidates = candidate_links(lang, kind)
+              tested = []
+              for rec in candidates:
+                  try:
+                      data = fetch(rec.href, referer=search_pages[lang], min_bytes=20_000)
+                      if data[:5] != b'%PDF-':
+                          tested.append((rec.href, 'not_pdf', len(data)))
+                          continue
+                      pages, text = pdf_info(data)
+                      tested.append((rec.href, pages, len(data)))
+                      if pages >= min_pages and ('6681' in text or 'BrainAurora' in text or '腦動極光' in text or '脑动极光' in text):
+                          return rec, data, pages, text
+                  except Exception as exc:
+                      tested.append((rec.href, 'error', repr(exc)))
+              raise RuntimeError(f'Unable to select {kind} {lang}; candidates/tested={tested}')
+
+          wanted = [
+              ('annual_2024', '2024年年度报告', '2024 Annual Report', 80),
+              ('annual_2025', '2025年年度报告', '2025 Annual Report', 80),
+              ('prospectus', '最终招股章程', 'Final Prospectus', 300),
+          ]
+
+          selected = []
+          for kind, zh_label, en_label, min_pages in wanted:
+              for lang in ('ZH', 'EN'):
+                  rec, data, pages, text = select_pdf(lang, kind, min_pages)
+                  label = zh_label if lang == 'ZH' else en_label
+                  selected.append({
+                      'kind': kind,
+                      'lang': lang,
+                      'label': label,
+                      'source': rec.href,
+                      'title': rec.title,
+                      'context': rec.context,
+                      'data': data,
+                      'pages': pages,
+                  })
+
+          # Prefer a full 2026 interim report if it exists; otherwise use the latest interim-results announcement.
+          for lang in ('ZH', 'EN'):
+              picked = None
+              try:
+                  picked = select_pdf(lang, 'interim_2026_full', 20)
+                  kind = 'interim_2026_full'
+                  label = '2026年中期报告' if lang == 'ZH' else '2026 Interim Report'
+              except Exception:
+                  picked = select_pdf(lang, 'interim_2026_results', 5)
+                  kind = 'interim_2026_results'
+                  label = '2026年中期业绩公告' if lang == 'ZH' else '2026 Interim Results Announcement'
+              rec, data, pages, text = picked
+              selected.append({
+                  'kind': kind,
+                  'lang': lang,
+                  'label': label,
+                  'source': rec.href,
+                  'title': rec.title,
+                  'context': rec.context,
+                  'data': data,
+                  'pages': pages,
+              })
+
+          order_map = {'annual_2024': 1, 'annual_2025': 2, 'prospectus': 3, 'interim_2026_full': 4, 'interim_2026_results': 4}
+          manifest = []
+          for item in sorted(selected, key=lambda x: (order_map[x['kind']], 0 if x['lang'] == 'ZH' else 1)):
+              suffix = '中文版' if item['lang'] == 'ZH' else '英文版'
+              filename = f"{order_map[item['kind']]:02d}_{item['label']}_{suffix}_{item['pages']}页.pdf"
+              dest = root / filename
+              dest.write_bytes(item['data'])
+
+              subprocess.run(['qpdf', '--check', str(dest)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview_prefix = previews / dest.stem
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '100', '-singlefile', str(dest), str(preview_prefix)
+              ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(preview_prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'first-page render failed: {dest.name}')
+
+              sha = hashlib.sha256(item['data']).hexdigest()
+              manifest.append({
+                  'kind': item['kind'],
+                  'language': '中文' if item['lang'] == 'ZH' else 'English',
+                  'label': item['label'],
+                  'pdf_file': dest.name,
+                  'pages': item['pages'],
+                  'bytes': len(item['data']),
+                  'sha256': sha,
+                  'source_url': item['source'],
+                  'hkex_title': item['title'],
+                  'hkex_context': item['context'],
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'validation': ['PDF header', 'company/ticker identity', 'page count', 'qpdf structure', 'first-page render'],
+              })
+
+          latest_kind = next((m['kind'] for m in manifest if m['kind'].startswith('interim_2026')), '')
+          latest_note = (
+              '截至整理日，港交所已刊发2026年完整中期报告。'
+              if latest_kind == 'interim_2026_full'
+              else '截至整理日，港交所尚未刊发2026年完整中期报告；本包以2026年8月28日发布的中期业绩公告作为最新阶段性财务披露。'
+          )
+
+          readme = [
+              '脑动极光医疗科技有限公司（06681.HK）全部年报、招股说明书及最新阶段性财务报告',
+              '整理日期：2026-09-27',
+              '',
+              '本包收录港交所官方PDF原件，按中文和英文分别保存。',
+              '脑动极光于2025年1月8日在港交所上市；截至整理日，完整年度报告包括2024年和2025年。',
+              latest_note,
+              '',
+              '文件清单：',
+          ]
+          for i, m in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {m['label']}（{m['language']}，{m['pages']}页）",
+                  f"   文件：{m['pdf_file']}",
+                  f"   港交所来源：{m['source_url']}",
+                  f"   SHA-256：{m['sha256']}",
+                  '',
+              ]
+          readme += [
+              '核验项目：PDF文件头、公司名称/股票代码、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+              '“最新季报”按港股披露习惯对应最近一期中期报告或中期业绩公告，并非A股口径第一/第三季度报告。',
+          ]
+          (root / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f"{m['sha256']}  {m['pdf_file']}\n" for m in manifest), encoding='utf-8')
+          (root / 'HKEX_title_search_sources.json').write_text(json.dumps(search_pages, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zpath = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{PACKAGE}/{p.relative_to(root)}')
+          with zipfile.ZipFile(zpath) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_count = len([n for n in z.namelist() if n.lower().endswith('.pdf')])
+              if pdf_count != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} != {len(manifest)}')
+
+          print('FINAL_ZIP', zpath, zpath.stat().st_size, hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: brainaurora-06681-filings-final
+          path: 脑动极光_06681_全部年报_招股说明书及最新阶段性财务报告.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
