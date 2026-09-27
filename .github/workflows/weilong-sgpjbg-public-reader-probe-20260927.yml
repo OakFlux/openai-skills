@@ -1,0 +1,130 @@
+name: Probe public SGPJBG readers for Weilong reports 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weilong-sgpjbg-public-reader-probe-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet playwright requests beautifulsoup4 lxml pillow
+          python -m playwright install --with-deps chromium
+      - name: Inspect readers and network resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import asyncio, html, json, re, urllib.parse
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT=Path('sgpjbg_probe');OUT.mkdir(exist_ok=True)
+          targets=[
+            ('guohai_41','https://www.sgpjbg.com/baogao/715100.html'),
+            ('guosen_39','https://www.sgpjbg.com/baogao/615041.html'),
+            ('dongwu_23','https://www.sgpjbg.com/baogao/630214.html'),
+            ('tianfeng_37','https://www.sgpjbg.com/baogao/37562.html'),
+          ]
+          ses=requests.Session();ses.trust_env=False
+          ses.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          # Save raw HTTP and extract all URL-looking strings.
+          for name,url in targets:
+            rec={'name':name,'url':url}
+            try:
+              r=ses.get(url,timeout=(30,180),allow_redirects=True)
+              rec.update(status=r.status_code,final=r.url,ctype=r.headers.get('content-type'),bytes=len(r.content),headers=dict(r.headers))
+              (OUT/f'{name}_raw.html').write_bytes(r.content)
+              text=r.text
+              soup=BeautifulSoup(text,'lxml')
+              rec['title']=soup.title.get_text(' ',strip=True) if soup.title else ''
+              vals=[]
+              attrs=('src','href','data-src','data-original','data-url','data-file','data-pdf','data-page','content')
+              for tag in soup.find_all(True):
+                for a in attrs:
+                  v=tag.get(a)
+                  if v and isinstance(v,str):
+                    v=html.unescape(v).replace('\\/','/')
+                    if not v.startswith(('javascript:','data:','#')): vals.append(urllib.parse.urljoin(r.url,v))
+              for m in re.finditer(r'https?://[^\s"\'<>\\]+',text): vals.append(html.unescape(m.group(0)).replace('\\/','/'))
+              rec['urls']=sorted(set(x for x in vals if len(x)<3000))
+              rec['interesting']=sorted(set(x for x in vals if any(k in x.lower() for k in ('pdf','jpg','jpeg','png','webp','viewer','page','oss','cos','cdn','file','down','preview','static'))))
+              lines=[]
+              for ln in text.splitlines():
+                if any(k in ln.lower() for k in ('pdf','viewer','page','image','img','preview','down','file','oss','cos','cdn','bookid','docid')):
+                  s=re.sub(r'\s+',' ',ln).strip()
+                  if 0<len(s)<12000:lines.append(s)
+              rec['interesting_lines']=lines[:3000]
+            except Exception as e:rec['error']=repr(e)
+            (OUT/f'{name}_raw.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),encoding='utf-8')
+            print('RAW',name,rec.get('status'),rec.get('bytes'),rec.get('title'),len(rec.get('interesting',[])),rec.get('error',''),flush=True)
+
+          async def browser_probe():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True,args=['--no-sandbox','--disable-dev-shm-usage'])
+              context=await browser.new_context(viewport={'width':1440,'height':1000},locale='zh-CN',user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36')
+              for name,url in targets:
+                page=await context.new_page(); net=[]
+                async def on_response(resp):
+                  try:
+                    ct=resp.headers.get('content-type','')
+                    u=resp.url
+                    if any(k in u.lower() for k in ('pdf','jpg','jpeg','png','webp','viewer','page','oss','cos','cdn','file','preview','down')) or any(k in ct.lower() for k in ('pdf','image','json')):
+                      net.append({'url':u,'status':resp.status,'content_type':ct,'length':resp.headers.get('content-length'),'resource_type':resp.request.resource_type})
+                  except Exception:pass
+                page.on('response',on_response)
+                rec={'name':name,'url':url}
+                try:
+                  await page.goto(url,wait_until='domcontentloaded',timeout=120000)
+                  await page.wait_for_timeout(6000)
+                  # Scroll slowly to load all lazy reader pages.
+                  for _ in range(80):
+                    await page.evaluate('window.scrollBy(0, 900)')
+                    await page.wait_for_timeout(150)
+                    at_end=await page.evaluate('window.scrollY + window.innerHeight >= document.body.scrollHeight - 10')
+                    if at_end:break
+                  await page.wait_for_timeout(5000)
+                  rec['final']=page.url;rec['title']=await page.title();rec['height']=await page.evaluate('document.body.scrollHeight')
+                  rec['body']= (await page.locator('body').inner_text(timeout=30000))[:200000]
+                  rec['dom']=await page.evaluate('''() => {
+                    const out=[];
+                    for (const el of document.querySelectorAll('*')) {
+                      const obj={tag:el.tagName}; let keep=false;
+                      for (const k of ['src','href','data-src','data-original','data-url','data-file','data-pdf','data-page','style']) {
+                        const v=el.getAttribute && el.getAttribute(k); if(v){obj[k]=v; keep=true;}
+                      }
+                      if (keep) out.push(obj);
+                    }
+                    return out;
+                  }''')
+                  await page.screenshot(path=str(OUT/f'{name}_full.png'),full_page=True,timeout=120000)
+                except Exception as e:rec['error']=repr(e)
+                rec['network']=net
+                (OUT/f'{name}_browser.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),encoding='utf-8')
+                try:(OUT/f'{name}_browser.html').write_text(await page.content(),encoding='utf-8')
+                except Exception:pass
+                print('BROWSER',name,rec.get('title'),rec.get('height'),len(net),rec.get('error',''),flush=True)
+                await page.close()
+              await browser.close()
+          asyncio.run(browser_probe())
+          PY
+          grep -RInE "https?[^[:space:]\"']+\.(pdf|jpg|jpeg|png|webp)|pdfUrl|fileUrl|viewer|pageUrl|preview|bookId|docId" sgpjbg_probe > sgpjbg_probe/grep_hits.txt || true
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: weilong-sgpjbg-public-reader-probe-20260927
+          path: sgpjbg_probe
+          retention-days: 7
+          if-no-files-found: error
