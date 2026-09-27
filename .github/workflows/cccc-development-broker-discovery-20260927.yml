@@ -1,0 +1,204 @@
+name: Discover CCCC Development broker reports 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cccc-development-broker-discovery-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests pypdf
+
+      - name: Query Eastmoney research API and inspect PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import time
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          out = Path('cccc-development-broker-discovery')
+          out.mkdir(exist_ok=True)
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://data.eastmoney.com/report/stock.jshtml?code=000736',
+          })
+
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          all_rows = []
+          for page in range(1, 10):
+              params = {
+                  'cb': 'datatable',
+                  'pageSize': '100',
+                  'beginTime': '2015-01-01',
+                  'endTime': '2026-09-27',
+                  'pageNo': str(page),
+                  'fields': '',
+                  'qType': '0',
+                  'orgCode': '',
+                  'author': '',
+                  'code': '000736',
+                  'industryCode': '*',
+                  'industry': '*',
+                  'rating': '*',
+                  'ratingChange': '*',
+              }
+              r = s.get(endpoint, params=params, timeout=(30, 120))
+              print('API', page, r.status_code, r.url, 'bytes', len(r.content), flush=True)
+              r.raise_for_status()
+              txt = r.text.strip()
+              m = re.match(r'^[^(]+\((.*)\)\s*;?$', txt, re.S)
+              if m:
+                  txt = m.group(1)
+              try:
+                  payload = json.loads(txt)
+              except Exception:
+                  print('API_TEXT_HEAD', txt[:2000], flush=True)
+                  raise
+              rows = payload.get('data') or []
+              print('API_ROWS', page, len(rows), 'hits', payload.get('hits'), flush=True)
+              all_rows.extend(rows)
+              if len(rows) < 100:
+                  break
+
+          # Deduplicate by information code.
+          uniq = {}
+          for row in all_rows:
+              code = str(row.get('infoCode') or row.get('infocode') or row.get('info_code') or '')
+              if code:
+                  uniq[code] = row
+          rows = list(uniq.values())
+          rows.sort(key=lambda x: str(x.get('publishDate') or x.get('publishDateTime') or ''), reverse=True)
+          print('UNIQUE_ROWS', len(rows), flush=True)
+
+          metadata = []
+          for row in rows:
+              code = str(row.get('infoCode') or row.get('infocode') or row.get('info_code') or '')
+              item = {
+                  'infoCode': code,
+                  'title': row.get('title'),
+                  'orgSName': row.get('orgSName'),
+                  'orgName': row.get('orgName'),
+                  'publishDate': row.get('publishDate'),
+                  'predictNextTwoYearEps': row.get('predictNextTwoYearEps'),
+                  'emRatingName': row.get('emRatingName'),
+                  'researcher': row.get('researcher'),
+                  'stockName': row.get('stockName'),
+                  'stockCode': row.get('stockCode'),
+                  'industryName': row.get('industryName'),
+              }
+              metadata.append(item)
+              print('META', json.dumps(item, ensure_ascii=False), flush=True)
+          (out / 'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Inspect report PDFs. Prioritize titles that look like company coverage and exclude obvious short updates.
+          exclude_title = ('点评', '快报', '季报', '中报', '年报', '公告', '跟踪', '点评报告', '事件点评')
+          candidates = []
+          preferred = []
+          others = []
+          for row in rows:
+              title = str(row.get('title') or '')
+              if any(x in title for x in ('深度', '首次覆盖', '公司研究', '价值重估', '成长')):
+                  preferred.append(row)
+              else:
+                  others.append(row)
+          ordered = preferred + others
+
+          for idx, row in enumerate(ordered[:80], 1):
+              code = str(row.get('infoCode') or '')
+              title = str(row.get('title') or '')
+              if not code:
+                  continue
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+              ]
+              tmp = out / f'{idx:03d}_{code}.pdf'
+              final_url = None
+              error = None
+              for url in urls:
+                  try:
+                      with s.get(url, timeout=(30, 180), stream=True, allow_redirects=True) as r:
+                          if r.status_code != 200:
+                              continue
+                          with tmp.open('wb') as fh:
+                              for chunk in r.iter_content(1024 * 1024):
+                                  if chunk:
+                                      fh.write(chunk)
+                          if tmp.stat().st_size < 30_000 or not tmp.read_bytes()[:8].startswith(b'%PDF-'):
+                              tmp.unlink(missing_ok=True)
+                              continue
+                          final_url = r.url
+                          break
+                  except Exception as exc:
+                      error = repr(exc)
+                      tmp.unlink(missing_ok=True)
+              if not final_url:
+                  print('PDF_MISS', code, title, error, flush=True)
+                  continue
+              try:
+                  reader = PdfReader(str(tmp), strict=False)
+                  pages = len(reader.pages)
+                  text = ''
+                  for p in reader.pages[:min(8, pages)]:
+                      try:
+                          text += '\n' + (p.extract_text() or '')
+                      except Exception:
+                          pass
+                  compact = re.sub(r'\s+', '', text)
+                  identity_ok = any(x in compact for x in ('中交地产', '中交发展', '中房地產', '中房地产')) and ('000736' in compact or '736' in compact)
+                  broker = str(row.get('orgSName') or row.get('orgName') or '')
+                  rec = {
+                      'infoCode': code,
+                      'title': title,
+                      'broker': broker,
+                      'publishDate': row.get('publishDate'),
+                      'pages': pages,
+                      'bytes': tmp.stat().st_size,
+                      'identity_ok': identity_ok,
+                      'pdf_url': final_url,
+                      'first_text': text[:1500],
+                  }
+                  candidates.append(rec)
+                  print('PDF_OK', json.dumps({k: rec[k] for k in ('infoCode','title','broker','publishDate','pages','bytes','identity_ok','pdf_url')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('PDF_PARSE_ERROR', code, title, repr(exc), flush=True)
+              finally:
+                  tmp.unlink(missing_ok=True)
+              time.sleep(0.15)
+
+          candidates.sort(key=lambda x: (x['identity_ok'], x['pages'], str(x['publishDate'])), reverse=True)
+          (out / 'candidates.json').write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('TOP_CANDIDATES', flush=True)
+          for rec in candidates[:30]:
+              print(json.dumps({k: rec[k] for k in ('infoCode','title','broker','publishDate','pages','bytes','identity_ok','pdf_url')}, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cccc-development-broker-discovery
+          path: cccc-development-broker-discovery/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
