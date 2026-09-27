@@ -1,0 +1,304 @@
+name: Build Yunzhisheng 09678 filings package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/unisound-09678-filings-final-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils fonts-noto-cjk
+          python -m pip install --quiet playwright requests pypdf
+          python -m playwright install --with-deps chromium
+
+      - name: Discover official HKEX documents, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import asyncio
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from playwright.async_api import async_playwright
+          from pypdf import PdfReader
+
+          PACKAGE = '云知声_09678_全部年报_招股说明书及最新阶段性财务报告'
+          root = Path(PACKAGE)
+          root.mkdir(exist_ok=True)
+          preview_dir = root / '首页预览'
+          preview_dir.mkdir(exist_ok=True)
+          discovery_dir = Path('_discovery')
+          discovery_dir.mkdir(exist_ok=True)
+
+          STOCK_ID = '1000262960'
+          TITLE_URL = 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=' + STOCK_ID
+
+          async def collect_language(lang: str) -> list[dict[str, Any]]:
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context(
+                      viewport={'width': 1600, 'height': 1200},
+                      locale='zh-CN' if lang == 'ZH' else 'en-US',
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+                  )
+                  page = await context.new_page()
+                  url = TITLE_URL + '&lang=' + lang
+                  await page.goto(url, wait_until='domcontentloaded', timeout=120000)
+                  await page.wait_for_timeout(5000)
+
+                  # Load all rows, including the listing documents near the end of the archive.
+                  stagnant = 0
+                  previous = -1
+                  for _ in range(15):
+                      count = await page.locator('a[href*="/listedco/listconews/sehk/"]').count()
+                      if count == previous:
+                          stagnant += 1
+                      else:
+                          stagnant = 0
+                      previous = count
+                      clicked = await page.evaluate('''() => {
+                        const nodes = [...document.querySelectorAll('button,a,div,span')];
+                        const el = nodes.find(x => {
+                          const t = (x.innerText || '').trim().toUpperCase();
+                          return (t === 'LOAD MORE' || t.includes('載入更多') || t.includes('加载更多')) &&
+                                 x.offsetParent !== null;
+                        });
+                        if (el) { el.click(); return true; }
+                        window.scrollTo(0, document.body.scrollHeight);
+                        return false;
+                      }''')
+                      await page.wait_for_timeout(1800)
+                      if stagnant >= 2 and not clicked:
+                          break
+
+                  records = await page.locator('a[href*="/listedco/listconews/sehk/"]').evaluate_all('''els => els.map(e => {
+                    let p = e;
+                    let context = (e.innerText || '').trim();
+                    for (let i = 0; i < 8 && p; i++, p = p.parentElement) {
+                      const t = (p.innerText || '').replace(/\s+/g, ' ').trim();
+                      if (t.length >= context.length && t.length < 1800) context = t;
+                      if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(t) || /\b\d{4}[年\/-]\d{1,2}[月\/-]\d{1,2}/.test(t)) break;
+                    }
+                    return {
+                      text: (e.innerText || '').replace(/\s+/g, ' ').trim(),
+                      context,
+                      href: e.href
+                    };
+                  })''')
+                  title = await page.title()
+                  body_sample = (await page.locator('body').inner_text())[:20000]
+                  (discovery_dir / f'title_search_{lang}.html').write_text(await page.content(), encoding='utf-8')
+                  (discovery_dir / f'title_search_{lang}.json').write_text(json.dumps({'url': url, 'title': title, 'records': records, 'body_sample': body_sample}, ensure_ascii=False, indent=2), encoding='utf-8')
+                  await browser.close()
+                  return records
+
+          async def discover() -> dict[str, list[dict[str, Any]]]:
+              result = {}
+              for lang in ('EN', 'ZH'):
+                  result[lang] = await collect_language(lang)
+              return result
+
+          all_records = asyncio.run(discover())
+
+          def normalize(s: str) -> str:
+              return re.sub(r'\s+', ' ', s or '').strip()
+
+          def candidate_score(rec: dict[str, Any], doc_type: str, lang: str) -> int:
+              t = (normalize(rec.get('text', '')) + ' ' + normalize(rec.get('context', ''))).upper()
+              href = rec.get('href', '')
+              score = 0
+              if not href.lower().endswith('.pdf'):
+                  score -= 50
+              if doc_type == 'annual':
+                  if 'ANNUAL REPORT' in t and '2025' in t: score += 100
+                  if ('年度報告' in t or '年度报告' in t) and '2025' in t: score += 100
+                  if '/2026/0429/' in href: score += 20
+              elif doc_type == 'prospectus':
+                  if 'GLOBAL OFFERING' in t: score += 100
+                  if 'PROSPECTUS' in t: score += 80
+                  if '全球發售' in t or '全球发售' in t: score += 100
+                  if '招股' in t: score += 80
+                  if '/2025/0620/' in href: score += 40
+              elif doc_type == 'interim_2026':
+                  if 'INTERIM RESULTS' in t and '2026' in t: score += 100
+                  if ('中期業績' in t or '中期业绩' in t) and '2026' in t: score += 100
+                  if '/2026/0828/' in href: score += 30
+                  if 'MONTHLY RETURN' in t or '月報表' in t or '月报表' in t: score -= 100
+              if lang == 'ZH' and ('_C.PDF' in href.upper() or 'ZH' in t): score += 3
+              if lang == 'EN' and '_C.PDF' not in href.upper(): score += 3
+              return score
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+              'Accept': 'application/pdf,text/html;q=0.8,*/*;q=0.5',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/',
+          })
+
+          def fetch_pdf(url: str) -> tuple[bytes, dict[str, Any]]:
+              last: Any = None
+              for attempt in range(6):
+                  try:
+                      r = session.get(url, timeout=(30, 180), allow_redirects=True)
+                      last = {'status': r.status_code, 'final_url': r.url, 'content_type': r.headers.get('content-type', ''), 'bytes': len(r.content)}
+                      if r.status_code == 200 and r.content[:5] == b'%PDF-' and len(r.content) > 30_000:
+                          return r.content, last
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(2 + attempt)
+              raise RuntimeError(f'Unable to download PDF {url}: {last}')
+
+          # Known official English annual-report URL is retained as a fallback if the title page changes.
+          fallbacks = {
+              ('annual', 'EN'): ['https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0429/2026042906218.pdf'],
+              ('annual', 'ZH'): ['https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0429/2026042906218_c.pdf'],
+          }
+
+          document_specs = [
+              ('annual', 'EN', '01_Unisound_2025_Annual_Report_EN.pdf', 100),
+              ('annual', 'ZH', '02_云知声_2025年年度报告_中文.pdf', 100),
+              ('prospectus', 'EN', '03_Unisound_Final_Prospectus_Global_Offering_EN_2025-06-20.pdf', 400),
+              ('prospectus', 'ZH', '04_云知声_最终招股章程_全球发售_中文_2025-06-20.pdf', 400),
+              ('interim_2026', 'EN', '05_Unisound_2026_Interim_Results_Announcement_EN.pdf', 15),
+              ('interim_2026', 'ZH', '06_云知声_2026年中期业绩公告_中文.pdf', 15),
+          ]
+
+          manifest = []
+          selected_urls: set[str] = set()
+          for doc_type, lang, filename, min_pages in document_specs:
+              candidates = []
+              for rec in all_records.get(lang, []):
+                  score = candidate_score(rec, doc_type, lang)
+                  if score > 0:
+                      candidates.append((score, rec))
+              for fb in fallbacks.get((doc_type, lang), []):
+                  candidates.append((10, {'href': fb, 'text': 'fallback official URL', 'context': ''}))
+              candidates.sort(key=lambda x: x[0], reverse=True)
+
+              errors = []
+              chosen = None
+              for score, rec in candidates:
+                  url = rec.get('href', '')
+                  if not url or url in selected_urls:
+                      continue
+                  try:
+                      data, download_meta = fetch_pdf(url)
+                      temp = discovery_dir / f'candidate_{doc_type}_{lang}_{len(errors)}.pdf'
+                      temp.write_bytes(data)
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < min_pages:
+                          errors.append({'url': url, 'score': score, 'pages': pages, 'reason': f'page count below {min_pages}'})
+                          temp.unlink(missing_ok=True)
+                          continue
+                      chosen = {'url': url, 'score': score, 'record': rec, 'data': data, 'pages': pages, 'download': download_meta}
+                      temp.unlink(missing_ok=True)
+                      break
+                  except Exception as exc:
+                      errors.append({'url': url, 'score': score, 'reason': repr(exc)})
+              if chosen is None:
+                  (discovery_dir / f'errors_{doc_type}_{lang}.json').write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding='utf-8')
+                  raise RuntimeError(f'No valid {doc_type} {lang} PDF found; errors={errors[:10]}')
+
+              selected_urls.add(chosen['url'])
+              path = root / filename
+              path.write_bytes(chosen['data'])
+              subprocess.run(['qpdf', '--check', str(path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = preview_dir / path.stem
+              subprocess.run(['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '120', '-singlefile', str(path), str(prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 15_000:
+                  raise RuntimeError(f'First-page render failed: {path}')
+              sha = hashlib.sha256(path.read_bytes()).hexdigest()
+              manifest.append({
+                  'document_type': doc_type,
+                  'language': lang,
+                  'pdf_file': path.name,
+                  'pages': chosen['pages'],
+                  'bytes': path.stat().st_size,
+                  'sha256': sha,
+                  'official_url': chosen['url'],
+                  'matched_title': chosen['record'].get('text'),
+                  'matched_context': chosen['record'].get('context'),
+                  'download': chosen['download'],
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'validation': ['PDF signature', 'minimum page threshold', 'qpdf structure', 'first-page render'],
+              })
+
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['pdf_file']}\n" for x in manifest), encoding='utf-8')
+
+          lines = [
+              '云知声智能科技股份有限公司（09678.HK）官方披露资料包',
+              '整理日期：2026-09-27',
+              '',
+              '本包收录港交所官方PDF原件：2025年年度报告、最终招股章程，以及截至2026年6月30日止六个月的中期业绩公告，均提供中文和英文版本。',
+              '',
+              '范围说明：',
+              '1. 云知声于2025年6月30日在香港联交所上市，因此上市后完整年度报告目前只有2025年年度报告。',
+              '2. 2022—2024年历史财务资料收录于2025年6月20日的最终招股章程，不存在对应年份的独立上市公司年度报告。',
+              '3. 港股公司通常不按A股口径披露第一季度和第三季度报告。截至整理日，最新阶段性财务披露为2026年中期业绩公告；如后续发布完整2026年中期报告，本包未包含未来文件。',
+              '',
+              '文件清单：',
+          ]
+          for i, item in enumerate(manifest, 1):
+              lines += [
+                  f"{i}. {item['pdf_file']}",
+                  f"   页数：{item['pages']}；大小：{item['bytes']}字节",
+                  f"   港交所官方来源：{item['official_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          lines += ['全部PDF已完成文件头、页数、qpdf结构和首页渲染检查；压缩包完成CRC完整性测试。']
+          (root / '00_文件清单与说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          # Keep discovery metadata for reproducibility, but omit bulky HTML pages from the final package.
+          (root / 'HKEX标题检索记录.json').write_text(json.dumps(all_records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zpath = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{PACKAGE}/{p.relative_to(root)}')
+          with zipfile.ZipFile(zpath) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 6:
+                  raise RuntimeError(f'Expected 6 PDFs, found {len(pdfs)}')
+          zip_sha = hashlib.sha256(zpath.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zpath, zpath.stat().st_size, zip_sha)
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: unisound-09678-filings-final
+          path: 云知声_09678_全部年报_招股说明书及最新阶段性财务报告.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
