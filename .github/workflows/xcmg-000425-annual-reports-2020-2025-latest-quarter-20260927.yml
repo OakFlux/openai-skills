@@ -1,0 +1,371 @@
+name: Package XCMG 2020-2025 annual reports and latest quarter 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/xcmg-000425-annual-reports-2020-2025-latest-quarter-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download official CNINFO PDFs, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import quote, urljoin
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          STOCK_CODE = '000425'
+          COMPANY = '徐工机械'
+          AS_OF = '2026-09-27'
+          PACKAGE_DIR = Path('徐工机械_000425.SZ_2020-2025年报及最新季报')
+          PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
+          WORK = Path('_work')
+          WORK.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(
+              total=8, connect=8, read=8, status=8,
+              backoff_factor=1.2,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET', 'POST'],
+              raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/json, text/javascript, */*; q=0.01',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'Origin': 'https://www.cninfo.com.cn',
+              'X-Requested-With': 'XMLHttpRequest',
+          })
+
+          def clean_title(value: str) -> str:
+              text = html.unescape(value or '')
+              text = re.sub(r'<[^>]+>', '', text)
+              text = text.replace('\u3000', ' ').replace('&nbsp;', ' ')
+              return re.sub(r'\s+', '', text).strip()
+
+          def get_org_id() -> str:
+              url = f'https://www.cninfo.com.cn/new/information/topSearch/query?keyWord={quote(COMPANY)}&maxNum=20'
+              try:
+                  r = session.get(url, timeout=(20, 90))
+                  r.raise_for_status()
+                  data = r.json()
+                  if isinstance(data, dict):
+                      data = data.get('keyBoardList') or data.get('data') or data.get('records') or []
+                  for item in data or []:
+                      code = str(item.get('code') or item.get('secCode') or item.get('stockCode') or '')
+                      name = str(item.get('zwjc') or item.get('secName') or item.get('name') or '')
+                      oid = item.get('orgId') or item.get('orgid')
+                      if code == STOCK_CODE and oid:
+                          print('ORG_ID_FROM_SEARCH', oid, name, flush=True)
+                          return str(oid)
+              except Exception as exc:
+                  print('ORG_ID_SEARCH_FAILED', repr(exc), flush=True)
+              # Standard CNINFO org-id form for long-listed Shenzhen issuers.
+              return 'gssz0000425'
+
+          ORG_ID = get_org_id()
+          DISCLOSURE_REFERER = f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK_CODE}&orgId={ORG_ID}'
+
+          def query_announcements(category: str, start: str, end: str, max_pages: int = 20) -> list[dict]:
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              rows: list[dict] = []
+              for page in range(1, max_pages + 1):
+                  payload = {
+                      'pageNum': str(page),
+                      'pageSize': '30',
+                      'column': 'szse',
+                      'tabName': 'fulltext',
+                      'plate': 'sz',
+                      'stock': f'{STOCK_CODE},{ORG_ID}',
+                      'searchkey': '',
+                      'secid': '',
+                      'category': category,
+                      'trade': '',
+                      'seDate': f'{start}~{end}',
+                      'sortName': '',
+                      'sortType': '',
+                      'isHLtitle': 'true',
+                  }
+                  headers = {'Referer': DISCLOSURE_REFERER}
+                  r = session.post(endpoint, data=payload, headers=headers, timeout=(25, 120))
+                  if r.status_code != 200:
+                      raise RuntimeError(f'CNINFO query HTTP {r.status_code}: {r.text[:300]}')
+                  data = r.json()
+                  batch = data.get('announcements') or []
+                  print('QUERY', category or '<all>', start, end, 'page', page, 'count', len(batch), flush=True)
+                  rows.extend(batch)
+                  if not batch or len(batch) < 30:
+                      break
+                  time.sleep(0.35)
+              # Stable de-duplication by announcement id / URL.
+              dedup: dict[str, dict] = {}
+              for row in rows:
+                  key = str(row.get('announcementId') or row.get('adjunctUrl') or json.dumps(row, ensure_ascii=False, sort_keys=True))
+                  dedup[key] = row
+              return list(dedup.values())
+
+          annual_rows = query_announcements('category_ndbg_szsh;', '2021-01-01', AS_OF)
+          if not annual_rows:
+              annual_rows = query_announcements('', '2021-01-01', AS_OF)
+
+          quarter_rows = []
+          for category in ('category_yjdbg_szsh;', 'category_sjdbg_szsh;'):
+              try:
+                  quarter_rows.extend(query_announcements(category, '2025-01-01', AS_OF))
+              except Exception as exc:
+                  print('QUARTER_CATEGORY_FAILED', category, repr(exc), flush=True)
+          if not quarter_rows:
+              quarter_rows = query_announcements('', '2025-01-01', AS_OF)
+
+          (WORK / 'annual_query.json').write_text(json.dumps(annual_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          (WORK / 'quarter_query.json').write_text(json.dumps(quarter_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def announcement_ts(row: dict) -> int:
+              value = row.get('announcementTime') or row.get('announcementDate') or 0
+              try:
+                  return int(value)
+              except Exception:
+                  return 0
+
+          excluded = ('摘要', '英文', '审计报告', '鉴证报告', '问询函', '回复', '取消', '提示性公告', '董事会决议', '监事会决议')
+
+          def select_annual(year: int) -> dict:
+              marker = f'{year}年年度报告'
+              candidates = []
+              for row in annual_rows:
+                  title = clean_title(row.get('announcementTitle', ''))
+                  if marker not in title or any(x in title for x in excluded):
+                      continue
+                  score = 0
+                  if re.fullmatch(rf'(?:{COMPANY}[:：])?{year}年年度报告', title):
+                      score += 100
+                  if '修订' in title or '更新' in title:
+                      score += 30
+                  if row.get('adjunctType', '').upper() == 'PDF':
+                      score += 10
+                  candidates.append((score, announcement_ts(row), row, title))
+              if not candidates:
+                  available = [clean_title(r.get('announcementTitle', '')) for r in annual_rows]
+                  raise RuntimeError(f'No full annual report found for {year}. Titles sample: {available[:80]}')
+              candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+              score, ts, row, title = candidates[0]
+              row = dict(row)
+              row['_clean_title'] = title
+              row['_selection_score'] = score
+              return row
+
+          annual_selected = [select_annual(y) for y in range(2020, 2026)]
+
+          def select_latest_quarter() -> dict:
+              candidates = []
+              seen = set()
+              for row in quarter_rows:
+                  key = str(row.get('announcementId') or row.get('adjunctUrl'))
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  title = clean_title(row.get('announcementTitle', ''))
+                  if not re.search(r'20\d{2}年(?:第一|第三)季度报告', title):
+                      continue
+                  if any(x in title for x in excluded):
+                      continue
+                  score = 0
+                  if re.fullmatch(rf'(?:{COMPANY}[:：])?20\d{{2}}年(?:第一|第三)季度报告', title):
+                      score += 100
+                  if '修订' in title or '更新' in title:
+                      score += 30
+                  if row.get('adjunctType', '').upper() == 'PDF':
+                      score += 10
+                  candidates.append((announcement_ts(row), score, row, title))
+              if not candidates:
+                  available = [clean_title(r.get('announcementTitle', '')) for r in quarter_rows]
+                  raise RuntimeError(f'No quarterly report found. Titles sample: {available[:100]}')
+              # Latest disclosure date is primary; revised copy wins within the same period/date.
+              candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+              ts, score, row, title = candidates[0]
+              row = dict(row)
+              row['_clean_title'] = title
+              row['_selection_score'] = score
+              return row
+
+          latest_quarter = select_latest_quarter()
+          selected = annual_selected + [latest_quarter]
+          print('SELECTED_TITLES', json.dumps([x['_clean_title'] for x in selected], ensure_ascii=False), flush=True)
+
+          def announcement_date(row: dict) -> str:
+              ts = announcement_ts(row)
+              if ts > 10_000_000_000:
+                  return datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
+              if ts > 1_000_000_000:
+                  return datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
+              text = str(row.get('announcementTime') or row.get('announcementDate') or '')
+              m = re.search(r'(20\d{2})[-/]?(\d{2})[-/]?(\d{2})', text)
+              return '-'.join(m.groups()) if m else text
+
+          def source_url(row: dict) -> str:
+              path = str(row.get('adjunctUrl') or '').strip()
+              if not path:
+                  raise RuntimeError(f'Missing adjunctUrl for {row.get("_clean_title")}')
+              return urljoin('https://static.cninfo.com.cn/', path.lstrip('/'))
+
+          records = []
+          for idx, row in enumerate(selected, start=1):
+              title = row['_clean_title']
+              if idx <= 6:
+                  year = 2019 + idx
+                  filename = f'{idx:02d}_{COMPANY}_{year}年年度报告.pdf'
+                  expected = [COMPANY, str(year), '年度报告']
+                  min_pages = 80
+              else:
+                  m = re.search(r'(20\d{2})年(第一|第三)季度报告', title)
+                  if not m:
+                      raise RuntimeError(f'Cannot parse quarterly title: {title}')
+                  qyear, qword = m.groups()
+                  filename = f'{idx:02d}_{COMPANY}_{qyear}年{qword}季度报告.pdf'
+                  expected = [COMPANY, qyear, '季度报告']
+                  min_pages = 8
+
+              url = source_url(row)
+              dest = PACKAGE_DIR / filename
+              headers = {
+                  'Referer': DISCLOSURE_REFERER,
+                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              }
+              print('DOWNLOAD', title, url, flush=True)
+              with session.get(url, headers=headers, timeout=(30, 300), stream=True) as r:
+                  r.raise_for_status()
+                  with dest.open('wb') as f:
+                      for chunk in r.iter_content(1024 * 1024):
+                          if chunk:
+                              f.write(chunk)
+              data = dest.read_bytes()
+              if not data.startswith(b'%PDF'):
+                  raise RuntimeError(f'Not a PDF: {filename}; head={data[:80]!r}')
+              if len(data) < 100_000:
+                  raise RuntimeError(f'PDF unexpectedly small: {filename}; bytes={len(data)}')
+
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {filename}: {check.stderr[-1200:]}')
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'Page count too small for {filename}: {pages} < {min_pages}')
+
+              textfile = WORK / f'{idx:02d}.txt'
+              pdftotext = subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(pages, 15)), str(dest), str(textfile)],
+                  capture_output=True, text=True,
+              )
+              sample = textfile.read_text(encoding='utf-8', errors='ignore') if textfile.exists() else ''
+              compact = re.sub(r'\s+', '', sample)
+              missing = [term for term in expected if term not in compact]
+              if missing:
+                  # Permit extraction-poor official PDFs only when page count and file size are substantial.
+                  if len(data) < 500_000 or pages < min_pages:
+                      raise RuntimeError(f'Identity terms missing in {filename}: {missing}')
+                  print('TEXT_WARNING', filename, missing, 'pdftotext=', pdftotext.returncode, flush=True)
+
+              digest = hashlib.sha256(data).hexdigest()
+              rec = {
+                  'filename': filename,
+                  'official_title': title,
+                  'fiscal_year_or_period': str(2019 + idx) if idx <= 6 else re.search(r'20\d{2}年(?:第一|第三)季度', title).group(0),
+                  'announcement_date': announcement_date(row),
+                  'source': '巨潮资讯网（CNINFO）官方披露原件',
+                  'source_url': url,
+                  'announcement_id': row.get('announcementId'),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+              }
+              records.append(rec)
+              print('VALIDATED', json.dumps(rec, ensure_ascii=False), flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 PDFs, got {len(records)}')
+
+          readme = [
+              '徐工机械（000425.SZ）2020-2025年报及最新季报',
+              f'整理与核验日期：{AS_OF}',
+              '',
+              '口径说明：',
+              '1. 年报部分包含2020、2021、2022、2023、2024和2025年度完整年度报告正文，共6份。',
+              '2. “最新季报”严格按第一季度报告/第三季度报告口径，在截至整理日已披露文件中选择公告日期最新的一份；不以半年度报告替代季报。',
+              '3. 所有PDF均来自巨潮资讯网官方披露地址；已排除年度报告摘要、英文版、审计报告单行附件和提示性公告。',
+              '4. 已执行PDF文件头、页数、公司/期间文本抽样、qpdf结构检查、SHA-256和ZIP CRC检查。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(records, 1):
+              readme.extend([
+                  f'{i}. {rec["official_title"]}',
+                  f'   文件：{rec["filename"]}',
+                  f'   公告日期：{rec["announcement_date"]}',
+                  f'   页数：{rec["pages"]}；大小：{rec["bytes"] / 1048576:.2f} MB',
+                  f'   官方来源：{rec["source_url"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  '',
+              ])
+          (PACKAGE_DIR / '00_文件清单与官方来源.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (PACKAGE_DIR / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (PACKAGE_DIR / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{r["sha256"]}  {r["filename"]}' for r in records) + '\n', encoding='utf-8'
+          )
+
+          final_zip = Path('徐工机械_000425.SZ_2020-2025年报及最新季报.zip')
+          with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for fp in sorted(PACKAGE_DIR.iterdir()):
+                  zf.write(fp, arcname=fp.name)
+          with zipfile.ZipFile(final_zip, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              names = zf.namelist()
+              pdfs = [n for n in names if n.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs, expected 7: {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size, hashlib.sha256(final_zip.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcmg-000425-2020-2025-annual-reports-latest-quarter-20260927
+          path: 徐工机械_000425.SZ_2020-2025年报及最新季报.zip
+          retention-days: 7
+          if-no-files-found: error
