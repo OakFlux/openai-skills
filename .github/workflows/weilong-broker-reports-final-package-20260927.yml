@@ -1,0 +1,230 @@
+name: Build Weilong broker research PDF package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weilong-broker-reports-final-package-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil, subprocess, time, zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urlparse
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          PACKAGE='卫龙美味_09985.HK_券商深度报告_3份'
+          out=Path(PACKAGE); out.mkdir(exist_ok=True)
+          work=Path('_work'); work.mkdir(exist_ok=True)
+          API='https://reportapi.eastmoney.com/report/list'
+
+          s=requests.Session(); s.trust_env=False
+          retry=Retry(total=5,connect=5,read=5,backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=['GET'])
+          s.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=8,pool_maxsize=8))
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            'Referer':'https://data.eastmoney.com/',
+            'Accept':'application/json,text/javascript,application/pdf,*/*;q=0.8',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def parse_api(r):
+            try:return r.json()
+            except Exception:
+              t=r.text.strip(); m=re.search(r'^[^(]*\((.*)\)\s*;?$',t,re.S)
+              return json.loads(m.group(1)) if m else {}
+
+          def scan_day(day:str):
+            found=[]
+            for qtype in ('0','1'):
+              for page in range(1,16):
+                params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':day,'endTime':day,'pageNo':str(page),'qType':qtype,
+                  'orgCode':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)
+                }
+                r=s.get(API,params=params,timeout=(20,100)); r.raise_for_status(); d=parse_api(r)
+                data=d.get('data') or []
+                total=int(d.get('TotalPage') or d.get('totalPage') or 1)
+                print('SCAN',day,qtype,page,total,len(data),flush=True)
+                for rec in data:
+                  txt=json.dumps(rec,ensure_ascii=False)
+                  if any(k in txt for k in ('卫龙','衛龍','09985','9985')):
+                    found.append(rec)
+                if page>=total:break
+                time.sleep(.15)
+            return found
+
+          # Exact dates plus adjacent publication dates seen across report aggregators.
+          days=[
+            '2025-02-26','2025-02-27','2025-02-28',
+            '2025-04-27','2025-04-28','2025-04-29','2025-04-30',
+            '2025-06-23','2025-06-24','2025-06-25','2025-06-26',
+            '2024-10-17','2024-10-18','2024-10-19',
+            '2021-05-20','2021-05-21','2021-05-22',
+          ]
+          records=[]
+          for day in days:
+            try: records.extend(scan_day(day))
+            except Exception as e: print('SCAN_ERR',day,repr(e),flush=True)
+
+          # Deduplicate records by infoCode/title/date.
+          uniq={}
+          for rec in records:
+            info=rec.get('infoCode') or rec.get('INFOCODE') or rec.get('id') or ''
+            title=rec.get('title') or rec.get('TITLE') or rec.get('reportTitle') or ''
+            date=rec.get('publishDate') or rec.get('PUBLISHDATE') or rec.get('date') or ''
+            uniq[(str(info),str(title),str(date))]=rec
+          records=list(uniq.values())
+          print('MATCH_RECORDS',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+
+          # Seed one verified original long-form report in case API metadata changes.
+          seeds=[{
+            'title':'食品加工行业深度研究-卫龙美味：小辣条造就大玩家，黄金赛道的稀缺性龙头',
+            'broker':'天风证券','date':'2021-05-21',
+            'urls':['https://pdf.dfcfw.com/pdf/H3_AP202105211493069853_1.pdf'],
+            'known_pages':37,
+          }]
+
+          candidates=[]
+          for rec in records:
+            title=str(rec.get('title') or rec.get('TITLE') or rec.get('reportTitle') or '').strip()
+            org=str(rec.get('orgSName') or rec.get('orgName') or rec.get('ORGNAME') or rec.get('broker') or '').strip()
+            date=str(rec.get('publishDate') or rec.get('PUBLISHDATE') or rec.get('date') or '')[:10]
+            info=rec.get('infoCode') or rec.get('INFOCODE') or rec.get('id')
+            urls=[]
+            for key in ('pdfUrl','pdf_url','downloadUrl','download_url','fileUrl','file_url'):
+              if rec.get(key): urls.append(str(rec[key]))
+            if info:
+              urls += [f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf']
+            candidates.append({'title':title,'broker':org,'date':date,'urls':urls,'record':rec})
+          candidates += seeds
+
+          safe_re=re.compile(r'[^0-9A-Za-z\u4e00-\u9fff._-]+')
+          def safe(sv): return safe_re.sub('_',sv).strip('_')[:100] or 'report'
+
+          def try_download(c,idx):
+            for u in c['urls']:
+              try:
+                r=s.get(u,timeout=(25,180),allow_redirects=True)
+                ctype=(r.headers.get('content-type') or '').lower()
+                if r.status_code!=200 or len(r.content)<100000 or not r.content.startswith(b'%PDF'):
+                  print('REJECT_HTTP',r.status_code,len(r.content),ctype,u,flush=True); continue
+                tmp=work/f'cand_{idx}_{hashlib.md5(u.encode()).hexdigest()[:8]}.pdf'; tmp.write_bytes(r.content)
+                reader=PdfReader(str(tmp),strict=False); pages=len(reader.pages)
+                text=''
+                for pg in reader.pages[:min(pages,8)]:
+                  try:text+='\n'+(pg.extract_text() or '')
+                  except Exception:pass
+                identity=('卫龙' in text or '衛龍' in text or 'WEILONG' in text.upper() or '09985' in text or '9985' in text)
+                if not identity and pages<20:
+                  print('REJECT_IDENTITY',pages,u,flush=True); tmp.unlink(missing_ok=True); continue
+                q=subprocess.run(['qpdf','--check',str(tmp)],capture_output=True,text=True)
+                if q.returncode not in (0,3):
+                  print('REJECT_QPDF',u,q.stderr[-500:],flush=True); tmp.unlink(missing_ok=True); continue
+                return {'path':tmp,'pages':pages,'bytes':len(r.content),'url':u,'text_sample':text[:5000]}
+              except Exception as e:
+                print('DOWNLOAD_ERR',u,repr(e),flush=True)
+            return None
+
+          valid=[]
+          seen_sha=set()
+          for i,c in enumerate(candidates,1):
+            result=try_download(c,i)
+            if not result: continue
+            sha=hashlib.sha256(result['path'].read_bytes()).hexdigest()
+            if sha in seen_sha:
+              result['path'].unlink(missing_ok=True); continue
+            seen_sha.add(sha)
+            title=c['title'] or '卫龙美味证券研究报告'
+            broker=c['broker'] or '证券研究机构'
+            date=c['date'] or '日期未知'
+            valid.append({**c,**result,'sha256':sha,'title':title,'broker':broker,'date':date})
+            print('VALID',broker,date,result['pages'],title,result['url'],flush=True)
+
+          # Prefer long-form reports (>=15 pages), recent dates, and broker diversity.
+          def date_key(v):
+            try:return datetime.strptime(v['date'][:10],'%Y-%m-%d')
+            except:return datetime(1900,1,1)
+          long=[v for v in valid if v['pages']>=15]
+          long.sort(key=lambda v:(date_key(v),v['pages']),reverse=True)
+          selected=[]; brokers=set()
+          for v in long:
+            if len(selected)>=3:break
+            # keep at most one report from the same broker where possible
+            b=v['broker']
+            if b in brokers and len(long)>len(selected)+1:continue
+            selected.append(v);brokers.add(b)
+          # Always retain the verified Tianfeng deep report when fewer than 3 recent long reports were found.
+          if len(selected)<3:
+            for v in valid:
+              if '小辣条造就大玩家' in v['title'] and v not in selected:
+                selected.append(v);break
+          if len(selected)<2:
+            raise RuntimeError(f'Only {len(selected)} validated deep reports found; candidates={len(valid)}')
+          selected=selected[:3]
+
+          manifest=[]
+          for n,v in enumerate(selected,1):
+            fn=f"{n:02d}_{safe(v['broker'])}_{safe(v['title'])}_{safe(v['date'])}.pdf"
+            dest=out/fn; shutil.copy2(v['path'],dest)
+            # first-page preview for quality verification, kept outside final ZIP
+            prev=work/f'preview_{n:02d}'
+            subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','120',str(dest),str(prev)],check=True,capture_output=True)
+            rec={'filename':fn,'broker':v['broker'],'title':v['title'],'date':v['date'],'pages':v['pages'],'bytes':v['bytes'],'source_url':v['url'],'sha256':v['sha256']}
+            manifest.append(rec)
+
+          readme=[
+            '卫龙美味（09985.HK）券商深度报告资料包',
+            '整理日期：2026-09-27','',
+            f'共收录 {len(manifest)} 份已验证原始 PDF。',
+            '核验项目：PDF 文件头、文件大小、页数、公司身份文本、qpdf 结构检查、首屏渲染、ZIP CRC、SHA-256。','',
+            '文件清单：'
+          ]
+          for i,m in enumerate(manifest,1):
+            readme += [f"{i}. {m['broker']}：《{m['title']}》",f"   日期：{m['date']}；页数：{m['pages']}；文件：{m['filename']}",f"   来源：{m['source_url']}",f"   SHA-256：{m['sha256']}",'']
+          (out/'00_文件清单与核验说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text('\n'.join(f"{m['sha256']}  {m['filename']}" for m in manifest)+'\n',encoding='utf-8')
+
+          zipname=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zipname,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+            for p in sorted(out.iterdir()):z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zipname) as z:
+            bad=z.testzip()
+            if bad:raise RuntimeError(f'ZIP CRC failure: {bad}')
+          print('FINAL_ZIP',zipname,zipname.stat().st_size,hashlib.sha256(zipname.read_bytes()).hexdigest(),flush=True)
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2),flush=True)
+          PY
+
+      - name: Upload final ZIP and previews
+        uses: actions/upload-artifact@v4
+        with:
+          name: weilong-09985-broker-deep-reports-final-zip-20260927
+          path: |
+            卫龙美味_09985.HK_券商深度报告_3份.zip
+            _work/preview_*.png
+          retention-days: 7
+          if-no-files-found: error
