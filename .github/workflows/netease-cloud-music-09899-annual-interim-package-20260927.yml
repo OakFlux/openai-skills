@@ -1,0 +1,435 @@
+name: Build NetEase Cloud Music 09899 annual and latest interim package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/netease-cloud-music-09899-annual-interim-package-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover HKEX filings download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          TODAY = '20260927'
+          PACKAGE = '网易云音乐_09899_2020-2025年报_2026最新中期报告_官方原件'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/json,text/plain,text/html,application/pdf,*/*',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=en',
+          })
+
+          def request(url: str, *, params=None, timeout=(30, 180), stream=False):
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      r = session.get(url, params=params, timeout=timeout, allow_redirects=True, stream=stream)
+                      print('GET', attempt, r.status_code, r.url, flush=True)
+                      r.raise_for_status()
+                      return r
+                  except Exception as exc:
+                      last = exc
+                      print('GET_ERR', attempt, url, repr(exc), flush=True)
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'GET failed: {url}: {last!r}')
+
+          # 1) Resolve HKEX internal stockId from the public autocomplete endpoint.
+          prefix_url = 'https://www1.hkexnews.hk/search/prefix.do'
+          pr = request(prefix_url, params={
+              'callback': 'callback', 'lang': 'EN', 'type': 'A',
+              'name': '09899', 'market': 'SEHK',
+          })
+          prefix_text = pr.text.strip()
+          m = re.search(r'^[^(]*\((.*)\)\s*;?$', prefix_text, re.S)
+          prefix_payload = json.loads(m.group(1) if m else prefix_text)
+          print('PREFIX_PAYLOAD', json.dumps(prefix_payload, ensure_ascii=False)[:10000], flush=True)
+          items = prefix_payload if isinstance(prefix_payload, list) else prefix_payload.get('data') or prefix_payload.get('result') or []
+          if isinstance(items, str):
+              items = json.loads(items)
+          if not items:
+              raise RuntimeError('HKEX prefix endpoint returned no matches for 09899')
+
+          def normalized_code(obj):
+              return ''.join(ch for ch in str(obj.get('stockCode') or obj.get('code') or obj.get('CODE') or '') if ch.isdigit()).zfill(5)
+
+          chosen = None
+          for item in items:
+              text = json.dumps(item, ensure_ascii=False).lower()
+              if normalized_code(item) == '09899' or 'cloud music' in text or '網易雲音樂' in text or '云音乐' in text:
+                  chosen = item
+                  break
+          chosen = chosen or items[0]
+          stock_id = chosen.get('stockId') or chosen.get('stockID') or chosen.get('id') or chosen.get('ID')
+          if not stock_id:
+              # Some payloads encode the stock id inside a combined value string.
+              text = json.dumps(chosen, ensure_ascii=False)
+              mm = re.search(r'"stockId"\s*:\s*"?([^",}]+)', text, re.I)
+              stock_id = mm.group(1) if mm else None
+          if not stock_id:
+              raise RuntimeError(f'Could not resolve stockId from {chosen!r}')
+          print('STOCK_ID', stock_id, 'MATCH', json.dumps(chosen, ensure_ascii=False), flush=True)
+
+          # 2) Query all company filings from HKEX title search.
+          search_url = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          params = {
+              'sortDir': '0', 'sortByOptions': 'DateTime', 'category': '0',
+              'market': 'SEHK', 'stockId': str(stock_id), 'documentType': '-1',
+              'fromDate': '20190101', 'toDate': TODAY, 'title': '', 'searchType': '0',
+              't1code': '-2', 't2Gcode': '-2', 't2code': '-2',
+              'rowRange': '2500', 'lang': 'E',
+          }
+          sr = request(search_url, params=params)
+          payload = sr.json()
+          raw_rows = payload.get('result') or payload.get('resultList') or payload.get('records') or []
+          rows = json.loads(raw_rows) if isinstance(raw_rows, str) else raw_rows
+          if not isinstance(rows, list) or not rows:
+              raise RuntimeError(f'HKEX title search returned no rows: keys={list(payload)}')
+          print('ROW_COUNT', len(rows), flush=True)
+          Path('hkex_09899_all_rows.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def plain(value) -> str:
+              text = html.unescape(str(value or ''))
+              text = re.sub(r'<[^>]+>', ' ', text)
+              return re.sub(r'\s+', ' ', text).strip()
+
+          def row_text(row) -> str:
+              return ' '.join(plain(row.get(k)) for k in ('TITLE','LONG_TEXT','SHORT_TEXT','STOCK_NAME','FILE_INFO')).strip()
+
+          def row_date(row) -> str:
+              s = str(row.get('DATE_TIME') or row.get('DATE') or '')
+              # HKEX usually returns DD/MM/YYYY HH:MM
+              m = re.search(r'(\d{2})/(\d{2})/(\d{4})', s)
+              if m:
+                  return f'{m.group(3)}-{m.group(2)}-{m.group(1)}'
+              m = re.search(r'(\d{4})[-/](\d{2})[-/](\d{2})', s)
+              return f'{m.group(1)}-{m.group(2)}-{m.group(3)}' if m else s
+
+          def row_url(row) -> str:
+              vals = []
+              for key in ('FILE_LINK','DOD_WEB_PATH','WEB_PATH','URL','LINK','FILE_INFO'):
+                  val = row.get(key)
+                  if val:
+                      vals.append(html.unescape(str(val)))
+              blob = ' '.join(vals)
+              urls = re.findall(r'https?://[^\s"<>]+?\.pdf(?:\?[^\s"<>]*)?', blob, re.I)
+              paths = re.findall(r'(?:https?://[^\s"<>]+)?(/listedco/listconews/[^\s"<>]+?\.pdf(?:\?[^\s"<>]*)?)', blob, re.I)
+              candidates = urls + ['https://www1.hkexnews.hk' + p for p in paths]
+              # Some rows expose a relative path without the /listedco prefix regex matching.
+              for val in vals:
+                  val = val.strip().replace('\\/', '/')
+                  if val.lower().endswith('.pdf'):
+                      candidates.append(urljoin('https://www1.hkexnews.hk/', val))
+              for u in candidates:
+                  u = u.rstrip('.,;)')
+                  if '.pdf' in u.lower():
+                      return u
+              raise RuntimeError(f'No PDF URL in HKEX row: {json.dumps(row, ensure_ascii=False)[:3000]}')
+
+          def year_from_text(text: str, pub_date: str, kind: str) -> int | None:
+              # Prefer year immediately adjacent to the report title.
+              patterns = [
+                  rf'(?i)(?:annual report|interim report|half[- ]year report)\s*(20\d{{2}})',
+                  rf'(?i)(20\d{{2}})\s*(?:annual report|interim report|half[- ]year report)',
+              ]
+              for pat in patterns:
+                  mm = re.search(pat, text)
+                  if mm:
+                      return int(mm.group(1))
+              years = [int(y) for y in re.findall(r'20\d{2}', text)]
+              if kind == 'annual':
+                  for y in years:
+                      if 2021 <= y <= 2025:
+                          return y
+                  try:
+                      return int(pub_date[:4]) - 1
+                  except Exception:
+                      return None
+              if kind == 'interim':
+                  for y in years:
+                      if 2024 <= y <= 2026:
+                          return y
+                  try:
+                      return int(pub_date[:4])
+                  except Exception:
+                      return None
+              return None
+
+          annual_candidates: dict[int, list[dict]] = {y: [] for y in range(2021, 2026)}
+          interim_candidates: list[dict] = []
+          results_candidates: list[dict] = []
+          prospectus_candidates: list[dict] = []
+
+          for row in rows:
+              text = row_text(row)
+              low = text.lower()
+              date = row_date(row)
+              excluded_annual = any(k in low for k in (
+                  'results announcement','annual results','summary','notification','notice of publication',
+                  'environmental','social and governance','esg','sustainability','circular','poll results',
+              ))
+              if 'annual report' in low and not excluded_annual:
+                  y = year_from_text(text, date, 'annual')
+                  if y in annual_candidates:
+                      annual_candidates[y].append({'row': row, 'text': text, 'date': date})
+              excluded_interim = any(k in low for k in (
+                  'interim results','results announcement','notification','notice of publication',
+                  'summary','circular','poll results',
+              ))
+              if ('interim report' in low or 'half-year report' in low) and not excluded_interim:
+                  y = year_from_text(text, date, 'interim')
+                  interim_candidates.append({'row': row, 'text': text, 'date': date, 'year': y, 'formal': True})
+              if ('interim results' in low or 'first half' in low) and not any(k in low for k in ('notice of board meeting','date of board meeting')):
+                  y = year_from_text(text, date, 'interim')
+                  results_candidates.append({'row': row, 'text': text, 'date': date, 'year': y, 'formal': False})
+              if any(k in low for k in ('global offering','prospectus')) and not any(k in low for k in ('supplemental','application proof','post hearing information pack','hearing information pack')):
+                  prospectus_candidates.append({'row': row, 'text': text, 'date': date})
+
+          print('ANNUAL_COUNTS', {k: len(v) for k,v in annual_candidates.items()}, flush=True)
+          print('INTERIM_CANDIDATES', json.dumps([{k:v for k,v in c.items() if k!='row'} for c in interim_candidates], ensure_ascii=False), flush=True)
+          print('RESULTS_CANDIDATES', json.dumps([{k:v for k,v in c.items() if k!='row'} for c in results_candidates], ensure_ascii=False), flush=True)
+          print('PROSPECTUS_COUNT', len(prospectus_candidates), flush=True)
+
+          def choose_best(cands: list[dict], prefer_year: int | None = None) -> dict:
+              if not cands:
+                  raise RuntimeError('No candidate documents available')
+              def score(c):
+                  text = c['text'].lower()
+                  exact = 1 if re.fullmatch(r'(?i)\s*(?:20\d{2}\s+)?(?:annual report|interim report)(?:\s+20\d{2})?\s*', plain(c['row'].get('TITLE'))) else 0
+                  year_score = 1 if prefer_year and c.get('year') == prefer_year else 0
+                  return (year_score, exact, c['date'])
+              return sorted(cands, key=score, reverse=True)[0]
+
+          selected = []
+          # Prospectus is used only because there is no standalone 2020 annual report before the Dec-2021 listing.
+          if not prospectus_candidates:
+              raise RuntimeError('Could not find the 2021 listing prospectus needed for 2020 audited financial coverage')
+          prosp = sorted(prospectus_candidates, key=lambda c: c['date'], reverse=True)[0]
+          selected.append({
+              'filename': '00_网易云音乐_09899_2020年度经审计财务资料_2021招股章程.pdf',
+              'category': '2020年度财务资料（招股章程）',
+              'report_year': 2020,
+              'title': prosp['text'],
+              'disclosure_date': prosp['date'],
+              'url': row_url(prosp['row']),
+              'min_pages': 300,
+          })
+
+          for year in range(2021, 2026):
+              choice = choose_best(annual_candidates[year], prefer_year=year)
+              selected.append({
+                  'filename': f'{year-2020:02d}_网易云音乐_09899_{year}年年度报告.pdf',
+                  'category': '年度报告',
+                  'report_year': year,
+                  'title': choice['text'],
+                  'disclosure_date': choice['date'],
+                  'url': row_url(choice['row']),
+                  'min_pages': 100,
+              })
+
+          # Prefer a formal 2026 interim report. If not published yet, use the 2026 interim results announcement.
+          formal_2026 = [c for c in interim_candidates if c.get('year') == 2026 or c['date'].startswith('2026-')]
+          if formal_2026:
+              latest = choose_best(formal_2026, prefer_year=2026)
+              latest_category = '最新中期报告'
+              min_pages = 35
+              latest_filename = '06_网易云音乐_09899_2026年中期报告_最新定期报告.pdf'
+          else:
+              result_2026 = [c for c in results_candidates if c.get('year') == 2026 or c['date'].startswith('2026-')]
+              if not result_2026:
+                  # Last-resort formal interim report from the latest available year.
+                  latest = choose_best(interim_candidates)
+                  latest_category = '最新中期报告'
+                  min_pages = 35
+                  latest_filename = f"06_网易云音乐_09899_{latest.get('year') or latest['date'][:4]}年中期报告_最新定期报告.pdf"
+              else:
+                  latest = choose_best(result_2026, prefer_year=2026)
+                  latest_category = '2026年中期业绩公告（正式中期报告尚未发布时的替代）'
+                  min_pages = 10
+                  latest_filename = '06_网易云音乐_09899_2026年中期业绩公告_最新财务披露.pdf'
+          selected.append({
+              'filename': latest_filename,
+              'category': latest_category,
+              'report_year': latest.get('year') or int(latest['date'][:4]),
+              'title': latest['text'],
+              'disclosure_date': latest['date'],
+              'url': row_url(latest['row']),
+              'min_pages': min_pages,
+          })
+
+          print('SELECTED', json.dumps(selected, ensure_ascii=False, indent=2), flush=True)
+
+          def download_pdf(doc: dict, dest: Path) -> str:
+              errors = []
+              for base_url in [doc['url'], doc['url'].replace('https://www.hkexnews.hk/', 'https://www1.hkexnews.hk/')]:
+                  for attempt in range(1, 5):
+                      tmp = dest.with_suffix('.pdf.part')
+                      try:
+                          with session.get(base_url, timeout=(30, 300), allow_redirects=True, stream=True) as r:
+                              print('DOWNLOAD', dest.name, attempt, r.status_code, base_url, 'FINAL', r.url, flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in r.iter_content(1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          size = tmp.stat().st_size
+                          with tmp.open('rb') as fh:
+                              head = fh.read(8)
+                          if size < 100_000 or not head.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF: size={size}, head={head!r}')
+                          tmp.replace(dest)
+                          return str(r.url)
+                      except Exception as exc:
+                          errors.append(f'{base_url} attempt {attempt}: {exc!r}')
+                          tmp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'Download failed for {dest.name}: {errors}')
+
+          def extract_sample(reader: PdfReader) -> str:
+              n = len(reader.pages)
+              indices = list(range(min(35, n)))
+              if n > 40:
+                  indices += list(range(max(0, n - 5), n))
+              parts = []
+              for idx in dict.fromkeys(indices):
+                  try:
+                      parts.append(reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              return '\n'.join(parts)
+
+          records = []
+          seen_hashes = set()
+          identity_terms = ['cloud music inc', 'netease cloud music inc', '雲音樂股份有限公司', '網易雲音樂股份有限公司', '9899']
+
+          for doc in selected:
+              dest = OUT / doc['filename']
+              final_url = download_pdf(doc, dest)
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < doc['min_pages']:
+                  raise RuntimeError(f'Unexpectedly short PDF {dest.name}: {pages} pages < {doc["min_pages"]}')
+              sample = extract_sample(reader).lower()
+              if not any(term.lower() in sample for term in identity_terms):
+                  raise RuntimeError(f'Company identity could not be verified in {dest.name}')
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {dest.name}: {check.stderr[-2000:]}')
+              data = dest.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {dest.name}')
+              seen_hashes.add(sha)
+              rec = {
+                  **{k: doc[k] for k in ('filename','category','report_year','title','disclosure_date')},
+                  'source': '香港交易所披露易（HKEXnews）',
+                  'source_url': final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+              }
+              records.append(rec)
+              print('VALIDATED', json.dumps(rec, ensure_ascii=False), flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 PDFs, got {len(records)}')
+          if {r['report_year'] for r in records if r['category'] == '年度报告'} != {2021, 2022, 2023, 2024, 2025}:
+              raise RuntimeError('Annual-report year coverage is incomplete')
+
+          latest_rec = records[-1]
+          readme = [
+              '网易云音乐（09899.HK）2020—2025年度财务报告及最新一期中期财务披露',
+              '整理日期：2026-09-27',
+              '',
+              '一、收录范围',
+              '1. 2021、2022、2023、2024、2025年完整年度报告，共5份。',
+              '2. 最新一期中期财务披露，共1份。',
+              '3. 2021年上市招股章程，共1份；其中包含2020年度经审计历史财务资料。',
+              '',
+              '二、关于2020年报告',
+              '网易云音乐于2021年12月在香港上市，2020年尚未作为独立上市公司发布年度报告。',
+              '为覆盖用户要求的2020年度，本包收录上市招股章程，其中载有截至2020年12月31日止年度的经审计历史财务资料。',
+              '',
+              '三、关于“最新季报”',
+              '香港上市主体通常发布年度报告和中期报告，而非独立季度报告。',
+              f"本包收录的最新文件为：{latest_rec['category']}；披露日期：{latest_rec['disclosure_date']}。",
+              '',
+              '四、文件清单',
+          ]
+          for i, r in enumerate(records, 1):
+              readme.extend([
+                  f"{i}. {r['filename']}",
+                  f"   类别：{r['category']}；报告年度：{r['report_year']}；披露日期：{r['disclosure_date']}",
+                  f"   页数：{r['pages']}；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '五、完整性核验',
+              '全部PDF均已检查文件头、公司身份、页数、qpdf结构、重复文件及SHA-256；最终ZIP已通过CRC测试。',
+          ])
+
+          (OUT / '00_文件清单与范围说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+          (OUT / 'HKEX检索原始记录.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for p in sorted(OUT.iterdir()):
+                  zf.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(pdfs), 'SHA256', zip_sha, flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: netease-cloud-music-09899-annual-interim-final
+          path: 网易云音乐_09899_2020-2025年报_2026最新中期报告_官方原件.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
