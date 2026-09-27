@@ -1,0 +1,114 @@
+name: Daqo Energy Exchange Prospectus Probe
+
+on:
+  push:
+    branches:
+      - chatgpt-daqoenergy-filings-20260927
+    paths:
+      - .github/workflows/daqoenergy_exchange_probe_20260927.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+
+      - name: Query SSE and CNINFO
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import io, json, re, time
+          from urllib.parse import urljoin
+          import requests
+          from pypdf import PdfReader
+
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          # SSE historical announcement API around IPO dates.
+          api='https://query.sse.com.cn/security/stock/queryCompanyBulletin.do'
+          for report_type in ('ALL','DQBG',''):
+            params={
+              'isPagination':'true','productId':'688303','keyWord':'招股说明书',
+              'securityType':'0101,120100,020100,020200,120200',
+              'reportType2':report_type,'reportType':'','beginDate':'2021-06-01','endDate':'2021-07-31',
+              'pageHelp.pageSize':'100','pageHelp.pageNo':'1','pageHelp.beginPage':'1','pageHelp.cacheSize':'1','pageHelp.endPage':'5',
+              '_':str(int(time.time()*1000)),
+            }
+            try:
+              r=s.get(api,params=params,headers={'Referer':'https://www.sse.com.cn/disclosure/listedinfo/regular/','X-Requested-With':'XMLHttpRequest'},timeout=90)
+              print('\nSSE',report_type,r.status_code,len(r.content),r.url)
+              print(r.text[:10000])
+            except Exception as e: print('SSEERR',report_type,repr(e))
+
+          # CNINFO organization lookup.
+          try:
+            u='https://www.cninfo.com.cn/new/information/topSearch/query'
+            r=s.post(u,data={'keyWord':'688303','maxNum':'20'},headers={'Referer':'https://www.cninfo.com.cn/'},timeout=60)
+            print('\nCNINFO_SEARCH',r.status_code,len(r.content),r.url,r.text[:5000])
+            org_ids=[]
+            try:
+              obj=r.json()
+              stack=[obj]
+              while stack:
+                x=stack.pop()
+                if isinstance(x,dict):
+                  if x.get('code')=='688303' or x.get('secCode')=='688303':
+                    for k in ('orgId','orgid','org_id'):
+                      if x.get(k): org_ids.append(str(x[k]))
+                  stack.extend(x.values())
+                elif isinstance(x,list): stack.extend(x)
+            except Exception: pass
+          except Exception as e:
+            print('CNINFO_SEARCH_ERR',repr(e)); org_ids=[]
+          org_ids=list(dict.fromkeys(org_ids))
+          print('ORG_IDS',org_ids)
+
+          # Query full-text announcements. Try code-only and code+orgId stock formats.
+          query='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          stock_values=['688303']+[f'688303,{x}' for x in org_ids]
+          all_rows=[]
+          for stock in stock_values:
+            for column in ('sse','kcb'):
+              data={
+                'pageNum':'1','pageSize':'100','column':column,'tabName':'fulltext','plate':'shkcp',
+                'stock':stock,'searchkey':'招股说明书','secid':'','category':'','trade':'',
+                'seDate':'2021-06-01~2021-07-31','sortName':'','sortType':'','isHLtitle':'true',
+              }
+              try:
+                r=s.post(query,data=data,headers={'Referer':'https://www.cninfo.com.cn/new/fulltextSearch?notautosubmit=&keyWord=招股说明书','Origin':'https://www.cninfo.com.cn','X-Requested-With':'XMLHttpRequest'},timeout=90)
+                print('\nCNINFO_QUERY',stock,column,r.status_code,len(r.content),r.text[:10000])
+                obj=r.json()
+                rows=obj.get('announcements') or []
+                for row in rows:
+                  row['_stock_query']=stock; row['_column']=column
+                all_rows.extend(rows)
+              except Exception as e: print('CNINFO_QUERY_ERR',stock,column,repr(e))
+
+          # Validate any PDF attachment URLs found.
+          candidates=[]
+          for row in all_rows:
+            title=re.sub('<[^>]+>','',str(row.get('announcementTitle') or row.get('title') or ''))
+            adjunct=row.get('adjunctUrl') or row.get('url') or ''
+            print('ROW',json.dumps({'title':title,'adjunctUrl':adjunct,'announcementTime':row.get('announcementTime'),'announcementId':row.get('announcementId')},ensure_ascii=False))
+            if adjunct:
+              candidates.append(('https://static.cninfo.com.cn/'+str(adjunct).lstrip('/'),title))
+          seen=set()
+          for url,title in candidates:
+            if url in seen: continue
+            seen.add(url)
+            try:
+              rr=s.get(url,headers={'Referer':'https://www.cninfo.com.cn/'},timeout=180)
+              print('PDFTRY',title,url,rr.status_code,len(rr.content),rr.url,rr.headers.get('content-type'),repr(rr.content[:16]))
+              if rr.status_code==200 and rr.content.startswith(b'%PDF-'):
+                reader=PdfReader(io.BytesIO(rr.content))
+                print('PDFOK',json.dumps({'title':title,'url':url,'final_url':rr.url,'pages':len(reader.pages),'bytes':len(rr.content),'encrypted':reader.is_encrypted},ensure_ascii=False))
+            except Exception as e: print('PDFERR',url,repr(e))
+          PY
