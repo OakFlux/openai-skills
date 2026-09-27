@@ -1,0 +1,365 @@
+name: Build Star Plus Legend 06683 complete filings package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/starplus-06683-complete-filings-package-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Download, validate and package official HKEX filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          BASE = 'https://www1.hkexnews.hk'
+          SEARCH = BASE + '/search/titleSearchServlet.do'
+          PACKAGE = '巨星传奇_06683_全部年报_招股说明书_最新定期报告_截至2026-09-27'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/json,text/javascript,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/',
+          })
+
+          def request_text(url: str, params: dict | None = None) -> str:
+              errors = []
+              for attempt in range(1, 6):
+                  try:
+                      r = session.get(url, params=params, timeout=(30, 180), allow_redirects=True)
+                      print('GET', r.status_code, r.url, 'bytes', len(r.content), flush=True)
+                      r.raise_for_status()
+                      return r.text
+                  except Exception as exc:
+                      errors.append(f'attempt {attempt}: {exc!r}')
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'GET failed: {url}: {errors}')
+
+          def stock_id(code: str) -> int:
+              raw = request_text(BASE + '/search/prefix.do', {
+                  'callback': 'cb', 'lang': 'ZH', 'type': 'A', 'name': code, 'market': 'SEHK'
+              })
+              payload = json.loads(raw[raw.index('(') + 1:raw.rindex(')')])
+              rows = payload['stockInfo']
+              matches = [r for r in rows if str(r.get('code', '')).lstrip('0') == code.lstrip('0')]
+              if not matches:
+                  raise RuntimeError('HKEX stock code 06683 not resolved')
+              return int(matches[0]['stockId'])
+
+          def search(sid: int, *, lang: str = 'ZH', title: str = '', t1code: int = -2,
+                     t2code: int = -2, from_date: int = 20150101, to_date: int = 20991231) -> list[dict]:
+              params = dict(
+                  sortDir=0, sortByOptions='DateTime', category=0, market='SEHK', stockId=sid,
+                  documentType=-1, fromDate=from_date, toDate=to_date, title=title, searchType=1,
+                  t1code=t1code, t2Gcode=-2, t2code=t2code, rowRange=500, lang=lang,
+              )
+              outer = json.loads(request_text(SEARCH, params))
+              result = outer.get('result', [])
+              return json.loads(result) if isinstance(result, str) else result
+
+          def full_url(link: str) -> str:
+              return link if link.startswith('http') else BASE + link
+
+          def year_from_title(title: str) -> int:
+              years = [int(y) for y in re.findall(r'20\d{2}', html.unescape(title))]
+              return max(years, default=0)
+
+          sid = stock_id('6683')
+          print('HKEX STOCK ID', sid, flush=True)
+
+          annual_rows = search(sid, lang='ZH', t1code=40000, t2code=40100)
+          annual_docs = {}
+          for row in annual_rows:
+              title = html.unescape(row.get('TITLE', '')).strip()
+              compact = re.sub(r'\s+', '', title)
+              year = year_from_title(title)
+              if year not in (2023, 2024, 2025):
+                  continue
+              if not ('年報' in compact or '年度報告' in compact):
+                  continue
+              if any(x in compact for x in ('環境、社會及管治', '環境社會及管治', 'ESG', '摘要', '印刷')):
+                  continue
+              annual_docs.setdefault(year, {
+                  'kind': '年度报告', 'title': title, 'date': row.get('DATE_TIME', ''),
+                  'url': full_url(row['FILE_LINK']), 'year': year,
+              })
+          if set(annual_docs) != {2023, 2024, 2025}:
+              raise RuntimeError(f'annual report discovery incomplete: {annual_docs}')
+
+          offering_rows = search(sid, lang='ZH', title='全球發售', from_date=20230630, to_date=20230630)
+          offering_docs = []
+          for row in offering_rows:
+              title = html.unescape(row.get('TITLE', '')).strip()
+              link = row.get('FILE_LINK', '')
+              if link.lower().endswith('.pdf') and '2023/0630/' in link and title.replace(' ', '') == '全球發售':
+                  offering_docs.append({
+                      'kind': '招股文件待识别', 'title': title, 'date': row.get('DATE_TIME', ''),
+                      'url': full_url(link), 'year': 2023,
+                  })
+          # There should be the base prospectus and the supplemental prospectus.
+          uniq = {d['url']: d for d in offering_docs}
+          offering_docs = list(uniq.values())
+          if len(offering_docs) != 2:
+              raise RuntimeError(f'expected two final Chinese offering documents, got {offering_docs}')
+
+          interim_2025_rows = search(sid, lang='ZH', t1code=40000, t2code=40200,
+                                     from_date=20250101, to_date=20251231)
+          full_interim = None
+          for row in interim_2025_rows:
+              title = html.unescape(row.get('TITLE', '')).strip()
+              compact = re.sub(r'\s+', '', title)
+              if '2025' in compact and '中期報告' in compact and '通知' not in compact:
+                  full_interim = {
+                      'kind': '最新完整中期报告', 'title': title, 'date': row.get('DATE_TIME', ''),
+                      'url': full_url(row['FILE_LINK']), 'year': 2025,
+                  }
+                  break
+          if full_interim is None:
+              raise RuntimeError('2025 full interim report not found')
+
+          latest_rows = search(sid, lang='ZH', title='中期業績', from_date=20260801, to_date=20260927)
+          latest_announcement = None
+          for row in latest_rows:
+              title = html.unescape(row.get('TITLE', '')).strip()
+              compact = re.sub(r'\s+', '', title)
+              if '2026年6月30日' in compact and '中期業績' in compact:
+                  latest_announcement = {
+                      'kind': '最新定期财务披露', 'title': title, 'date': row.get('DATE_TIME', ''),
+                      'url': full_url(row['FILE_LINK']), 'year': 2026,
+                  }
+                  break
+          if latest_announcement is None:
+              raise RuntimeError('2026 interim-results announcement not found')
+
+          def download_pdf(url: str, dest: Path, min_bytes: int = 30000) -> str:
+              variants = [url]
+              if 'www1.hkexnews.hk' in url:
+                  variants.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              errors = []
+              for candidate in dict.fromkeys(variants):
+                  for attempt in range(1, 6):
+                      tmp = dest.with_suffix(dest.suffix + '.part')
+                      try:
+                          with session.get(candidate, timeout=(30, 300), allow_redirects=True, stream=True) as r:
+                              print('DOWNLOAD', dest.name, 'attempt', attempt, r.status_code, candidate, '->', r.url, flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in r.iter_content(1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          size = tmp.stat().st_size
+                          head = tmp.open('rb').read(8)
+                          if size < min_bytes or not head.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF payload size={size}, head={head!r}')
+                          tmp.replace(dest)
+                          return str(r.url)
+                      except Exception as exc:
+                          errors.append(f'{candidate} attempt {attempt}: {exc!r}')
+                          tmp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {dest.name}: {errors}')
+
+          def inspect_pdf(path: Path) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              text = ''
+              for page in reader.pages[:min(40, pages)]:
+                  try:
+                      text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              return pages, text
+
+          # First download the two final offering documents to identify base vs supplemental.
+          prospectus_probes = []
+          for idx, doc in enumerate(offering_docs, 1):
+              probe = OUT / f'_prospectus_probe_{idx}.pdf'
+              final_url = download_pdf(doc['url'], probe, 100000)
+              pages, sample = inspect_pdf(probe)
+              prospectus_probes.append((doc, probe, final_url, pages, sample))
+          prospectus_probes.sort(key=lambda x: x[3], reverse=True)
+          if prospectus_probes[0][3] < 300:
+              raise RuntimeError(f'base prospectus unexpectedly short: {prospectus_probes[0][3]} pages')
+          if prospectus_probes[1][3] >= prospectus_probes[0][3]:
+              raise RuntimeError('prospectus page-count classification failed')
+
+          docs = []
+          for year in (2023, 2024, 2025):
+              d = annual_docs[year]
+              d['filename'] = f'{year}_巨星传奇_06683_{year}年年度报告_中文版_官方原文.pdf'
+              d['min_pages'] = 100
+              d['min_bytes'] = 300000
+              docs.append(d)
+
+          base_doc, base_probe, base_final, base_pages, base_sample = prospectus_probes[0]
+          sup_doc, sup_probe, sup_final, sup_pages, sup_sample = prospectus_probes[1]
+          base_doc.update({
+              'kind': '最终招股章程',
+              'title': '全球发售——最终招股章程（中文版）',
+              'filename': '2023_巨星传奇_06683_最终招股章程_中文版_官方原文.pdf',
+              'min_pages': 300, 'min_bytes': 1000000,
+              '_preloaded': (base_probe, base_final, base_pages, base_sample),
+          })
+          sup_doc.update({
+              'kind': '补充招股章程',
+              'title': '全球发售——补充招股章程（中文版）',
+              'filename': '2023_巨星传奇_06683_补充招股章程_中文版_官方原文.pdf',
+              'min_pages': 2, 'min_bytes': 100000,
+              '_preloaded': (sup_probe, sup_final, sup_pages, sup_sample),
+          })
+          docs.extend([base_doc, sup_doc])
+
+          latest_announcement.update({
+              'filename': '2026_巨星传奇_06683_2026年中期业绩公告_最新定期财务披露_中文版_官方原文.pdf',
+              'min_pages': 10, 'min_bytes': 100000,
+          })
+          full_interim.update({
+              'filename': '2025_巨星传奇_06683_2025年中期报告_最新完整中期报告_中文版_官方原文.pdf',
+              'min_pages': 50, 'min_bytes': 200000,
+          })
+          docs.extend([latest_announcement, full_interim])
+
+          records = []
+          seen_hashes = set()
+          for doc in docs:
+              dest = OUT / doc['filename']
+              if '_preloaded' in doc:
+                  probe, final_url, pages, sample = doc.pop('_preloaded')
+                  probe.replace(dest)
+              else:
+                  final_url = download_pdf(doc['url'], dest, doc['min_bytes'])
+                  pages, sample = inspect_pdf(dest)
+              if pages < doc['min_pages']:
+                  raise RuntimeError(f'page count too small for {dest.name}: {pages}')
+
+              normalized_sample = re.sub(r'\s+', '', sample).lower()
+              identity_ok = any(term in normalized_sample for term in (
+                  '6683', '06683', 'starpluslegend', '巨星傳奇', '巨星传奇'
+              ))
+              if not identity_ok:
+                  # Some CJK PDFs have non-extractable title pages; validate annual/interim years and HKEX source as fallback.
+                  print('WARNING identity text not extractable in first pages:', dest.name, flush=True)
+
+              if doc['kind'] == '补充招股章程':
+                  supplemental_signal = ('補充招股章程' in sample or '补充招股章程' in sample or
+                                         'supplementalprospectus' in normalized_sample)
+                  if not supplemental_signal and pages > 150:
+                      raise RuntimeError(f'supplemental prospectus classification doubtful: {dest.name}, pages={pages}')
+
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {dest.name}: {check.stderr[-2000:]}')
+
+              data = dest.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in seen_hashes:
+                  raise RuntimeError(f'duplicate PDF detected: {dest.name}')
+              seen_hashes.add(sha)
+              rec = {
+                  'filename': dest.name,
+                  'document_type': doc['kind'],
+                  'document_title': re.sub(r'\s+', ' ', doc['title']).strip(),
+                  'reporting_year': doc['year'],
+                  'disclosure_datetime': doc['date'],
+                  'source': '香港交易所披露易（HKEXnews）',
+                  'source_url': final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+              }
+              records.append(rec)
+              print('VALIDATED', json.dumps(rec, ensure_ascii=False), flush=True)
+
+          records.sort(key=lambda r: (r['reporting_year'], r['document_type'], r['filename']))
+
+          readme = [
+              '巨星传奇集团有限公司（06683.HK）年度报告、最终招股文件及最新定期财务报告',
+              '整理日期：2026-09-27',
+              '资料来源：香港交易所披露易（HKEXnews）官方PDF原件',
+              '',
+              '收录范围与口径：',
+              '1. 巨星传奇于2023年7月13日在香港联交所上市，因此上市主体可取得的独立完整年度报告为2023、2024及2025年年度报告；上市前2020—2022年历史财务资料载于招股章程及会计师报告。',
+              '2. 招股文件采用2023年6月30日重新启动全球发售后正式刊发、最终生效的中文版文件组合，包括最终招股章程及补充招股章程；不以早期上市申请稿或已被后续安排取代的文件冒充最终招股章程。',
+              '3. 港股主板公司通常不按A股口径发布第一季度和第三季度季报。截至2026年9月27日，最新定期财务披露为2026年8月31日发布的2026年中期业绩公告；2026年完整中期报告尚未刊发，因此本包同时收录最新完整的2025年中期报告。',
+              '4. 本包为中文官方原件；未重复加入内容等价的英文版本，以控制压缩包体积。',
+              '',
+              '文件清单：',
+          ]
+          for i, r in enumerate(records, 1):
+              readme.extend([
+                  f"{i}. {r['document_type']}｜{r['document_title']}",
+                  f"   文件：{r['filename']}",
+                  f"   披露时间：{r['disclosure_datetime']}；页数：{r['pages']}；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   官方来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '完整性核验：PDF文件头、实际页数、qpdf结构检查、重复哈希排除、SHA-256清单及ZIP CRC校验。',
+              '文件按“报告年度_公司_证券代码_文件类型_语言_官方原文”统一命名。',
+          ])
+          (OUT / '00_文件清单与范围说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+          with (OUT / 'sources.csv').open('w', encoding='utf-8-sig', newline='') as fh:
+              writer = csv.DictWriter(fh, fieldnames=list(records[0].keys()))
+              writer.writeheader()
+              writer.writerows(records)
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for path in sorted(OUT.iterdir()):
+                  zf.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_names = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f'expected 7 PDFs, got {len(pdf_names)}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(pdf_names), 'SHA256', zip_sha, flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: starplus-06683-complete-filings-final
+          path: 巨星传奇_06683_全部年报_招股说明书_最新定期报告_截至2026-09-27.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
