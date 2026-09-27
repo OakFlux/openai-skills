@@ -1,34 +1,331 @@
-name: Xujiahui report search 20260927
+name: Build Xujiahui broker research public pages 20260927
+
 on:
   push:
     paths:
       - '.github/workflows/xujiahui-report-search-20260927.yml'
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
-  search:
+  package:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
-      - name: Inspect report page
+      - name: Install PDF tools
         run: |
-          mkdir -p out
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 lxml reportlab pypdf
+
+      - name: Fetch public research pages and build package
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
-          import requests
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
           from pathlib import Path
-          s=requests.Session(); s.trust_env=False
-          s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://stock.finance.sina.com.cn/'})
-          u='https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/493370648229/index.phtml'
-          r=s.get(u,timeout=60)
-          Path('out/report.html').write_bytes(r.content)
-          print(r.status_code)
-          print(r.url)
-          print(len(r.content))
-          print(r.text[:50000])
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_CENTER, TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+          from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+          PACKAGE = '徐家汇_002561_券商深度报告_公开页面版_3份'
+          root = Path(PACKAGE)
+          root.mkdir(exist_ok=True)
+          html_dir = root / '来源网页原件'
+          html_dir.mkdir(exist_ok=True)
+          preview_dir = root / '首页预览'
+          preview_dir.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'order': 1,
+                  'report_id': '493370648229',
+                  'broker_expected': '中泰证券',
+                  'date_expected': '2015-08-20',
+                  'title_expected': '徐家汇(002561)深度研究：优质商圈+高盈利能力+高分红',
+                  'analyst_expected': '胡彦超',
+                  'filename': '01_中泰证券_徐家汇_深度研究_优质商圈高盈利能力高分红_公开页面版_2015-08-20.pdf',
+              },
+              {
+                  'order': 2,
+                  'report_id': '351673115156',
+                  'broker_expected': '东兴证券',
+                  'date_expected': '2011-02-22',
+                  'title_expected': '徐家汇(002561)：巩固与转型并行不悖铸就内外兼修企业价值',
+                  'analyst_expected': '银国宏',
+                  'filename': '02_东兴证券_徐家汇_巩固与转型并行不悖铸就内外兼修企业价值_公开页面版_2011-02-22.pdf',
+              },
+              {
+                  'order': 3,
+                  'report_id': '351590289389',
+                  'broker_expected': '光大证券',
+                  'date_expected': '2011-02-21',
+                  'title_expected': '徐家汇(002561)：坐拥上海黄金商圈_门店错位经营得当',
+                  'analyst_expected': '唐佳睿',
+                  'filename': '03_光大证券_徐家汇_坐拥上海黄金商圈门店错位经营得当_公开页面版_2011-02-21.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Referer': 'https://stock.finance.sina.com.cn/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def fetch_page(url: str) -> tuple[bytes, str, dict]:
+              last = None
+              for attempt in range(6):
+                  try:
+                      r = session.get(url, timeout=(20, 120), allow_redirects=True)
+                      last = {
+                          'status': r.status_code,
+                          'final_url': r.url,
+                          'content_type': r.headers.get('content-type', ''),
+                          'bytes': len(r.content),
+                      }
+                      if r.status_code == 200 and len(r.content) > 10000:
+                          text = r.content.decode('gb18030', 'replace')
+                          if '徐家汇' in text and 'blk_container' in text:
+                              return r.content, text, last
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'Fetch failed {url}: {last}')
+
+          def clean_text(value: str) -> str:
+              value = html.unescape(value or '')
+              value = value.replace('\u3000', ' ')
+              value = re.sub(r'[ \t\r\f\v]+', ' ', value)
+              value = re.sub(r'\n\s*\n+', '\n\n', value)
+              return value.strip()
+
+          def parse_report(text: str) -> dict:
+              soup = BeautifulSoup(text, 'lxml')
+              title_node = soup.select_one('.content h1') or soup.find('h1') or soup.title
+              title = clean_text(title_node.get_text(' ', strip=True) if title_node else '')
+              meta_node = soup.select_one('.content .creab') or soup.select_one('.creab')
+              meta_text = clean_text(meta_node.get_text(' ', strip=True) if meta_node else '')
+              content_node = soup.select_one('.content .blk_container') or soup.select_one('.blk_container')
+              if not content_node:
+                  raise RuntimeError('Research content block not found')
+              # Preserve public-page paragraph separation introduced by <br> tags.
+              for br in content_node.find_all('br'):
+                  br.replace_with('\n')
+              body = clean_text(content_node.get_text('\n', strip=True))
+              broker = ''
+              analyst = ''
+              date = ''
+              m = re.search(r'机构[：:]\s*(.+?)(?:研究员|日期|$)', meta_text)
+              if m: broker = clean_text(m.group(1))
+              m = re.search(r'研究员[：:]\s*(.+?)(?:日期|$)', meta_text)
+              if m: analyst = clean_text(m.group(1))
+              m = re.search(r'日期[：:]\s*(\d{4}-\d{2}-\d{2})', meta_text)
+              if m: date = m.group(1)
+              return {
+                  'title': title,
+                  'metadata_text': meta_text,
+                  'broker': broker,
+                  'analyst': analyst,
+                  'date': date,
+                  'body': body,
+              }
+
+          pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+          styles = getSampleStyleSheet()
+          title_style = ParagraphStyle(
+              'ChineseTitle', parent=styles['Title'], fontName='STSong-Light',
+              fontSize=16, leading=23, alignment=TA_CENTER, spaceAfter=10,
+          )
+          notice_style = ParagraphStyle(
+              'Notice', parent=styles['Normal'], fontName='STSong-Light',
+              fontSize=9, leading=14, alignment=TA_LEFT, textColor=colors.HexColor('#555555'),
+              borderColor=colors.HexColor('#BBBBBB'), borderWidth=0.6,
+              borderPadding=7, backColor=colors.HexColor('#F5F5F5'), spaceAfter=10,
+              wordWrap='CJK',
+          )
+          body_style = ParagraphStyle(
+              'ChineseBody', parent=styles['BodyText'], fontName='STSong-Light',
+              fontSize=10.5, leading=18, alignment=TA_LEFT, firstLineIndent=21,
+              spaceAfter=8, wordWrap='CJK',
+          )
+          meta_style = ParagraphStyle(
+              'ChineseMeta', parent=styles['Normal'], fontName='STSong-Light',
+              fontSize=9.5, leading=15, wordWrap='CJK',
+          )
+          source_style = ParagraphStyle(
+              'Source', parent=styles['Normal'], fontName='STSong-Light',
+              fontSize=8, leading=12, textColor=colors.HexColor('#555555'), wordWrap='CJK',
+          )
+
+          def esc(s: str) -> str:
+              return html.escape(s or '', quote=True)
+
+          def make_pdf(report: dict, parsed: dict, source_url: str, dest: Path) -> None:
+              doc = SimpleDocTemplate(
+                  str(dest), pagesize=A4,
+                  leftMargin=19*mm, rightMargin=19*mm,
+                  topMargin=17*mm, bottomMargin=17*mm,
+                  title=parsed['title'], author=report['broker_expected'],
+                  subject='公开研报页面整理版（非券商原始完整PDF）',
+              )
+              story = []
+              story.append(Paragraph(esc(parsed['title']), title_style))
+              story.append(Paragraph(
+                  '资料性质说明：本文件由公开可访问的新浪财经研报页面排版生成，完整保留该页面公开展示的题名、机构、研究员、日期和正文摘要。它不是券商发布的原始完整PDF，也未绕过任何账户、会员或付费访问限制。',
+                  notice_style,
+              ))
+              meta_rows = [
+                  ['券商机构', parsed['broker'] or report['broker_expected']],
+                  ['研究员', parsed['analyst'] or report['analyst_expected']],
+                  ['发布日期', parsed['date'] or report['date_expected']],
+                  ['股票', '徐家汇（002561.SZ）'],
+              ]
+              meta_table = Table(
+                  [[Paragraph(esc(a), meta_style), Paragraph(esc(b), meta_style)] for a,b in meta_rows],
+                  colWidths=[28*mm, 125*mm], hAlign='LEFT',
+              )
+              meta_table.setStyle(TableStyle([
+                  ('FONTNAME',(0,0),(-1,-1),'STSong-Light'),
+                  ('VALIGN',(0,0),(-1,-1),'TOP'),
+                  ('GRID',(0,0),(-1,-1),0.35,colors.HexColor('#CCCCCC')),
+                  ('BACKGROUND',(0,0),(0,-1),colors.HexColor('#F1F1F1')),
+                  ('LEFTPADDING',(0,0),(-1,-1),6),('RIGHTPADDING',(0,0),(-1,-1),6),
+                  ('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),
+              ]))
+              story.append(meta_table)
+              story.append(Spacer(1, 8*mm))
+              paragraphs = [clean_text(p) for p in re.split(r'\n\s*\n+', parsed['body']) if clean_text(p)]
+              if not paragraphs:
+                  paragraphs = [parsed['body']]
+              for para in paragraphs:
+                  story.append(Paragraph(esc(para).replace('\n','<br/>'), body_style))
+              story.append(Spacer(1, 7*mm))
+              story.append(Paragraph('公开来源页面：' + esc(source_url), source_style))
+              doc.build(story)
+
+          manifest = []
+          for report in reports:
+              report_id = report['report_id']
+              source_url = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{report_id}/index.phtml'
+              raw, text, fetch_meta = fetch_page(source_url)
+              html_path = html_dir / f'{report["order"]:02d}_{report_id}_新浪财经公开页面.html'
+              html_path.write_bytes(raw)
+              parsed = parse_report(text)
+              if '徐家汇' not in parsed['title']:
+                  raise RuntimeError(f'Issuer identity check failed: {parsed["title"]}')
+              if len(parsed['body']) < 250:
+                  raise RuntimeError(f'Public research-page body too short for {report_id}: {len(parsed["body"])}')
+              pdf_path = root / report['filename']
+              make_pdf(report, parsed, source_url, pdf_path)
+              reader = PdfReader(str(pdf_path), strict=False)
+              pages = len(reader.pages)
+              extracted = ''.join((p.extract_text() or '') for p in reader.pages[:min(3,pages)])
+              if '徐家汇' not in extracted:
+                  raise RuntimeError(f'Generated PDF text identity check failed: {pdf_path.name}')
+              subprocess.run(['qpdf','--check',str(pdf_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = preview_dir / pdf_path.stem
+              subprocess.run(
+                  ['pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(pdf_path),str(prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              preview = Path(str(prefix)+'.png')
+              if not preview.exists() or preview.stat().st_size < 10000:
+                  raise RuntimeError(f'Preview render failed: {pdf_path.name}')
+              sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+              manifest.append({
+                  **report,
+                  'source_url': source_url,
+                  'source_html_file': str(Path('来源网页原件') / html_path.name),
+                  'parsed_title': parsed['title'],
+                  'parsed_broker': parsed['broker'],
+                  'parsed_analyst': parsed['analyst'],
+                  'parsed_date': parsed['date'],
+                  'public_body_characters': len(parsed['body']),
+                  'pdf_file': pdf_path.name,
+                  'pdf_pages': pages,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha,
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'fetch': fetch_meta,
+                  'document_nature': '公开研报页面整理版；非券商原始完整PDF',
+                  'validation': ['public source-page identity','public body length','searchable PDF text','qpdf structure','first-page render'],
+              })
+
+          readme = [
+              '徐家汇（002561.SZ）券商深度研究公开页面资料包',
+              '整理日期：2026-09-27',
+              '',
+              '本包收录3份券商研究报告在新浪财经公开展示的研报页面，并将公开页面中的题名、机构、研究员、发布日期和正文摘要排版为可检索PDF。',
+              '重要说明：这些文件不是券商发布的原始完整PDF。经公开检索，相关原始券商PDF未找到无需登录即可合法下载的公开入口；本包未绕过任何账户、会员、付费或数据库访问限制。',
+              '',
+          ]
+          for i,r in enumerate(manifest,1):
+              readme += [
+                  f"{i}. {r['parsed_broker'] or r['broker_expected']}：《{r['parsed_title']}》",
+                  f"   日期：{r['parsed_date'] or r['date_expected']}；研究员：{r['parsed_analyst'] or r['analyst_expected']}",
+                  f"   本包PDF：{r['pdf_pages']}页；公开正文字符数：{r['public_body_characters']}",
+                  f"   来源页面：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ]
+          readme += [
+              '包内同时保存3个来源网页HTML原件、各PDF首页预览、manifest.json和SHA256SUMS.txt。',
+              '报告观点与版权归原券商、研究员及来源平台所有，仅供研究参考，不构成投资建议。',
+              '核验项目：来源页面公司身份、公开正文完整提取、PDF可检索文本、qpdf结构、首页渲染、ZIP CRC与SHA-256。',
+          ]
+          (root / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{r['sha256']}  {r['pdf_file']}\n" for r in manifest), encoding='utf-8'
+          )
+
+          zpath = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{PACKAGE}/{p.relative_to(root)}')
+          with zipfile.ZipFile(zpath) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'PDF count mismatch: {len(pdfs)}')
+          english = Path('Xujiahui_002561_Broker_Research_Public_Pages_3.zip')
+          english.write_bytes(zpath.read_bytes())
+          print('FINAL_ZIP', zpath, zpath.stat().st_size, hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
           PY
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
         with:
-          name: xujiahui-report-page
-          path: out
-          retention-days: 7
+          name: xujiahui-002561-broker-research-public-pages-final
+          path: |
+            徐家汇_002561_券商深度报告_公开页面版_3份.zip
+            Xujiahui_002561_Broker_Research_Public_Pages_3.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
