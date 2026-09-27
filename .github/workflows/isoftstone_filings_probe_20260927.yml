@@ -1,0 +1,151 @@
+name: iSoftStone Filings Probe
+
+on:
+  push:
+    branches:
+      - chatgpt-isoftstone-filings-20260927
+    paths:
+      - .github/workflows/isoftstone_filings_probe_20260927.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Discover and validate filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import io, json, re
+          from datetime import date, timedelta
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK='301236'
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def get(url, referer=None, timeout=90):
+              headers={'Referer':referer} if referer else {}
+              r=s.get(url,headers=headers,timeout=timeout,allow_redirects=True)
+              r.raise_for_status()
+              return r
+
+          def decode(r):
+              r.encoding=r.apparent_encoding or 'gb18030'
+              return r.text
+
+          def list_entries(url, detail_marker):
+              r=get(url)
+              soup=BeautifulSoup(decode(r),'html.parser')
+              out=[]
+              for a in soup.find_all('a',href=True):
+                  href=urljoin(r.url,a['href'])
+                  if detail_marker not in href:
+                      continue
+                  title=' '.join(a.get_text(' ',strip=True).split())
+                  tr=a.find_parent('tr')
+                  context=' '.join((tr.get_text(' ',strip=True) if tr else (a.parent.get_text(' ',strip=True) if a.parent else title)).split())
+                  out.append({'title':title,'context':context,'detail_url':href})
+              dedup={x['detail_url']:x for x in out}
+              out=list(dedup.values())
+              print('\nLIST',url,'COUNT',len(out))
+              print(json.dumps(out,ensure_ascii=False,indent=2))
+              return out
+
+          def detail_pdf(entry):
+              r=get(entry['detail_url'])
+              soup=BeautifulSoup(decode(r),'html.parser')
+              candidates=[]
+              for a in soup.find_all('a',href=True):
+                  text=' '.join(a.get_text(' ',strip=True).split())
+                  href=urljoin(r.url,a['href'])
+                  blob=(text+' '+href).lower()
+                  if '下载公告' in text or '.pdf' in blob:
+                      candidates.append(href)
+              candidates += re.findall(r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+\.PDF',r.text,re.I)
+              seen=[]
+              for u in candidates:
+                  u=u.replace('&amp;','&')
+                  if u not in seen: seen.append(u)
+              for u in seen:
+                  try:
+                      rr=get(u,entry['detail_url'],180)
+                      if rr.content.startswith(b'%PDF-') and len(rr.content)>50000:
+                          reader=PdfReader(io.BytesIO(rr.content))
+                          result={'title':entry['title'],'context':entry['context'],'detail_url':entry['detail_url'],'pdf_url':u,'final_url':rr.url,'bytes':len(rr.content),'pages':len(reader.pages),'encrypted':reader.is_encrypted}
+                          print('PDF_OK',json.dumps(result,ensure_ascii=False))
+                          return result
+                  except Exception as exc:
+                      print('PDF_ERR',u,repr(exc))
+              print('NO_DIRECT_PDF',json.dumps(entry,ensure_ascii=False),'CANDIDATES',json.dumps(seen,ensure_ascii=False))
+              return None
+
+          annual_url=f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK}/page_type/ndbg.phtml'
+          q1_url=f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK}/page_type/yjdbg.phtml'
+          prospectus_url=f'https://vip.stock.finance.sina.com.cn/corp/go.php/vISSUE_RaiseExplanation/stockid/{STOCK}.phtml'
+
+          annual=list_entries(annual_url,'vCB_AllBulletinDetail.php')
+          q1=list_entries(q1_url,'vCB_AllBulletinDetail.php')
+          prospectus=list_entries(prospectus_url,'vISSUE_RaiseExplanationDetail.php')
+
+          selected_annual=[]
+          for year in range(2021,2026):
+              candidates=[x for x in annual if str(year) in x['title'] and '年度报告' in x['title'] and '摘要' not in x['title']]
+              if not candidates: raise RuntimeError(f'missing annual {year}')
+              selected_annual.append(candidates[0])
+          q1_candidates=[x for x in q1 if '2026' in x['title'] and ('一季度报告' in x['title'] or '第一季度报告' in x['title']) and '摘要' not in x['title']]
+          if not q1_candidates: raise RuntimeError('missing 2026 Q1')
+          selected=selected_annual+[q1_candidates[0]]
+          results=[detail_pdf(x) for x in selected]
+          print('\nSELECTED_RESULTS',json.dumps(results,ensure_ascii=False,indent=2))
+
+          # Select the final IPO prospectus, not filing drafts or prospectus of intent.
+          final_candidates=[]
+          for x in prospectus:
+              t=x['title']
+              if '招股说明书' in t and '申报稿' not in t and '意向书' not in t and '更新' not in t:
+                  final_candidates.append(x)
+          print('FINAL_PROSPECTUS_CANDIDATES',json.dumps(final_candidates,ensure_ascii=False,indent=2))
+          if not final_candidates: raise RuntimeError('No final prospectus candidate')
+          entry=final_candidates[0]
+          direct=detail_pdf(entry)
+          if direct:
+              print('FINAL_PROSPECTUS_PDF',json.dumps(direct,ensure_ascii=False))
+          else:
+              # Sina stores issue attachments by detail id and announcement date. Probe around IPO date.
+              m=re.search(r'id=(\d+)',entry['detail_url'])
+              if not m: raise RuntimeError('No prospectus detail id')
+              detail_id=m.group(1)
+              found=[]
+              start=date(2022,2,20); end=date(2022,3,16)
+              day=start
+              while day<=end:
+                  url=f'https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/{day.year}/{day.year}-{day.month}/{day.isoformat()}/{detail_id}.PDF'
+                  try:
+                      rr=get(url,entry['detail_url'],60)
+                      if rr.content.startswith(b'%PDF-') and len(rr.content)>100000:
+                          reader=PdfReader(io.BytesIO(rr.content))
+                          rec={'title':entry['title'],'context':entry['context'],'detail_url':entry['detail_url'],'pdf_url':url,'final_url':rr.url,'bytes':len(rr.content),'pages':len(reader.pages),'encrypted':reader.is_encrypted}
+                          found.append(rec)
+                          print('PROSPECTUS_FOUND',json.dumps(rec,ensure_ascii=False))
+                          break
+                  except Exception:
+                      pass
+                  day += timedelta(days=1)
+              if not found: raise RuntimeError(f'Prospectus PDF not found for id={detail_id}')
+          PY
