@@ -1,0 +1,303 @@
+name: Build Ping An Bank 000001 broker deep report package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/pingan-bank-000001-broker-package-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '000001'
+          COMPANY = '平安银行'
+          PACKAGE = '平安银行_000001_券商深度报告_3份_公开完整PDF'
+          WORK = Path('pingan_bank_work')
+          DOWNLOADS = WORK / 'downloads'
+          FINAL = WORK / PACKAGE
+          OUT = Path('artifact_out')
+          for p in (DOWNLOADS, FINAL, OUT):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept': 'application/json,text/javascript,application/pdf,*/*;q=0.01',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:90]
+
+          def get_json(url: str, params: dict) -> dict:
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      r = session.get(url, params=params, timeout=(20, 120))
+                      print('API', attempt, r.status_code, len(r.content), r.url, flush=True)
+                      r.raise_for_status()
+                      return r.json()
+                  except Exception as exc:
+                      last = exc
+                      print('API_ERR', attempt, repr(exc), flush=True)
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'API failed: {last!r}')
+
+          api = 'https://reportapi.eastmoney.com/report/list'
+          records = []
+          for page in range(1, 8):
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2017-01-01', 'endTime': '2026-09-27',
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': CODE, 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+              data = get_json(api, params)
+              batch = data.get('data') or []
+              if not batch:
+                  break
+              records.extend(batch)
+              if len(batch) < 100:
+                  break
+
+          uniq = {}
+          for row in records:
+              blob = json.dumps(row, ensure_ascii=False)
+              if CODE not in blob and COMPANY not in blob:
+                  continue
+              key = str(row.get('infoCode') or row.get('id') or blob)
+              uniq[key] = row
+          metadata = list(uniq.values())
+          metadata.sort(key=lambda x: str(x.get('publishDate') or ''), reverse=True)
+          (WORK / 'all_metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('METADATA_COUNT', len(metadata), flush=True)
+
+          deep_terms = [
+              '深度', '首次覆盖', '公司深度', '银行转型', '零售银行', '财富管理',
+              '私人银行', '私行', '供应链金融', '数字银行', '金融科技', '对公',
+              '信用卡', '消费金融', '资产质量', '估值重塑', '改革', '转型',
+              '成长', '零售', '综合金融', '护城河', '拐点', '价值重估'
+          ]
+          shallow_terms = ['点评', '季报', '年报点评', '中报点评', '月报', '跟踪', '简评', '快报', '业绩点评']
+
+          def meta_score(row: dict) -> tuple:
+              title = str(row.get('title') or '')
+              low = title.lower()
+              deep = sum(4 for t in deep_terms if t.lower() in low)
+              if '深度' in title or '首次覆盖' in title:
+                  deep += 14
+              shallow = sum(4 for t in shallow_terms if t in title)
+              year = int(str(row.get('publishDate') or '0')[:4] or 0)
+              return (deep - shallow, year, str(row.get('publishDate') or ''))
+
+          candidates = sorted(metadata, key=meta_score, reverse=True)[:60]
+          valid = []
+          seen_sha = set()
+
+          def download_report(info_code: str, target: Path):
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_01.pdf',
+              ]
+              errors = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, timeout=(25, 180), allow_redirects=True)
+                          print('PDF', info_code, attempt, r.status_code, len(r.content), url, 'FINAL', r.url, flush=True)
+                          if r.status_code == 200 and len(r.content) > 100_000 and r.content.startswith(b'%PDF-'):
+                              target.write_bytes(r.content)
+                              return r.url
+                      except Exception as exc:
+                          errors.append(repr(exc))
+                      time.sleep(attempt)
+              raise RuntimeError('; '.join(errors) or 'no valid PDF variant')
+
+          for row in candidates:
+              info = str(row.get('infoCode') or '')
+              if not info:
+                  continue
+              title = str(row.get('title') or '').strip() or info
+              broker = str(row.get('orgSName') or row.get('orgName') or '未知券商').strip()
+              date = str(row.get('publishDate') or '')[:10]
+              tmp = DOWNLOADS / f'{info}.pdf'
+              try:
+                  source_url = download_report(info, tmp)
+                  reader = PdfReader(str(tmp), strict=False)
+                  pages = len(reader.pages)
+                  sample_parts = []
+                  sample_indices = list(range(min(14, pages)))
+                  if pages > 18:
+                      sample_indices.extend(range(max(0, pages - 3), pages))
+                  for i in dict.fromkeys(sample_indices):
+                      try:
+                          sample_parts.append(reader.pages[i].extract_text() or '')
+                      except Exception:
+                          pass
+                  sample = '\n'.join(sample_parts)
+                  low = sample.lower()
+                  identity = (
+                      COMPANY in sample or CODE in sample or 'ping an bank' in low or
+                      '平安银行股份有限公司' in sample or '平安銀' in sample
+                  )
+                  research = any(k in sample for k in ['证券研究报告', '公司研究', '深度研究', '首次覆盖', '银行业研究']) or 'equity research' in low
+                  if not identity or not research or pages < 15:
+                      print('REJECT', info, title, pages, identity, research, flush=True)
+                      tmp.unlink(missing_ok=True)
+                      continue
+                  q = subprocess.run(['qpdf', '--check', str(tmp)], capture_output=True, text=True)
+                  if q.returncode not in (0, 3):
+                      raise RuntimeError('qpdf check failed: ' + q.stderr[-1000:])
+                  data = tmp.read_bytes()
+                  sha = hashlib.sha256(data).hexdigest()
+                  if sha in seen_sha:
+                      tmp.unlink(missing_ok=True)
+                      continue
+                  seen_sha.add(sha)
+                  title_low = title.lower()
+                  keyword_score = sum(5 for t in deep_terms if t.lower() in title_low)
+                  if '深度' in title or '首次覆盖' in title:
+                      keyword_score += 16
+                  keyword_score -= sum(5 for t in shallow_terms if t in title)
+                  page_score = 14 if pages >= 60 else 12 if pages >= 45 else 10 if pages >= 35 else 8 if pages >= 25 else 6 if pages >= 18 else 4
+                  recent_score = max(0, int(date[:4] or 0) - 2018) if re.match(r'20\d{2}', date) else 0
+                  score = keyword_score + page_score + recent_score
+                  rec = {
+                      'info_code': info,
+                      'title': title,
+                      'broker': broker,
+                      'publish_date': date,
+                      'pages': pages,
+                      'bytes': len(data),
+                      'sha256': sha,
+                      'source_url': source_url,
+                      'score': score,
+                      'file': str(tmp),
+                  }
+                  valid.append(rec)
+                  print('VALID', json.dumps({k: rec[k] for k in ('title','broker','publish_date','pages','score')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('PROBE_ERR', info, title, repr(exc), flush=True)
+                  tmp.unlink(missing_ok=True)
+
+          if len(valid) < 2:
+              raise RuntimeError(f'Only {len(valid)} valid long-form reports found')
+
+          valid.sort(key=lambda x: (x['score'], x['pages'], x['publish_date']), reverse=True)
+          selected = []
+          used_brokers = set()
+          for rec in valid:
+              if rec['broker'] in used_brokers:
+                  continue
+              selected.append(rec)
+              used_brokers.add(rec['broker'])
+              if len(selected) == 3:
+                  break
+          if len(selected) < 3:
+              for rec in valid:
+                  if rec not in selected:
+                      selected.append(rec)
+                  if len(selected) == 3:
+                      break
+          selected = selected[:3]
+
+          final_records = []
+          for i, rec in enumerate(selected, 1):
+              filename = f'{i:02d}_{safe(rec["publish_date"])}_{safe(rec["broker"])}_{safe(rec["title"])}.pdf'
+              dest = FINAL / filename
+              shutil.copy2(rec['file'], dest)
+              final_records.append({
+                  'filename': filename,
+                  'broker': rec['broker'],
+                  'title': rec['title'],
+                  'publish_date': rec['publish_date'],
+                  'pages': rec['pages'],
+                  'bytes': rec['bytes'],
+                  'sha256': rec['sha256'],
+                  'source_url': rec['source_url'],
+                  'info_code': rec['info_code'],
+              })
+
+          readme = [
+              '平安银行（000001.SZ）券商深度报告合集',
+              '整理日期：2026-09-27',
+              '',
+              '筛选标准：公开可直接下载的完整PDF；公司身份及券商研究属性可核验；优先长篇深度、首次覆盖或专题研究；尽量分散券商来源。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(final_records, 1):
+              readme += [
+                  f'{i}. {rec["filename"]}',
+                  f'   券商：{rec["broker"]}',
+                  f'   标题：{rec["title"]}',
+                  f'   日期：{rec["publish_date"]}；页数：{rec["pages"]}',
+                  f'   来源：{rec["source_url"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  '',
+              ]
+          readme += ['完整性核验：已检查PDF文件头、公司身份、券商研究标识、实际页数、qpdf结构、重复文件及SHA-256；ZIP已通过CRC测试。']
+          (FINAL / '00_文件清单与范围说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(final_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in final_records), encoding='utf-8')
+
+          zip_path = OUT / f'{PACKAGE}.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(FINAL.iterdir()):
+                  zf.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              if len(pdfs) != len(final_records):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)} vs {len(final_records)}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('SELECTED_FINAL', json.dumps(final_records, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'SHA256', zip_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pingan-bank-000001-broker-deep-reports-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
