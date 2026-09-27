@@ -11,7 +11,6 @@ from pathlib import Path
 import fitz
 import requests
 from PIL import Image, ImageDraw
-from pypdf import PdfReader
 
 OUT = Path('output')
 VERIFY = OUT / 'verification'
@@ -38,19 +37,15 @@ session.headers.update({
 
 def download(url):
     last = None
-    for attempt in range(5):
+    for attempt in range(4):
         try:
-            with session.get(url, timeout=240, allow_redirects=True, stream=True) as response:
-                print('FETCH', response.status_code, response.url, response.headers.get('content-type'))
-                response.raise_for_status()
-                data = bytearray()
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        data.extend(chunk)
-                return bytes(data), response.url
+            response = session.get(url, timeout=90, allow_redirects=True)
+            print('FETCH', response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+            response.raise_for_status()
+            return response.content, response.url
         except Exception as exc:
             last = exc
-            time.sleep(min(12, 2 ** attempt))
+            time.sleep(min(8, 2 ** attempt))
     raise RuntimeError(f'Failed to download {url}: {last}')
 
 
@@ -65,30 +60,31 @@ for filename, url, expected_pages, year, doc_type in FILES:
     path = OUT / filename
     path.write_bytes(data)
 
-    reader = PdfReader(str(path))
-    encrypted = reader.is_encrypted
-    if encrypted and not reader.decrypt(''):
+    doc = fitz.open(str(path))
+    encrypted = bool(doc.needs_pass)
+    if encrypted and not doc.authenticate(''):
+        doc.close()
         raise RuntimeError(f'{filename} is password protected')
-    pages = len(reader.pages)
+    pages = doc.page_count
     if pages != expected_pages:
+        doc.close()
         raise RuntimeError(f'{filename} page mismatch: {pages} != {expected_pages}')
 
-    text_parts = []
-    for page_index in range(min(6, pages)):
-        try:
-            text_parts.append(reader.pages[page_index].extract_text() or '')
-        except Exception:
-            pass
-    text = re.sub(r'\s+', '', ' '.join(text_parts))
-    if '温氏食品集团股份有限公司' not in text and '温氏股份' not in text:
+    text = ''
+    for page_index in range(min(3, pages)):
+        text += doc[page_index].get_text('text') or ''
+    normalized = re.sub(r'\s+', '', text)
+    if '温氏食品集团股份有限公司' not in normalized and '温氏股份' not in normalized:
+        doc.close()
         raise RuntimeError(f'{filename} company identity check failed')
-    if year not in text:
+    if year not in normalized:
+        doc.close()
         raise RuntimeError(f'{filename} report year check failed')
-    if doc_type not in text:
+    if doc_type not in normalized:
+        doc.close()
         raise RuntimeError(f'{filename} document type check failed')
 
-    doc = fitz.open(str(path))
-    pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.25, 1.25), alpha=False)
+    pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.15, 1.15), alpha=False)
     render = VERIFY / f'{path.stem}_page1.png'
     pix.save(str(render))
     doc.close()
@@ -107,26 +103,26 @@ for filename, url, expected_pages, year, doc_type in FILES:
         'first_page_render': render.name,
     }
     manifest.append(record)
-    print('VALIDATED', json.dumps(record, ensure_ascii=False))
+    print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
 
 # Contact sheet for visual inspection.
 thumbs = []
 for render in renders:
     image = Image.open(render).convert('RGB')
-    image.thumbnail((460, 620))
-    canvas = Image.new('RGB', (480, 670), 'white')
-    canvas.paste(image, ((480 - image.width) // 2, 8))
-    ImageDraw.Draw(canvas).text((10, 642), render.stem[:68], fill='black')
+    image.thumbnail((440, 600))
+    canvas = Image.new('RGB', (460, 650), 'white')
+    canvas.paste(image, ((460 - image.width) // 2, 8))
+    ImageDraw.Draw(canvas).text((10, 622), render.stem[:68], fill='black')
     thumbs.append(canvas)
     image.close()
 cols = 2
 rows_n = (len(thumbs) + cols - 1) // cols
-sheet = Image.new('RGB', (cols * 480, rows_n * 670), 'white')
+sheet = Image.new('RGB', (cols * 460, rows_n * 650), 'white')
 for index, canvas in enumerate(thumbs):
-    sheet.paste(canvas, ((index % cols) * 480, (index // cols) * 670))
+    sheet.paste(canvas, ((index % cols) * 460, (index // cols) * 650))
     canvas.close()
 contact_sheet = VERIFY / 'contact_sheet.jpg'
-sheet.save(contact_sheet, 'JPEG', quality=90)
+sheet.save(contact_sheet, 'JPEG', quality=88)
 sheet.close()
 
 note = '''温氏食品集团股份有限公司（证券简称：温氏股份，证券代码：300498）定期报告资料包
@@ -145,7 +141,8 @@ note = '''温氏食品集团股份有限公司（证券简称：温氏股份，�
 (OUT / '00_文件清单及校验值.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
 
 zip_path = OUT / '温氏股份_2020-2025年报_2026年第一季度报告.zip'
-with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+# PDFs are already compressed; storing avoids expensive and ineffective recompression.
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as archive:
     archive.write(OUT / '00_资料说明.txt', '00_资料说明.txt')
     archive.write(OUT / '00_文件清单及校验值.json', '00_文件清单及校验值.json')
     for filename, *_ in FILES:
@@ -164,4 +161,4 @@ summary = {
     'reports': manifest,
 }
 (OUT / 'BUILD_SUMMARY.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
-print('FINAL_SUMMARY', json.dumps({k: summary[k] for k in ('zip', 'zip_bytes', 'zip_sha256', 'pdf_count', 'total_pages')}, ensure_ascii=False))
+print('FINAL_SUMMARY', json.dumps({k: summary[k] for k in ('zip', 'zip_bytes', 'zip_sha256', 'pdf_count', 'total_pages')}, ensure_ascii=False), flush=True)
