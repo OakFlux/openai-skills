@@ -1,0 +1,412 @@
+name: Build Daodaoquan 002852 Annual Reports Package
+
+on:
+  push:
+    branches:
+      - tmp-daodaoquan-002852-reports-20260929
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf pymupdf beautifulsoup4
+
+      - name: Download, verify and package reports
+        shell: bash
+        run: |
+          cat > /tmp/build_daodaoquan.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK = "002852"
+          COMPANY = "道道全"
+          OUT = Path("output")
+          RAW = OUT / "raw"
+          SELECTED = OUT / "selected"
+          RENDERS = OUT / "renders"
+          for p in (OUT, RAW, SELECTED, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+              ),
+              "Accept": "application/json,text/plain,text/html,application/pdf,*/*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+              "Referer": "https://data.eastmoney.com/",
+          })
+
+          log_lines: list[str] = []
+
+          def log(message: str) -> None:
+              print(message, flush=True)
+              log_lines.append(message)
+
+          def safe_name(text: str, max_len: int = 120) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text)
+              text = re.sub(r"\s+", "_", text).strip(" ._")
+              return (text or "file")[:max_len]
+
+          def clean_title(text: str) -> str:
+              text = BeautifulSoup(html.unescape(text or ""), "html.parser").get_text(" ", strip=True)
+              text = re.sub(r"\s+", "", text)
+              return text.replace("：", ":")
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def iter_strings(obj: Any):
+              if isinstance(obj, dict):
+                  for value in obj.values():
+                      yield from iter_strings(value)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      yield from iter_strings(value)
+              elif isinstance(obj, str):
+                  yield obj
+
+          def announcement_rows() -> list[dict[str, Any]]:
+              endpoint = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+              rows: list[dict[str, Any]] = []
+              for page in range(1, 16):
+                  params = {
+                      "sr": "-1",
+                      "page_size": "100",
+                      "page_index": str(page),
+                      "ann_type": "A",
+                      "client_source": "web",
+                      "stock_list": STOCK,
+                  }
+                  response = session.get(endpoint, params=params, timeout=60)
+                  response.raise_for_status()
+                  payload = response.json()
+                  data = payload.get("data")
+                  if isinstance(data, dict):
+                      page_rows = data.get("list") or data.get("data") or data.get("items") or []
+                  elif isinstance(data, list):
+                      page_rows = data
+                  else:
+                      page_rows = payload.get("list") or []
+                  if not page_rows:
+                      break
+                  rows.extend(page_rows)
+                  log(f"Eastmoney announcement page {page}: {len(page_rows)} rows")
+                  if len(page_rows) < 100:
+                      break
+                  time.sleep(0.3)
+              dedup: dict[str, dict[str, Any]] = {}
+              for row in rows:
+                  art_code = str(row.get("art_code") or row.get("artCode") or "")
+                  if art_code:
+                      dedup[art_code] = row
+              result = list(dedup.values())
+              (OUT / "announcement_metadata.json").write_text(
+                  json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              log(f"Total unique announcement records: {len(result)}")
+              return result
+
+          def row_title(row: dict[str, Any]) -> str:
+              return str(row.get("title") or row.get("notice_title") or row.get("announcementTitle") or "")
+
+          EXCLUDE = ("摘要", "英文版", "审计报告", "社会责任", "更正公告", "取消", "提示性公告")
+
+          def choose_target(rows: list[dict[str, Any]], year: int, kind: str) -> dict[str, Any] | None:
+              candidates: list[tuple[float, dict[str, Any]]] = []
+              for row in rows:
+                  title_raw = row_title(row)
+                  title = clean_title(title_raw)
+                  if any(word in title for word in EXCLUDE):
+                      continue
+                  if kind == "annual":
+                      if f"{year}年年度报告" not in title:
+                          continue
+                      score = 1000.0
+                      if title.endswith(f"{year}年年度报告"):
+                          score += 100
+                      if "修订" in title or "更新" in title:
+                          score -= 20
+                  else:
+                      if "2026年" not in title or not any(
+                          phrase in title for phrase in ("第一季度报告", "一季度报告")
+                      ):
+                          continue
+                      score = 1000.0
+                      if title.endswith("2026年第一季度报告") or title.endswith("2026年一季度报告"):
+                          score += 100
+                  notice_date = str(row.get("notice_date") or row.get("noticeDate") or "")
+                  date_digits = re.sub(r"\D", "", notice_date)[:8]
+                  if date_digits:
+                      try:
+                          score += int(date_digits) / 100000000
+                      except ValueError:
+                          pass
+                  candidates.append((score, row))
+              if not candidates:
+                  return None
+              candidates.sort(key=lambda item: item[0], reverse=True)
+              return candidates[0][1]
+
+          def resolve_content_urls(art_code: str) -> list[str]:
+              urls: list[str] = []
+              endpoints = [
+                  "https://np-cnotice-stock.eastmoney.com/api/content/ann",
+                  "https://np-cnotice-stock.eastmoney.com/api/content/ann?client_source=web",
+              ]
+              for endpoint in endpoints:
+                  try:
+                      response = session.get(
+                          endpoint,
+                          params={"art_code": art_code, "client_source": "web", "page_index": "1"},
+                          timeout=45,
+                      )
+                      response.raise_for_status()
+                      try:
+                          payload = response.json()
+                      except Exception:
+                          continue
+                      for value in iter_strings(payload):
+                          if value.startswith(("http://", "https://")) and ".pdf" in value.lower():
+                              urls.append(value.replace("\\/", "/"))
+                  except Exception as exc:
+                      log(f"Content API lookup failed for {art_code}: {exc}")
+              return urls
+
+          def download_pdf(art_code: str, destination: Path) -> str:
+              timestamp = int(time.time() * 1000)
+              candidates = [
+                  f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf?{timestamp}.pdf=",
+                  f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf?download=1",
+                  f"https://pdf.dfcfw.com/pdf/H3_{art_code}_1.pdf",
+              ]
+              candidates.extend(resolve_content_urls(art_code))
+              candidates = list(dict.fromkeys(candidates))
+              errors: list[str] = []
+              for url in candidates:
+                  try:
+                      with session.get(url, stream=True, timeout=120, allow_redirects=True) as response:
+                          response.raise_for_status()
+                          with destination.open("wb") as f:
+                              for chunk in response.iter_content(1024 * 256):
+                                  if chunk:
+                                      f.write(chunk)
+                      if destination.stat().st_size < 50_000:
+                          raise RuntimeError(f"file too small: {destination.stat().st_size}")
+                      with destination.open("rb") as f:
+                          if f.read(5) != b"%PDF-":
+                              raise RuntimeError("payload is not PDF")
+                      return url
+                  except Exception as exc:
+                      errors.append(f"{url}: {exc}")
+                      destination.unlink(missing_ok=True)
+              raise RuntimeError("; ".join(errors[-5:]))
+
+          def extract_opening_text(path: Path, pages: int = 8) -> str:
+              parts: list[str] = []
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  for i in range(min(pages, len(reader.pages))):
+                      try:
+                          parts.append(reader.pages[i].extract_text() or "")
+                      except Exception:
+                          pass
+              except Exception:
+                  pass
+              if len("".join(parts)) < 200:
+                  try:
+                      doc = pymupdf.open(path)
+                      for i in range(min(pages, doc.page_count)):
+                          parts.append(doc.load_page(i).get_text("text"))
+                      doc.close()
+                  except Exception:
+                      pass
+              return "\n".join(parts)
+
+          def validate_report(path: Path, year: int, kind: str) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              page_count = len(reader.pages)
+              min_pages = 50 if kind == "annual" else 5
+              if page_count < min_pages:
+                  raise RuntimeError(f"unexpected page count {page_count} (< {min_pages})")
+              opening = extract_opening_text(path)
+              normalized = re.sub(r"\s+", "", opening)
+              if COMPANY not in normalized and STOCK not in normalized:
+                  raise RuntimeError("company identity not found in opening pages")
+              if str(year) not in normalized:
+                  raise RuntimeError(f"report year {year} not found in opening pages")
+              if kind == "annual" and "年度报告" not in normalized:
+                  raise RuntimeError("annual report label not found")
+              if kind == "quarter" and not any(
+                  phrase in normalized for phrase in ("第一季度报告", "一季度报告")
+              ):
+                  raise RuntimeError("quarterly report label not found")
+              doc = pymupdf.open(path)
+              if doc.page_count != page_count:
+                  raise RuntimeError("page count mismatch between parsers")
+              render_dir = RENDERS / path.stem
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for index in sorted(set([0, page_count // 2, page_count - 1])):
+                  page = doc.load_page(index)
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  image_path = render_dir / f"page-{index + 1:03d}.png"
+                  pix.save(image_path)
+                  if image_path.stat().st_size < 5_000:
+                      raise RuntimeError(f"rendered page {index + 1} appears empty")
+              doc.close()
+              return page_count, opening[:1500]
+
+          rows = announcement_rows()
+          targets: list[dict[str, Any]] = []
+          for year in range(2020, 2026):
+              row = choose_target(rows, year, "annual")
+              if not row:
+                  raise SystemExit(f"Could not find {year} annual report announcement")
+              targets.append({"year": year, "kind": "annual", "row": row})
+          q1 = choose_target(rows, 2026, "quarter")
+          if not q1:
+              raise SystemExit("Could not find 2026 Q1 report announcement")
+          targets.append({"year": 2026, "kind": "quarter", "row": q1})
+
+          manifest: list[dict[str, Any]] = []
+          for index, target in enumerate(targets, 1):
+              year = int(target["year"])
+              kind = str(target["kind"])
+              row = target["row"]
+              art_code = str(row.get("art_code") or row.get("artCode") or "")
+              title = clean_title(row_title(row))
+              notice_date = str(row.get("notice_date") or row.get("noticeDate") or "")[:10]
+              if not art_code:
+                  raise SystemExit(f"Missing art_code for {title}")
+              raw_path = RAW / f"{art_code}.pdf"
+              source_url = download_pdf(art_code, raw_path)
+              page_count, opening_sample = validate_report(raw_path, year, kind)
+              if kind == "annual":
+                  package_name = f"{index:02d}_道道全_{year}年年度报告.pdf"
+              else:
+                  package_name = f"{index:02d}_道道全_2026年第一季度报告.pdf"
+              package_path = SELECTED / package_name
+              package_path.write_bytes(raw_path.read_bytes())
+              record = {
+                  "year": year,
+                  "type": "年度报告" if kind == "annual" else "第一季度报告",
+                  "announcement_title": title,
+                  "announcement_date": notice_date,
+                  "art_code": art_code,
+                  "pages": page_count,
+                  "size_bytes": package_path.stat().st_size,
+                  "source_pdf_url": source_url,
+                  "sha256": sha256(package_path),
+                  "package_filename": package_name,
+                  "opening_text_sample": opening_sample,
+              }
+              manifest.append(record)
+              log(f"Accepted {package_name}: {page_count} pages, {package_path.stat().st_size} bytes")
+
+          readme_lines = [
+              "# 道道全（002852）2020—2025年报及最新季度报告",
+              "",
+              f"整理时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+              "",
+              "本包包含2020—2025年完整年度报告6份，以及截至2026-09-29已披露的最新季度报告——2026年第一季度报告1份。",
+              "所有PDF均来自公开公告附件，未使用摘要版替代完整年度报告。",
+              "已检查PDF文件头、页面树和公司/年份标识，并渲染抽查首页、中间页和末页；压缩包已执行CRC完整性测试。",
+              "",
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme_lines += [
+                  f"## {i}. {item['announcement_title']}",
+                  f"- 公告日期：{item['announcement_date']}",
+                  f"- 页数：{item['pages']}",
+                  f"- 文件：`{item['package_filename']}`",
+                  f"- 原始公开PDF：{item['source_pdf_url']}",
+                  f"- SHA-256：`{item['sha256']}`",
+                  "",
+              ]
+
+          (SELECTED / "README_文件清单与来源.md").write_text(
+              "\n".join(readme_lines), encoding="utf-8"
+          )
+          clean_manifest = []
+          for item in manifest:
+              copy = dict(item)
+              copy.pop("opening_text_sample", None)
+              clean_manifest.append(copy)
+          (SELECTED / "manifest.json").write_text(
+              json.dumps(clean_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          (SELECTED / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  {item['package_filename']}" for item in clean_manifest) + "\n",
+              encoding="utf-8",
+          )
+          (OUT / "run.log").write_text("\n".join(log_lines), encoding="utf-8")
+
+          zip_cn = OUT / "道道全_002852_2020-2025年报及2026年第一季度报告_20260929.zip"
+          zip_en = OUT / "Daodaoquan_002852_Annual_Reports_2020_2025_and_2026Q1.zip"
+          for zip_path in (zip_cn, zip_en):
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                  for path in sorted(SELECTED.iterdir()):
+                      archive.write(path, arcname=path.name)
+              with zipfile.ZipFile(zip_path) as archive:
+                  bad = archive.testzip()
+                  if bad:
+                      raise RuntimeError(f"ZIP CRC failure: {bad}")
+              log(f"Created {zip_path.name}: {zip_path.stat().st_size} bytes; SHA256={sha256(zip_path)}")
+
+          summary = {
+              "report_count": len(clean_manifest),
+              "reports": clean_manifest,
+              "zip_cn": str(zip_cn),
+              "zip_cn_sha256": sha256(zip_cn),
+              "zip_en": str(zip_en),
+              "zip_en_sha256": sha256(zip_en),
+          }
+          (OUT / "package_summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_daodaoquan.py
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Daodaoquan-002852-Annual-Reports-Package
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/manifest.json
+            output/run.log
+            output/announcement_metadata.json
+          if-no-files-found: error
+          retention-days: 3
