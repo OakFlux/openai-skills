@@ -1,0 +1,309 @@
+name: Build Huada Jiutian Broker Reports Package
+
+on:
+  push:
+    branches:
+      - tmp-huadajiutian-reports-20260928
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf beautifulsoup4
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download, verify and package original reports
+        shell: bash
+        run: |
+          cat > /tmp/build_huadajiutian.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          REPORTS = OUT / 'reports'
+          RENDERS = OUT / 'renders'
+          OUT.mkdir(exist_ok=True)
+          REPORTS.mkdir(exist_ok=True)
+          RENDERS.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                            '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/report/',
+          })
+
+          candidates = [
+              {
+                  'org': '华安证券',
+                  'date': '2022-07-29',
+                  'title': '国产替代叠加景气下游，国产EDA龙头未来可期',
+                  'expected_min_pages': 30,
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP202207291576686697_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H3_AP202207291576686697_1.pdf?1659090800000.pdf=',
+                  ],
+              },
+              {
+                  'org': '山西证券',
+                  'date': '2022-09-14',
+                  'title': '国内EDA行业龙头，国产替代助力腾飞',
+                  'expected_min_pages': 15,
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP202209141578377630_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H3_AP202209141578377630_1.pdf?1663142400000.pdf=',
+                  ],
+              },
+          ]
+
+          # Public 2025 deep-report pages are inspected only for an openly exposed PDF URL.
+          # If no direct public PDF is exposed, they are skipped rather than bypassing login/paywall controls.
+          public_pages = [
+              {
+                  'org': '浙商证券',
+                  'date': '2025-04-02',
+                  'title': '国产半导体EDA领航者，加速赶超全球三巨头',
+                  'expected_min_pages': 20,
+                  'page_urls': [
+                      'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_Show/kind/lastest/rptid/796950981355/index.phtml',
+                      'https://www.sdyanbao.com/detail/868266',
+                  ],
+              },
+              {
+                  'org': '东方证券',
+                  'date': '2025-06-15',
+                  'title': '“自研+并购”铸就国产EDA龙头崛起之路',
+                  'expected_min_pages': 25,
+                  'page_urls': [
+                      'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/8/rptid/803346180341/index.phtml',
+                      'https://www.microbell.com/repinfodetail_4213190.html',
+                  ],
+              },
+          ]
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def safe_name(text: str) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', text)
+              text = re.sub(r'\s+', '_', text).strip(' ._')
+              return text[:120]
+
+          def validate_pdf(path: Path, min_pages: int) -> tuple[bool, int, str]:
+              try:
+                  if path.stat().st_size < 50_000:
+                      return False, 0, 'too small'
+                  with path.open('rb') as f:
+                      if f.read(5) != b'%PDF-':
+                          return False, 0, 'not a PDF'
+                  reader = PdfReader(str(path), strict=False)
+                  pages = len(reader.pages)
+                  if pages < min_pages:
+                      return False, pages, f'only {pages} pages, expected >= {min_pages}'
+                  sample_indices = sorted(set([0, pages // 2, pages - 1]))
+                  text = ''
+                  for idx in sample_indices:
+                      page = reader.pages[idx]
+                      _ = page.mediabox
+                      try:
+                          text += page.extract_text() or ''
+                      except Exception:
+                          pass
+                  if '华大九天' not in text and '301269' not in text:
+                      # Some PDFs have image-only cover/interior pages; inspect the first five text layers.
+                      for idx in range(min(5, pages)):
+                          try:
+                              text += reader.pages[idx].extract_text() or ''
+                          except Exception:
+                              pass
+                  if '华大九天' not in text and '301269' not in text:
+                      return False, pages, 'company identity not found in sampled text'
+                  return True, pages, ''
+              except Exception as exc:
+                  return False, 0, f'{type(exc).__name__}: {exc}'
+
+          def download(url: str, dest: Path) -> bool:
+              try:
+                  headers = {'Referer': url if 'sina' in url else 'https://data.eastmoney.com/report/'}
+                  with session.get(url, headers=headers, timeout=90, stream=True, allow_redirects=True) as r:
+                      r.raise_for_status()
+                      with dest.open('wb') as f:
+                          for chunk in r.iter_content(256 * 1024):
+                              if chunk:
+                                  f.write(chunk)
+                  return True
+              except Exception as exc:
+                  print(f'DOWNLOAD FAILED {url}: {exc}', flush=True)
+                  dest.unlink(missing_ok=True)
+                  return False
+
+          def discover_public_pdf(page_url: str) -> list[str]:
+              try:
+                  r = session.get(page_url, timeout=60)
+                  r.raise_for_status()
+                  html = r.text
+                  urls = []
+                  for m in re.findall(r'https?://[^\"\'<>\s]+?\.pdf(?:\?[^\"\'<>\s]*)?', html, re.I):
+                      urls.append(m.replace('&amp;', '&'))
+                  soup = BeautifulSoup(html, 'html.parser')
+                  for tag in soup.find_all(['a', 'iframe', 'embed', 'object', 'source']):
+                      for attr in ('href', 'src', 'data'):
+                          value = tag.get(attr)
+                          if value and '.pdf' in value.lower():
+                              urls.append(urljoin(page_url, value))
+                  # Capture common JSON/JS attachment fields even when extension is omitted.
+                  for pattern in [r'pdfUrl\s*[:=]\s*[\"\']([^\"\']+)',
+                                  r'downloadUrl\s*[:=]\s*[\"\']([^\"\']+)',
+                                  r'fileUrl\s*[:=]\s*[\"\']([^\"\']+)']:
+                      for value in re.findall(pattern, html, re.I):
+                          urls.append(urljoin(page_url, value.replace('\\/', '/')))
+                  return list(dict.fromkeys(urls))
+              except Exception as exc:
+                  print(f'PAGE INSPECTION FAILED {page_url}: {exc}', flush=True)
+                  return []
+
+          selected = []
+
+          for item in candidates:
+              filename = f"{safe_name(item['date'])}_{safe_name(item['org'])}_{safe_name(item['title'])}.pdf"
+              dest = REPORTS / filename
+              success_url = None
+              for url in item['urls']:
+                  if not download(url, dest):
+                      continue
+                  ok, pages, reason = validate_pdf(dest, item['expected_min_pages'])
+                  if ok:
+                      success_url = url
+                      break
+                  print(f'INVALID {url}: {reason}', flush=True)
+                  dest.unlink(missing_ok=True)
+              if not success_url:
+                  raise SystemExit(f"Required report unavailable: {item['title']}")
+              ok, pages, _ = validate_pdf(dest, item['expected_min_pages'])
+              selected.append({**item, 'filename': filename, 'pages': pages,
+                               'size_bytes': dest.stat().st_size,
+                               'sha256': sha256(dest), 'download_url': success_url})
+              print(f"DOWNLOADED {item['org']} {item['title']} [{pages} pages]", flush=True)
+
+          # Add one recent report only if an unprotected direct PDF is publicly exposed.
+          for item in public_pages:
+              if len(selected) >= 3:
+                  break
+              discovered = []
+              for page_url in item['page_urls']:
+                  discovered.extend(discover_public_pdf(page_url))
+              for url in list(dict.fromkeys(discovered)):
+                  filename = f"{safe_name(item['date'])}_{safe_name(item['org'])}_{safe_name(item['title'])}.pdf"
+                  dest = REPORTS / filename
+                  if not download(url, dest):
+                      continue
+                  ok, pages, reason = validate_pdf(dest, item['expected_min_pages'])
+                  if not ok:
+                      print(f'PUBLIC PDF REJECTED {url}: {reason}', flush=True)
+                      dest.unlink(missing_ok=True)
+                      continue
+                  selected.append({**item, 'filename': filename, 'pages': pages,
+                                   'size_bytes': dest.stat().st_size,
+                                   'sha256': sha256(dest), 'download_url': url})
+                  print(f"ADDED PUBLIC PDF {item['org']} {item['title']} [{pages} pages]", flush=True)
+                  break
+
+          # Render first, middle and last pages of every selected PDF as a structural/visual smoke test.
+          for item in selected:
+              pdf = REPORTS / item['filename']
+              reader = PdfReader(str(pdf))
+              pages = len(reader.pages)
+              sample_pages = sorted(set([1, pages // 2 + 1, pages]))
+              out_prefix = RENDERS / safe_name(Path(item['filename']).stem)
+              for pageno in sample_pages:
+                  cmd = ['pdftoppm', '-f', str(pageno), '-l', str(pageno), '-png', '-r', '80', str(pdf), str(out_prefix) + f'_p{pageno}']
+                  subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+          readme = [
+              '# 华大九天（301269.SZ）券商深度报告原始 PDF 整理包',
+              '',
+              f'报告数量：{len(selected)} 份',
+              '',
+              '本包只收录通过公开链接直接取得的原始 PDF。未使用摘要版、重新排版版或绕过登录/付费限制的文件。',
+              '每份 PDF 已核对文件头、页数、公司名称/证券代码，并渲染首页、中间页和末页进行结构检查。',
+              '',
+          ]
+          for i, item in enumerate(selected, 1):
+              readme += [
+                  f"## {i}. {item['org']}｜{item['date']}",
+                  f"- 标题：《{item['title']}》",
+                  f"- 页数：{item['pages']}页",
+                  f"- 文件：`{item['filename']}`",
+                  f"- 原始公开地址：{item['download_url']}",
+                  f"- SHA-256：`{item['sha256']}`",
+                  '',
+              ]
+          (REPORTS / 'README_文件清单与来源.md').write_text('\n'.join(readme), encoding='utf-8')
+          (REPORTS / 'manifest.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          (REPORTS / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{item['sha256']}  {item['filename']}" for item in selected) + '\n', encoding='utf-8')
+
+          zip_names = [
+              OUT / '华大九天_301269_券商深度报告_原始PDF_2-3份_20260928.zip',
+              OUT / 'Empyrean_Technology_301269_Broker_Deep_Reports_Original_PDFs_20260928.zip',
+          ]
+          for zip_path in zip_names:
+              with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for p in sorted(REPORTS.iterdir()):
+                      zf.write(p, arcname=p.name)
+              with zipfile.ZipFile(zip_path) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+              print(f'CREATED {zip_path} size={zip_path.stat().st_size} sha256={sha256(zip_path)}', flush=True)
+
+          summary = {
+              'selected_count': len(selected),
+              'reports': selected,
+              'zip_cn': str(zip_names[0]),
+              'zip_en': str(zip_names[1]),
+              'zip_sha256': sha256(zip_names[0]),
+          }
+          (OUT / 'package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+          PY
+          python /tmp/build_huadajiutian.py
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Huada-Jiutian-301269-Broker-Deep-Reports
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/reports/README_文件清单与来源.md
+            output/reports/manifest.json
+          if-no-files-found: error
+          retention-days: 3
