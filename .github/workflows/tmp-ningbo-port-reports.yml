@@ -1,0 +1,492 @@
+name: Build Ningbo Port Broker Reports Package
+
+on:
+  push:
+    branches:
+      - tmp-ningbo-port-reports-20260928
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf beautifulsoup4
+
+      - name: Discover, download, verify and package reports
+        shell: bash
+        run: |
+          cat > /tmp/build_package.py <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          CAND = OUT / 'candidates'
+          SELECTED = OUT / 'selected'
+          OUT.mkdir(exist_ok=True)
+          CAND.mkdir(exist_ok=True)
+          SELECTED.mkdir(exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                            '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/report/',
+          })
+
+          log_lines: list[str] = []
+          def log(msg: str) -> None:
+              print(msg, flush=True)
+              log_lines.append(msg)
+
+          def safe_name(text: str, maxlen: int = 100) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', text).strip(' ._')
+              text = re.sub(r'\s+', '_', text)
+              return (text or 'report')[:maxlen]
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def validate_pdf(path: Path) -> tuple[bool, int, str]:
+              try:
+                  if path.stat().st_size < 15_000:
+                      return False, 0, 'file too small'
+                  with path.open('rb') as f:
+                      if f.read(5) != b'%PDF-':
+                          return False, 0, 'missing PDF header'
+                  reader = PdfReader(str(path), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 2:
+                      return False, pages, 'too few pages'
+                  # Touch representative pages so malformed xref/page trees are detected.
+                  for idx in sorted(set([0, pages // 2, pages - 1])):
+                      _ = reader.pages[idx].mediabox
+                  return True, pages, ''
+              except Exception as exc:
+                  return False, 0, f'{type(exc).__name__}: {exc}'
+
+          def get_json_response(resp: requests.Response):
+              text = resp.text.strip()
+              try:
+                  return resp.json()
+              except Exception:
+                  m = re.search(r'^[^(]*\((.*)\)\s*;?$', text, re.S)
+                  if m:
+                      return json.loads(m.group(1))
+                  raise
+
+          def query_eastmoney() -> list[dict]:
+              endpoint = 'https://reportapi.eastmoney.com/report/list2'
+              all_rows: list[dict] = []
+              windows = [
+                  ('2010-01-01', '2018-12-31'),
+                  ('2019-01-01', '2023-12-31'),
+                  ('2024-01-01', '2026-12-31'),
+              ]
+              for begin, end in windows:
+                  for page in range(1, 21):
+                      payload = {
+                          'pageSize': 100,
+                          'pageNo': page,
+                          'p': page,
+                          'pageNum': page,
+                          'pageNumber': page,
+                          'beginTime': begin,
+                          'endTime': end,
+                          'code': '601018',
+                          'industryCode': '*',
+                          'rating': None,
+                          'ratingChange': None,
+                          'orgCode': None,
+                          'rcode': '',
+                          'qType': '1',
+                      }
+                      data = None
+                      errors = []
+                      for mode in ('json', 'form'):
+                          try:
+                              if mode == 'json':
+                                  r = s.post(endpoint, json=payload, timeout=40)
+                              else:
+                                  r = s.post(endpoint, data=payload, timeout=40)
+                              r.raise_for_status()
+                              data = get_json_response(r)
+                              if isinstance(data, dict):
+                                  break
+                          except Exception as exc:
+                              errors.append(f'{mode}:{exc}')
+                      if not isinstance(data, dict):
+                          log(f'Eastmoney query failed {begin}..{end} page {page}: {errors}')
+                          break
+                      rows = data.get('data') or data.get('result') or []
+                      if isinstance(rows, str):
+                          try:
+                              rows = json.loads(rows)
+                          except Exception:
+                              rows = []
+                      if not rows:
+                          break
+                      all_rows.extend(rows)
+                      log(f'Eastmoney {begin}..{end} page {page}: {len(rows)} rows')
+                      if len(rows) < 100:
+                          break
+                      time.sleep(0.2)
+              # Dedupe while preserving newest copy of metadata.
+              dedup: dict[str, dict] = {}
+              for row in all_rows:
+                  key = str(row.get('infoCode') or row.get('encodeUrl') or row.get('title') or '')
+                  if key:
+                      dedup[key] = row
+              rows = list(dedup.values())
+              (OUT / 'eastmoney_search_results.json').write_text(
+                  json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+              return rows
+
+          def extract_record(row: dict) -> dict:
+              return {
+                  'title': str(row.get('title') or row.get('reportTitle') or '').strip(),
+                  'org': str(row.get('orgSName') or row.get('orgName') or row.get('orgNameCn') or '').strip(),
+                  'date': str(row.get('publishDate') or row.get('publishTime') or '').strip()[:10],
+                  'analyst': str(row.get('researcher') or row.get('researcherName') or row.get('author') or '').strip(),
+                  'info_code': str(row.get('infoCode') or row.get('encodeUrl') or '').strip(),
+                  'stock_code': str(row.get('stockCode') or row.get('secuCode') or '601018').strip(),
+                  'stock_name': str(row.get('stockName') or '宁波港').strip(),
+                  'source': '东方财富研报数据库',
+              }
+
+          def download_url(url: str, path: Path) -> bool:
+              try:
+                  with s.get(url, timeout=75, stream=True, allow_redirects=True) as r:
+                      r.raise_for_status()
+                      ctype = (r.headers.get('content-type') or '').lower()
+                      with path.open('wb') as f:
+                          for chunk in r.iter_content(1024 * 256):
+                              if chunk:
+                                  f.write(chunk)
+                  ok, pages, reason = validate_pdf(path)
+                  if not ok:
+                      log(f'Invalid PDF {url}: {reason}; type={ctype}; size={path.stat().st_size if path.exists() else 0}')
+                      path.unlink(missing_ok=True)
+                      return False
+                  return True
+              except Exception as exc:
+                  log(f'Download failed {url}: {exc}')
+                  path.unlink(missing_ok=True)
+                  return False
+
+          def pdf_urls_for(info_code: str, row: dict) -> list[str]:
+              urls: list[str] = []
+              # Some API versions expose the attachment URL directly.
+              for key, value in row.items():
+                  if isinstance(value, str) and '.pdf' in value.lower() and value.startswith(('http://', 'https://')):
+                      urls.append(value)
+              if info_code:
+                  base = f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf'
+                  urls.extend([
+                      base,
+                      base + f'?{int(time.time() * 1000)}.pdf=',
+                      base + '?download=1',
+                  ])
+              # Stable known URLs discovered from the public detail pages.
+              if info_code == 'AP202609011828891233':
+                  urls.insert(0, 'https://pdf.dfcfw.com/pdf/H3_AP202609011828891233_1.pdf')
+              if info_code == 'AP202311071609246534':
+                  urls.insert(0, 'https://pdf.dfcfw.com/pdf/H3_AP202311071609246534_1.pdf')
+              return list(dict.fromkeys(urls))
+
+          records: list[dict] = []
+          rows = query_eastmoney()
+          log(f'Total Eastmoney rows: {len(rows)}')
+
+          # Always seed two reports with known public infoCodes in case list2 omits them.
+          seeded = [
+              {
+                  'title': '2026年半年报点评：打造世界级港口集群，主营业务利润稳健',
+                  'orgSName': '西南证券',
+                  'publishDate': '2026-08-27',
+                  'infoCode': 'AP202609011828891233',
+                  'stockCode': '601018',
+                  'stockName': '宁波港',
+              },
+              {
+                  'title': '2023年Q3点评：收购大榭码头，贡献第三季度业绩',
+                  'orgSName': '太平洋证券',
+                  'publishDate': '2023-11-07',
+                  'infoCode': 'AP202311071609246534',
+                  'stockCode': '601018',
+                  'stockName': '宁波港',
+              },
+          ]
+          existing_codes = {str(r.get('infoCode') or '') for r in rows}
+          for row in seeded:
+              if row['infoCode'] not in existing_codes:
+                  rows.append(row)
+
+          for idx, row in enumerate(rows, 1):
+              rec = extract_record(row)
+              title = rec['title']
+              if not title:
+                  continue
+              joined = f"{rec['stock_code']} {rec['stock_name']} {title}"
+              if '601018' not in joined and '宁波港' not in joined and '宁波舟山港' not in joined:
+                  continue
+              info = rec['info_code']
+              tmp = CAND / f'{safe_name(info or str(idx))}.pdf'
+              success_url = ''
+              for url in pdf_urls_for(info, row):
+                  if download_url(url, tmp):
+                      success_url = url
+                      break
+              if not success_url:
+                  continue
+              ok, pages, reason = validate_pdf(tmp)
+              if not ok:
+                  continue
+              rec.update({
+                  'path': str(tmp),
+                  'pages': pages,
+                  'size_bytes': tmp.stat().st_size,
+                  'download_url': success_url,
+                  'sha256': sha256(tmp),
+              })
+              records.append(rec)
+              log(f"Downloaded {rec['date']} {rec['org']} {title} [{pages}p]")
+
+          # Scrape Sina for historical report metadata and any exposed original PDF links.
+          sina_meta: list[dict] = []
+          for page in range(1, 6):
+              url = ('https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/'
+                     f'index.phtml?symbol=sh601018&t1=all&p={page}')
+              try:
+                  r = s.get(url, timeout=45)
+                  r.raise_for_status()
+                  r.encoding = r.apparent_encoding or 'gb18030'
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  for a in soup.find_all('a', href=True):
+                      text = ' '.join(a.get_text(' ', strip=True).split())
+                      href = urljoin(url, a['href'])
+                      if 'vReport_Show' in href and ('宁波港' in text or '601018' in text):
+                          m = re.search(r'/rptid/(\d+)/', href)
+                          if m:
+                              sina_meta.append({'title': text, 'rptid': m.group(1), 'detail_url': href})
+              except Exception as exc:
+                  log(f'Sina list page {page} failed: {exc}')
+          dedup_sina = {x['rptid']: x for x in sina_meta}
+          sina_meta = list(dedup_sina.values())
+          (OUT / 'sina_historical_report_index.json').write_text(
+              json.dumps(sina_meta, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          for meta in sina_meta:
+              if not any(k in meta['title'] for k in ('深度', '首次覆盖', '调研报告')):
+                  continue
+              try:
+                  r = s.get(meta['detail_url'], timeout=45)
+                  r.raise_for_status()
+                  r.encoding = r.apparent_encoding or 'gb18030'
+                  html = r.text
+                  candidates = re.findall(r'https?://[^\"\'<>\s]+\.pdf(?:\?[^\"\'<>\s]*)?', html, re.I)
+                  soup = BeautifulSoup(html, 'html.parser')
+                  for a in soup.find_all('a', href=True):
+                      href = urljoin(meta['detail_url'], a['href'])
+                      if '.pdf' in href.lower():
+                          candidates.append(href)
+                  for j, pdf_url in enumerate(dict.fromkeys(candidates)):
+                      tmp = CAND / f"sina_{meta['rptid']}_{j}.pdf"
+                      if not download_url(pdf_url, tmp):
+                          continue
+                      ok, pages, _ = validate_pdf(tmp)
+                      rec = {
+                          'title': meta['title'],
+                          'org': '新浪研报页所列券商',
+                          'date': '',
+                          'analyst': '',
+                          'info_code': f"SINA-{meta['rptid']}",
+                          'stock_code': '601018',
+                          'stock_name': '宁波港',
+                          'source': '新浪财经研报页',
+                          'path': str(tmp),
+                          'pages': pages,
+                          'size_bytes': tmp.stat().st_size,
+                          'download_url': pdf_url,
+                          'sha256': sha256(tmp),
+                      }
+                      records.append(rec)
+                      log(f"Downloaded Sina historical {meta['title']} [{pages}p]")
+                      break
+              except Exception as exc:
+                  log(f"Sina detail failed {meta['detail_url']}: {exc}")
+
+          # Dedupe identical bytes and metadata.
+          unique: list[dict] = []
+          seen_sha: set[str] = set()
+          seen_key: set[tuple[str, str, str]] = set()
+          for rec in records:
+              key = (rec.get('date',''), rec.get('org',''), rec.get('title',''))
+              if rec['sha256'] in seen_sha or key in seen_key:
+                  continue
+              seen_sha.add(rec['sha256'])
+              seen_key.add(key)
+              unique.append(rec)
+          records = unique
+
+          def score(rec: dict) -> float:
+              title = rec.get('title', '')
+              pages = int(rec.get('pages', 0))
+              date = rec.get('date', '')
+              sc = min(pages, 60) * 1.7
+              if '深度' in title: sc += 65
+              if '首次覆盖' in title or '首次覆盖报告' in title: sc += 58
+              if '调研报告' in title: sc += 45
+              if '半年报点评' in title and '2026' in title: sc += 38
+              if '公司研究' in title: sc += 20
+              if '点评' in title and pages <= 8: sc -= 12
+              if date.startswith('2026'): sc += 35
+              elif date.startswith('2025'): sc += 22
+              elif date.startswith('2023'): sc += 12
+              elif date.startswith('2019'): sc += 10
+              if '非凡大港' in title: sc += 90
+              if '市场份额提升' in title: sc += 80
+              if rec.get('info_code') == 'AP202609011828891233': sc += 100
+              return sc
+
+          records.sort(key=score, reverse=True)
+          (OUT / 'all_downloaded_candidates.json').write_text(
+              json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          selected: list[dict] = []
+          # Keep the new first-coverage report, then prefer genuine long/deep/first-coverage work.
+          recent = next((r for r in records if r.get('info_code') == 'AP202609011828891233'), None)
+          if recent:
+              selected.append(recent)
+
+          for rec in records:
+              if rec in selected:
+                  continue
+              title = rec.get('title', '')
+              if int(rec.get('pages', 0)) >= 10 or any(k in title for k in ('深度', '首次覆盖', '调研报告')):
+                  if all(rec['sha256'] != x['sha256'] for x in selected):
+                      selected.append(rec)
+              if len(selected) >= 3:
+                  break
+
+          # If deep reports are scarce, complete the requested 2-3 report set with valid company reports.
+          for rec in records:
+              if len(selected) >= 3:
+                  break
+              if all(rec['sha256'] != x['sha256'] for x in selected):
+                  selected.append(rec)
+
+          if len(selected) < 2:
+              log(f'ERROR: only {len(selected)} valid reports available')
+              raise SystemExit(2)
+
+          selected = selected[:3]
+          readme_lines = [
+              '# 宁波港（601018）券商研究报告原始 PDF 整理包',
+              '',
+              f'整理时间：{datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}',
+              f'报告数量：{len(selected)} 份',
+              '',
+              '说明：本包仅收录从公开链接直接下载的原始 PDF；未重新排版、未以摘要替代原文。',
+              '每份文件均检查 PDF 文件头、页面树和首页/中间页/末页对象，并计算 SHA-256。',
+              '',
+          ]
+          manifest_rows = []
+          for i, rec in enumerate(selected, 1):
+              org = rec.get('org') or '券商'
+              date = rec.get('date') or '日期待核'
+              title = rec.get('title') or '宁波港研究报告'
+              filename = f'{i:02d}_{safe_name(org, 28)}_{safe_name(date, 12)}_{safe_name(title, 90)}.pdf'
+              src = Path(rec['path'])
+              dst = SELECTED / filename
+              dst.write_bytes(src.read_bytes())
+              rec = dict(rec)
+              rec['package_filename'] = filename
+              rec['sha256'] = sha256(dst)
+              rec['size_bytes'] = dst.stat().st_size
+              manifest_rows.append(rec)
+              readme_lines += [
+                  f'## {i}. {title}',
+                  f'- 机构：{org}',
+                  f'- 日期：{date}',
+                  f'- 页数：{rec["pages"]}',
+                  f'- 文件：`{filename}`',
+                  f'- 原始公开下载地址：{rec["download_url"]}',
+                  f'- SHA-256：`{rec["sha256"]}`',
+                  '',
+              ]
+
+          (SELECTED / 'README_文件清单与来源.md').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (SELECTED / 'manifest.json').write_text(
+              json.dumps(manifest_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          (SELECTED / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{r['sha256']}  {r['package_filename']}" for r in manifest_rows) + '\n',
+              encoding='utf-8')
+          (OUT / 'run.log').write_text('\n'.join(log_lines), encoding='utf-8')
+
+          zip_cn = OUT / '宁波港_601018_券商深度报告_原始PDF_2-3份_20260928.zip'
+          zip_en = OUT / 'Ningbo_Port_601018_Broker_Research_Original_PDFs_20260928.zip'
+          for zip_path in (zip_cn, zip_en):
+              with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for p in sorted(SELECTED.iterdir()):
+                      zf.write(p, arcname=p.name)
+              with zipfile.ZipFile(zip_path) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+              log(f'Created {zip_path} ({zip_path.stat().st_size} bytes, SHA256={sha256(zip_path)})')
+
+          summary = {
+              'selected_count': len(manifest_rows),
+              'reports': manifest_rows,
+              'zip_cn': str(zip_cn),
+              'zip_cn_sha256': sha256(zip_cn),
+              'zip_en': str(zip_en),
+              'zip_en_sha256': sha256(zip_en),
+          }
+          (OUT / 'package_summary.json').write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_package.py
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ningbo-Port-601018-Broker-Research-Package
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/run.log
+            output/all_downloaded_candidates.json
+            output/eastmoney_search_results.json
+          if-no-files-found: error
+          retention-days: 3
