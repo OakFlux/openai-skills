@@ -1,0 +1,246 @@
+name: Build Ruixin Technology 300828 brokerage reports ZIP 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ruixin-300828-brokerage-reports-package-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+
+      - name: Download reports, validate and build ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '锐新科技_300828_券商研究报告精选_3份'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'filename': '01_国信证券_2022-04-11_2021年年报点评_精密铝合金产品规模快速增长_未来着重开发新能源领域需求.pdf',
+                  'broker': '国信证券',
+                  'date': '2022-04-11',
+                  'title': '2021年年报点评：精密铝合金产品规模快速增长，未来将着重开发新能源领域需求',
+                  'authors': '刘孟峦、杨耀洪',
+                  'report_type': '公司研究/年报点评',
+                  'rating': '买入',
+                  'info_code': 'AP202204111558601773',
+                  'expected_pages': 7,
+                  'min_pages': 6,
+                  'min_bytes': 500_000,
+              },
+              {
+                  'filename': '02_华鑫证券_2020-03-30_新股询价报告_锐新科技.pdf',
+                  'broker': '华鑫证券',
+                  'date': '2020-03-30',
+                  'title': '新股询价报告：锐新科技',
+                  'authors': '于芳',
+                  'report_type': '新股研究',
+                  'rating': '',
+                  'info_code': 'AP202007241393793370',
+                  'expected_pages': 3,
+                  'min_pages': 3,
+                  'min_bytes': 250_000,
+              },
+              {
+                  'filename': '03_东莞证券_2020-03-30_新股网下申购询价建议报告_锐新科技.pdf',
+                  'broker': '东莞证券',
+                  'date': '2020-03-30',
+                  'title': '新股网下申购询价建议报告（锐新科技）',
+                  'authors': '黄秀瑜、邵梓朗',
+                  'report_type': '新股研究',
+                  'rating': '',
+                  'info_code': 'AP202003301377191188',
+                  'expected_pages': 2,
+                  'min_pages': 2,
+                  'min_bytes': 180_000,
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def candidates(info_code: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.PDF',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.PDF',
+              ]
+
+          def validate(path: Path, report: dict) -> tuple[int, int]:
+              size = path.stat().st_size
+              if size < report['min_bytes']:
+                  raise RuntimeError(f'file too small: {size}')
+              with path.open('rb') as fh:
+                  header = fh.read(8)
+              if not header.startswith(b'%PDF-'):
+                  raise RuntimeError(f'invalid PDF header: {header!r}')
+
+              pages = len(PdfReader(str(path), strict=False).pages)
+              if pages < report['min_pages'] or abs(pages - report['expected_pages']) > 1:
+                  raise RuntimeError(f'unexpected page count: {pages}')
+
+              check = subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(path)],
+                  capture_output=True,
+                  text=True,
+              )
+              if check.returncode != 0:
+                  raise RuntimeError(f'qpdf check failed: {check.stderr[-1500:]}')
+
+              render_root = path.parent / (path.stem + '_render_check')
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '96', str(path), str(render_root)],
+                  capture_output=True,
+                  text=True,
+              )
+              render_file = Path(str(render_root) + '.png')
+              if render.returncode != 0 or not render_file.exists() or render_file.stat().st_size < 8_000:
+                  raise RuntimeError(f'first-page render failed: {render.stderr[-1000:]}')
+              render_size = render_file.stat().st_size
+              render_file.unlink(missing_ok=True)
+              return pages, render_size
+
+          def download(report: dict, destination: Path) -> tuple[str, int, int]:
+              errors: list[str] = []
+              for url in candidates(report['info_code']):
+                  for attempt in range(1, 4):
+                      temp = destination.with_suffix(destination.suffix + '.part')
+                      temp.unlink(missing_ok=True)
+                      try:
+                          with session.get(
+                              url,
+                              headers={
+                                  'Referer': 'https://data.eastmoney.com/',
+                                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                              },
+                              stream=True,
+                              allow_redirects=True,
+                              timeout=(30, 420),
+                          ) as response:
+                              print('DOWNLOAD', destination.name, 'attempt', attempt, 'status', response.status_code, url, 'final', response.url, flush=True)
+                              response.raise_for_status()
+                              with temp.open('wb') as fh:
+                                  for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          pages, render_size = validate(temp, report)
+                          temp.replace(destination)
+                          return str(response.url), pages, render_size
+                      except Exception as exc:
+                          errors.append(f'{url} attempt {attempt}: {exc!r}')
+                          temp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {destination.name}: {errors}')
+
+          records: list[dict] = []
+          hashes: set[str] = set()
+          for report in reports:
+              path = OUT / report['filename']
+              source_url, pages, render_size = download(report, path)
+              data = path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'duplicate PDF: {path.name}')
+              hashes.add(digest)
+              record = {
+                  'filename': path.name,
+                  'broker': report['broker'],
+                  'date': report['date'],
+                  'title': report['title'],
+                  'authors': report['authors'],
+                  'report_type': report['report_type'],
+                  'rating': report['rating'],
+                  'info_code': report['info_code'],
+                  'source_url': source_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_size,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '天津锐新昌科技股份有限公司（300828.SZ，证券简称：锐新科技）券商研究报告精选',
+              '整理日期：2026-09-29',
+              '',
+              '公开渠道中，锐新科技的券商覆盖较少，尚未检索到篇幅较长且可公开下载的典型公司深度报告。',
+              '本包收录目前能够核验并直接下载的3份券商原始排版PDF：1份公司研究/年报点评及2份新股研究报告。',
+              '全部PDF均完成文件头、文件大小、页数、qpdf结构、首页渲染、SHA-256及ZIP CRC检查。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              rating = f"；评级：{record['rating']}" if record['rating'] else ''
+              readme.extend([
+                  f"{index}. {record['broker']}，{record['date']}，{record['report_type']}",
+                  f"   标题：{record['title']}",
+                  f"   作者：{record['authors']}{rating}；页数：{record['pages']}；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   文件：{record['filename']}",
+                  f"   来源：{record['source_url']}",
+                  f"   信息代码：{record['info_code']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+
+          (OUT / '00_报告清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'expected 3 PDFs, found {len(pdfs)}')
+
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(records), 'SHA256', hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload completed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruixin-300828-brokerage-reports-20260929
+          path: 锐新科技_300828_券商研究报告精选_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
