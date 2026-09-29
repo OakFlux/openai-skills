@@ -1,0 +1,138 @@
+name: South Precision Sina Detail Attachment Probe
+
+on:
+  push:
+    branches:
+      - chatgpt-nanfangjinggong-reports-20260929
+    paths:
+      - .github/workflows/nanfang_jinggong_sina_detail_probe_20260929.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install parser
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Inspect report pages and linked scripts
+        shell: bash
+        run: |
+          python - <<'PY'
+          import io, json, re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          rptids = [
+              '822148019858',
+              '783892788824',
+              '718998434579',
+              '692474675836',
+              '524057227848',
+              '523524453420',
+          ]
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+          all_candidates = []
+          for rptid in rptids:
+              page_url = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rptid}/index.phtml'
+              response = session.get(page_url, timeout=60, allow_redirects=True)
+              response.encoding = response.apparent_encoding or 'gb18030'
+              html = response.text
+              soup = BeautifulSoup(html, 'html.parser')
+              print('\n' + '=' * 120)
+              print('REPORT', rptid, 'STATUS', response.status_code, 'BYTES', len(response.content), 'URL', response.url, 'ENC', response.encoding)
+              print('TITLE', soup.title.get_text(' ', strip=True) if soup.title else '')
+
+              urls = []
+              attrs = ('href', 'src', 'data', 'data-src', 'value')
+              for tag in soup.find_all(True):
+                  for attr in attrs:
+                      value = tag.get(attr)
+                      if not value or not isinstance(value, str):
+                          continue
+                      full = urljoin(response.url, value)
+                      blob = (tag.get_text(' ', strip=True) + ' ' + full).lower()
+                      if any(key in blob for key in ('pdf', 'download', 'attach', 'file', 'report', 'original', 'resource', rptid.lower())):
+                          urls.append({'tag': tag.name, 'attr': attr, 'text': tag.get_text(' ', strip=True)[:160], 'url': full})
+              absolute = sorted(set(re.findall(r'https?://[^\"\'<>\\s]+', html)))
+              for value in absolute:
+                  lower = value.lower()
+                  if any(key in lower for key in ('pdf', 'download', 'attach', 'file', 'report', 'original', 'resource', rptid.lower())):
+                      urls.append({'tag': 'regex', 'attr': '', 'text': '', 'url': value.replace('\\/', '/')})
+              # Also capture relative .pdf paths and common JS object assignments.
+              for value in re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']', html, re.I):
+                  urls.append({'tag': 'regex-relative-pdf', 'attr': '', 'text': '', 'url': urljoin(response.url, value.replace('\\/', '/'))})
+
+              dedup = []
+              seen = set()
+              for item in urls:
+                  url = item['url'].replace('&amp;', '&').replace('\\/', '/')
+                  if url not in seen:
+                      item['url'] = url
+                      dedup.append(item)
+                      seen.add(url)
+              print('CANDIDATE_URLS', json.dumps(dedup, ensure_ascii=False, indent=2))
+
+              print('RELEVANT_LINES')
+              for index, line in enumerate(html.splitlines(), 1):
+                  if re.search(r'pdf|attach|download|file|report|original|resource|rptid|研报|原文|下载|附件|文档|href|src', line, re.I):
+                      print(index, line[:7000])
+
+              # Fetch relevant linked JS and search for attachment APIs/path templates.
+              scripts = []
+              for script in soup.find_all('script', src=True):
+                  scripts.append(urljoin(response.url, script['src']))
+              for script_url in scripts:
+                  try:
+                      js = session.get(script_url, headers={'Referer': response.url}, timeout=45)
+                      js.encoding = js.apparent_encoding or 'utf-8'
+                      if re.search(r'pdf|download|attach|file|report|original|resource', js.text, re.I):
+                          print('SCRIPT', script_url, js.status_code, len(js.content))
+                          for index, line in enumerate(js.text.splitlines(), 1):
+                              if re.search(r'pdf|download|attach|file|report|original|resource', line, re.I):
+                                  print('JSLINE', index, line[:7000])
+                  except Exception as exc:
+                      print('SCRIPT_ERROR', script_url, repr(exc))
+
+              # Probe any likely PDF candidates discovered.
+              for item in dedup:
+                  url = item['url']
+                  if '.pdf' not in url.lower() and 'original' not in url.lower() and 'download' not in url.lower():
+                      continue
+                  try:
+                      pdf_response = session.get(url, headers={'Referer': response.url}, timeout=90, allow_redirects=True)
+                      print('PROBE_URL', url, pdf_response.status_code, len(pdf_response.content), pdf_response.url, pdf_response.headers.get('content-type'), repr(pdf_response.content[:16]))
+                      if pdf_response.status_code == 200 and pdf_response.content.startswith(b'%PDF'):
+                          reader = PdfReader(io.BytesIO(pdf_response.content))
+                          text = ''
+                          for i in range(min(3, len(reader.pages))):
+                              try:
+                                  text += reader.pages[i].extract_text() or ''
+                              except Exception:
+                                  pass
+                          result = {
+                              'rptid': rptid,
+                              'page_url': response.url,
+                              'pdf_url': url,
+                              'final_url': pdf_response.url,
+                              'pages': len(reader.pages),
+                              'bytes': len(pdf_response.content),
+                              'encrypted': bool(reader.is_encrypted),
+                              'text_excerpt': re.sub(r'\s+', ' ', text)[:1200],
+                          }
+                          all_candidates.append(result)
+                          print('PDF_OK', json.dumps(result, ensure_ascii=False))
+                  except Exception as exc:
+                      print('PROBE_ERROR', url, repr(exc))
+          print('\nALL_PDF_RESULTS', json.dumps(all_candidates, ensure_ascii=False, indent=2))
+          PY
