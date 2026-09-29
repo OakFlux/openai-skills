@@ -1,0 +1,310 @@
+name: Package Fujian Cement broker reports parallel v2 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-broker-parallel-v2-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - report_id: '4582'
+            filename: '01_长江证券_封闭市场的小而美_2020-02-10.pdf'
+            title: '福建水泥（600802）：封闭市场的小而美'
+            institution: '长江证券'
+            publish_date: '2020-02-10'
+            expected_pages: '22'
+          - report_id: '4580'
+            filename: '02_天风证券_首次覆盖_高弹性低估值关注预期差_2020-02-05.pdf'
+            title: '福建水泥（600802）首次覆盖：高弹性低估值，关注预期差'
+            institution: '天风证券'
+            publish_date: '2020-02-05'
+            expected_pages: '19'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      REPORT_ID: ${{ matrix.report_id }}
+      OUTPUT_FILENAME: ${{ matrix.filename }}
+      REPORT_TITLE: ${{ matrix.title }}
+      INSTITUTION: ${{ matrix.institution }}
+      PUBLISH_DATE: ${{ matrix.publish_date }}
+      EXPECTED_PAGES: ${{ matrix.expected_pages }}
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full unar qpdf poppler-utils file
+          python -m pip install --quiet requests pypdf pillow img2pdf
+
+      - name: Acquire and validate report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, os, re, shutil, subprocess, time
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          rid = os.environ['REPORT_ID']
+          filename = os.environ['OUTPUT_FILENAME']
+          title = os.environ['REPORT_TITLE']
+          institution = os.environ['INSTITUTION']
+          publish_date = os.environ['PUBLISH_DATE']
+          expected_pages = int(os.environ['EXPECTED_PAGES'])
+          page_url = f'https://www.sgpjbg.com/baogao/{rid}.html'
+          output = Path('output'); output.mkdir(exist_ok=True)
+          work = Path('work'); work.mkdir(exist_ok=True)
+          archive_path = work / f'{rid}.rar'
+
+          user_agents = [
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+          ]
+
+          def session_for(n: int) -> requests.Session:
+              s = requests.Session(); s.trust_env = False
+              retry = Retry(total=4, connect=4, read=4, status=4, backoff_factor=0.8,
+                            status_forcelist=[429,500,502,503,504], allowed_methods=['GET','POST'], raise_on_status=False)
+              s.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4))
+              s.headers.update({
+                  'User-Agent': user_agents[n % len(user_agents)],
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                  'Accept-Encoding': 'identity',
+                  'Referer': 'https://www.sgpjbg.com/',
+              })
+              s.cookies.set('view_bookid', rid, domain='www.sgpjbg.com', path='/')
+              return s
+
+          errors = []
+          archive_url = None
+          for generation in range(1, 21):
+              s = session_for(generation)
+              try:
+                  for warm_url in [
+                      'https://www.sgpjbg.com/',
+                      page_url + f'?cache={int(time.time())}{generation}',
+                      f'https://www.sgpjbg.com/bgdown/{rid}.html?cache={int(time.time())}{generation}',
+                  ]:
+                      try:
+                          warm = s.get(warm_url, timeout=(20,90), allow_redirects=True)
+                          print('WARM', rid, generation, warm.status_code, len(warm.content), warm.url, flush=True)
+                      except Exception as exc:
+                          print('WARM_ERROR', rid, generation, repr(exc), flush=True)
+                  s.cookies.set('view_bookid', rid, domain='www.sgpjbg.com', path='/')
+                  api = s.post(
+                      'https://www.sgpjbg.com/sgpjbg/View.aspx/DownLoad',
+                      json={'id': rid},
+                      headers={'Content-Type':'application/json; charset=utf-8','X-Requested-With':'XMLHttpRequest','Referer':page_url},
+                      timeout=(30,150),
+                  )
+                  print('API', rid, generation, api.status_code, repr(api.text[:300]), s.cookies.get_dict(), flush=True)
+                  if api.status_code != 200:
+                      errors.append(f'API HTTP {api.status_code}')
+                      time.sleep(2)
+                      continue
+                  try:
+                      archive_url = api.json().get('d')
+                  except Exception as exc:
+                      errors.append(f'API JSON {exc!r}')
+                      archive_url = None
+                  if not archive_url:
+                      time.sleep(2)
+                      continue
+                  for attempt in range(1, 31):
+                      response = s.get(archive_url, headers={'Referer':page_url,'Accept':'application/octet-stream,*/*;q=0.8'},
+                                       timeout=(30,300), stream=True)
+                      print('ARCHIVE', rid, generation, attempt, response.status_code,
+                            response.headers.get('content-type'), response.headers.get('content-length'), archive_url, flush=True)
+                      if response.status_code == 200:
+                          temp = archive_path.with_suffix('.part')
+                          with temp.open('wb') as handle:
+                              for chunk in response.iter_content(1024*1024):
+                                  if chunk: handle.write(chunk)
+                          data = temp.read_bytes()
+                          if len(data) > 100_000 and data.startswith(b'Rar!'):
+                              temp.replace(archive_path)
+                              break
+                          temp.unlink(missing_ok=True)
+                          errors.append(f'invalid archive {len(data)} bytes')
+                      time.sleep(1.5)
+                  if archive_path.exists():
+                      break
+              except Exception as exc:
+                  errors.append(repr(exc))
+              time.sleep(3)
+          if not archive_path.exists():
+              raise RuntimeError(f'Archive acquisition failed for {rid}: {errors[-40:]}')
+
+          extract_dir = work / 'extracted'; extract_dir.mkdir(exist_ok=True)
+          extraction_method = None
+          commands = [
+              ['7z','x','-y',f'-o{extract_dir}',str(archive_path)],
+              ['7z','x','-y','-pwww.sgpjbg.com',f'-o{extract_dir}',str(archive_path)],
+              ['7z','x','-y','-psgpjbg.com',f'-o{extract_dir}',str(archive_path)],
+              ['unar','-f','-o',str(extract_dir),str(archive_path)],
+          ]
+          for command in commands:
+              run = subprocess.run(command, capture_output=True, text=True)
+              print('EXTRACT', command, run.returncode, run.stdout[-2000:], run.stderr[-1000:], flush=True)
+              if run.returncode == 0 and any(p.is_file() for p in extract_dir.rglob('*')):
+                  extraction_method = command[0]
+                  break
+          if extraction_method is None:
+              raise RuntimeError('RAR extraction failed')
+
+          all_files = [p for p in extract_dir.rglob('*') if p.is_file()]
+          print('FILES', [(str(p), p.stat().st_size) for p in all_files], flush=True)
+          destination = output / filename
+          acquisition = None
+
+          pdf_candidates = []
+          for p in all_files:
+              try:
+                  if p.read_bytes()[:5] == b'%PDF-':
+                      pages = len(PdfReader(str(p), strict=False).pages)
+                      pdf_candidates.append((abs(pages-expected_pages), -p.stat().st_size, pages, p))
+              except Exception as exc:
+                  print('PDF_CANDIDATE_ERROR', p, repr(exc), flush=True)
+          pdf_candidates.sort()
+          if pdf_candidates and pdf_candidates[0][2] == expected_pages:
+              shutil.copyfile(pdf_candidates[0][3], destination)
+              acquisition = 'archive_original_pdf'
+          else:
+              image_candidates = []
+              for p in all_files:
+                  try:
+                      with Image.open(p) as im:
+                          width, height = im.size
+                          if width >= 500 and height >= 650:
+                              image_candidates.append((p, width, height))
+                  except Exception:
+                      continue
+              def natural(path: Path):
+                  return [int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)', str(path))]
+              image_candidates.sort(key=lambda x: natural(x[0]))
+              print('IMAGE_CANDIDATES', [(str(p),w,h) for p,w,h in image_candidates], flush=True)
+              if len(image_candidates) < expected_pages:
+                  raise RuntimeError(f'Only {len(image_candidates)} page images; expected {expected_pages}')
+              # Prefer a consecutive set with similar dimensions, then the first expected number.
+              selected = image_candidates[:expected_pages]
+              if len(image_candidates) > expected_pages:
+                  best = None
+                  for start in range(0, len(image_candidates)-expected_pages+1):
+                      window = image_candidates[start:start+expected_pages]
+                      widths = [x[1] for x in window]; heights = [x[2] for x in window]
+                      score = (max(widths)-min(widths)) + (max(heights)-min(heights))
+                      if best is None or score < best[0]: best = (score, window)
+                  selected = best[1]
+              norm = work / 'normalized'; norm.mkdir(exist_ok=True)
+              normalized = []
+              for idx,(p,_,_) in enumerate(selected,1):
+                  with Image.open(p) as im:
+                      im = im.convert('RGB')
+                      target = norm / f'{idx:03d}.jpg'
+                      im.save(target, 'JPEG', quality=96, optimize=True)
+                      normalized.append(str(target))
+              destination.write_bytes(img2pdf.convert(normalized))
+              acquisition = 'archive_page_images_recombined'
+
+          data = destination.read_bytes()
+          if not data.startswith(b'%PDF-'): raise RuntimeError('Output is not PDF')
+          check = subprocess.run(['qpdf','--check',str(destination)],capture_output=True,text=True)
+          if check.returncode not in (0,3): raise RuntimeError(check.stderr[-1500:])
+          pages = len(PdfReader(str(destination), strict=False).pages)
+          if pages != expected_pages: raise RuntimeError(f'Pages {pages} != {expected_pages}')
+          textfile = work / 'text.txt'
+          subprocess.run(['pdftotext',str(destination),str(textfile)],capture_output=True,text=True)
+          text = textfile.read_text(encoding='utf-8',errors='ignore') if textfile.exists() else ''
+          compact = re.sub(r'\s+','',text)
+          if compact and ('福建水泥' not in compact or '600802' not in compact):
+              raise RuntimeError('PDF identity text mismatch')
+          render_base = work / 'page1'
+          render = subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','100',str(destination),str(render_base)],capture_output=True,text=True)
+          rendered = Path(str(render_base)+'.png')
+          if render.returncode or not rendered.exists() or rendered.stat().st_size < 10000:
+              raise RuntimeError('First-page render failed')
+          digest = hashlib.sha256(data).hexdigest()
+          metadata = {
+              'report_id': rid, 'filename': filename, 'title': title, 'institution': institution,
+              'publish_date': publish_date, 'pages': pages, 'bytes': len(data), 'sha256': digest,
+              'source_page': page_url, 'archive_url': archive_url, 'acquisition': acquisition,
+          }
+          (output / f'{rid}.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('VALIDATED',json.dumps(metadata,ensure_ascii=False),flush=True)
+          PY
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fujian-cement-report-${{ matrix.report_id }}
+          path: output
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  package:
+    needs: acquire
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download report artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fujian-cement-report-*
+          path: downloads
+          merge-multiple: true
+      - name: Build and verify final ZIP
+        run: |
+          python - <<'PY'
+          import hashlib,json,zipfile
+          from pathlib import Path
+          from pypdf import PdfReader
+          root=Path('downloads')
+          pdfs=sorted(root.glob('*.pdf'))
+          metas=sorted(root.glob('*.json'))
+          if len(pdfs)!=2 or len(metas)!=2: raise RuntimeError(f'files: {pdfs}, {metas}')
+          records=[json.loads(p.read_text(encoding='utf-8')) for p in metas]
+          for p in pdfs:
+              if not p.read_bytes().startswith(b'%PDF-'): raise RuntimeError(f'not PDF {p}')
+              pages=len(PdfReader(str(p),strict=False).pages)
+              expected=next(r['pages'] for r in records if r['filename']==p.name)
+              if pages!=expected: raise RuntimeError(f'page mismatch {p}: {pages} != {expected}')
+          package=Path('福建水泥_600802.SH_券商深度报告_2份'); package.mkdir(exist_ok=True)
+          for p in pdfs: (package/p.name).write_bytes(p.read_bytes())
+          readme=['福建水泥（600802.SH）券商深度研究报告精选（2份）','整理与核验日期：2026-09-29','','收录口径：仅完整公司深度/首次覆盖报告；未以3—5页业绩点评凑数。','报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。','','文件清单：']
+          for i,r in enumerate(sorted(records,key=lambda x:x['publish_date'],reverse=True),1):
+              readme += [f'{i}. {r["title"]}',f'   机构：{r["institution"]}；发布日期：{r["publish_date"]}',f'   文件：{r["filename"]}；页数：{r["pages"]}；大小：{r["bytes"]/1048576:.2f} MB',f'   取得方式：{r["acquisition"]}',f'   来源页：{r["source_page"]}',f'   SHA-256：{r["sha256"]}','']
+          (package/'00_文件清单与来源说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (package/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (package/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records),encoding='utf-8')
+          out=Path('福建水泥_600802.SH_券商深度报告_2份.zip')
+          with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as z:
+              for p in sorted(package.iterdir()): z.write(p,arcname=p.name)
+          with zipfile.ZipFile(out) as z:
+              bad=z.testzip(); names=z.namelist(); count=sum(n.lower().endswith('.pdf') for n in names)
+              if bad or count!=2: raise RuntimeError(f'ZIP bad={bad}, PDF count={count}')
+          print('FINAL',out.stat().st_size,hashlib.sha256(out.read_bytes()).hexdigest())
+          PY
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: fujian-cement-broker-research-parallel-v2-20260929
+          path: 福建水泥_600802.SH_券商深度报告_2份.zip
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
