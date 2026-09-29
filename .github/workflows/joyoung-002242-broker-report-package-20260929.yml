@@ -1,0 +1,480 @@
+name: Build Joyoung broker research report package 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/joyoung-002242-broker-report-package-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf reportlab beautifulsoup4 lxml
+
+      - name: Download public report pages, create summary and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_CENTER, TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+          from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+          PACKAGE = '九阳股份_002242_券商深度及首次覆盖报告_公开资料版_3份'
+          root = Path(PACKAGE)
+          root.mkdir(exist_ok=True)
+          preview_dir = root / '首页预览'
+          preview_dir.mkdir(exist_ok=True)
+          source_dir = root / '公开来源记录'
+          source_dir.mkdir(exist_ok=True)
+          work = Path('_work_joyoung_broker')
+          work.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+              last: Any = None
+              for attempt in range(6):
+                  try:
+                      r = session.post(
+                          url,
+                          json=payload,
+                          headers={'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/'},
+                          timeout=(20, 120),
+                      )
+                      last = {'status': r.status_code, 'text': r.text[:500]}
+                      if r.status_code == 200:
+                          return r.json()
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def collect_records(obj: Any) -> list[dict[str, Any]]:
+              found: list[dict[str, Any]] = []
+              def walk(x: Any) -> None:
+                  if isinstance(x, dict):
+                      if isinstance(x.get('id'), int) and isinstance(x.get('name'), str):
+                          found.append(x)
+                      for value in x.values():
+                          walk(value)
+                  elif isinstance(x, list):
+                      for value in x:
+                          walk(value)
+              walk(obj)
+              return list({int(item['id']): item for item in found}.values())
+
+          def normalize(text: str) -> str:
+              return re.sub(r'[\s，,：:；;（）()《》“”"\-_/]+', '', text or '').lower()
+
+          def get_detail(report_id: int) -> dict[str, Any]:
+              response = post_json('https://api.sdyanbao.com/api/file/detail', {'id': report_id})
+              data = response.get('data') if isinstance(response, dict) else None
+              if not isinstance(data, dict):
+                  raise RuntimeError(f'Invalid report detail for {report_id}: {response}')
+              return data
+
+          def find_east_asia_report() -> dict[str, Any] | None:
+              queries = [
+                  '把握产品红利 构建品牌壁垒',
+                  '九阳股份 把握产品红利',
+                  '九阳股份 构建品牌壁垒',
+                  '九阳股份 公司首次覆盖报告',
+              ]
+              matches: dict[int, dict[str, Any]] = {}
+              for query in queries:
+                  payload = {
+                      'device':1,'hideTrader':0,'onlyTitle':1,'order':0,
+                      'page':1,'pageSize':100,'keyword':query,'pageCount':0,
+                      'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'',
+                  }
+                  try:
+                      result = post_json('https://api.sdyanbao.com/api/file/search', payload)
+                  except Exception:
+                      continue
+                  for record in collect_records(result):
+                      title = str(record.get('name') or '')
+                      compact = normalize(title)
+                      if '九阳股份' in title and ('把握产品红利' in title or '构建品牌壁垒' in title):
+                          matches[int(record['id'])] = record
+                      elif '九阳股份' in title and '首次覆盖' in title:
+                          matches[int(record['id'])] = record
+              for report_id, record in sorted(matches.items(), reverse=True):
+                  try:
+                      detail = get_detail(report_id)
+                  except Exception:
+                      continue
+                  title = str(detail.get('name') or record.get('name') or '')
+                  if detail.get('page_url') and detail.get('page_count') and '九阳股份' in title:
+                      return {
+                          'id': report_id,
+                          'name': title,
+                          'page_url': str(detail['page_url']),
+                          'page_count': int(detail['page_count']),
+                          'time_text': str(record.get('time_text') or '2022-08-11'),
+                      }
+              return None
+
+          def fetch_image(url: str, referer: str) -> bytes:
+              last: Any = None
+              headers = {
+                  'User-Agent': session.headers['User-Agent'],
+                  'Referer': referer,
+                  'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+              }
+              for attempt in range(7):
+                  try:
+                      r = session.get(url, headers=headers, timeout=(20, 120), allow_redirects=True)
+                      last = {'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type','')}
+                      if r.status_code == 200 and len(r.content) > 12000:
+                          with Image.open(BytesIO(r.content)) as im:
+                              im.verify()
+                          return r.content
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'Image download failed {url}: {last}')
+
+          def make_preview_pdf(spec: dict[str, Any]) -> dict[str, Any]:
+              report_id = int(spec['report_id'])
+              detail = get_detail(report_id)
+              detail_name = str(detail.get('name') or '')
+              if '九阳股份' not in detail_name:
+                  raise RuntimeError(f'Issuer mismatch for report {report_id}: {detail_name}')
+              page_url = str(detail.get('page_url') or spec.get('page_url') or '').rstrip('/')
+              total_pages = int(detail.get('page_count') or spec['total_pages'])
+              public_pages = min(int(spec['public_pages']), total_pages)
+              source_page = f'https://www.sdyanbao.com/detail/{report_id}'
+              wdir = work / f'report_{report_id}'
+              wdir.mkdir(exist_ok=True)
+              image_files: list[Path] = []
+              image_urls: list[str] = []
+              for page_no in range(public_pages):
+                  successful_url = None
+                  raw = None
+                  for extension in ('png', 'jpg', 'jpeg'):
+                      candidate = f'{page_url}/{page_no}.{extension}'
+                      try:
+                          raw = fetch_image(candidate, source_page)
+                          successful_url = candidate
+                          break
+                      except Exception:
+                          continue
+                  if raw is None or successful_url is None:
+                      raise RuntimeError(f'Unable to fetch public page {page_no} for {report_id}')
+                  src = wdir / f'{page_no:02d}_source'
+                  src.write_bytes(raw)
+                  with Image.open(BytesIO(raw)) as image:
+                      rgba = image.convert('RGBA')
+                      white = Image.new('RGBA', rgba.size, (255,255,255,255))
+                      white.alpha_composite(rgba)
+                      rgb = white.convert('RGB')
+                      out = wdir / f'{page_no:02d}.jpg'
+                      rgb.save(out, 'JPEG', quality=95, subsampling=0)
+                  image_files.append(out)
+                  image_urls.append(successful_url)
+
+              pdf_path = root / spec['filename']
+              opened = [Image.open(path).convert('RGB') for path in image_files]
+              try:
+                  opened[0].save(
+                      pdf_path,
+                      save_all=True,
+                      append_images=opened[1:],
+                      resolution=150.0,
+                      quality=95,
+                  )
+              finally:
+                  for image in opened:
+                      image.close()
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != public_pages:
+                  raise RuntimeError(f'PDF page mismatch for {pdf_path.name}: {actual_pages} vs {public_pages}')
+              subprocess.run(['qpdf','--check',str(pdf_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = preview_dir / pdf_path.stem
+              subprocess.run(
+                  ['pdftoppm','-f','1','-l','1','-png','-r','130','-singlefile',str(pdf_path),str(prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              preview_file = Path(str(prefix) + '.png')
+              if not preview_file.exists() or preview_file.stat().st_size < 15000:
+                  raise RuntimeError(f'First-page render failed: {pdf_path.name}')
+              sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+              return {
+                  **spec,
+                  'detail_name': detail_name,
+                  'source_page': source_page,
+                  'page_url': page_url,
+                  'image_urls': image_urls,
+                  'original_total_pages': total_pages,
+                  'public_pages_in_pdf': public_pages,
+                  'pdf_file': pdf_path.name,
+                  'pdf_pages': actual_pages,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha,
+                  'preview_file': str(Path('首页预览') / preview_file.name),
+                  'document_nature': '券商报告公开预览原页',
+                  'validation': ['report-detail identity','all public page images','image integrity','white-background compositing','PDF page count','qpdf structure','first-page render'],
+              }
+
+          def make_public_summary_pdf() -> dict[str, Any]:
+              source_url = 'https://www.nbd.com.cn/articles/2022-08-11/2402067.html'
+              source_html = ''
+              try:
+                  response = session.get(source_url, timeout=(20, 120), allow_redirects=True)
+                  if response.status_code == 200 and len(response.content) > 5000:
+                      source_html = response.content.decode(response.encoding or 'utf-8', 'replace')
+                      (source_dir / '东亚前海证券_首次覆盖公开报道.html').write_text(source_html, encoding='utf-8')
+              except Exception:
+                  source_html = ''
+
+              pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+              styles = getSampleStyleSheet()
+              title_style = ParagraphStyle(
+                  'title_cn', parent=styles['Title'], fontName='STSong-Light',
+                  fontSize=16, leading=23, alignment=TA_CENTER, spaceAfter=10,
+              )
+              body_style = ParagraphStyle(
+                  'body_cn', parent=styles['BodyText'], fontName='STSong-Light',
+                  fontSize=10.5, leading=18, alignment=TA_LEFT, wordWrap='CJK', spaceAfter=7,
+              )
+              notice_style = ParagraphStyle(
+                  'notice_cn', parent=body_style, fontSize=9, leading=14,
+                  textColor=colors.HexColor('#555555'), backColor=colors.HexColor('#F4F4F4'),
+                  borderColor=colors.HexColor('#BBBBBB'), borderWidth=0.5, borderPadding=7,
+              )
+              meta_style = ParagraphStyle(
+                  'meta_cn', parent=body_style, fontSize=9.5, leading=15,
+              )
+
+              def esc(text: str) -> str:
+                  return html.escape(text or '', quote=True)
+
+              pdf_path = root / '03_东亚前海证券_九阳股份_首次覆盖_把握产品红利构建品牌壁垒_公开摘要版_2022-08-11.pdf'
+              doc = SimpleDocTemplate(
+                  str(pdf_path), pagesize=A4,
+                  leftMargin=19*mm, rightMargin=19*mm, topMargin=17*mm, bottomMargin=17*mm,
+                  title='九阳股份公司首次覆盖报告：把握产品红利，构建品牌壁垒',
+                  author='东亚前海证券（公开报道摘要）',
+                  subject='公开报道摘要，非券商原始完整PDF',
+              )
+              story = [
+                  Paragraph('九阳股份公司首次覆盖报告：把握产品红利，构建品牌壁垒', title_style),
+                  Paragraph(
+                      '资料性质说明：本文件根据公开媒体对东亚前海证券首次覆盖报告的报道整理，仅保留公开披露的评级理由与风险提示。它不是券商原始完整PDF，也未绕过账户、会员、付费或数据库访问限制。',
+                      notice_style,
+                  ),
+                  Spacer(1, 5*mm),
+              ]
+              table_data = [
+                  [Paragraph('券商机构', meta_style), Paragraph('东亚前海证券', meta_style)],
+                  [Paragraph('报告类型', meta_style), Paragraph('公司首次覆盖报告', meta_style)],
+                  [Paragraph('发布日期', meta_style), Paragraph('2022-08-11', meta_style)],
+                  [Paragraph('投资评级', meta_style), Paragraph('推荐', meta_style)],
+                  [Paragraph('股票', meta_style), Paragraph('九阳股份（002242.SZ）', meta_style)],
+              ]
+              table = Table(table_data, colWidths=[30*mm, 120*mm], hAlign='LEFT')
+              table.setStyle(TableStyle([
+                  ('FONTNAME',(0,0),(-1,-1),'STSong-Light'),
+                  ('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#CCCCCC')),
+                  ('BACKGROUND',(0,0),(0,-1),colors.HexColor('#F1F1F1')),
+                  ('VALIGN',(0,0),(-1,-1),'TOP'),
+                  ('LEFTPADDING',(0,0),(-1,-1),6),('RIGHTPADDING',(0,0),(-1,-1),6),
+                  ('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),
+              ]))
+              story += [table, Spacer(1, 7*mm)]
+              sections = [
+                  ('公开评级理由', [
+                      '公司是厨房小家电行业的重要企业，行业空间扩张与消费升级为长期发展提供基础。',
+                      '公司聚焦刚需品类并加强中腰部产品布局，空气炸锅、炊具等品类仍有进一步拓展空间。',
+                      '九阳与 SharkNinja 的协同效应逐步显现，清洁电器业务可能形成新的增长周期。',
+                      '供应链体系较完善，有助于公司应对快速变化的市场并把握爆款产品机会。',
+                      '公司多个品类处于行业前列，由豆浆机向品质生活小家电转型的效果逐步显现。',
+                  ]),
+                  ('公开风险提示', [
+                      '宏观经济下行风险。',
+                      '原材料价格持续上涨风险。',
+                      '新产品拓展不及预期风险。',
+                  ]),
+              ]
+              for heading, paragraphs in sections:
+                  story.append(Paragraph(f'<b>{esc(heading)}</b>', body_style))
+                  for paragraph in paragraphs:
+                      story.append(Paragraph('• ' + esc(paragraph), body_style))
+              story += [
+                  Spacer(1, 5*mm),
+                  Paragraph('公开来源：' + esc(source_url), ParagraphStyle('source', parent=body_style, fontSize=8.5, leading=13, textColor=colors.HexColor('#555555'))),
+              ]
+              doc.build(story)
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              pages = len(reader.pages)
+              extracted = ''.join((page.extract_text() or '') for page in reader.pages)
+              if '九阳股份' not in extracted or '东亚前海证券' not in extracted:
+                  raise RuntimeError('Summary PDF text identity validation failed')
+              subprocess.run(['qpdf','--check',str(pdf_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = preview_dir / pdf_path.stem
+              subprocess.run(
+                  ['pdftoppm','-f','1','-l','1','-png','-r','130','-singlefile',str(pdf_path),str(prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              preview_file = Path(str(prefix) + '.png')
+              if not preview_file.exists() or preview_file.stat().st_size < 10000:
+                  raise RuntimeError('Summary PDF render failed')
+              sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+              return {
+                  'broker':'东亚前海证券',
+                  'title':'九阳股份公司首次覆盖报告：把握产品红利，构建品牌壁垒',
+                  'date':'2022-08-11',
+                  'report_type':'公司首次覆盖报告',
+                  'rating':'推荐',
+                  'source_page':source_url,
+                  'pdf_file':pdf_path.name,
+                  'pdf_pages':pages,
+                  'bytes':pdf_path.stat().st_size,
+                  'sha256':sha,
+                  'preview_file':str(Path('首页预览') / preview_file.name),
+                  'document_nature':'公开媒体报道摘要；非券商原始完整PDF',
+                  'validation':['public source metadata','searchable PDF text','issuer and broker identity','qpdf structure','first-page render'],
+              }
+
+          reports: list[dict[str, Any]] = []
+
+          reports.append(make_preview_pdf({
+              'broker':'西部证券',
+              'title':'九阳股份（002242）深度报告：经营拐点将至',
+              'date':'2023-03-08',
+              'report_type':'公司深度报告',
+              'rating':'买入（维持）',
+              'report_id':361666,
+              'total_pages':27,
+              'public_pages':10,
+              'filename':'01_西部证券_九阳股份_深度报告_经营拐点将至_公开预览前10页_2023-03-08.pdf',
+          }))
+
+          reports.append(make_preview_pdf({
+              'broker':'华金证券',
+              'title':'九阳股份（002242）：外销向好、新品发力，经营有望改善',
+              'date':'2023-08-31',
+              'report_type':'公司研究/中报点评',
+              'rating':'增持',
+              'report_id':458866,
+              'total_pages':7,
+              'public_pages':7,
+              'filename':'02_华金证券_九阳股份_外销向好新品发力经营有望改善_公开报告页7页_2023-08-31.pdf',
+          }))
+
+          east_asia = find_east_asia_report()
+          if east_asia is not None:
+              reports.append(make_preview_pdf({
+                  'broker':'东亚前海证券',
+                  'title':'九阳股份公司首次覆盖报告：把握产品红利，构建品牌壁垒',
+                  'date':east_asia.get('time_text') or '2022-08-11',
+                  'report_type':'公司首次覆盖报告',
+                  'rating':'推荐',
+                  'report_id':int(east_asia['id']),
+                  'page_url':east_asia['page_url'],
+                  'total_pages':int(east_asia['page_count']),
+                  'public_pages':10,
+                  'filename':'03_东亚前海证券_九阳股份_首次覆盖_把握产品红利构建品牌壁垒_公开预览版_2022-08-11.pdf',
+              }))
+          else:
+              reports.append(make_public_summary_pdf())
+
+          readme = [
+              '九阳股份（002242.SZ）券商深度及首次覆盖报告公开资料包',
+              '整理日期：2026-09-29',
+              '',
+              '本包共收录3份资料。优先保存券商报告公开展示的原始页面；无法取得公开报告页的文件，以公开媒体报道摘要替代，并在文件名与说明中明确标注。',
+              '完整券商原始PDF若受到登录、会员、付费或数据库权限限制，本包未绕过相关访问控制。',
+              '',
+          ]
+          for index, report in enumerate(reports, 1):
+              readme += [
+                  f"{index}. {report.get('broker')}：《{report.get('title')}》",
+                  f"   日期：{report.get('date')}；类型：{report.get('report_type')}；评级：{report.get('rating')}",
+                  f"   文件性质：{report.get('document_nature')}",
+                  f"   PDF：{report.get('pdf_file')}；本包页数：{report.get('pdf_pages')}页",
+                  f"   原报告总页数：{report.get('original_total_pages','未公开或不适用')}；来源：{report.get('source_page')}",
+                  f"   SHA-256：{report.get('sha256')}",
+                  '',
+              ]
+          readme += [
+              '核验项目：来源记录、公司及报告身份、页面图片完整性、PDF页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+              '报告内容与版权归原券商、研究员及来源平台所有，仅供研究参考，不构成投资建议。',
+          ]
+          (root / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{report['sha256']}  {report['pdf_file']}\n" for report in reports),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(root.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{PACKAGE}/{path.relative_to(root)}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 3:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_names)}')
+
+          short_path = Path('joyoung_broker_reports.zip')
+          short_path.write_bytes(zip_path.read_bytes())
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'SHA256', zip_sha)
+          print('MANIFEST', json.dumps(reports, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: joyoung-002242-broker-research-reports-final
+          path: |
+            九阳股份_002242_券商深度及首次覆盖报告_公开资料版_3份.zip
+            joyoung_broker_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
