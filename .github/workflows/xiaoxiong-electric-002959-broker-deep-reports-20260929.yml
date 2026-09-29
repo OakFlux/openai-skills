@@ -1,0 +1,323 @@
+name: Build Xiaoxiong Electric broker deep report previews 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/xiaoxiong-electric-002959-broker-deep-reports-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf
+
+      - name: Download public previews, build PDFs and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '小熊电器_002959_券商深度报告_公开预览版_3份'
+          ROOT = Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREVIEW_DIR = ROOT / '首页预览'
+          PREVIEW_DIR.mkdir(exist_ok=True)
+          WORK = Path('_work_xiaoxiong')
+          WORK.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'id': 889744,
+                  'broker': '招商证券',
+                  'date': '2025-05-13',
+                  'title': '小熊电器（002959）：创意小家电领航，年轻人喜欢的小熊',
+                  'rating': '强烈推荐（首次）',
+                  'analysts': '史晋星、闫哲坤',
+                  'expected_pages': 18,
+                  'filename': '01_招商证券_小熊电器_创意小家电领航年轻人喜欢的小熊_公开预览前10页_2025-05-13.pdf',
+                  'required': ['小熊电器', '创意小家电领航', '年轻人喜欢的小熊'],
+              },
+              {
+                  'id': 899510,
+                  'broker': '财通证券',
+                  'date': '2025-06-27',
+                  'title': '小熊电器（002959）：内销经营逐步改善，积极发力外销市场',
+                  'rating': '增持（首次）',
+                  'analysts': '肖珮菁、孙谦',
+                  'expected_pages': 17,
+                  'filename': '02_财通证券_小熊电器_内销经营逐步改善积极发力外销市场_公开预览前10页_2025-06-27.pdf',
+                  'required': ['小熊电器', '内销经营逐步改善', '积极发力外销市场'],
+              },
+              {
+                  'id': None,
+                  'broker': '中信证券',
+                  'date': '2022-10-18',
+                  'title': '小熊电器（002959）深度跟踪报告：经营改善，创意小家电龙头再出发',
+                  'rating': '买入（上调）',
+                  'analysts': '纪敏',
+                  'expected_pages': 31,
+                  'filename': '03_中信证券_小熊电器_经营改善创意小家电龙头再出发_公开预览前10页_2022-10-18.pdf',
+                  'required': ['小熊电器', '经营改善', '创意小家电龙头再出发'],
+                  'search_queries': [
+                      '小熊电器 经营改善 创意小家电龙头再出发',
+                      '经营改善 创意小家电龙头再出发',
+                      '小熊电器 深度跟踪报告',
+                  ],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+              last: Any = None
+              for attempt in range(7):
+                  try:
+                      r = session.post(url, json=payload, timeout=(20, 120))
+                      last = {'status': r.status_code, 'text': r.text[:500]}
+                      if r.status_code == 200:
+                          return r.json()
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def collect_records(obj: Any) -> list[dict[str, Any]]:
+              found: list[dict[str, Any]] = []
+              def walk(x: Any) -> None:
+                  if isinstance(x, dict):
+                      if isinstance(x.get('id'), int) and isinstance(x.get('name'), str):
+                          found.append(x)
+                      for v in x.values():
+                          walk(v)
+                  elif isinstance(x, list):
+                      for v in x:
+                          walk(v)
+              walk(obj)
+              return list({int(x['id']): x for x in found}.values())
+
+          def norm(s: str) -> str:
+              return re.sub(r'[\s（）()：:，,。·、+＋&＆—\-_/]+', '', s or '').lower()
+
+          def locate_report_id(report: dict[str, Any]) -> int:
+              if report.get('id'):
+                  return int(report['id'])
+              candidates: dict[int, dict[str, Any]] = {}
+              for q in report.get('search_queries', []):
+                  payload = {
+                      'device': 1,
+                      'hideTrader': 0,
+                      'onlyTitle': 1,
+                      'order': 0,
+                      'page': 1,
+                      'pageSize': 100,
+                      'keyword': q,
+                      'pageCount': 0,
+                      'dateRange': 0,
+                      'startTime': '',
+                      'endTime': '',
+                      'typeIds': '',
+                      'industryIds': '',
+                  }
+                  data = post_json('https://api.sdyanbao.com/api/file/search', payload)
+                  for rec in collect_records(data):
+                      candidates[int(rec['id'])] = rec
+                  time.sleep(0.15)
+              scored: list[tuple[int, int, dict[str, Any]]] = []
+              for rec in candidates.values():
+                  name = norm(str(rec.get('name') or ''))
+                  score = sum(20 for term in report['required'] if norm(term) in name)
+                  if '深度' in str(rec.get('name') or ''):
+                      score += 5
+                  pages = int(rec.get('page_count') or 0)
+                  if pages >= 20:
+                      score += 3
+                  scored.append((score, pages, rec))
+              scored.sort(key=lambda x: (x[0], x[1], int(x[2].get('id') or 0)), reverse=True)
+              for score, pages, rec in scored:
+                  if score >= 40:
+                      return int(rec['id'])
+              raise RuntimeError(f'Could not locate report: {report["title"]}; candidates={scored[:10]}')
+
+          def fetch_image(url: str) -> bytes:
+              last: Any = None
+              headers = {
+                  'Referer': 'https://www.sdyanbao.com/',
+                  'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+              }
+              for attempt in range(7):
+                  try:
+                      r = session.get(url, headers=headers, timeout=(20, 120), allow_redirects=True)
+                      last = {'status': r.status_code, 'bytes': len(r.content), 'type': r.headers.get('content-type')}
+                      if r.status_code == 200 and len(r.content) > 15_000:
+                          with Image.open(BytesIO(r.content)) as im:
+                              im.verify()
+                          return r.content
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'Image failed {url}: {last}')
+
+          manifest: list[dict[str, Any]] = []
+          selection_log: list[dict[str, Any]] = []
+
+          for idx, report in enumerate(reports, 1):
+              rid = locate_report_id(report)
+              detail_response = post_json('https://api.sdyanbao.com/api/file/detail', {'id': rid})
+              detail = detail_response.get('data') if isinstance(detail_response, dict) else None
+              if not isinstance(detail, dict):
+                  raise RuntimeError(f'Invalid detail response for {rid}: {detail_response}')
+              source_name = str(detail.get('name') or '')
+              source_norm = norm(source_name)
+              if not all(norm(term) in source_norm for term in report['required'][:1]):
+                  raise RuntimeError(f'Issuer/title mismatch for {rid}: {source_name}')
+              page_url = str(detail.get('page_url') or '').rstrip('/')
+              total_pages = int(detail.get('page_count') or report['expected_pages'] or 0)
+              if not page_url or total_pages < 10:
+                  raise RuntimeError(f'Invalid preview metadata for {rid}: page_url={page_url}, pages={total_pages}')
+              preview_pages = min(10, total_pages)
+              work_dir = WORK / f'{idx:02d}_{rid}'
+              work_dir.mkdir(exist_ok=True)
+              image_files: list[Path] = []
+              for pno in range(preview_pages):
+                  raw = fetch_image(f'{page_url}/{pno}.png')
+                  src = work_dir / f'{pno:02d}_src.png'
+                  src.write_bytes(raw)
+                  with Image.open(src) as im:
+                      rgba = im.convert('RGBA')
+                      bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+                      bg.alpha_composite(rgba)
+                      rgb = bg.convert('RGB')
+                      jpg = work_dir / f'{pno:02d}.jpg'
+                      rgb.save(jpg, 'JPEG', quality=95, subsampling=0)
+                      image_files.append(jpg)
+
+              pdf_path = ROOT / report['filename']
+              images = [Image.open(p).convert('RGB') for p in image_files]
+              try:
+                  images[0].save(pdf_path, save_all=True, append_images=images[1:], resolution=150.0, quality=95)
+              finally:
+                  for im in images:
+                      im.close()
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != preview_pages:
+                  raise RuntimeError(f'Page-count mismatch: {pdf_path.name} {actual_pages} != {preview_pages}')
+              subprocess.run(['qpdf', '--check', str(pdf_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = PREVIEW_DIR / pdf_path.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(pdf_path), str(prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              preview_file = Path(str(prefix) + '.png')
+              if not preview_file.exists() or preview_file.stat().st_size < 10_000:
+                  raise RuntimeError(f'First-page render failed: {pdf_path.name}')
+              sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+              source_page = f'https://www.sdyanbao.com/detail/{rid}'
+              item = {
+                  **report,
+                  'id': rid,
+                  'source_name': source_name,
+                  'source_page': source_page,
+                  'page_image_base': page_url,
+                  'original_total_pages': total_pages,
+                  'public_preview_pages': preview_pages,
+                  'pdf_file': pdf_path.name,
+                  'actual_pdf_pages': actual_pages,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha,
+                  'preview_file': str(Path('首页预览') / preview_file.name),
+                  'document_nature': '公开预览版；不是券商原始完整PDF',
+                  'validation': ['public preview image integrity', 'white-background compositing', 'PDF page count', 'qpdf structure', 'first-page render'],
+              }
+              manifest.append(item)
+              selection_log.append({'report_id': rid, 'source_name': source_name, 'page_count': total_pages, 'page_url': page_url})
+
+          readme = [
+              '小熊电器股份有限公司（002959.SZ）券商深度报告公开预览资料包',
+              '整理日期：2026-09-29',
+              '',
+              '本包收录3份公司深度/首次覆盖类券商研究报告的公开预览原页。',
+              '完整券商原始PDF在相关研报平台需要账户、会员或数据库下载权限；本包未绕过任何登录、付费或访问控制。',
+              '因此，所有PDF均明确标注为“公开预览版”，不能视为完整券商原始PDF。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {item['broker']}：《{item['title']}》",
+                  f"   日期：{item['date']}；评级：{item['rating']}；分析师：{item['analysts']}",
+                  f"   原报告：{item['original_total_pages']}页；本包PDF：公开预览前{item['public_preview_pages']}页",
+                  f"   来源页面：{item['source_page']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          readme += [
+              '报告内容及版权归原券商与作者所有，仅供研究参考，不构成投资建议。',
+              '核验项目：页面图片完整性、透明背景白底校正、PDF页数、PDF结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'selection_log.json').write_text(json.dumps(selection_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['pdf_file']}\n" for x in manifest), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{PACKAGE}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+
+          short_path = Path('xiaoxiong_reports.zip')
+          short_path.write_bytes(zip_path.read_bytes())
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'SHA256', zip_sha)
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaoxiong-electric-002959-broker-deep-reports-final
+          path: |
+            小熊电器_002959_券商深度报告_公开预览版_3份.zip
+            xiaoxiong_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
