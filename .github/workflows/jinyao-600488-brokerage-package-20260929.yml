@@ -1,0 +1,382 @@
+name: Build Jinyao Pharma 600488 brokerage research package 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jinyao-600488-brokerage-package-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests beautifulsoup4 reportlab pypdf
+
+      - name: Download and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html as html_lib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_CENTER, TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+          from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+          PACKAGE = '津药药业_600488_券商深度及重点研究报告精选_3份'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+
+          records: list[dict] = []
+          seen_hashes: set[str] = set()
+
+          def validate_pdf(path: Path, min_pages: int = 1, min_bytes: int = 10_000) -> tuple[int, int]:
+              size = path.stat().st_size
+              if size < min_bytes:
+                  raise RuntimeError(f'{path.name} 文件过小：{size}')
+              with path.open('rb') as fh:
+                  if not fh.read(8).startswith(b'%PDF-'):
+                      raise RuntimeError(f'{path.name} 不是PDF文件')
+              pages = len(PdfReader(str(path), strict=False).pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{path.name} 页数异常：{pages}')
+              check = subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(path)],
+                  capture_output=True,
+                  text=True,
+              )
+              if check.returncode != 0:
+                  raise RuntimeError(f'{path.name} qpdf校验失败：{check.stderr[-1200:]}')
+              render_root = path.parent / (path.stem + '_render')
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '96', str(path), str(render_root)],
+                  capture_output=True,
+                  text=True,
+              )
+              rendered = Path(str(render_root) + '.png')
+              if render.returncode != 0 or not rendered.exists() or rendered.stat().st_size < 5_000:
+                  raise RuntimeError(f'{path.name} 首页渲染失败：{render.stderr[-800:]}')
+              render_size = rendered.stat().st_size
+              rendered.unlink(missing_ok=True)
+              return pages, render_size
+
+          def add_record(path: Path, meta: dict, source_url: str, edition: str) -> None:
+              pages, render_size = validate_pdf(path, meta.get('min_pages', 1), meta.get('min_bytes', 10_000))
+              data = path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in seen_hashes:
+                  raise RuntimeError(f'发现重复PDF：{path.name}')
+              seen_hashes.add(digest)
+              record = {
+                  'filename': path.name,
+                  'broker': meta['broker'],
+                  'date': meta['date'],
+                  'title': meta['title'],
+                  'authors': meta['authors'],
+                  'report_type': meta['report_type'],
+                  'edition': edition,
+                  'source_url': source_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_size,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          # 1) 2023 original broker PDF from Eastmoney public report server.
+          modern_meta = {
+              'broker': '华金证券',
+              'date': '2023-05-11',
+              'title': '混改推动业绩高速增长',
+              'authors': '周平',
+              'report_type': '公司研究报告',
+              'min_pages': 3,
+              'min_bytes': 150_000,
+          }
+          modern_path = OUT / '01_华金证券_2023-05-11_津药药业_混改推动业绩高速增长_原始PDF.pdf'
+          modern_code = 'AP202305111586475142'
+          modern_urls = [
+              f'https://pdf.dfcfw.com/pdf/H3_{modern_code}_1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H2_{modern_code}_1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H4_{modern_code}_1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H3_{modern_code}_1.PDF',
+          ]
+          modern_source = None
+          errors = []
+          for url in modern_urls:
+              tmp = modern_path.with_suffix('.pdf.part')
+              tmp.unlink(missing_ok=True)
+              try:
+                  with session.get(
+                      url,
+                      headers={'Referer': 'https://data.eastmoney.com/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                      stream=True,
+                      timeout=(30, 300),
+                      allow_redirects=True,
+                  ) as response:
+                      print('DOWNLOAD', modern_path.name, response.status_code, url, 'final', response.url, flush=True)
+                      response.raise_for_status()
+                      with tmp.open('wb') as fh:
+                          for chunk in response.iter_content(1024 * 1024):
+                              if chunk:
+                                  fh.write(chunk)
+                  validate_pdf(tmp, modern_meta['min_pages'], modern_meta['min_bytes'])
+                  tmp.replace(modern_path)
+                  modern_source = url
+                  break
+              except Exception as exc:
+                  errors.append(f'{url}: {exc!r}')
+                  tmp.unlink(missing_ok=True)
+          if not modern_source:
+              raise RuntimeError('2023年华金证券PDF下载失败：' + '; '.join(errors))
+          add_record(modern_path, modern_meta, modern_source, '券商原始排版PDF')
+
+          archive_reports = [
+              {
+                  'rptid': '569347040128',
+                  'filename': '02_中泰证券_2018-01-15_天药股份深度报告_原料药转型专科制剂_国内国际双线发展_新浪归档文本版.pdf',
+                  'broker': '中泰证券',
+                  'date': '2018-01-15',
+                  'title': '原料药转型专科制剂，国内国际双线发展',
+                  'authors': '池陈森、江琦',
+                  'report_type': '公司深度报告',
+                  'min_pages': 2,
+                  'min_bytes': 20_000,
+              },
+              {
+                  'rptid': '413022474773',
+                  'filename': '03_瑞银证券_2013-02-01_天药股份首次覆盖_乘行业整合东风_国内龙头迈向世界_新浪归档文本版.pdf',
+                  'broker': '瑞银证券',
+                  'date': '2013-02-01',
+                  'title': '乘行业整合东风，国内龙头迈向世界',
+                  'authors': '季序我',
+                  'report_type': '首次覆盖报告',
+                  'min_pages': 2,
+                  'min_bytes': 20_000,
+              },
+          ]
+
+          def extract_sina_text(report: dict) -> tuple[str, list[str], str]:
+              url = f'http://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{report["rptid"]}/index.phtml'
+              response = session.get(url, headers={'Referer': 'http://stock.finance.sina.com.cn/'}, timeout=(20, 90))
+              print('FETCH_ARCHIVE', response.status_code, url, len(response.content), flush=True)
+              response.raise_for_status()
+              response.encoding = response.apparent_encoding or 'gb18030'
+              soup = BeautifulSoup(response.text, 'html.parser')
+              heading = soup.select_one('div.content h1') or soup.find('h1')
+              body = soup.select_one('div.blk_container')
+              if not heading or not body:
+                  raise RuntimeError(f'新浪归档页面结构无法识别：{url}')
+              for br in body.find_all('br'):
+                  br.replace_with('\n')
+              raw = body.get_text('\n', strip=True)
+              raw = html_lib.unescape(raw)
+              raw = raw.replace('\u3000', ' ')
+              lines = []
+              for item in re.split(r'\n+', raw):
+                  item = re.sub(r'\s+', ' ', item).strip()
+                  if not item:
+                      continue
+                  if item.startswith('文本中涉及股票'):
+                      break
+                  if item in {'-->', '<!--'}:
+                      continue
+                  lines.append(item)
+              if len(''.join(lines)) < 500:
+                  raise RuntimeError(f'新浪归档正文过短：{url}')
+              return heading.get_text(' ', strip=True), lines, url
+
+          styles = getSampleStyleSheet()
+          title_style = ParagraphStyle(
+              'ChineseTitle', parent=styles['Title'], fontName='STSong-Light', fontSize=18,
+              leading=26, alignment=TA_CENTER, spaceAfter=8*mm, textColor=colors.HexColor('#1f2937'),
+              wordWrap='CJK',
+          )
+          subtitle_style = ParagraphStyle(
+              'ChineseSubtitle', parent=styles['Normal'], fontName='STSong-Light', fontSize=11,
+              leading=17, alignment=TA_CENTER, textColor=colors.HexColor('#4b5563'),
+              spaceAfter=5*mm, wordWrap='CJK',
+          )
+          note_style = ParagraphStyle(
+              'ChineseNote', parent=styles['Normal'], fontName='STSong-Light', fontSize=9.5,
+              leading=15, alignment=TA_LEFT, textColor=colors.HexColor('#7c2d12'),
+              backColor=colors.HexColor('#fff7ed'), borderColor=colors.HexColor('#fdba74'),
+              borderWidth=0.6, borderPadding=8, spaceAfter=6*mm, wordWrap='CJK',
+          )
+          body_style = ParagraphStyle(
+              'ChineseBody', parent=styles['BodyText'], fontName='STSong-Light', fontSize=10.5,
+              leading=18, alignment=TA_LEFT, firstLineIndent=21, spaceAfter=3.5*mm,
+              textColor=colors.HexColor('#111827'), wordWrap='CJK',
+          )
+          heading_style = ParagraphStyle(
+              'ChineseHeading', parent=styles['Heading2'], fontName='STSong-Light', fontSize=12.5,
+              leading=19, alignment=TA_LEFT, spaceBefore=3*mm, spaceAfter=2*mm,
+              textColor=colors.HexColor('#1e3a8a'), wordWrap='CJK',
+          )
+          footer_style = ParagraphStyle(
+              'ChineseFooter', parent=styles['Normal'], fontName='STSong-Light', fontSize=8,
+              leading=11, alignment=TA_CENTER, textColor=colors.HexColor('#6b7280'),
+          )
+
+          def create_archive_pdf(report: dict, page_heading: str, lines: list[str], source_url: str, dest: Path) -> None:
+              def add_page_number(canvas, doc):
+                  canvas.saveState()
+                  canvas.setFont('STSong-Light', 8)
+                  canvas.setFillColor(colors.HexColor('#6b7280'))
+                  canvas.drawCentredString(A4[0] / 2, 11*mm, f'新浪财经公开归档文本整理版  ·  第 {doc.page} 页')
+                  canvas.restoreState()
+
+              doc = SimpleDocTemplate(
+                  str(dest), pagesize=A4,
+                  rightMargin=20*mm, leftMargin=20*mm, topMargin=18*mm, bottomMargin=20*mm,
+                  title=report['title'], author=report['broker'], subject='券商研究报告公开归档文本整理版',
+              )
+              story = [
+                  Paragraph(html_lib.escape(report['title']), title_style),
+                  Paragraph(
+                      f"{html_lib.escape(report['broker'])}　|　{html_lib.escape(report['authors'])}　|　{report['date']}　|　{html_lib.escape(report['report_type'])}",
+                      subtitle_style,
+                  ),
+                  Paragraph(
+                      '版本说明：本文件依据新浪财经仍公开展示的研究报告归档页面整理，保留页面公开的报告正文内容。'
+                      '由于券商原始排版PDF的公开下载入口目前已不可用，本文件不是券商原始版式PDF，也不保证等同于原报告全部页码；'
+                      '文件名与首页已明确标注“新浪归档文本版”，仅用于资料检索与研究参考。',
+                      note_style,
+                  ),
+                  Table(
+                      [
+                          ['原归档标题', page_heading],
+                          ['归档来源', source_url],
+                          ['证券代码', '600488（现证券简称：津药药业；报告发表时简称：天药股份）'],
+                      ],
+                      colWidths=[30*mm, 130*mm],
+                      style=TableStyle([
+                          ('FONTNAME', (0,0), (-1,-1), 'STSong-Light'),
+                          ('FONTSIZE', (0,0), (-1,-1), 8.5),
+                          ('LEADING', (0,0), (-1,-1), 13),
+                          ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                          ('BACKGROUND', (0,0), (0,-1), colors.HexColor('#f3f4f6')),
+                          ('GRID', (0,0), (-1,-1), 0.35, colors.HexColor('#d1d5db')),
+                          ('LEFTPADDING', (0,0), (-1,-1), 5),
+                          ('RIGHTPADDING', (0,0), (-1,-1), 5),
+                          ('TOPPADDING', (0,0), (-1,-1), 5),
+                          ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+                      ]),
+                  ),
+                  Spacer(1, 7*mm),
+              ]
+
+              short_headings = {
+                  '投资要点', '主要观点', '风险提示', '投资建议',
+                  '乘行业整合之东风，从国内龙头走向世界',
+                  '规模、技术优势明显，保障公司利益最大化',
+                  '产品结构向高端升级，带动公司盈利能力提升',
+              }
+              for line in lines:
+                  escaped = html_lib.escape(line)
+                  is_heading = line in short_headings or (len(line) <= 28 and not re.search(r'[。；：]$', line))
+                  story.append(Paragraph(escaped, heading_style if is_heading else body_style))
+
+              story.extend([
+                  Spacer(1, 4*mm),
+                  Paragraph('资料仅供学习研究，不构成任何投资建议。原报告版权归相关券商及作者所有。', footer_style),
+              ])
+              doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+
+          for report in archive_reports:
+              page_heading, lines, source_url = extract_sina_text(report)
+              dest = OUT / report['filename']
+              create_archive_pdf(report, page_heading, lines, source_url, dest)
+              add_record(dest, report, source_url, '新浪财经公开归档文本整理版（非券商原始排版PDF）')
+
+          readme = [
+              '津药药业股份有限公司（600488.SH；曾用简称：天药股份）券商研究报告精选',
+              '整理日期：2026-09-29',
+              '',
+              '本压缩包共3份资料：',
+              '1. 2023年华金证券公司研究报告：券商原始排版PDF。',
+              '2. 2018年中泰证券公司深度报告：新浪财经公开归档文本整理版。',
+              '3. 2013年瑞银证券首次覆盖报告：新浪财经公开归档文本整理版。',
+              '',
+              '重要说明：较早两份报告的券商原始排版PDF公开下载入口目前已不可用，因此未将网页文本冒充原始PDF；'
+              '对应文件名和首页均明确标注“新浪归档文本版”。归档文本版保留新浪财经公开展示的报告内容，可能不等同于原报告全部页码。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. {record['broker']}，{record['date']}，{record['report_type']}",
+                  f"   标题：{record['title']}",
+                  f"   作者：{record['authors']}；版本：{record['edition']}",
+                  f"   文件：{record['filename']}；页数：{record['pages']}；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+
+          (OUT / '00_报告清单与版本说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          if len(records) != 3:
+              raise RuntimeError(f'报告数量异常：{len(records)}')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC校验失败：' + bad)
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP中PDF数量异常：{len(pdfs)}')
+
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(records), 'SHA256', hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinyao-600488-brokerage-reports-20260929
+          path: 津药药业_600488_券商深度及重点研究报告精选_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
