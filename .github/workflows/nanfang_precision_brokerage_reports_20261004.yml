@@ -1,0 +1,461 @@
+name: Nanfang Precision Brokerage Research Package
+
+on:
+  push:
+    branches:
+      - chatgpt-nanfang-precision-reports-20261004
+    paths:
+      - .github/workflows/nanfang_precision_brokerage_reports_20261004.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf pymupdf pillow
+
+      - name: Query, download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/verification
+          python - <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlencode
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          VERIFY = OUT / 'verification'
+          STOCK_CODE = '002553'
+          COMPANY_CURRENT = '南方精工'
+          COMPANY_OLD = '南方轴承'
+          AS_OF_DATE = '2026-10-04'
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          params = {
+              'pageSize': '200',
+              'pageNo': '1',
+              'qType': '0',
+              'code': STOCK_CODE,
+              'beginTime': '2010-01-01',
+              'endTime': AS_OF_DATE,
+              'fields': '',
+              'industryCode': '*',
+              'industry': '*',
+              'rating': '*',
+              'ratingChange': '*',
+              'orgCode': '',
+          }
+          api = 'https://reportapi.eastmoney.com/report/list?' + urlencode(params)
+          response = session.get(
+              api,
+              headers={'Referer': f'https://data.eastmoney.com/report/{STOCK_CODE}.html'},
+              timeout=90,
+          )
+          response.raise_for_status()
+          payload = response.json()
+          rows = payload.get('data') or []
+          print('API_HITS', payload.get('hits'), 'ROWS', len(rows))
+          if not rows:
+              raise RuntimeError('Eastmoney research API returned no rows')
+
+          def norm_date(row):
+              return str(row.get('publishDate') or '')[:10]
+
+          def broker(row):
+              return str(row.get('orgSName') or row.get('orgName') or '').strip()
+
+          def pages_api(row):
+              try:
+                  return int(row.get('attachPages') or 0)
+              except Exception:
+                  return 0
+
+          def describe(row):
+              return {
+                  'date': norm_date(row),
+                  'broker': broker(row),
+                  'title': row.get('title') or '',
+                  'authors': row.get('researcher') or '',
+                  'rating': row.get('emRatingName') or row.get('sRatingName') or '',
+                  'pages_api': pages_api(row),
+                  'size_kb_api': row.get('attachSize') or 0,
+                  'info_code': row.get('infoCode') or '',
+                  'column': row.get('column') or '',
+              }
+
+          all_described = [describe(row) for row in rows]
+          all_described.sort(key=lambda x: x['date'], reverse=True)
+          for index, item in enumerate(all_described, 1):
+              print('REPORT', index, json.dumps(item, ensure_ascii=False))
+          (OUT / 'all_report_metadata.json').write_text(
+              json.dumps(all_described, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          # Prefer three distinct institutions with the strongest available coverage.
+          target_rules = [
+              {
+                  'label': '中国银河证券',
+                  'org_terms': ('银河',),
+                  'date_min': '2025-01-01',
+                  'date_max': '2026-12-31',
+              },
+              {
+                  'label': '华鑫证券',
+                  'org_terms': ('华鑫',),
+                  'date_min': '2024-01-01',
+                  'date_max': '2025-12-31',
+              },
+              {
+                  'label': '东方财富证券',
+                  'org_terms': ('东方财富',),
+                  'date_min': '2021-01-01',
+                  'date_max': '2023-12-31',
+              },
+          ]
+
+          def row_score(row):
+              title = str(row.get('title') or '')
+              date = norm_date(row)
+              pages = pages_api(row)
+              score = pages * 4
+              if '深度' in title:
+                  score += 120
+              if '首次覆盖' in title or '首次推荐' in title:
+                  score += 100
+              if any(term in title for term in ('民企龙头', '成长', '进口替代', '人形机器人', '精密传动')):
+                  score += 40
+              if any(term in title for term in ('点评', '快报', '季报', '年报', '业绩预告')):
+                  score -= 80
+              if date >= '2025-01-01':
+                  score += 45
+              elif date >= '2024-01-01':
+                  score += 35
+              elif date >= '2022-01-01':
+                  score += 20
+              return score
+
+          selected_rows = []
+          selected_codes = set()
+          selected_brokers = set()
+          for rule in target_rules:
+              candidates = []
+              for row in rows:
+                  org = broker(row)
+                  date = norm_date(row)
+                  code = str(row.get('infoCode') or '')
+                  if not code:
+                      continue
+                  if not any(term in org for term in rule['org_terms']):
+                      continue
+                  if not (rule['date_min'] <= date <= rule['date_max']):
+                      continue
+                  candidates.append(row)
+              candidates.sort(key=lambda row: (row_score(row), norm_date(row)), reverse=True)
+              if candidates:
+                  row = candidates[0]
+                  selected_rows.append(row)
+                  selected_codes.add(str(row.get('infoCode') or ''))
+                  selected_brokers.add(broker(row))
+                  print('TARGET_SELECTED', rule['label'], json.dumps(describe(row), ensure_ascii=False))
+
+          # Fallback: add the strongest remaining reports, preferring distinct institutions.
+          remaining = [row for row in rows if str(row.get('infoCode') or '') not in selected_codes]
+          remaining.sort(key=lambda row: (row_score(row), norm_date(row)), reverse=True)
+          for row in remaining:
+              if len(selected_rows) >= 3:
+                  break
+              org = broker(row)
+              if org in selected_brokers:
+                  continue
+              selected_rows.append(row)
+              selected_codes.add(str(row.get('infoCode') or ''))
+              selected_brokers.add(org)
+              print('FALLBACK_SELECTED', json.dumps(describe(row), ensure_ascii=False))
+
+          if len(selected_rows) < 2:
+              raise RuntimeError(f'Only {len(selected_rows)} candidate reports selected')
+
+          def candidate_pdf_urls(row):
+              code = str(row.get('infoCode') or '')
+              urls = []
+              for key in ('attachUrl', 'pdfUrl', 'url'):
+                  value = row.get(key)
+                  if isinstance(value, str) and value.lower().endswith('.pdf'):
+                      urls.append(value)
+              urls.extend([
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}.pdf',
+              ])
+              dedup = []
+              seen = set()
+              for url in urls:
+                  if url and url not in seen:
+                      dedup.append(url)
+                      seen.add(url)
+              return dedup
+
+          def download_pdf(row):
+              errors = []
+              for url in candidate_pdf_urls(row):
+                  try:
+                      r = session.get(
+                          url,
+                          headers={'Referer': 'https://data.eastmoney.com/'},
+                          timeout=120,
+                          allow_redirects=True,
+                      )
+                      ctype = r.headers.get('content-type', '')
+                      print('FETCH_PDF', r.status_code, len(r.content), url, '->', r.url, ctype)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF') and len(r.content) > 30000:
+                          return r.content, url, r.url
+                      errors.append(f'{url}: {r.status_code} {ctype} {len(r.content)} bytes')
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError(' | '.join(errors))
+
+          def safe_name(text):
+              text = str(text).replace('“', '').replace('”', '').replace('：', '_').replace('，', '_')
+              text = re.sub(r'[\\/:*?"<>|\s]+', '_', text)
+              return re.sub(r'_+', '_', text).strip('_')[:70]
+
+          def extract_probe_text(pdf_path, page_limit=5):
+              doc = pymupdf.open(str(pdf_path))
+              chunks = []
+              for i in range(min(page_limit, doc.page_count)):
+                  chunks.append(doc[i].get_text('text'))
+              if doc.page_count:
+                  chunks.append(doc[-1].get_text('text'))
+              doc.close()
+              return '\n'.join(chunks)
+
+          def render(pdf_path, page_number, target):
+              doc = pymupdf.open(str(pdf_path))
+              page = doc[page_number]
+              pix = page.get_pixmap(matrix=pymupdf.Matrix(1.45, 1.45), alpha=False)
+              pix.save(str(target))
+              doc.close()
+
+          validated = []
+          failures = []
+          for row in selected_rows:
+              meta = describe(row)
+              try:
+                  pdf_bytes, source_url, final_url = download_pdf(row)
+                  temp = OUT / f"temp_{meta['info_code']}.pdf"
+                  temp.write_bytes(pdf_bytes)
+                  reader = PdfReader(str(temp))
+                  encrypted = bool(reader.is_encrypted)
+                  if encrypted and not reader.decrypt(''):
+                      raise RuntimeError('Password-protected PDF')
+                  pages = len(reader.pages)
+                  if pages < 5:
+                      raise RuntimeError(f'Only {pages} pages')
+                  probe_text = extract_probe_text(temp)
+                  compact = re.sub(r'\s+', '', probe_text)
+                  if not any(token in compact for token in (COMPANY_CURRENT, COMPANY_OLD, STOCK_CODE)):
+                      raise RuntimeError('Company identity check failed')
+
+                  order = len(validated) + 1
+                  filename = (
+                      f"{order:02d}_{safe_name(meta['broker'])}_{COMPANY_CURRENT}_"
+                      f"{safe_name(meta['title'])}_{meta['date']}_{pages}页.pdf"
+                  )
+                  final_pdf = OUT / filename
+                  temp.replace(final_pdf)
+
+                  first_render = VERIFY / f'{order:02d}_page1.png'
+                  last_render = VERIFY / f'{order:02d}_lastpage.png'
+                  render(final_pdf, 0, first_render)
+                  render(final_pdf, pages - 1, last_render)
+
+                  item = {
+                      **meta,
+                      'filename': filename,
+                      'source_url': source_url,
+                      'final_url': final_url,
+                      'source_page': f"https://data.eastmoney.com/report/zw_stock.jshtml?infocode={meta['info_code']}",
+                      'pages': pages,
+                      'bytes': len(pdf_bytes),
+                      'sha256': hashlib.sha256(pdf_bytes).hexdigest(),
+                      'encrypted': encrypted,
+                      'company_identity_verified': True,
+                  }
+                  validated.append(item)
+                  print('VALIDATED', json.dumps(item, ensure_ascii=False))
+              except Exception as exc:
+                  failure = {**meta, 'error': repr(exc)}
+                  failures.append(failure)
+                  print('FAILED', json.dumps(failure, ensure_ascii=False))
+
+          # If a selected report fails, keep trying remaining API rows until there are three valid files.
+          if len(validated) < 3:
+              already_attempted = {item['info_code'] for item in validated} | {item['info_code'] for item in failures}
+              for row in remaining:
+                  if len(validated) >= 3:
+                      break
+                  meta = describe(row)
+                  if meta['info_code'] in already_attempted:
+                      continue
+                  if any(term in meta['title'] for term in ('点评', '快报', '季报', '年报', '业绩预告')):
+                      continue
+                  try:
+                      pdf_bytes, source_url, final_url = download_pdf(row)
+                      temp = OUT / f"temp_{meta['info_code']}.pdf"
+                      temp.write_bytes(pdf_bytes)
+                      reader = PdfReader(str(temp))
+                      encrypted = bool(reader.is_encrypted)
+                      if encrypted and not reader.decrypt(''):
+                          raise RuntimeError('Password-protected PDF')
+                      pages = len(reader.pages)
+                      if pages < 5:
+                          raise RuntimeError(f'Only {pages} pages')
+                      compact = re.sub(r'\s+', '', extract_probe_text(temp))
+                      if not any(token in compact for token in (COMPANY_CURRENT, COMPANY_OLD, STOCK_CODE)):
+                          raise RuntimeError('Company identity check failed')
+                      order = len(validated) + 1
+                      filename = (
+                          f"{order:02d}_{safe_name(meta['broker'])}_{COMPANY_CURRENT}_"
+                          f"{safe_name(meta['title'])}_{meta['date']}_{pages}页.pdf"
+                      )
+                      final_pdf = OUT / filename
+                      temp.replace(final_pdf)
+                      render(final_pdf, 0, VERIFY / f'{order:02d}_page1.png')
+                      render(final_pdf, pages - 1, VERIFY / f'{order:02d}_lastpage.png')
+                      item = {
+                          **meta,
+                          'filename': filename,
+                          'source_url': source_url,
+                          'final_url': final_url,
+                          'source_page': f"https://data.eastmoney.com/report/zw_stock.jshtml?infocode={meta['info_code']}",
+                          'pages': pages,
+                          'bytes': len(pdf_bytes),
+                          'sha256': hashlib.sha256(pdf_bytes).hexdigest(),
+                          'encrypted': encrypted,
+                          'company_identity_verified': True,
+                      }
+                      validated.append(item)
+                      print('FALLBACK_VALIDATED', json.dumps(item, ensure_ascii=False))
+                  except Exception as exc:
+                      failures.append({**meta, 'error': repr(exc)})
+
+          if len(validated) < 2:
+              raise RuntimeError(f'Only {len(validated)} valid reports; failures={failures}')
+          validated = validated[:3]
+
+          # Contact sheet for visual validation of first and last pages.
+          thumbs = []
+          for index, item in enumerate(validated, 1):
+              for suffix, label in [('page1', 'first'), ('lastpage', 'last')]:
+                  image_path = VERIFY / f'{index:02d}_{suffix}.png'
+                  image = Image.open(image_path).convert('RGB')
+                  image.thumbnail((530, 730))
+                  canvas = Image.new('RGB', (560, 800), 'white')
+                  canvas.paste(image, ((560 - image.width) // 2, 40))
+                  ImageDraw.Draw(canvas).text(
+                      (15, 12), f"{index:02d} {item['broker']} {label} page ({item['pages']} pages)", fill='black'
+                  )
+                  thumbs.append(canvas)
+                  image.close()
+          cols = 2
+          rows_n = (len(thumbs) + cols - 1) // cols
+          sheet = Image.new('RGB', (cols * 560, rows_n * 800), 'white')
+          for idx, canvas in enumerate(thumbs):
+              sheet.paste(canvas, ((idx % cols) * 560, (idx // cols) * 800))
+              canvas.close()
+          contact_sheet = VERIFY / 'contact_sheet.jpg'
+          sheet.save(contact_sheet, 'JPEG', quality=90)
+          sheet.close()
+
+          note_lines = [
+              '南方精工（002553.SZ，曾用简称“南方轴承”）券商研究报告资料包',
+              '',
+              f'收录完整原始PDF：{len(validated)}份，合计{sum(item["pages"] for item in validated)}页。',
+              '筛选原则：优先公司深度、首次覆盖或研究框架较完整的报告；避免用网页摘要、新闻稿或付费预览冒充完整报告。',
+              '已核验PDF文件头、实际页数、加密状态、公司名称/证券代码，并渲染检查首页和末页。',
+              '文件仅供个人研究参考，不构成投资建议。',
+              '',
+          ]
+          for index, item in enumerate(validated, 1):
+              note_lines.extend([
+                  f"{index}. {item['broker']}：《{item['title']}》",
+                  f"   日期：{item['date']}；页数：{item['pages']}；分析师：{item['authors']}；评级：{item['rating']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ])
+          if failures:
+              note_lines.extend(['下载或验证失败的候选（未纳入）：', json.dumps(failures, ensure_ascii=False, indent=2)])
+
+          (OUT / '00_资料说明.txt').write_text('\n'.join(note_lines), encoding='utf-8')
+          manifest = {
+              'company': COMPANY_CURRENT,
+              'former_name': COMPANY_OLD,
+              'stock_code': '002553.SZ',
+              'as_of_date': AS_OF_DATE,
+              'pdf_count': len(validated),
+              'total_pages': sum(item['pages'] for item in validated),
+              'reports': validated,
+              'failed_candidates': failures,
+          }
+          (OUT / '00_文件清单及校验值.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          zip_path = OUT / 'nanfang_precision_brokerage_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              archive.write(OUT / '00_资料说明.txt', '00_资料说明.txt')
+              archive.write(OUT / '00_文件清单及校验值.json', '00_文件清单及校验值.json')
+              for item in validated:
+                  archive.write(OUT / item['filename'], item['filename'])
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              zip_entries = archive.namelist()
+
+          summary = {
+              **manifest,
+              'zip_filename': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'zip_entries': zip_entries,
+          }
+          (OUT / 'BUILD_SUMMARY.json').write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          print('FINAL_SUMMARY', json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+
+      - name: List package files
+        run: find output -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanfang-precision-brokerage-reports-package
+          path: |
+            output/nanfang_precision_brokerage_reports.zip
+            output/BUILD_SUMMARY.json
+            output/verification/contact_sheet.jpg
+          retention-days: 1
