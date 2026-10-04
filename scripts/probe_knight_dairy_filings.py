@@ -1,59 +1,45 @@
 #!/usr/bin/env python3
 import json
 from pathlib import Path
-from urllib.parse import urljoin
-
 import requests
-from bs4 import BeautifulSoup
 
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+    "Referer": "https://data.eastmoney.com/notices/",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 })
 
-base = "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/920786/page_type/ndbg.phtml"
-pages = [("annual_plain", base)]
-for number in range(1, 8):
-    pages.append((f"annual_p_{number}", base + f"?p={number}"))
-    pages.append((f"annual_page_{number}", base + f"?page={number}"))
-pages.extend([
-    ("quarter_q1", "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/920786/page_type/yjdbg.phtml"),
-    ("quarter_q3", "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/920786/page_type/sjdbg.phtml"),
-    ("prospectus", "https://vip.stock.finance.sina.com.cn/corp/go.php/vISSUE_RaiseExplanation/stockid/920786.phtml"),
-])
-
+api = "https://np-anotice-stock.eastmoney.com/api/security/ann"
 results = {}
-for label, url in pages:
-    response = session.get(url, timeout=90, allow_redirects=True)
-    response.encoding = response.apparent_encoding or "gb18030"
-    soup = BeautifulSoup(response.text, "html.parser")
-    links = []
-    pagination = []
-    for anchor in soup.find_all("a", href=True):
-        text = " ".join(anchor.get_text(" ", strip=True).split())
-        href = urljoin(response.url, anchor["href"])
-        if "vCB_AllBulletinDetail" in href or "vISSUE_RaiseExplanationDetail" in href:
-            links.append({"text": text, "href": href})
-        if "page=" in href or "?p=" in href:
-            pagination.append({"text": text, "href": href})
-    dedup = []
-    seen = set()
-    for item in links:
-        key = (item["text"], item["href"])
-        if key not in seen:
-            seen.add(key)
-            dedup.append(item)
-    results[label] = {
-        "status": response.status_code,
-        "final_url": response.url,
-        "links": dedup,
-        "pagination": pagination[:50],
-    }
-    print("PAGE", label, response.status_code, len(response.content), response.url)
-    print(json.dumps(dedup, ensure_ascii=False, indent=2))
-    if pagination:
-        print("PAGINATION", json.dumps(pagination[:20], ensure_ascii=False, indent=2))
+for code in ("832786", "920786"):
+    rows = []
+    for page in range(1, 16):
+        params = {
+            "sr": "-1",
+            "page_size": "100",
+            "page_index": str(page),
+            "ann_type": "A",
+            "client_source": "web",
+            "stock_list": code,
+        }
+        response = session.get(api, params=params, timeout=90)
+        print("API", code, page, response.status_code, len(response.content), response.url)
+        response.raise_for_status()
+        obj = response.json()
+        data = obj.get("data") or {}
+        page_rows = data.get("list") or []
+        print("PAGE_ROWS", len(page_rows), "TOTAL_HITS", data.get("total_hits"), "TOTAL_PAGES", data.get("total_pages"))
+        rows.extend(page_rows)
+        if not page_rows or page >= int(data.get("total_pages") or 1):
+            break
+    matches = []
+    for row in rows:
+        title = str(row.get("title") or row.get("notice_title") or "")
+        if any(term in title for term in ("年度报告", "招股说明书", "第一季度报告", "一季度报告", "第三季度报告", "三季度报告")):
+            matches.append(row)
+            print("MATCH", code, json.dumps(row, ensure_ascii=False))
+    results[code] = matches
 
 Path("output").mkdir(exist_ok=True)
 Path("output/knight_dairy_probe.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
