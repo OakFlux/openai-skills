@@ -14,7 +14,8 @@ api = "https://np-anotice-stock.eastmoney.com/api/security/ann"
 results = {}
 for code in ("832786", "920786"):
     rows = []
-    for page in range(1, 16):
+    total_hits = None
+    for page in range(1, 25):
         params = {
             "sr": "-1",
             "page_size": "100",
@@ -26,12 +27,14 @@ for code in ("832786", "920786"):
         response = session.get(api, params=params, timeout=90)
         print("API", code, page, response.status_code, len(response.content), response.url)
         response.raise_for_status()
-        obj = response.json()
-        data = obj.get("data") or {}
+        data = (response.json().get("data") or {})
         page_rows = data.get("list") or []
-        print("PAGE_ROWS", len(page_rows), "TOTAL_HITS", data.get("total_hits"), "TOTAL_PAGES", data.get("total_pages"))
+        total_hits = data.get("total_hits") if total_hits is None else total_hits
+        print("PAGE_ROWS", len(page_rows), "TOTAL_HITS", total_hits)
         rows.extend(page_rows)
-        if not page_rows or page >= int(data.get("total_pages") or 1):
+        if not page_rows:
+            break
+        if total_hits is not None and len(rows) >= int(total_hits):
             break
     matches = []
     for row in rows:
@@ -40,6 +43,7 @@ for code in ("832786", "920786"):
             matches.append(row)
             print("MATCH", code, json.dumps(row, ensure_ascii=False))
     results[code] = matches
+    print("FINAL", code, "ROWS", len(rows), "MATCHES", len(matches))
 
 Path("output").mkdir(exist_ok=True)
 Path("output/knight_dairy_probe.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
