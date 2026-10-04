@@ -1,0 +1,242 @@
+name: Build Hongyuan Green Energy brokerage deep reports ZIP 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hongyuan-603185-brokerage-deep-reports-package-20261004.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+
+      - name: Download selected deep reports and build ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '弘元绿能_603185_券商深度报告精选_3份'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'filename': '01_国信证券_2022-12-07_光伏硅片业务快速发展_积极延伸一体化产能布局.pdf',
+                  'broker': '国信证券',
+                  'date': '2022-12-07',
+                  'title': '光伏硅片业务快速发展，积极延伸一体化产能布局',
+                  'authors': '王蔚祺、王昕宇、李恒源',
+                  'rating': '增持',
+                  'info_code': 'AP202212071580882260',
+                  'expected_pages': 36,
+                  'min_pages': 34,
+                  'min_bytes': 1_500_000,
+              },
+              {
+                  'filename': '02_东吴证券_2022-10-09_硅片新贵_一体化布局成本领先.pdf',
+                  'broker': '东吴证券',
+                  'date': '2022-10-09',
+                  'title': '硅片新贵，一体化布局成本领先',
+                  'authors': '曾朵红、陈瑶、郭亚男',
+                  'rating': '买入',
+                  'info_code': 'AP202210081578985933',
+                  'expected_pages': 26,
+                  'min_pages': 24,
+                  'min_bytes': 700_000,
+              },
+              {
+                  'filename': '03_国金证券_2020-06-30_后浪_光伏单晶硅新势力_切片机将迎迭代.pdf',
+                  'broker': '国金证券',
+                  'date': '2020-06-30',
+                  'title': '“后浪”——光伏单晶硅新势力！切片机将迎迭代',
+                  'authors': '王华君',
+                  'rating': '买入',
+                  'info_code': 'AP202006301388373970',
+                  'expected_pages': 28,
+                  'min_pages': 26,
+                  'min_bytes': 1_200_000,
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def candidates(info_code: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.PDF',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.PDF',
+              ]
+
+          def validate(path: Path, report: dict) -> tuple[int, int]:
+              size = path.stat().st_size
+              if size < report['min_bytes']:
+                  raise RuntimeError(f'file too small: {size} < {report["min_bytes"]}')
+              with path.open('rb') as fh:
+                  header = fh.read(8)
+              if not header.startswith(b'%PDF-'):
+                  raise RuntimeError(f'invalid PDF header: {header!r}')
+
+              pages = len(PdfReader(str(path), strict=False).pages)
+              if pages < report['min_pages'] or abs(pages - report['expected_pages']) > 3:
+                  raise RuntimeError(f'unexpected page count: {pages}, expected about {report["expected_pages"]}')
+
+              check = subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(path)],
+                  capture_output=True,
+                  text=True,
+              )
+              if check.returncode != 0:
+                  raise RuntimeError(f'qpdf check failed: {check.stderr[-1500:]}')
+
+              render_root = path.parent / (path.stem + '_render_check')
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '96', str(path), str(render_root)],
+                  capture_output=True,
+                  text=True,
+              )
+              render_file = Path(str(render_root) + '.png')
+              if render.returncode != 0 or not render_file.exists() or render_file.stat().st_size < 8_000:
+                  raise RuntimeError(f'first-page render failed: {render.stderr[-1000:]}')
+              render_size = render_file.stat().st_size
+              render_file.unlink(missing_ok=True)
+              return pages, render_size
+
+          def download(report: dict, destination: Path) -> tuple[str, int, int]:
+              errors: list[str] = []
+              for url in candidates(report['info_code']):
+                  for attempt in range(1, 4):
+                      temp = destination.with_suffix(destination.suffix + '.part')
+                      temp.unlink(missing_ok=True)
+                      try:
+                          with session.get(
+                              url,
+                              headers={
+                                  'Referer': 'https://data.eastmoney.com/',
+                                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                              },
+                              stream=True,
+                              allow_redirects=True,
+                              timeout=(30, 600),
+                          ) as response:
+                              print('DOWNLOAD', destination.name, 'attempt', attempt, 'status', response.status_code, url, 'final', response.url, flush=True)
+                              response.raise_for_status()
+                              with temp.open('wb') as fh:
+                                  for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          pages, render_size = validate(temp, report)
+                          temp.replace(destination)
+                          return str(response.url), pages, render_size
+                      except Exception as exc:
+                          errors.append(f'{url} attempt {attempt}: {exc!r}')
+                          temp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {destination.name}: {errors}')
+
+          records: list[dict] = []
+          hashes: set[str] = set()
+          for report in reports:
+              path = OUT / report['filename']
+              source_url, pages, render_size = download(report, path)
+              data = path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'duplicate PDF: {path.name}')
+              hashes.add(digest)
+              record = {
+                  'filename': path.name,
+                  'broker': report['broker'],
+                  'date': report['date'],
+                  'title': report['title'],
+                  'authors': report['authors'],
+                  'rating': report['rating'],
+                  'info_code': report['info_code'],
+                  'source_url': source_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_size,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '弘元绿色能源股份有限公司（603185.SH，原证券简称：上机数控）券商深度报告精选',
+              '整理日期：2026-10-04',
+              '',
+              '筛选原则：优先选择完整篇幅、公司深度类报告，并覆盖不同券商。',
+              '名称说明：三份报告发布时公司证券简称仍为“上机数控”；公司于2023年更名为“弘元绿能”。',
+              '资料来源：东方财富研究报告公开文件服务器。',
+              '全部PDF均完成文件头、文件大小、页数、qpdf结构、首页渲染、SHA-256及ZIP CRC检查。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. {record['broker']}，{record['date']}，公司深度报告",
+                  f"   标题：{record['title']}",
+                  f"   作者：{record['authors']}；评级：{record['rating']}；页数：{record['pages']}；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   文件：{record['filename']}",
+                  f"   来源：{record['source_url']}",
+                  f"   信息代码：{record['info_code']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+
+          (OUT / '00_报告清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'expected 3 PDFs, found {len(pdfs)}')
+
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(records), 'SHA256', hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload completed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hongyuan-603185-brokerage-deep-reports-20261004
+          path: 弘元绿能_603185_券商深度报告精选_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
