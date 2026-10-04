@@ -1,0 +1,340 @@
+name: Nanhua Biological Broker Reports
+
+on:
+  push:
+    branches:
+      - chatgpt-nanhua-biological-broker-reports-20261004
+    paths:
+      - .github/workflows/nanhua_biological_broker_reports_20261004.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf pymupdf pillow
+
+      - name: Query Eastmoney, select, download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders
+          python - <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          REPORTS = OUT / 'reports'
+          RENDERS = OUT / 'renders'
+          API = 'https://reportapi.eastmoney.com/report/list'
+          PDF_TPL = 'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+          COMPANY_CODE = '000504'
+          COMPANY_NAME = '南华生物'
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def query(code):
+              all_rows = []
+              for page in range(1, 8):
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2000-01-01', 'endTime': '2030-01-01',
+                      'pageNo': str(page), 'fields': '', 'qType': '0',
+                      'orgCode': '', 'code': code, 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  }
+                  r = session.get(API, params=params, timeout=90, allow_redirects=True)
+                  print('API', code, page, r.status_code, len(r.content), r.url, r.headers.get('content-type'))
+                  r.raise_for_status()
+                  text = r.text.strip()
+                  try:
+                      obj = r.json()
+                  except Exception:
+                      match = re.search(r'^[^(]+\((.*)\)\s*;?$', text, re.S)
+                      if not match:
+                          raise
+                      obj = json.loads(match.group(1))
+                  rows = obj.get('data') or obj.get('Data') or obj.get('result') or []
+                  if isinstance(rows, dict):
+                      rows = rows.get('data') or rows.get('list') or rows.get('records') or []
+                  print('ROWS', code, page, len(rows), 'HITS', obj.get('hits'), 'TOTALPAGE', obj.get('TotalPage') or obj.get('totalPage'))
+                  for row in rows:
+                      print('ROW', json.dumps(row, ensure_ascii=False))
+                  all_rows.extend(rows)
+                  total_page = obj.get('TotalPage') or obj.get('totalPage') or 1
+                  try:
+                      if page >= int(total_page):
+                          break
+                  except Exception:
+                      if not rows:
+                          break
+              return all_rows
+
+          rows = []
+          for code in ('000504', 'SZ000504'):
+              try:
+                  got = query(code)
+                  rows.extend(got)
+                  if got:
+                      break
+              except Exception as exc:
+                  print('QUERY_ERROR', code, repr(exc))
+
+          dedup = {}
+          for row in rows:
+              info = str(row.get('infoCode') or row.get('info_code') or row.get('reportId') or '')
+              if not info:
+                  continue
+              title = str(row.get('title') or row.get('reportTitle') or '')
+              stock_code = str(row.get('stockCode') or row.get('code') or '')
+              stock_name = str(row.get('stockName') or row.get('name') or '')
+              if COMPANY_NAME not in title and COMPANY_NAME not in stock_name and COMPANY_CODE not in stock_code:
+                  continue
+              dedup[info] = row
+          records = list(dedup.values())
+          print('NANHUA_RECORD_COUNT', len(records))
+          (OUT / 'ALL_API_RECORDS.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          if not records:
+              raise RuntimeError('Eastmoney API returned no Nanhua Biological company reports')
+
+          def title(row):
+              return str(row.get('title') or row.get('reportTitle') or '').strip()
+
+          def pubdate(row):
+              return str(row.get('publishDate') or row.get('publishTime') or row.get('date') or row.get('reportDate') or '')[:10]
+
+          def org(row):
+              return str(row.get('orgSName') or row.get('orgName') or row.get('orgNameCn') or '').strip() or '券商'
+
+          def researcher(row):
+              value = row.get('researcher') or row.get('researcherName') or row.get('author') or ''
+              if isinstance(value, list):
+                  cleaned = []
+                  for item in value:
+                      item = str(item)
+                      cleaned.append(item.split('.', 1)[-1] if '.' in item else item)
+                  return '、'.join(cleaned)
+              return str(value)
+
+          def pages_meta(row):
+              try:
+                  return int(row.get('attachPages') or row.get('pages') or 0)
+              except Exception:
+                  return 0
+
+          def score(row):
+              t = title(row)
+              keyword = 0
+              rules = [
+                  ('深度', 120), ('首次覆盖', 115), ('投资价值', 110),
+                  ('公司研究', 100), ('价值分析', 100), ('调研', 75),
+                  ('新股', 65), ('研究报告', 60), ('推荐', 35),
+                  ('点评', 10), ('事件点评', 8), ('年报点评', 8), ('季报点评', 6),
+              ]
+              for key, value in rules:
+                  if key in t:
+                      keyword = max(keyword, value)
+              p = pages_meta(row)
+              try:
+                  date_score = int(pubdate(row).replace('-', '') or 0) / 100000000
+              except Exception:
+                  date_score = 0
+              # Page count is strongly weighted because the user requested deep reports.
+              return keyword + min(p, 80) * 3 + date_score
+
+          ranked = sorted(records, key=score, reverse=True)
+          print('RANKED')
+          for row in ranked:
+              print(json.dumps({'title': title(row), 'org': org(row), 'date': pubdate(row), 'attachPages': pages_meta(row), 'score': score(row), 'infoCode': row.get('infoCode')}, ensure_ascii=False))
+
+          # Prefer reports with at least 5 pages, preserving broker diversity when possible.
+          candidate_rows = [r for r in ranked if pages_meta(r) >= 5]
+          if len(candidate_rows) < 2:
+              candidate_rows = ranked
+
+          manifest = []
+          used_orgs = {}
+          failures = []
+          for row in candidate_rows:
+              if len(manifest) >= 3:
+                  break
+              broker = org(row)
+              # Avoid taking three reports from one broker when alternatives exist.
+              if used_orgs.get(broker, 0) >= 2 and len({org(x) for x in candidate_rows}) > 1:
+                  continue
+              info = str(row.get('infoCode') or row.get('info_code') or row.get('reportId'))
+              report_title = title(row)
+              date_value = pubdate(row) or 'unknown-date'
+              author = researcher(row)
+              safe_title = re.sub(r'[\\/:*?"<>|]+', '_', report_title).strip()[:88]
+              safe_broker = re.sub(r'[\\/:*?"<>|]+', '_', broker).strip()
+              filename = f'{len(manifest)+1:02d}_{safe_broker}_南华生物_{safe_title}_{date_value}.pdf'
+              url = PDF_TPL.format(info=info)
+              last = None
+              for attempt in range(4):
+                  try:
+                      response = session.get(url, timeout=180, allow_redirects=True)
+                      print('PDF', info, attempt + 1, response.status_code, len(response.content), response.url, response.headers.get('content-type'))
+                      if not (response.ok and response.content.startswith(b'%PDF-') and len(response.content) > 80_000):
+                          raise RuntimeError(f'HTTP {response.status_code}, head={response.content[:80]!r}')
+                      path = REPORTS / filename
+                      path.write_bytes(response.content)
+                      reader = PdfReader(str(path))
+                      if reader.is_encrypted:
+                          try:
+                              reader.decrypt('')
+                          except Exception:
+                              pass
+                      actual_pages = len(reader.pages)
+                      if actual_pages < 3:
+                          raise RuntimeError(f'PDF too short: {actual_pages} pages')
+
+                      # Basic identity check from the first pages when text is extractable.
+                      chunks = []
+                      for index in range(min(4, actual_pages)):
+                          try:
+                              chunks.append(reader.pages[index].extract_text() or '')
+                          except Exception:
+                              pass
+                      first_text = re.sub(r'\s+', '', ' '.join(chunks))
+                      if first_text and ('南华生物' not in first_text and '000504' not in first_text and '南华' not in first_text):
+                          raise RuntimeError('Company identity validation failed')
+
+                      doc = pymupdf.open(str(path))
+                      first = doc[0].get_pixmap(matrix=pymupdf.Matrix(1.25, 1.25), alpha=False)
+                      last_page = doc[-1].get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                      first_render = RENDERS / f'{path.stem}_first.png'
+                      last_render = RENDERS / f'{path.stem}_last.png'
+                      first.save(str(first_render))
+                      last_page.save(str(last_render))
+                      doc.close()
+
+                      data = path.read_bytes()
+                      rec = {
+                          'filename': filename,
+                          'title': report_title,
+                          'institution': broker,
+                          'researcher': author,
+                          'publish_date': date_value,
+                          'rating': row.get('emRatingName') or row.get('sRatingName') or '',
+                          'info_code': info,
+                          'source_api': API,
+                          'download_url': url,
+                          'final_url': response.url,
+                          'pages': actual_pages,
+                          'metadata_pages': pages_meta(row),
+                          'bytes': len(data),
+                          'sha256': hashlib.sha256(data).hexdigest(),
+                          'file_nature': '东方财富公开券商原始PDF',
+                          'raw_metadata': row,
+                      }
+                      manifest.append(rec)
+                      used_orgs[broker] = used_orgs.get(broker, 0) + 1
+                      print('VERIFIED', json.dumps({k: rec[k] for k in ('filename','title','institution','publish_date','pages','bytes','sha256')}, ensure_ascii=False))
+                      last = None
+                      break
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 * (attempt + 1))
+              if last is not None:
+                  failures.append({'title': report_title, 'institution': broker, 'info_code': info, 'error': repr(last)})
+                  print('FAILED_REPORT', json.dumps(failures[-1], ensure_ascii=False))
+
+          if len(manifest) < 2:
+              raise RuntimeError(f'Only {len(manifest)} usable full PDFs downloaded; failures={json.dumps(failures, ensure_ascii=False)}')
+
+          # Contact sheet for first and last page verification.
+          image_paths = []
+          for rec in manifest:
+              stem = Path(rec['filename']).stem
+              image_paths.extend([RENDERS / f'{stem}_first.png', RENDERS / f'{stem}_last.png'])
+          thumbs = []
+          for image_path in image_paths:
+              image = Image.open(image_path).convert('RGB')
+              image.thumbnail((420, 580))
+              canvas = Image.new('RGB', (440, 630), 'white')
+              canvas.paste(image, ((440 - image.width) // 2, 8))
+              ImageDraw.Draw(canvas).text((10, 604), image_path.stem[:58], fill='black')
+              thumbs.append(canvas)
+              image.close()
+          cols = 2
+          rows_n = (len(thumbs) + cols - 1) // cols
+          sheet = Image.new('RGB', (cols * 440, rows_n * 630), 'white')
+          for index, canvas in enumerate(thumbs):
+              sheet.paste(canvas, ((index % cols) * 440, (index // cols) * 630))
+              canvas.close()
+          contact_sheet = RENDERS / 'contact_sheet.jpg'
+          sheet.save(contact_sheet, 'JPEG', quality=90)
+          sheet.close()
+
+          readme = [
+              '南华生物（000504.SZ）券商研究报告资料包',
+              '',
+              '文件性质：均为东方财富公开研报接口提供的券商原始PDF，不是网页摘要或人工整理版。',
+              '选取口径：优先页数较多、标题具有深度/首次覆盖/公司研究性质的报告；不足时补充较完整的公司研究报告。',
+              '文件仅供个人研究与学习使用，版权归原券商及作者所有，不构成投资建议。',
+              '',
+              '文件清单：',
+          ]
+          for rec in manifest:
+              readme.append(f"- {rec['filename']} | {rec['pages']}页 | {rec['bytes']}字节 | SHA-256 {rec['sha256']}")
+          (REPORTS / '00_资料说明.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (REPORTS / '00_文件清单及校验值.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (REPORTS / '00_SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['filename']}" for r in manifest) + '\n', encoding='utf-8')
+          (OUT / 'DOWNLOAD_FAILURES.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = OUT / 'nanhua_biological_brokerage_deep_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=8) as archive:
+              for path in sorted(REPORTS.iterdir(), key=lambda p: p.name):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          summary = {
+              'zip_filename': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'report_count': len(manifest),
+              'total_pages': sum(r['pages'] for r in manifest),
+              'reports': manifest,
+              'failures': failures,
+              'all_api_records': records,
+          }
+          (OUT / 'BUILD_SUMMARY.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps({k: summary[k] for k in ('zip_filename','zip_bytes','zip_sha256','report_count','total_pages')}, ensure_ascii=False))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanhua-biological-brokerage-deep-reports
+          path: |
+            output/nanhua_biological_brokerage_deep_reports.zip
+            output/BUILD_SUMMARY.json
+            output/ALL_API_RECORDS.json
+            output/renders/contact_sheet.jpg
+          retention-days: 2
+          compression-level: 0
