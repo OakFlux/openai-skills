@@ -1,0 +1,308 @@
+name: Download Nanfang Precision Financial Reports
+
+on:
+  push:
+    branches:
+      - chatgpt-nanfang-precision-reports-20261004
+    paths:
+      - .github/workflows/download_nanfang_precision_financial_reports_20261004.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Download and verify reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports
+          python - <<'PY'
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CODE = "002553"
+          COMPANY = "南方精工"
+          OUT = Path("output/reports")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          targets = [
+              {"key": "2025_annual", "year": 2025, "kind": "annual", "filename": "南方精工_2025年年度报告.pdf", "date": "2026-04-15", "sina_id": "12089145"},
+              {"key": "2024_annual", "year": 2024, "kind": "annual", "filename": "南方精工_2024年年度报告.pdf", "date": "2025-04-23", "sina_id": "10938540"},
+              {"key": "2023_annual", "year": 2023, "kind": "annual", "filename": "南方精工_2023年年度报告.pdf", "date": "2024-04-19", "sina_id": "9999721"},
+              {"key": "2022_annual", "year": 2022, "kind": "annual", "filename": "南方精工_2022年年度报告.pdf", "date": "2023-03-31", "sina_id": "8941488"},
+              {"key": "2021_annual", "year": 2021, "kind": "annual", "filename": "南方精工_2021年年度报告.pdf", "date": "2022-04-12", "sina_id": "7977617"},
+              {"key": "2020_annual", "year": 2020, "kind": "annual", "filename": "南方精工_2020年年度报告.pdf", "date": "2021-03-26", "sina_id": "6979449"},
+              {"key": "2026_q1", "year": 2026, "kind": "q1", "filename": "南方精工_2026年第一季度报告.pdf", "date": "2026-04-30", "sina_id": None},
+          ]
+
+          def clean_title(value):
+              value = re.sub(r"<[^>]+>", "", value or "")
+              return html.unescape(value).replace(" ", "").strip()
+
+          def valid_target_title(title, target):
+              t = clean_title(title)
+              if "摘要" in t or "英文版" in t or "审计报告" in t:
+                  return False
+              if target["kind"] == "annual":
+                  return f"{target['year']}年年度报告" in t
+              return (f"{target['year']}年一季度报告" in t or f"{target['year']}年第一季度报告" in t)
+
+          def cninfo_announcements():
+              headers = {
+                  "Referer": "https://www.cninfo.com.cn/new/commonUrl?url=disclosure/list/notice",
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Origin": "https://www.cninfo.com.cn",
+              }
+              org_id = None
+              try:
+                  r = session.get(
+                      "https://www.cninfo.com.cn/new/information/topSearch/query",
+                      params={"keyWord": CODE, "maxSecNum": 20},
+                      headers=headers,
+                      timeout=60,
+                  )
+                  print("CNINFO_TOPSEARCH", r.status_code, len(r.content), r.headers.get("content-type"))
+                  if r.ok:
+                      data = r.json()
+                      if isinstance(data, list):
+                          for item in data:
+                              if str(item.get("code") or item.get("secCode") or "") == CODE:
+                                  org_id = item.get("orgId") or item.get("orgid")
+                                  break
+              except Exception as exc:
+                  print("CNINFO_TOPSEARCH_ERROR", repr(exc))
+
+              stock_values = []
+              if org_id:
+                  stock_values.append(f"{CODE},{org_id}")
+              stock_values.extend([CODE, f"{CODE},gssz000{CODE}"])
+
+              all_items = []
+              seen = set()
+              for stock in stock_values:
+                  try:
+                      payload = {
+                          "pageNum": 1,
+                          "pageSize": 100,
+                          "column": "szse",
+                          "tabName": "fulltext",
+                          "plate": "sz",
+                          "stock": stock,
+                          "searchkey": "",
+                          "secid": "",
+                          "category": "",
+                          "trade": "",
+                          "seDate": "2020-01-01~2026-10-04",
+                          "sortName": "",
+                          "sortType": "",
+                          "isHLtitle": "true",
+                      }
+                      r = session.post(
+                          "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+                          data=payload,
+                          headers=headers,
+                          timeout=90,
+                      )
+                      print("CNINFO_QUERY", stock, r.status_code, len(r.content), r.headers.get("content-type"))
+                      if not r.ok:
+                          continue
+                      data = r.json()
+                      items = data.get("announcements") or []
+                      for item in items:
+                          marker = item.get("announcementId") or item.get("adjunctUrl")
+                          if marker and marker not in seen:
+                              seen.add(marker)
+                              all_items.append(item)
+                      if all_items:
+                          break
+                  except Exception as exc:
+                      print("CNINFO_QUERY_ERROR", stock, repr(exc))
+              return all_items
+
+          cn_items = cninfo_announcements()
+          print("CNINFO_ITEMS", len(cn_items))
+
+          def find_cninfo_url(target):
+              candidates = []
+              for item in cn_items:
+                  if valid_target_title(item.get("announcementTitle"), target):
+                      candidates.append(item)
+              candidates.sort(key=lambda x: str(x.get("announcementTime") or x.get("announcementId") or ""), reverse=True)
+              if not candidates:
+                  return None, None
+              item = candidates[0]
+              adjunct = item.get("adjunctUrl")
+              if not adjunct:
+                  return None, None
+              return urljoin("https://static.cninfo.com.cn/", adjunct.lstrip("/")), {
+                  "source": "巨潮资讯网",
+                  "announcement_id": item.get("announcementId"),
+                  "title": clean_title(item.get("announcementTitle")),
+                  "adjunct_url": adjunct,
+              }
+
+          def sina_detail_for_q1():
+              listing = "https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/002553/page_type/yjdbg.phtml"
+              r = session.get(listing, timeout=90)
+              r.encoding = r.apparent_encoding or "gb18030"
+              print("SINA_Q1_LIST", r.status_code, len(r.content))
+              r.raise_for_status()
+              soup = BeautifulSoup(r.text, "html.parser")
+              for a in soup.find_all("a", href=True):
+                  text = a.get_text(" ", strip=True)
+                  if "2026年一季度报告" in text or "2026年第一季度报告" in text:
+                      href = urljoin(listing, a["href"])
+                      m = re.search(r"id=(\d+)", href)
+                      if m:
+                          return m.group(1)
+              m = re.search(r"vCB_AllBulletinDetail\.php\?id=(\d+)[^\"']*[^>]*>[^<]*2026年(?:一|第一)季度报告", r.text, re.I)
+              return m.group(1) if m else None
+
+          def sina_pdf_url(target):
+              sid = target.get("sina_id")
+              if not sid and target["kind"] == "q1":
+                  sid = sina_detail_for_q1()
+                  target["sina_id"] = sid
+              if not sid:
+                  return None, None
+              date = target["date"]
+              y, m, _ = date.split("-")
+              m_int = str(int(m))
+              url = f"https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESZ_STOCK/{y}/{y}-{m_int}/{date}/{sid}.PDF"
+              return url, {"source": "新浪财经公告镜像", "sina_id": sid, "date": date}
+
+          def download_pdf(url, path, referer=None):
+              headers = {"Accept": "application/pdf,*/*"}
+              if referer:
+                  headers["Referer"] = referer
+              last_error = None
+              for attempt in range(4):
+                  try:
+                      r = session.get(url, headers=headers, timeout=180, allow_redirects=True)
+                      print("FETCH", path.name, attempt + 1, r.status_code, len(r.content), r.url, r.headers.get("content-type"))
+                      if r.ok and r.content.startswith(b"%PDF"):
+                          path.write_bytes(r.content)
+                          return r.url
+                      last_error = RuntimeError(f"HTTP {r.status_code}, head={r.content[:60]!r}")
+                  except Exception as exc:
+                      last_error = exc
+                  time.sleep(2 * (attempt + 1))
+              raise RuntimeError(f"Unable to download {url}: {last_error!r}")
+
+          manifest = []
+          for target in targets:
+              out = OUT / target["filename"]
+              source_meta = None
+              used_url = None
+              final_url = None
+              errors = []
+
+              cn_url, cn_meta = find_cninfo_url(target)
+              if cn_url:
+                  try:
+                      final_url = download_pdf(cn_url, out, "https://www.cninfo.com.cn/")
+                      used_url = cn_url
+                      source_meta = cn_meta
+                  except Exception as exc:
+                      errors.append(f"CNINFO: {exc!r}")
+
+              if not out.exists():
+                  sina_url, sina_meta = sina_pdf_url(target)
+                  if sina_url:
+                      try:
+                          final_url = download_pdf(sina_url, out, "https://money.finance.sina.com.cn/")
+                          used_url = sina_url
+                          source_meta = sina_meta
+                      except Exception as exc:
+                          errors.append(f"SINA: {exc!r}")
+
+              if not out.exists():
+                  raise RuntimeError(f"Failed target {target}: {'; '.join(errors)}")
+
+              reader = PdfReader(str(out))
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f"Unexpected page count for {out}: {pages}")
+              digest = hashlib.sha256(out.read_bytes()).hexdigest()
+              first_text = ""
+              try:
+                  first_text = (reader.pages[0].extract_text() or "")[:1000]
+              except Exception:
+                  pass
+              if str(target["year"]) not in first_text and "年度报告" not in first_text and "季度报告" not in first_text:
+                  print("WARN_FIRST_PAGE_TEXT", out.name, repr(first_text[:200]))
+
+              rec = {
+                  "filename": out.name,
+                  "year": target["year"],
+                  "kind": target["kind"],
+                  "pages": pages,
+                  "bytes": out.stat().st_size,
+                  "sha256": digest,
+                  "download_url": used_url,
+                  "final_url": final_url,
+                  "source": source_meta,
+              }
+              manifest.append(rec)
+              print("VERIFIED", json.dumps(rec, ensure_ascii=False))
+
+          readme = [
+              "南方精工（002553）定期报告资料包",
+              "",
+              "收录范围：2020—2025年年度报告，以及截至2026-10-04最新已披露的季度报告（2026年第一季度报告）。",
+              "说明：2026年半年度报告属于半年度报告，不作为‘季度报告’替代件收入本包。",
+              "",
+              "文件清单：",
+          ]
+          for rec in manifest:
+              readme.append(f"- {rec['filename']} | {rec['pages']}页 | {rec['bytes']}字节 | SHA-256 {rec['sha256']}")
+          readme.append("")
+          readme.append("文件均经PDF文件头、页数和可读性校验。")
+          (OUT / "README.txt").write_text("\n".join(readme), encoding="utf-8")
+          (OUT / "metadata.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          (OUT / "SHA256SUMS.txt").write_text("\n".join(f"{r['sha256']}  {r['filename']}" for r in manifest) + "\n", encoding="utf-8")
+
+          zip_path = Path("output/南方精工_2020-2025年报及2026年第一季度报告.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for p in sorted(OUT.iterdir(), key=lambda x: x.name):
+                  zf.write(p, arcname=p.name)
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP CRC failure: {bad}")
+          print("ZIP", zip_path, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest())
+          PY
+
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanfang-precision-2020-2025-annual-and-2026-q1
+          path: output/南方精工_2020-2025年报及2026年第一季度报告.zip
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
