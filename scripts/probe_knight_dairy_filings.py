@@ -12,37 +12,48 @@ session.headers.update({
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 })
 
-pages = []
-for code in ("832786", "920786"):
-    for page_type in ("ndbg", "yjdbg", "sjdbg"):
-        pages.append((f"{code}_{page_type}", f"https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{code}/page_type/{page_type}.phtml"))
-    pages.append((f"{code}_prospectus", f"https://vip.stock.finance.sina.com.cn/corp/go.php/vISSUE_RaiseExplanation/stockid/{code}.phtml"))
+base = "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/920786/page_type/ndbg.phtml"
+pages = [("annual_plain", base)]
+for number in range(1, 8):
+    pages.append((f"annual_p_{number}", base + f"?p={number}"))
+    pages.append((f"annual_page_{number}", base + f"?page={number}"))
+pages.extend([
+    ("quarter_q1", "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/920786/page_type/yjdbg.phtml"),
+    ("quarter_q3", "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/920786/page_type/sjdbg.phtml"),
+    ("prospectus", "https://vip.stock.finance.sina.com.cn/corp/go.php/vISSUE_RaiseExplanation/stockid/920786.phtml"),
+])
 
 results = {}
 for label, url in pages:
-    try:
-        response = session.get(url, timeout=90, allow_redirects=True)
-        response.encoding = response.apparent_encoding or "gb18030"
-        soup = BeautifulSoup(response.text, "html.parser")
-        links = []
-        for anchor in soup.find_all("a", href=True):
-            text = " ".join(anchor.get_text(" ", strip=True).split())
-            href = urljoin(response.url, anchor["href"])
-            if any(term in text for term in ("年度报告", "季度报告", "一季度报告", "三季度报告", "招股说明书")) or "vCB_AllBulletinDetail" in href or "vISSUE_RaiseExplanationDetail" in href:
-                links.append({"text": text, "href": href})
-        dedup = []
-        seen = set()
-        for item in links:
-            key = (item["text"], item["href"])
-            if key not in seen:
-                seen.add(key)
-                dedup.append(item)
-        results[label] = {"status": response.status_code, "final_url": response.url, "links": dedup}
-        print(label, response.status_code, len(response.content), response.url)
-        print(json.dumps(dedup, ensure_ascii=False, indent=2))
-    except Exception as exc:
-        results[label] = {"error": repr(exc)}
-        print("ERROR", label, repr(exc))
+    response = session.get(url, timeout=90, allow_redirects=True)
+    response.encoding = response.apparent_encoding or "gb18030"
+    soup = BeautifulSoup(response.text, "html.parser")
+    links = []
+    pagination = []
+    for anchor in soup.find_all("a", href=True):
+        text = " ".join(anchor.get_text(" ", strip=True).split())
+        href = urljoin(response.url, anchor["href"])
+        if "vCB_AllBulletinDetail" in href or "vISSUE_RaiseExplanationDetail" in href:
+            links.append({"text": text, "href": href})
+        if "page=" in href or "?p=" in href:
+            pagination.append({"text": text, "href": href})
+    dedup = []
+    seen = set()
+    for item in links:
+        key = (item["text"], item["href"])
+        if key not in seen:
+            seen.add(key)
+            dedup.append(item)
+    results[label] = {
+        "status": response.status_code,
+        "final_url": response.url,
+        "links": dedup,
+        "pagination": pagination[:50],
+    }
+    print("PAGE", label, response.status_code, len(response.content), response.url)
+    print(json.dumps(dedup, ensure_ascii=False, indent=2))
+    if pagination:
+        print("PAGINATION", json.dumps(pagination[:20], ensure_ascii=False, indent=2))
 
 Path("output").mkdir(exist_ok=True)
 Path("output/knight_dairy_probe.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
