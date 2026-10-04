@@ -1,0 +1,343 @@
+name: Shenhuafa A Official Filings Package
+
+on:
+  push:
+    branches:
+      - chatgpt-shenhuafa-a-filings-20261004
+    paths:
+      - .github/workflows/shenhuafa_a_filings_20261004.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf pillow
+
+      - name: Download, validate, render, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders
+          python - <<'PY'
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+
+          CODE = "000020"
+          COMPANY = "深圳中恒华发股份有限公司"
+          SHORT_NAMES = ("深华发A", "深华发Ａ", "深华发", COMPANY)
+          OUT = Path("output/reports")
+          RENDERS = Path("output/renders")
+          OUT.mkdir(parents=True, exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          ANNUAL_LIST = f"https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{CODE}/page_type/ndbg.phtml"
+          Q1_LISTS = [
+              f"https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{CODE}/page_type/yjdbg.phtml",
+              f"https://money.finance.sina.com.cn/corp/view/vCB_BulletinYi.php?page_type=yjdbg&stockid={CODE}&type=list",
+          ]
+
+          def get_text_page(url, timeout=90):
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = session.get(url, timeout=timeout, allow_redirects=True)
+                      print("PAGE", attempt + 1, r.status_code, len(r.content), r.url, r.headers.get("content-type"))
+                      r.raise_for_status()
+                      r.encoding = r.apparent_encoding or "gb18030"
+                      return r
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(10, 2 ** attempt))
+              raise RuntimeError(f"Unable to fetch {url}: {last!r}")
+
+          def normalize(value):
+              value = html.unescape(value or "")
+              value = value.replace("Ａ", "A").replace("Ｂ", "B")
+              value = re.sub(r"\s+", "", value)
+              return value
+
+          def collect_entries(list_url):
+              r = get_text_page(list_url)
+              soup = BeautifulSoup(r.text, "html.parser")
+              entries = []
+              seen = set()
+              for a in soup.find_all("a", href=True):
+                  title = " ".join(a.get_text(" ", strip=True).split())
+                  href = urljoin(r.url, a.get("href"))
+                  if not title or "vCB_AllBulletinDetail.php" not in href:
+                      continue
+                  marker = (normalize(title), href)
+                  if marker in seen:
+                      continue
+                  seen.add(marker)
+                  container = a.find_parent(["tr", "li", "div", "td"]) or a.parent
+                  context = " ".join(container.get_text(" ", strip=True).split()) if container else title
+                  date_match = re.search(r"20\d{2}-\d{2}-\d{2}", context)
+                  entries.append({
+                      "title": title,
+                      "normalized_title": normalize(title),
+                      "detail_url": href,
+                      "announcement_date": date_match.group(0) if date_match else None,
+                      "context": context,
+                  })
+              print("ENTRIES", list_url, len(entries))
+              for entry in entries[:30]:
+                  print("ENTRY", json.dumps(entry, ensure_ascii=False))
+              return entries
+
+          annual_entries = collect_entries(ANNUAL_LIST)
+          q1_entries = []
+          q1_errors = []
+          for q1_url in Q1_LISTS:
+              try:
+                  q1_entries.extend(collect_entries(q1_url))
+              except Exception as exc:
+                  q1_errors.append(repr(exc))
+          if not q1_entries:
+              raise RuntimeError(f"No Q1 listing entries found: {q1_errors}")
+
+          def choose_annual(year):
+              candidates = []
+              needle = f"{year}年年度报告"
+              for entry in annual_entries:
+                  title = entry["normalized_title"]
+                  if needle not in title:
+                      continue
+                  if any(term in title for term in ("摘要", "英文版", "审计报告", "业绩快报", "业绩预告")):
+                      continue
+                  candidates.append(entry)
+              if not candidates:
+                  raise RuntimeError(f"No annual-report listing entry for {year}")
+              candidates.sort(key=lambda x: ("深华发A" in x["normalized_title"], x["announcement_date"] or ""), reverse=True)
+              return candidates[0]
+
+          def choose_q1(year):
+              candidates = []
+              for entry in q1_entries:
+                  title = entry["normalized_title"]
+                  if str(year) not in title:
+                      continue
+                  if not (f"{year}年一季度报告" in title or f"{year}年第一季度报告" in title):
+                      continue
+                  if any(term in title for term in ("摘要", "英文版", "正文")):
+                      continue
+                  candidates.append(entry)
+              if not candidates:
+                  available = [e["title"] for e in q1_entries if str(year) in e["normalized_title"]]
+                  raise RuntimeError(f"No Q1 listing entry for {year}; available={available}")
+              candidates.sort(key=lambda x: ("深华发A" in x["normalized_title"], x["announcement_date"] or ""), reverse=True)
+              return candidates[0]
+
+          selections = []
+          for year in range(2020, 2026):
+              selections.append({
+                  "year": year,
+                  "kind": "annual",
+                  "filename": f"深华发A_{year}年年度报告.pdf",
+                  "entry": choose_annual(year),
+              })
+          selections.append({
+              "year": 2026,
+              "kind": "q1",
+              "filename": "深华发A_2026年第一季度报告_最新季报.pdf",
+              "entry": choose_q1(2026),
+          })
+
+          def resolve_pdf(entry):
+              r = get_text_page(entry["detail_url"])
+              soup = BeautifulSoup(r.text, "html.parser")
+              candidates = []
+              for a in soup.find_all("a", href=True):
+                  text = normalize(a.get_text(" ", strip=True))
+                  href = urljoin(r.url, a.get("href"))
+                  upper = href.upper()
+                  if "下载公告" in text or ("FILE.FINANCE.SINA.COM.CN" in upper and ".PDF" in upper):
+                      candidates.append(href)
+              candidates += re.findall(r"https?://file\.finance\.sina\.com\.cn/[^\"'<>\s]+\.PDF", r.text, re.I)
+              dedup = []
+              seen = set()
+              for candidate in candidates:
+                  candidate = html.unescape(candidate)
+                  if candidate not in seen:
+                      seen.add(candidate)
+                      dedup.append(candidate)
+              if not dedup:
+                  raise RuntimeError(f"No PDF link on detail page: {entry['detail_url']}")
+              dedup.sort(key=lambda value: (not value.upper().endswith(".PDF"), len(value)))
+              return dedup[0], r.url
+
+          def download_pdf(url, referer, path):
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = session.get(
+                          url,
+                          headers={"Referer": referer, "Accept": "application/pdf,*/*"},
+                          timeout=240,
+                          allow_redirects=True,
+                      )
+                      print("PDF", path.name, attempt + 1, r.status_code, len(r.content), r.url, r.headers.get("content-type"))
+                      if r.ok and r.content.startswith(b"%PDF-") and len(r.content) > 50_000:
+                          path.write_bytes(r.content)
+                          return r.url
+                      last = RuntimeError(f"HTTP {r.status_code}, head={r.content[:80]!r}")
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(12, 2 ** attempt))
+              raise RuntimeError(f"Unable to download {url}: {last!r}")
+
+          manifest = []
+          render_paths = []
+          for item in selections:
+              entry = item["entry"]
+              pdf_url, detail_final_url = resolve_pdf(entry)
+              path = OUT / item["filename"]
+              pdf_final_url = download_pdf(pdf_url, entry["detail_url"], path)
+
+              reader = PdfReader(str(path))
+              if reader.is_encrypted:
+                  raise RuntimeError(f"Encrypted PDF: {path.name}")
+              pages = len(reader.pages)
+              minimum = 80 if item["kind"] == "annual" else 5
+              if pages < minimum:
+                  raise RuntimeError(f"Unexpected page count for {path.name}: {pages}")
+
+              text_chunks = []
+              for index in range(min(5, pages)):
+                  try:
+                      text_chunks.append(reader.pages[index].extract_text() or "")
+                  except Exception:
+                      pass
+              doc = fitz.open(str(path))
+              if len("".join(text_chunks).strip()) < 80:
+                  text_chunks = [doc[index].get_text("text") for index in range(min(5, doc.page_count))]
+              normalized_text = normalize(" ".join(text_chunks))
+              if not any(normalize(name) in normalized_text for name in SHORT_NAMES):
+                  raise RuntimeError(f"Company identity validation failed for {path.name}")
+              if str(item["year"]) not in normalized_text:
+                  raise RuntimeError(f"Report year validation failed for {path.name}")
+              if item["kind"] == "annual":
+                  if "年度报告" not in normalized_text and "ANNUALREPORT" not in normalized_text.upper():
+                      raise RuntimeError(f"Annual-report type validation failed for {path.name}")
+              else:
+                  if not any(term in normalized_text for term in ("第一季度报告", "一季度报告")):
+                      raise RuntimeError(f"Q1-report type validation failed for {path.name}")
+
+              pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.25, 1.25), alpha=False)
+              render_path = RENDERS / f"{path.stem}_page1.png"
+              pix.save(str(render_path))
+              doc.close()
+              render_paths.append(render_path)
+
+              data = path.read_bytes()
+              rec = {
+                  "filename": path.name,
+                  "report_year": item["year"],
+                  "report_type": "年度报告" if item["kind"] == "annual" else "第一季度报告",
+                  "listing_title": entry["title"],
+                  "announcement_date": entry["announcement_date"],
+                  "detail_url": entry["detail_url"],
+                  "detail_final_url": detail_final_url,
+                  "download_url": pdf_url,
+                  "download_final_url": pdf_final_url,
+                  "pages": pages,
+                  "bytes": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "first_page_render": render_path.name,
+              }
+              manifest.append(rec)
+              print("VERIFIED", json.dumps(rec, ensure_ascii=False))
+
+          # Visual contact sheet of all covers.
+          thumbs = []
+          for render_path in render_paths:
+              image = Image.open(render_path).convert("RGB")
+              image.thumbnail((450, 610))
+              canvas = Image.new("RGB", (470, 660), "white")
+              canvas.paste(image, ((470 - image.width) // 2, 8))
+              ImageDraw.Draw(canvas).text((10, 635), render_path.stem[:60], fill="black")
+              thumbs.append(canvas)
+              image.close()
+          cols = 2
+          rows = (len(thumbs) + cols - 1) // cols
+          sheet = Image.new("RGB", (cols * 470, rows * 660), "white")
+          for index, canvas in enumerate(thumbs):
+              sheet.paste(canvas, ((index % cols) * 470, (index // cols) * 660))
+              canvas.close()
+          sheet.save(RENDERS / "contact_sheet.jpg", "JPEG", quality=90)
+          sheet.close()
+
+          readme = [
+              "深圳中恒华发股份有限公司（证券简称：深华发A，证券代码：000020）定期报告资料包",
+              "",
+              "收录范围：2020年至2025年完整年度报告，共6份；以及截至2026年10月4日最新正式季度报告——2026年第一季度报告。",
+              "公司已披露2026年半年度报告，但半年度报告不属于标题明确的季度报告；截至2026年10月4日，2026年第三季度报告尚未披露。",
+              "所有PDF均取自新浪财经保存的上市公司公告原始附件，并与公告详情页标题、日期及公司名称交叉核验。",
+              "",
+              "文件清单：",
+          ]
+          for rec in manifest:
+              readme.append(f"- {rec['filename']} | {rec['pages']}页 | {rec['bytes']}字节 | SHA-256 {rec['sha256']}")
+          readme += [
+              "",
+              "校验项目：PDF文件头、实际页数、加密状态、公司名称、报告年份、报告类型及首页渲染；ZIP已执行CRC完整性检查。",
+          ]
+          (OUT / "00_资料说明.txt").write_text("\n".join(readme) + "\n", encoding="utf-8")
+          (OUT / "00_文件清单及校验值.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          (OUT / "00_SHA256SUMS.txt").write_text("\n".join(f"{r['sha256']}  {r['filename']}" for r in manifest) + "\n", encoding="utf-8")
+
+          zip_path = Path("output/shenhuafa_a_2020_2025_annual_reports_and_2026_q1.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=7) as zf:
+              for path in sorted(OUT.iterdir(), key=lambda value: value.name):
+                  zf.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP CRC failure: {bad}")
+
+          summary = {
+              "zip_filename": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "pdf_count": len(manifest),
+              "total_pages": sum(item["pages"] for item in manifest),
+              "reports": manifest,
+          }
+          Path("output/BUILD_SUMMARY.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("FINAL_SUMMARY", json.dumps({k: summary[k] for k in ("zip_filename", "zip_bytes", "zip_sha256", "pdf_count", "total_pages")}, ensure_ascii=False))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenhuafa-a-official-filings
+          path: |
+            output/shenhuafa_a_2020_2025_annual_reports_and_2026_q1.zip
+            output/BUILD_SUMMARY.json
+            output/renders/contact_sheet.jpg
+          retention-days: 2
+          compression-level: 0
