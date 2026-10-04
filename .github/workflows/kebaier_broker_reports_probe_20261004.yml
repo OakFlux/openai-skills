@@ -1,0 +1,273 @@
+name: Kebaier Broker Reports Probe
+
+on:
+  push:
+    branches:
+      - chatgpt-kebaier-broker-reports-20261004
+    paths:
+      - .github/workflows/kebaier_broker_reports_probe_20261004.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Locate public report pages and package PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/pages
+          python - <<'PY'
+          import hashlib
+          import io
+          import json
+          import zipfile
+          from datetime import date, timedelta
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          REPORTS_DIR = OUT / 'reports'
+          PAGES_ROOT = OUT / 'pages'
+
+          candidates = [
+              {
+                  'id': 4548201,
+                  'nominal_date': '2024-10-21',
+                  'title': '北交所新股申购报告：改性塑料行业“小巨人”，CPP产品技术国际先进',
+                  'institution': '开源证券',
+                  'analyst': '诸海滨',
+                  'filename': '01_开源证券_科拜尔_北交所新股申购报告_改性塑料行业小巨人_CPP产品技术国际先进_2024-10-21.pdf',
+                  'source_page': 'https://www.fxbaogao.com/detail/4548201',
+                  'priority': 1,
+              },
+              {
+                  'id': 5040892,
+                  'nominal_date': '2025-09-03',
+                  'title': '产能瓶颈突破在即，2025H1营收同比+8.93%——北交所信息更新',
+                  'institution': '开源证券',
+                  'analyst': '诸海滨',
+                  'filename': '02_开源证券_科拜尔_产能瓶颈突破在即_2025H1信息更新_2025-09-03.pdf',
+                  'source_page': 'https://www.fxbaogao.com/detail/5040892',
+                  'priority': 4,
+              },
+              {
+                  'id': 5409574,
+                  'nominal_date': '2026-05-08',
+                  'title': '深耕家电主业，横向拓展汽车应用场景打开成长空间',
+                  'institution': '开源证券',
+                  'analyst': '诸海滨',
+                  'filename': '02_开源证券_科拜尔_深耕家电主业_拓展汽车应用场景_2026-05-08.pdf',
+                  'source_page': 'https://www.fxbaogao.com/detail/5409574',
+                  'priority': 2,
+              },
+              {
+                  'id': 5644438,
+                  'nominal_date': '2026-08-26',
+                  'title': '家电赛道新品上量，改性塑料赛道景气上行，2026H1归母净利润同比+46.87%',
+                  'institution': '开源证券',
+                  'analyst': '诸海滨',
+                  'filename': '03_开源证券_科拜尔_家电新品上量_改性塑料景气上行_2026H1更新_2026-08-26.pdf',
+                  'source_page': 'https://www.fxbaogao.com/detail/5644438',
+                  'priority': 3,
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def valid_image(data: bytes):
+              if len(data) < 5000:
+                  return False, None
+              try:
+                  im = Image.open(io.BytesIO(data))
+                  info = {'format': im.format, 'width': im.width, 'height': im.height}
+                  ok = im.width > 500 and im.height > 500
+                  im.close()
+                  return ok, info
+              except Exception:
+                  return False, None
+
+          def find_base(report):
+              nominal = date.fromisoformat(report['nominal_date'])
+              probes = []
+              # Search a broad publication/ingestion window around the nominal date.
+              offsets = [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 7, -7, 10, -10, 14, -14]
+              for offset in offsets:
+                  d = nominal + timedelta(days=offset)
+                  for ext in ('png', 'jpg', 'jpeg'):
+                      base = f'https://public.fxbaogao.com/report-image/{d:%Y/%m/%d}/{report["id"]}-{{page}}.{ext}'
+                      url = base.format(page=1)
+                      try:
+                          r = session.get(url, headers={'Referer': report['source_page']}, timeout=45, allow_redirects=True)
+                          ok, info = valid_image(r.content)
+                          rec = {'url': url, 'status': r.status_code, 'bytes': len(r.content), 'ctype': r.headers.get('content-type'), 'ok': ok, 'info': info}
+                          probes.append(rec)
+                          print('PROBE', json.dumps({'id': report['id'], **rec}, ensure_ascii=False))
+                          if r.status_code == 200 and ok:
+                              return base, probes
+                      except Exception as exc:
+                          probes.append({'url': url, 'error': repr(exc), 'ok': False})
+              return None, probes
+
+          def download_pages(report, base):
+              report_dir = PAGES_ROOT / str(report['id'])
+              report_dir.mkdir(parents=True, exist_ok=True)
+              paths = []
+              records = []
+              misses = 0
+              seen_hashes = set()
+              for page in range(1, 101):
+                  url = base.format(page=page)
+                  try:
+                      r = session.get(url, headers={'Referer': report['source_page']}, timeout=60, allow_redirects=True)
+                      ok, info = valid_image(r.content)
+                      digest = hashlib.sha256(r.content).hexdigest() if r.content else None
+                      duplicate = digest in seen_hashes if digest else False
+                      rec = {
+                          'page': page, 'url': url, 'status': r.status_code, 'bytes': len(r.content),
+                          'ctype': r.headers.get('content-type'), 'ok': ok, 'info': info,
+                          'sha256': digest, 'duplicate': duplicate,
+                      }
+                      records.append(rec)
+                      print('PAGE', json.dumps({'id': report['id'], **rec}, ensure_ascii=False))
+                      if r.status_code == 200 and ok and not duplicate:
+                          suffix = '.' + base.rsplit('.', 1)[-1]
+                          path = report_dir / f'{page:03d}{suffix}'
+                          path.write_bytes(r.content)
+                          paths.append(path)
+                          seen_hashes.add(digest)
+                          misses = 0
+                      else:
+                          misses += 1
+                          if paths and misses >= 3:
+                              break
+                  except Exception as exc:
+                      records.append({'page': page, 'url': url, 'error': repr(exc), 'ok': False})
+                      misses += 1
+                      if paths and misses >= 3:
+                          break
+              return paths, records
+
+          completed = []
+          failed = []
+          for report in candidates:
+              base, probes = find_base(report)
+              if not base:
+                  failed.append({'id': report['id'], 'title': report['title'], 'reason': 'No public image base found', 'probes': probes})
+                  continue
+              paths, page_records = download_pages(report, base)
+              if not paths:
+                  failed.append({'id': report['id'], 'title': report['title'], 'reason': 'No pages downloaded', 'base': base, 'pages': page_records})
+                  continue
+              pdf_bytes = img2pdf.convert([str(p) for p in paths])
+              pdf_path = REPORTS_DIR / report['filename']
+              pdf_path.write_bytes(pdf_bytes)
+              reader = PdfReader(str(pdf_path))
+              if len(reader.pages) != len(paths):
+                  raise RuntimeError(f'PDF page count mismatch for {pdf_path.name}')
+              rec = {
+                  **report,
+                  'image_base': base,
+                  'page_count': len(paths),
+                  'bytes': len(pdf_bytes),
+                  'sha256': hashlib.sha256(pdf_bytes).hexdigest(),
+                  'public_image_pages': page_records,
+              }
+              completed.append(rec)
+              print('COMPLETED', json.dumps({k: rec[k] for k in ('id','title','page_count','bytes','sha256','image_base')}, ensure_ascii=False))
+
+          # Prefer one substantive IPO/deep report and the two most recent updates.
+          completed.sort(key=lambda x: x['priority'])
+          selected = completed[:3]
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} usable reports found: {json.dumps(failed, ensure_ascii=False)}')
+
+          selected_names = {item['filename'] for item in selected}
+          for path in REPORTS_DIR.glob('*.pdf'):
+              if path.name not in selected_names:
+                  path.unlink()
+
+          readme_lines = [
+              '科拜尔（920066.BJ）券商研究报告资料包',
+              '',
+              '说明：',
+              '- 公开渠道中，科拜尔的独立长篇公司研究较少。本包优先收录一份北交所新股申购报告，并搭配两份较新的公司信息更新报告。',
+              '- PDF由报告平台公开展示的逐页原始图像按原顺序合成，未改写正文、未补写缺失页面。',
+              '- 若公开展示范围少于报告原始全文，文件性质会在清单中据实标注为“公开展示页合成版”，不会冒充完整原版。',
+              '',
+              '文件清单：',
+          ]
+          manifest = []
+          for item in selected:
+              file_path = REPORTS_DIR / item['filename']
+              status = '公开展示页合成版'
+              readme_lines.append(
+                  f"- {item['filename']} | {item['institution']} | {item['nominal_date']} | {item['page_count']}页 | {status} | SHA-256 {item['sha256']}"
+              )
+              manifest.append({
+                  'filename': item['filename'],
+                  'title': item['title'],
+                  'institution': item['institution'],
+                  'analyst': item['analyst'],
+                  'report_date': item['nominal_date'],
+                  'source_page': item['source_page'],
+                  'image_base': item['image_base'],
+                  'page_count': item['page_count'],
+                  'bytes': item['bytes'],
+                  'sha256': item['sha256'],
+                  'file_nature': status,
+              })
+
+          (REPORTS_DIR / '00_资料说明.txt').write_text('\n'.join(readme_lines) + '\n', encoding='utf-8')
+          (REPORTS_DIR / '00_文件清单及校验值.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (REPORTS_DIR / '00_SHA256SUMS.txt').write_text('\n'.join(f"{m['sha256']}  {m['filename']}" for m in manifest) + '\n', encoding='utf-8')
+          (OUT / 'probe_failures.json').write_text(json.dumps(failed, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = OUT / 'kebaier_brokerage_research_reports.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=8) as archive:
+              for path in sorted(REPORTS_DIR.iterdir(), key=lambda p: p.name):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          summary = {
+              'zip_filename': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'report_count': len(manifest),
+              'total_pages': sum(m['page_count'] for m in manifest),
+              'reports': manifest,
+              'failed_candidates': [{'id': f.get('id'), 'title': f.get('title'), 'reason': f.get('reason')} for f in failed],
+          }
+          (OUT / 'BUILD_SUMMARY.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps(summary, ensure_ascii=False))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: kebaier-brokerage-research-reports
+          path: |
+            output/kebaier_brokerage_research_reports.zip
+            output/BUILD_SUMMARY.json
+            output/probe_failures.json
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error
