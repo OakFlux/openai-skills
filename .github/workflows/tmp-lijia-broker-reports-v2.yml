@@ -1,0 +1,222 @@
+name: Build Verified Lijia Deep Reports V2
+
+on:
+  push:
+    branches:
+      - tmp-lijia-broker-reports-20261004
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf pymupdf
+
+      - name: Download, verify and package reports
+        shell: bash
+        run: |
+          cat > /tmp/package_lijia_deep_reports.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('output_v2')
+          RAW = OUT / 'raw'
+          SELECTED = OUT / 'selected'
+          RENDERS = OUT / 'renders'
+          for p in (OUT, RAW, SELECTED, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          REPORTS = [
+              {
+                  'org': '开源证券',
+                  'date': '2022-10-08',
+                  'analysts': '诸海滨团队',
+                  'title': '北交所新股申购报告：力佳科技：锂锰扣式电池“小巨人”，募投5.6亿支产能布局物联网新兴领域',
+                  'info_code': 'AP202210071578941208',
+                  'expected_pages': 29,
+                  'type': '新股申购长篇报告',
+              },
+              {
+                  'org': '东吴证券',
+                  'date': '2024-12-20',
+                  'analysts': '朱洁羽',
+                  'title': '锂锰扣式电池“小巨人”，下游需求旺盛扩产稳健发展',
+                  'info_code': 'AP202412201641373602',
+                  'expected_pages': 24,
+                  'type': '公司深度报告',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36',
+              'Accept': 'application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/report/',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def safe_name(text: str, limit: int = 100) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', text)
+              text = re.sub(r'\s+', '_', text).strip(' ._')
+              return text[:limit]
+
+          def download(report: dict, destination: Path) -> str:
+              code = report['info_code']
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?download=1',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+              ]
+              errors = []
+              for url in urls:
+                  try:
+                      with session.get(url, timeout=120, stream=True, allow_redirects=True) as r:
+                          r.raise_for_status()
+                          with destination.open('wb') as f:
+                              for chunk in r.iter_content(1024 * 256):
+                                  if chunk:
+                                      f.write(chunk)
+                      if destination.stat().st_size < 100_000:
+                          raise RuntimeError(f'file too small: {destination.stat().st_size}')
+                      with destination.open('rb') as f:
+                          if f.read(5) != b'%PDF-':
+                              raise RuntimeError('not a PDF')
+                      return url
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc}')
+                      destination.unlink(missing_ok=True)
+              raise RuntimeError(' | '.join(errors))
+
+          def validate(report: dict, path: Path) -> int:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(f"unexpected page count {pages}, expected {report['expected_pages']}")
+              text_parts = []
+              for i in range(min(8, pages)):
+                  try:
+                      text_parts.append(reader.pages[i].extract_text() or '')
+                  except Exception:
+                      pass
+              text = re.sub(r'\s+', '', '\n'.join(text_parts))
+              if not any(x in text for x in ('力佳科技', '力佳电源', '835237', '920237')):
+                  raise RuntimeError('company identity not found in opening pages')
+
+              doc = pymupdf.open(path)
+              if doc.page_count != pages:
+                  raise RuntimeError('page count mismatch between parsers')
+              rdir = RENDERS / path.stem
+              rdir.mkdir(parents=True, exist_ok=True)
+              for idx in sorted(set([0, pages // 2, pages - 1])):
+                  pix = doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  out = rdir / f'page-{idx+1:03d}.png'
+                  pix.save(out)
+                  if out.stat().st_size < 5_000:
+                      raise RuntimeError(f'blank or broken render at page {idx+1}')
+              doc.close()
+              return pages
+
+          manifest = []
+          readme = [
+              '# 力佳科技（835237／920237）券商深度研究报告原始PDF',
+              '',
+              f'整理时间：{datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}',
+              '',
+              '本包收录公开渠道可直接下载并核验的两份长篇券商公司研究报告。',
+              '未使用网页摘要、预览截图或重新排版文件补足数量。',
+              '',
+          ]
+
+          for i, report in enumerate(REPORTS, 1):
+              raw = RAW / f"{report['info_code']}.pdf"
+              source = download(report, raw)
+              pages = validate(report, raw)
+              filename = f"{i:02d}_{report['org']}_{report['date']}_{safe_name(report['title'], 90)}.pdf"
+              dst = SELECTED / filename
+              dst.write_bytes(raw.read_bytes())
+              item = {
+                  **report,
+                  'pages': pages,
+                  'size_bytes': dst.stat().st_size,
+                  'package_filename': filename,
+                  'source_pdf_url': source,
+                  'sha256': sha256(dst),
+              }
+              manifest.append(item)
+              readme += [
+                  f"## {i}. {report['title']}",
+                  f"- 机构：{report['org']}",
+                  f"- 日期：{report['date']}",
+                  f"- 分析师：{report['analysts']}",
+                  f"- 类型：{report['type']}",
+                  f"- 页数：{pages}",
+                  f"- 文件：`{filename}`",
+                  f"- 原始公开PDF：{source}",
+                  f"- SHA-256：`{item['sha256']}`",
+                  '',
+              ]
+
+          (SELECTED / 'README_文件清单与来源.md').write_text('\n'.join(readme), encoding='utf-8')
+          (SELECTED / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (SELECTED / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{x['sha256']}  {x['package_filename']}" for x in manifest) + '\n', encoding='utf-8')
+
+          zip_cn = OUT / '力佳科技_835237_券商深度报告_原始PDF_2份_20261004.zip'
+          zip_en = OUT / 'Lijia_Technology_835237_Broker_Deep_Reports_Original_PDFs_2_20261004.zip'
+          for zp in (zip_cn, zip_en):
+              with zipfile.ZipFile(zp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for p in sorted(SELECTED.iterdir()):
+                      zf.write(p, arcname=p.name)
+              with zipfile.ZipFile(zp) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          summary = {
+              'count': len(manifest),
+              'total_pages': sum(x['pages'] for x in manifest),
+              'reports': manifest,
+              'zip_cn': str(zip_cn),
+              'zip_cn_sha256': sha256(zip_cn),
+              'zip_en': str(zip_en),
+              'zip_en_sha256': sha256(zip_en),
+          }
+          (OUT / 'package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/package_lijia_deep_reports.py
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lijia-835237-Verified-Deep-Reports
+          path: |
+            output_v2/*.zip
+            output_v2/package_summary.json
+          if-no-files-found: error
+          retention-days: 3
