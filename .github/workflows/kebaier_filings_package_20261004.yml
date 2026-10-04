@@ -1,0 +1,361 @@
+name: Kebaier Official Filings Package
+
+on:
+  push:
+    branches:
+      - chatgpt-kebaier-filings-20261004
+    paths:
+      - .github/workflows/kebaier_filings_package_20261004.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf pillow
+
+      - name: Download, validate, render, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders
+          python - <<'PY'
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+
+          CODE = '920066'
+          COMPANY = '合肥科拜尔新材料股份有限公司'
+          SHORT = '科拜尔'
+          AS_OF = '2026-10-04'
+          OUT = Path('output/reports')
+          RENDERS = Path('output/renders')
+          OUT.mkdir(parents=True, exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def get_page(url, timeout=90):
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = session.get(url, timeout=timeout, allow_redirects=True)
+                      print('PAGE', attempt + 1, r.status_code, len(r.content), r.url, r.headers.get('content-type'))
+                      r.raise_for_status()
+                      r.encoding = r.apparent_encoding or 'gb18030'
+                      return r
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(12, 2 ** attempt))
+              raise RuntimeError(f'Unable to fetch {url}: {last!r}')
+
+          def normalize(value):
+              value = html.unescape(value or '')
+              return re.sub(r'\s+', '', value)
+
+          def numeric_id(url):
+              m = re.search(r'(?:\?|&)id=(\d+)', url)
+              return int(m.group(1)) if m else -1
+
+          def collect_annual_entries():
+              url = f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{CODE}/page_type/ndbg.phtml'
+              r = get_page(url)
+              soup = BeautifulSoup(r.text, 'html.parser')
+              entries = []
+              seen = set()
+              for a in soup.find_all('a', href=True):
+                  title = ' '.join(a.get_text(' ', strip=True).split())
+                  href = urljoin(r.url, a['href'])
+                  if 'vCB_AllBulletinDetail.php' not in href or '年度报告' not in title:
+                      continue
+                  nt = normalize(title)
+                  if any(x in nt for x in ('摘要', '英文版', '审计报告', '业绩快报', '业绩预告')):
+                      continue
+                  key = (nt, href)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  entries.append({'title': title, 'detail_url': href, 'id': numeric_id(href)})
+              print('ANNUAL_ENTRIES', json.dumps(entries, ensure_ascii=False, indent=2))
+              return entries
+
+          annual_entries = collect_annual_entries()
+
+          def annual_candidates(year):
+              needle = f'{year}年年度报告'
+              candidates = [e for e in annual_entries if needle in normalize(e['title'])]
+              candidates.sort(key=lambda e: e['id'], reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'No annual report entry for {year}')
+              return candidates
+
+          annual_specs = []
+          for year in range(2022, 2026):
+              annual_specs.append({
+                  'filename': f'科拜尔_{year}年年度报告.pdf',
+                  'category': f'{year}年年度报告',
+                  'year': year,
+                  'kind': 'annual',
+                  'detail_candidates': [e['detail_url'] for e in annual_candidates(year)],
+                  'listing_candidates': annual_candidates(year),
+                  'min_pages': 80,
+              })
+
+          q1_detail = 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=920066&id=12260401'
+          prospectus_detail = 'https://money.finance.sina.com.cn/corp/view/vISSUE_RaiseExplanationDetail.php?stockid=920066&id=10532533'
+          specs = annual_specs + [
+              {
+                  'filename': '科拜尔_向不特定合格投资者公开发行股票并在北京证券交易所上市招股说明书_最终发行版_2024-10-18.pdf',
+                  'category': '最终发行版招股说明书',
+                  'year': 2024,
+                  'kind': 'prospectus',
+                  'detail_candidates': [prospectus_detail],
+                  'listing_candidates': [{'title': '科拜尔：向不特定合格投资者公开发行股票并在北京证券交易所上市招股说明书', 'detail_url': prospectus_detail, 'id': 10532533}],
+                  'min_pages': 300,
+              },
+              {
+                  'filename': '科拜尔_2026年第一季度报告_最新季报.pdf',
+                  'category': f'2026年第一季度报告（截至{AS_OF}最新正式季报）',
+                  'year': 2026,
+                  'kind': 'q1',
+                  'detail_candidates': [q1_detail],
+                  'listing_candidates': [{'title': '科拜尔：2026年一季度报告', 'detail_url': q1_detail, 'id': 12260401}],
+                  'min_pages': 5,
+              },
+          ]
+
+          def resolve_pdf(detail_url):
+              r = get_page(detail_url)
+              soup = BeautifulSoup(r.text, 'html.parser')
+              candidates = []
+              for a in soup.find_all('a', href=True):
+                  text = normalize(a.get_text(' ', strip=True))
+                  href = urljoin(r.url, a['href'])
+                  upper = href.upper()
+                  if '下载公告' in text or ('FILE.FINANCE.SINA.COM.CN' in upper and '.PDF' in upper):
+                      candidates.append(href)
+              candidates += re.findall(r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+\.PDF', r.text, re.I)
+              dedup = []
+              seen = set()
+              for value in candidates:
+                  value = html.unescape(value)
+                  if value not in seen:
+                      seen.add(value)
+                      dedup.append(value)
+              if not dedup:
+                  raise RuntimeError(f'No PDF attachment link found: {detail_url}')
+              dedup.sort(key=lambda x: (not x.upper().endswith('.PDF'), len(x)))
+              print('RESOLVED', detail_url, dedup)
+              return dedup[0], r.url
+
+          def download_pdf(url, referer, path):
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = session.get(
+                          url,
+                          headers={'Referer': referer, 'Accept': 'application/pdf,*/*'},
+                          timeout=240,
+                          allow_redirects=True,
+                      )
+                      print('PDF', path.name, attempt + 1, r.status_code, len(r.content), r.url, r.headers.get('content-type'))
+                      if r.ok and r.content.startswith(b'%PDF-') and len(r.content) > 50_000:
+                          path.write_bytes(r.content)
+                          return r.url
+                      last = RuntimeError(f'HTTP {r.status_code}, head={r.content[:80]!r}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(12, 2 ** attempt))
+              raise RuntimeError(f'Unable to download {url}: {last!r}')
+
+          def first_pages_text(path, pages, limit=8):
+              reader = PdfReader(str(path))
+              if reader.is_encrypted and not reader.decrypt(''):
+                  raise RuntimeError(f'Password-protected PDF: {path.name}')
+              chunks = []
+              for i in range(min(limit, pages)):
+                  try:
+                      chunks.append(reader.pages[i].extract_text() or '')
+                  except Exception:
+                      pass
+              text = ' '.join(chunks)
+              if len(text.strip()) < 100:
+                  doc = pymupdf.open(str(path))
+                  text = ' '.join(doc[i].get_text('text') for i in range(min(limit, doc.page_count)))
+                  doc.close()
+              return normalize(text)
+
+          def validate(path, spec):
+              reader = PdfReader(str(path))
+              encrypted = reader.is_encrypted
+              if encrypted and not reader.decrypt(''):
+                  raise RuntimeError(f'Encrypted PDF: {path.name}')
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'Unexpected page count {pages} for {path.name}')
+              text = first_pages_text(path, pages)
+              upper = text.upper()
+              if not any(normalize(token).upper() in upper for token in (COMPANY, SHORT, 'HEFEI KEBAIER NEW MATERIAL')):
+                  raise RuntimeError(f'Company identity validation failed: {path.name}')
+              if str(spec['year']) not in text:
+                  raise RuntimeError(f'Report year validation failed: {path.name}')
+              if spec['kind'] == 'annual':
+                  if '年度报告' not in text and 'ANNUALREPORT' not in upper:
+                      raise RuntimeError(f'Annual-report type validation failed: {path.name}')
+              elif spec['kind'] == 'q1':
+                  if not any(term in text for term in ('第一季度报告', '一季度报告')):
+                      raise RuntimeError(f'Q1 type validation failed: {path.name}')
+              else:
+                  if '招股说明书' not in text and 'PROSPECTUS' not in upper:
+                      raise RuntimeError(f'Prospectus type validation failed: {path.name}')
+                  if '申报稿' in text[:3000]:
+                      raise RuntimeError(f'Prospectus appears to be filing draft: {path.name}')
+              return pages, encrypted
+
+          manifest = []
+          render_paths = []
+          for spec in specs:
+              errors = []
+              success = None
+              for index, detail_url in enumerate(spec['detail_candidates']):
+                  path = OUT / spec['filename']
+                  try:
+                      pdf_url, detail_final_url = resolve_pdf(detail_url)
+                      pdf_final_url = download_pdf(pdf_url, detail_url, path)
+                      pages, encrypted = validate(path, spec)
+                      success = (path, detail_url, detail_final_url, pdf_url, pdf_final_url, pages, encrypted, index)
+                      break
+                  except Exception as exc:
+                      errors.append({'detail_url': detail_url, 'error': repr(exc)})
+                      path.unlink(missing_ok=True)
+                      print('CANDIDATE_FAILED', json.dumps(errors[-1], ensure_ascii=False))
+              if success is None:
+                  raise RuntimeError(f'No valid candidate for {spec["category"]}: {json.dumps(errors, ensure_ascii=False)}')
+
+              path, detail_url, detail_final_url, pdf_url, pdf_final_url, pages, encrypted, selected_index = success
+              doc = pymupdf.open(str(path))
+              pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(1.25, 1.25), alpha=False)
+              render_path = RENDERS / f'{path.stem}_page1.png'
+              pix.save(str(render_path))
+              doc.close()
+              render_paths.append(render_path)
+
+              data = path.read_bytes()
+              listing = spec['listing_candidates'][selected_index] if selected_index < len(spec['listing_candidates']) else {}
+              record = {
+                  'filename': path.name,
+                  'category': spec['category'],
+                  'report_year': spec['year'],
+                  'document_type': spec['kind'],
+                  'listing_title': listing.get('title'),
+                  'detail_url': detail_url,
+                  'detail_final_url': detail_final_url,
+                  'download_url': pdf_url,
+                  'download_final_url': pdf_final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'encrypted': encrypted,
+                  'first_page_render': render_path.name,
+                  'candidate_index': selected_index,
+              }
+              manifest.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False))
+
+          # Visual contact sheet.
+          thumbs = []
+          for render_path in render_paths:
+              image = Image.open(render_path).convert('RGB')
+              image.thumbnail((450, 610))
+              canvas = Image.new('RGB', (470, 660), 'white')
+              canvas.paste(image, ((470 - image.width) // 2, 8))
+              ImageDraw.Draw(canvas).text((10, 635), render_path.stem[:60], fill='black')
+              thumbs.append(canvas)
+              image.close()
+          cols = 2
+          rows = (len(thumbs) + cols - 1) // cols
+          sheet = Image.new('RGB', (cols * 470, rows * 660), 'white')
+          for idx, canvas in enumerate(thumbs):
+              sheet.paste(canvas, ((idx % cols) * 470, (idx // cols) * 660))
+              canvas.close()
+          contact_sheet = RENDERS / 'contact_sheet.jpg'
+          sheet.save(contact_sheet, 'JPEG', quality=90)
+          sheet.close()
+
+          readme = [
+              '合肥科拜尔新材料股份有限公司（证券简称：科拜尔；北交所代码：920066；原新三板代码：873664）披露文件资料包',
+              '',
+              '文件范围：',
+              '1. 公司2022年挂牌新三板以来发布的全部正式年度报告：2022年至2025年，共4份。',
+              '2. 2024年10月18日最终发行版《向不特定合格投资者公开发行股票并在北京证券交易所上市招股说明书》，不含申报稿。',
+              f'3. 2026年第一季度报告，为截至{AS_OF}最新标题明确为“季度报告”的正式文件。',
+              '',
+              '口径说明：',
+              '- 新浪披露列表中2022年年度报告存在同名重复记录，本包按公告ID由新到旧逐份验证，采用最新可正常打开且内容匹配的版本。',
+              '- 公司已披露2026年半年度报告，但半年度报告不属于标题明确的季度报告；截至2026年10月4日，2026年第三季度报告尚未披露。',
+              '- PDF附件取自新浪财经保存的上市公司公告原始附件镜像，并与公告标题、公司名称、年份和文件类型交叉核验。',
+              '',
+              '完整性检查：',
+              '- PDF文件头、实际页数、加密状态、公司名称、报告年份和文件类型；',
+              '- 每份PDF首页渲染检查；',
+              '- ZIP CRC完整性测试。',
+              '',
+              '文件清单：',
+          ]
+          for rec in manifest:
+              readme.append(f"- {rec['filename']} | {rec['pages']}页 | {rec['bytes']}字节 | SHA-256 {rec['sha256']}")
+          (OUT / '00_资料说明.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (OUT / '00_文件清单及校验值.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / '00_SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['filename']}" for r in manifest) + '\n', encoding='utf-8')
+
+          zip_path = Path('output/kebaier_all_annual_reports_prospectus_latest_quarter.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=8) as zf:
+              for path in sorted(OUT.iterdir(), key=lambda p: p.name):
+                  zf.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          summary = {
+              'zip_filename': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'pdf_count': len(manifest),
+              'total_pages': sum(r['pages'] for r in manifest),
+              'reports': manifest,
+          }
+          Path('output/BUILD_SUMMARY.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps({k: summary[k] for k in ('zip_filename','zip_bytes','zip_sha256','pdf_count','total_pages')}, ensure_ascii=False))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: kebaier-official-filings
+          path: |
+            output/kebaier_all_annual_reports_prospectus_latest_quarter.zip
+            output/BUILD_SUMMARY.json
+            output/renders/contact_sheet.jpg
+          retention-days: 2
+          compression-level: 0
