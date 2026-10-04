@@ -1,0 +1,168 @@
+name: Discover Lanfeng Biochemical broker reports 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lanfeng-biochemical-002513-broker-report-discovery-20261004.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pillow
+
+      - name: Query public research-report index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pages
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+          import requests
+          from PIL import Image
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Origin':'https://www.sdyanbao.com',
+            'Referer':'https://www.sdyanbao.com/',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+            last=None
+            for attempt in range(6):
+              try:
+                r=s.post(url,json=payload,timeout=(20,120))
+                last={'status':r.status_code,'text':r.text[:500]}
+                if r.status_code==200:
+                  return r.json()
+              except Exception as exc:
+                last={'error':repr(exc)}
+              time.sleep(1+attempt)
+            raise RuntimeError((url,last))
+
+          def collect_records(obj: Any) -> list[dict[str, Any]]:
+            found=[]
+            def walk(x: Any):
+              if isinstance(x,dict):
+                if isinstance(x.get('id'),int) and isinstance(x.get('name'),str):
+                  found.append(x)
+                for v in x.values(): walk(v)
+              elif isinstance(x,list):
+                for v in x: walk(v)
+            walk(obj)
+            return list({int(r['id']):r for r in found}.values())
+
+          queries=[
+            '蓝丰生化','002513','*ST蓝丰','蓝丰生化 深度报告','蓝丰生化 首次覆盖','蓝丰生化 公司研究',
+            '蓝丰生化 农药','蓝丰生化 光伏','江苏蓝丰 生化 研报'
+          ]
+          raw={}; records={}
+          for q in queries:
+            payload={
+              'device':1,'hideTrader':0,'onlyTitle':1,'order':0,
+              'page':1,'pageSize':100,'keyword':q,'pageCount':0,
+              'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':''
+            }
+            try:
+              data=post_json('https://api.sdyanbao.com/api/file/search',payload)
+              raw[q]=data
+              for r in collect_records(data): records[int(r['id'])]=r
+            except Exception as exc:
+              raw[q]={'error':repr(exc)}
+            time.sleep(.1)
+
+          candidates=[]
+          for rid,r in records.items():
+            name=str(r.get('name') or '')
+            typ=r.get('type')
+            type_name=typ.get('name') if isinstance(typ,dict) else str(typ or '')
+            if not any(x in name for x in ('蓝丰生化','*ST蓝丰','江苏蓝丰')):
+              continue
+            if any(x in name for x in ('年度报告','半年度报告','季度报告','一季度报告','三季度报告','审计报告','公告','说明书','法律意见书','回复函')):
+              continue
+            if type_name and not any(x in type_name for x in ('公司研究','行业研究','券商报告','研报')):
+              # keep unknown types, but exclude clear non-research types
+              if type_name in ('财报','公告','招股书'):
+                continue
+            candidates.append((rid,r))
+          candidates.sort(reverse=True)
+          candidates=candidates[:80]
+
+          details=[]
+          for rid,r in candidates:
+            try:
+              response=post_json('https://api.sdyanbao.com/api/file/detail',{'id':rid})
+              data=response.get('data') if isinstance(response,dict) else None
+              if not isinstance(data,dict): data={}
+              details.append({'record':r,'detail':data})
+            except Exception as exc:
+              details.append({'record':r,'detail':{},'error':repr(exc)})
+            time.sleep(.05)
+
+          summary=[]
+          for x in details:
+            r=x.get('record') if isinstance(x.get('record'),dict) else {}
+            d=x.get('detail') if isinstance(x.get('detail'),dict) else {}
+            typ=r.get('type')
+            record_type=typ.get('name') if isinstance(typ,dict) else typ
+            name=str(d.get('name') or r.get('name') or '')
+            pages=int(d.get('page_count') or r.get('page_count') or 0)
+            base=str(d.get('page_url') or '').rstrip('/')
+            item={
+              'id':r.get('id'),'name':name,'time_text':r.get('time_text'),
+              'record_type':record_type,'page_count':pages,'page_url':base,
+              'data_source':d.get('data_source'),'file_size':d.get('file_size'),
+              'original_id':d.get('original_id'),'error':x.get('error'),
+            }
+            summary.append(item)
+
+          summary.sort(key=lambda x:(str(x.get('time_text') or ''),x.get('page_count') or 0,x.get('id') or 0),reverse=True)
+          Path('out/search_raw.json').write_text(json.dumps(raw,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Save first pages for up to 20 plausible company-research reports.
+          page_manifest=[]
+          selected=[x for x in summary if x.get('page_url') and (x.get('page_count') or 0)>=3][:20]
+          for item in selected:
+            url=f"{item['page_url']}/0.png"
+            last=None
+            for attempt in range(5):
+              try:
+                rr=s.get(url,timeout=(20,90),headers={'Referer':'https://www.sdyanbao.com/','User-Agent':s.headers['User-Agent']})
+                last={'status':rr.status_code,'bytes':len(rr.content),'type':rr.headers.get('content-type','')}
+                if rr.status_code==200 and len(rr.content)>10000:
+                  with Image.open(BytesIO(rr.content)) as im:
+                    im.verify()
+                  safe=re.sub(r'[\\/:*?"<>|]+','_',str(item['name']))[:80]
+                  path=Path('out/pages')/f"{item['id']}_{safe}.png"
+                  path.write_bytes(rr.content)
+                  page_manifest.append({'id':item['id'],'name':item['name'],'file':str(path),'url':url,**last})
+                  break
+              except Exception as exc:
+                last={'error':repr(exc)}
+              time.sleep(1+attempt)
+            else:
+              page_manifest.append({'id':item['id'],'name':item['name'],'url':url,'failed':last})
+          Path('out/page_manifest.json').write_text(json.dumps(page_manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanfeng-biochemical-002513-broker-report-discovery
+          path: out
+          retention-days: 7
+          if-no-files-found: error
