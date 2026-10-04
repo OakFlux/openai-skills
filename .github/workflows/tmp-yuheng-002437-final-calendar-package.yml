@@ -1,0 +1,233 @@
+name: Build Final Yuheng 002437 Broker Reports From Calendar
+
+on:
+  push:
+    branches:
+      - tmp-yuheng-002437-broker-reports-20261004
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf pymupdf
+      - name: Fetch full calendar, download and package reports
+        shell: bash
+        run: |
+          cat > /tmp/final_yuheng.py <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time, zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import requests, pymupdf
+          from pypdf import PdfReader
+
+          OUT=Path('output_final'); RAW=OUT/'raw'; SEL=OUT/'selected'; REND=OUT/'renders'
+          for p in (OUT,RAW,SEL,REND): p.mkdir(parents=True,exist_ok=True)
+          s=requests.Session(); s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36',
+            'Accept':'application/pdf,application/json,text/plain,*/*',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+            'Referer':'https://data.eastmoney.com/stockcalendar/002437.html'})
+          logs=[]
+          def log(x): print(x,flush=True); logs.append(x)
+          def sha(path):
+            h=hashlib.sha256()
+            with path.open('rb') as f:
+              for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+            return h.hexdigest()
+          def safe(x,n=95):
+            x=re.sub(r'[\\/:*?"<>|\r\n\t]+','_',x or '')
+            x=re.sub(r'\s+','_',x).strip(' ._')
+            return (x or 'report')[:n]
+
+          # Fetch the entire stock-calendar history; the legacy report API no longer returns this ticker.
+          all_rows=[]
+          base='https://datacenter-web.eastmoney.com/api/data/v1/get'
+          for page in range(1,20):
+            params={'reportName':'RPT_STOCKCALENDAR','columns':'ALL','filter':'(SECURITY_CODE="002437")',
+                    'pageSize':'500','pageNumber':str(page),'source':'WEB','client':'WEB'}
+            r=s.get(base,params=params,timeout=60); r.raise_for_status(); j=r.json()
+            result=j.get('result') or {}; rows=result.get('data') or []
+            log(f'CALENDAR page={page} rows={len(rows)} pages={result.get("pages")} count={result.get("count")}')
+            if not rows: break
+            all_rows.extend(rows)
+            if page>=int(result.get('pages') or page): break
+          research=[]
+          for row in all_rows:
+            if str(row.get('EVENT_TYPE_CODE'))=='020' or str(row.get('EVENT_TYPE'))=='研报':
+              content=str(row.get('LEVEL1_CONTENT') or '')
+              m=re.search(r'《([^》]+)》',content)
+              title=m.group(1).strip() if m else content.strip()
+              research.append({
+                'date':str(row.get('NOTICE_DATE') or '')[:10],
+                'info_code':str(row.get('INFO_CODE') or '').strip(),
+                'title':title,
+                'content':content,
+                'calendar_record':row,
+              })
+          (OUT/'all_research_events.json').write_text(json.dumps(research,ensure_ascii=False,indent=2),encoding='utf-8')
+          log(f'RESEARCH_EVENTS={len(research)}')
+          for rec in research:
+            if rec['date']>='2024-01-01' or any(k in rec['title'] for k in ('深度','首次覆盖','投资价值','骨科优势企业')):
+              log('EVENT | '+rec['date']+' | '+rec['info_code']+' | '+rec['title'])
+
+          # Exact preferred titles, then older substantive/new-stock company reports as fallback.
+          def priority(rec):
+            t=rec['title']; d=rec['date']; p=0
+            if '双核心业务筑牢基本盘' in t: p+=100000
+            if '产品管线丰富，业绩逐渐回暖' in t: p+=95000
+            if '骨科优势企业，后续产品丰富' in t: p+=80000
+            if '专攻骨科和肿瘤疾病' in t: p+=78000
+            if '特色营销为优秀产品护航' in t: p+=76000
+            if '创新有储备' in t: p+=74000
+            if '深度' in t: p+=20000
+            if '首次覆盖' in t: p+=18000
+            if '投资价值' in t: p+=15000
+            if d.startswith('2025'): p+=12000
+            elif d.startswith('2024'): p+=10000
+            elif d.startswith('2010'): p+=3000
+            return p
+
+          candidates=[x for x in research if x['info_code'] and (
+            x['date']>='2024-01-01' or
+            any(k in x['title'] for k in ('双核心业务','产品管线丰富','骨科优势企业','专攻骨科和肿瘤疾病','特色营销为优秀产品护航','创新有储备','深度','首次覆盖','投资价值'))
+          )]
+          candidates.sort(key=priority,reverse=True)
+
+          def urls(code):
+            now=int(time.time()*1000)
+            return [
+              f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{now}.pdf=',
+              f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf?{now}.pdf=',
+              f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?download=1',
+            ]
+          def validate(path):
+            if path.stat().st_size<80000: return False,0,'small',''
+            with path.open('rb') as f:
+              if f.read(5)!=b'%PDF-': return False,0,'header',''
+            try:
+              reader=PdfReader(str(path),strict=False); pages=len(reader.pages)
+              if pages<8: return False,pages,'too few',''
+              parts=[]
+              for i in range(min(12,pages)):
+                try: parts.append(reader.pages[i].extract_text() or '')
+                except Exception: pass
+              text='\n'.join(parts); compact=re.sub(r'\s+','',text)
+              if not any(k in compact for k in ('誉衡药业','哈尔滨誉衡药业','002437')):
+                return False,pages,'company missing',text[:5000]
+              doc=pymupdf.open(path)
+              if doc.page_count!=pages: return False,pages,'page mismatch',text[:5000]
+              rd=REND/path.stem; rd.mkdir(exist_ok=True)
+              for idx in sorted(set([0,pages//2,pages-1])):
+                pix=doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(1,1),alpha=False)
+                out=rd/f'page-{idx+1:03d}.png'; pix.save(out)
+                if out.stat().st_size<4000: return False,pages,'blank render',text[:5000]
+              doc.close(); return True,pages,'',text
+            except Exception as e: return False,0,f'{type(e).__name__}:{e}',''
+          def download(rec):
+            dst=RAW/f"{safe(rec['info_code'])}.pdf"
+            for u in urls(rec['info_code']):
+              try:
+                with s.get(u,timeout=120,stream=True,allow_redirects=True) as r:
+                  r.raise_for_status()
+                  with dst.open('wb') as f:
+                    for ch in r.iter_content(256*1024):
+                      if ch: f.write(ch)
+                ok,pages,reason,text=validate(dst)
+                if ok: return dst,u,pages,text
+                log(f"REJECT {rec['info_code']} {u} {reason} pages={pages} bytes={dst.stat().st_size if dst.exists() else 0}")
+              except Exception as e:
+                log(f"FAIL {rec['info_code']} {u} {type(e).__name__}:{e}")
+              dst.unlink(missing_ok=True)
+            return None
+
+          downloaded=[]
+          for rec in candidates:
+            if len(downloaded)>=8: break
+            got=download(rec)
+            if not got: continue
+            path,url,pages,text=got
+            # Infer institution and analyst from front-matter text where possible.
+            compact=re.sub(r'\s+','',text)
+            org='券商'
+            for name in ('江海证券','天风证券','申银万国','申万宏源','招商证券','东方证券','中信建投','兴业证券','长江证券','湘财证券','国海证券','中信证券','国金证券','华泰证券','广发证券','国泰海通','海通证券'):
+              if name in compact: org=name; break
+            analyst=''
+            for pat in (r'分析师[：:]?([\u4e00-\u9fa5、，,]{2,30})',r'研究员[：:]?([\u4e00-\u9fa5、，,]{2,30})'):
+              m=re.search(pat,text)
+              if m: analyst=m.group(1).strip('，,、 '); break
+            item={**rec,'org':org,'analyst':analyst,'pages':pages,'path':str(path),'source_pdf_url':url,'sha256':sha(path),'front_text':text[:10000]}
+            downloaded.append(item)
+            log(f"ACCEPT {rec['date']} {org} {pages}p {rec['title']} {rec['info_code']}")
+
+          # Dedupe and select target reports; exact modern deep reports take priority.
+          uniq=[]; seen=set()
+          for x in sorted(downloaded,key=lambda z:(priority(z),z['pages']),reverse=True):
+            key=(re.sub(r'\s+','',x['title']),x['sha256'])
+            if key in seen: continue
+            seen.add(key); uniq.append(x)
+          selected=uniq[:3]
+          if len(selected)<2:
+            (OUT/'downloaded_candidates.json').write_text(json.dumps(downloaded,ensure_ascii=False,indent=2),encoding='utf-8')
+            (OUT/'run.log').write_text('\n'.join(logs),encoding='utf-8')
+            raise SystemExit(f'Only {len(selected)} verified PDFs')
+
+          readme=['# 誉衡药业（002437）券商研究报告原始PDF','',
+                  f'整理时间：{datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}',
+                  f'收录数量：{len(selected)}份','',
+                  '仅收录公开链接可直接下载、公司身份及PDF结构可核验的原始券商PDF。',
+                  '优先收录现代公司深度报告；数量不足时补充完整的新股研究报告，并在清单中按实际类型说明。','']
+          manifest=[]
+          for i,x in enumerate(selected,1):
+            fn=f"{i:02d}_{safe(x['org'],25)}_{safe(x['date'],12)}_{safe(x['title'],88)}.pdf"
+            src=Path(x['path']); dst=SEL/fn; dst.write_bytes(src.read_bytes())
+            typ='公司深度报告'
+            if x['date'].startswith('2010'): typ='上市阶段新股/公司研究报告'
+            item={k:v for k,v in x.items() if k not in ('path','front_text','calendar_record')}
+            item.update({'type':typ,'package_filename':fn,'size_bytes':dst.stat().st_size,'sha256':sha(dst)})
+            manifest.append(item)
+            readme += [f"## {i}. {x['title']}",f"- 机构：{x['org']}",f"- 日期：{x['date']}",
+                       f"- 类型：{typ}",f"- 分析师：{x['analyst'] or 'PDF前部未稳定提取'}",f"- 页数：{x['pages']}",
+                       f"- 文件：`{fn}`",f"- 来源PDF：{x['source_pdf_url']}",f"- SHA-256：`{item['sha256']}`",'']
+          (SEL/'README_文件清单与来源.md').write_text('\n'.join(readme),encoding='utf-8')
+          (SEL/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (SEL/'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['package_filename']}" for x in manifest)+'\n',encoding='utf-8')
+          (OUT/'downloaded_candidates.json').write_text(json.dumps(downloaded,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'run.log').write_text('\n'.join(logs),encoding='utf-8')
+
+          zcn=OUT/f'誉衡药业_002437_券商深度及公司研究报告_原始PDF_{len(selected)}份_20261004.zip'
+          zen=OUT/f'Yuheng_Pharma_002437_Broker_Research_Original_PDFs_{len(selected)}_20261004.zip'
+          for zp in (zcn,zen):
+            with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for p in sorted(SEL.iterdir()): z.write(p,arcname=p.name)
+            with zipfile.ZipFile(zp) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError(f'ZIP CRC {bad}')
+            log(f'CREATED {zp} bytes={zp.stat().st_size} sha256={sha(zp)}')
+          summary={'count':len(manifest),'total_pages':sum(x['pages'] for x in manifest),'reports':manifest,
+                   'zip_cn':str(zcn),'zip_cn_sha256':sha(zcn),'zip_en':str(zen),'zip_en_sha256':sha(zen)}
+          (OUT/'package_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+          python /tmp/final_yuheng.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yuheng-002437-Final-Broker-Reports
+          path: |
+            output_final/*.zip
+            output_final/package_summary.json
+            output_final/run.log
+            output_final/all_research_events.json
+            output_final/downloaded_candidates.json
+          if-no-files-found: error
+          retention-days: 3
