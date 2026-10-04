@@ -1,0 +1,238 @@
+name: Aiko Solar Broker Deep Reports Package
+
+on:
+  push:
+    branches:
+      - chatgpt-aiko-broker-reports-20261004
+    paths:
+      - .github/workflows/aiko_broker_package_20261004.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf pymupdf pillow
+
+      - name: Download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders
+          python - <<'PY'
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          REPORTS = OUT / 'reports'
+          RENDERS = OUT / 'renders'
+
+          reports = [
+              {
+                  'filename': '01_国金证券_爱旭股份_BC时代启幕_龙头有望迎来戴维斯双击_2026-09-27.pdf',
+                  'info_code': 'AP202609261829925974',
+                  'title': '“曙光初现”系列（二）爱旭股份：BC时代启幕，龙头有望迎来戴维斯双击',
+                  'broker': '国金证券',
+                  'date': '2026-09-27',
+                  'analyst': '姚遥',
+                  'rating': '买入',
+                  'expected_pages': 25,
+              },
+              {
+                  'filename': '02_山西证券_爱旭股份_BC龙头破茧成蝶_2026-02-12.pdf',
+                  'info_code': 'AP202602121819893104',
+                  'title': 'BC龙头，破茧成蝶',
+                  'broker': '山西证券',
+                  'date': '2026-02-12',
+                  'analyst': '肖索、贾惠淋',
+                  'rating': '买入',
+                  'expected_pages': 26,
+              },
+              {
+                  'filename': '03_开源证券_爱旭股份_BC龙头乘风光伏反内卷_高溢价驱动业绩高弹性_2025-12-29.pdf',
+                  'info_code': 'AP202512291810623201',
+                  'title': '公司首次覆盖报告：BC龙头乘风光伏反内卷，高溢价驱动业绩高弹性',
+                  'broker': '开源证券',
+                  'date': '2025-12-29',
+                  'analyst': '殷晟路、周航',
+                  'rating': '增持',
+                  'expected_pages': 17,
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/stock.jshtml',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def fetch_pdf(url):
+              last = None
+              for attempt in range(5):
+                  try:
+                      response = session.get(url, timeout=180, allow_redirects=True)
+                      print('FETCH', response.status_code, len(response.content), response.url, response.headers.get('content-type'))
+                      if response.status_code == 200 and response.content.startswith(b'%PDF-'):
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}, head={response.content[:32]!r}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(10, 2 ** attempt))
+              raise RuntimeError(f'Failed to fetch {url}: {last}')
+
+          manifest = []
+          render_paths = []
+          for item in reports:
+              candidates = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{item["info_code"]}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{item["info_code"]}.pdf',
+              ]
+              response = None
+              used_url = None
+              errors = []
+              for url in candidates:
+                  try:
+                      response = fetch_pdf(url)
+                      used_url = url
+                      break
+                  except Exception as exc:
+                      errors.append({'url': url, 'error': repr(exc)})
+              if response is None:
+                  raise RuntimeError(f'All PDF URLs failed for {item["title"]}: {errors}')
+
+              data = response.content
+              if len(data) < 100_000:
+                  raise RuntimeError(f'PDF too small for {item["title"]}: {len(data)}')
+              path = REPORTS / item['filename']
+              path.write_bytes(data)
+
+              reader = PdfReader(str(path))
+              if reader.is_encrypted and not reader.decrypt(''):
+                  raise RuntimeError(f'Password-protected PDF: {path.name}')
+              page_count = len(reader.pages)
+              if page_count != item['expected_pages']:
+                  raise RuntimeError(f'Page count mismatch for {path.name}: {page_count} != {item["expected_pages"]}')
+
+              doc = fitz.open(str(path))
+              text = ''.join(doc[i].get_text('text') for i in range(min(5, doc.page_count)))
+              normalized = re.sub(r'\s+', '', text)
+              if '爱旭股份' not in normalized and '600732' not in normalized and '上海爱旭' not in normalized:
+                  raise RuntimeError(f'Company identity validation failed: {path.name}')
+              broker_tokens = [item['broker'], item['broker'].replace('证券', '')]
+              if not any(token and token in normalized for token in broker_tokens):
+                  raise RuntimeError(f'Broker validation failed: {path.name}')
+
+              for label, index in [('first', 0), ('last', doc.page_count - 1)]:
+                  pix = doc[index].get_pixmap(matrix=fitz.Matrix(1.3, 1.3), alpha=False)
+                  render_path = RENDERS / f'{path.stem}_{label}.png'
+                  pix.save(str(render_path))
+                  render_paths.append(render_path)
+              doc.close()
+
+              record = {
+                  'filename': path.name,
+                  'title': item['title'],
+                  'broker': item['broker'],
+                  'date': item['date'],
+                  'analyst': item['analyst'],
+                  'rating': item['rating'],
+                  'info_code': item['info_code'],
+                  'source_url': used_url,
+                  'final_url': response.url,
+                  'pages': page_count,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'encrypted': reader.is_encrypted,
+              }
+              manifest.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False))
+
+          thumbs = []
+          for image_path in render_paths:
+              image = Image.open(image_path).convert('RGB')
+              image.thumbnail((420, 580))
+              canvas = Image.new('RGB', (440, 630), 'white')
+              canvas.paste(image, ((440 - image.width) // 2, 8))
+              ImageDraw.Draw(canvas).text((10, 605), image_path.stem[:58], fill='black')
+              thumbs.append(canvas)
+              image.close()
+          cols = 2
+          rows_n = (len(thumbs) + cols - 1) // cols
+          sheet = Image.new('RGB', (cols * 440, rows_n * 630), 'white')
+          for idx, canvas in enumerate(thumbs):
+              sheet.paste(canvas, ((idx % cols) * 440, (idx // cols) * 630))
+              canvas.close()
+          contact_sheet = RENDERS / 'contact_sheet.jpg'
+          sheet.save(contact_sheet, 'JPEG', quality=90)
+          sheet.close()
+
+          readme_lines = [
+              '爱旭股份（600732.SH）券商深度研究报告资料包',
+              '',
+              '文件范围：3份公开可直接取得的完整券商原始PDF。',
+              '筛选原则：优先选择近年、篇幅较长、标题明确为深度/首次覆盖的公司研究报告。',
+              '来源：东方财富公开研报PDF服务器。',
+              '',
+              '文件清单：',
+          ]
+          for record in manifest:
+              readme_lines.append(
+                  f"- {record['filename']} | {record['broker']} | {record['date']} | "
+                  f"{record['pages']}页 | {record['rating']} | 分析师：{record['analyst']}"
+              )
+          readme_lines += [
+              '',
+              '核验：已检查PDF文件头、实际页数、公司名称、券商名称、加密状态，并渲染首页与末页。',
+              '压缩包已执行ZIP CRC完整性测试。',
+              '文件仅供个人研究与学习使用，请遵守原始报告版权和免责声明。',
+          ]
+          (REPORTS / '00_资料说明.txt').write_text('\n'.join(readme_lines) + '\n', encoding='utf-8')
+          (REPORTS / '00_文件清单及校验值.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (REPORTS / '00_SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['filename']}" for r in manifest) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'aiko_solar_broker_deep_reports_3.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in sorted(REPORTS.iterdir(), key=lambda p: p.name):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          summary = {
+              'zip_filename': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'report_count': len(manifest),
+              'total_pages': sum(r['pages'] for r in manifest),
+              'reports': manifest,
+          }
+          (OUT / 'BUILD_SUMMARY.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps({k: summary[k] for k in ('zip_filename','zip_bytes','zip_sha256','report_count','total_pages')}, ensure_ascii=False))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiko-broker-deep-reports-package
+          path: |
+            output/aiko_solar_broker_deep_reports_3.zip
+            output/BUILD_SUMMARY.json
+            output/renders/contact_sheet.jpg
+          retention-days: 2
+          compression-level: 0
