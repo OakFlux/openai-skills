@@ -1,0 +1,358 @@
+name: Nanhua Historical Broker Public Fulltext Package
+
+on:
+  push:
+    branches:
+      - chatgpt-nanhua-biological-broker-reports-20261004
+    paths:
+      - .github/workflows/nanhua_historical_broker_public_fulltext_package_20261004.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 reportlab pypdf pymupdf pillow
+
+      - name: Fetch public full text, typeset, verify, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/reports output/renders
+          python - <<'PY'
+          import hashlib
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageDraw
+          from pypdf import PdfReader
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_CENTER, TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+          from reportlab.platypus import (
+              BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer,
+              Table, TableStyle, PageBreak, KeepTogether
+          )
+          from xml.sax.saxutils import escape
+
+          OUT = Path('output')
+          REPORTS = OUT / 'reports'
+          RENDERS = OUT / 'renders'
+          COMPANY_NOTE = (
+              '证券代码000504现名为南华生物。以下研报发表于公司使用“赛迪传媒”证券简称、'
+              '主营文化传媒业务的历史阶段，研究结论不对应公司当前生物医药及其他业务。'
+          )
+          FILE_NATURE = '新浪财经公开全文排版版（非原始券商PDF）'
+
+          selections = [
+              {
+                  'id': '239791214234',
+                  'filename': '01_国投证券_赛迪传媒_业务扩张引致成本上升_投资收益再成主角_2007-08-07_公开全文排版版.pdf',
+                  'expected_title': '赛迪传媒(000504)：业务扩张引致成本上升 投资收益再成“主角”',
+              },
+              {
+                  'id': '227181924657',
+                  'filename': '02_中国银河证券_赛迪传媒_2007将是腾飞起步之年_2007-03-14_公开全文排版版.pdf',
+                  'expected_title': '赛迪传媒(000504)调研简报：2007将是腾飞起步之年',
+              },
+              {
+                  'id': '227111904454',
+                  'filename': '03_华泰联合证券_赛迪传媒_转型之路漫漫而修远_2007-03-13_公开全文排版版.pdf',
+                  'expected_title': '赛迪传媒(000504)调研报告：转型之路漫漫而修远',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+
+          def clean(value):
+              value = value.replace('\xa0', ' ')
+              value = re.sub(r'\s+', ' ', value)
+              return value.strip()
+
+          def fetch_report(item):
+              url = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{item["id"]}/index.phtml'
+              response = session.get(url, timeout=90, allow_redirects=True)
+              response.raise_for_status()
+              response.encoding = response.apparent_encoding or 'gb18030'
+              soup = BeautifulSoup(response.text, 'html.parser')
+              heading = soup.find('h1')
+              title = clean(heading.get_text(' ', strip=True) if heading else item['expected_title'])
+              page_text = clean(soup.get_text(' ', strip=True))
+              meta_match = re.search(
+                  r'类别：\s*公司\s*机构：\s*(.*?)\s*研究员：\s*(.*?)\s*日期：\s*(\d{4}-\d{2}-\d{2})',
+                  page_text
+              )
+              if not meta_match:
+                  raise RuntimeError(f'Metadata not found for {item["id"]}')
+              institution, researcher, report_date = [clean(x) for x in meta_match.groups()]
+              date_pos = page_text.find(report_date, meta_match.start())
+              body_start = date_pos + len(report_date)
+              body_end = page_text.find('数据推荐', body_start)
+              if body_end < 0:
+                  body_end = len(page_text)
+              body = clean(page_text[body_start:body_end])
+              if len(body) < 200:
+                  raise RuntimeError(f'Public full text too short for {item["id"]}: {len(body)}')
+              if '赛迪传媒' not in title or '000504' not in title:
+                  raise RuntimeError(f'Identity mismatch for {item["id"]}: {title}')
+              return {
+                  **item,
+                  'source_url': url,
+                  'final_url': response.url,
+                  'title': title,
+                  'institution': institution,
+                  'researcher': researcher,
+                  'report_date': report_date,
+                  'body': body,
+                  'source_html_sha256': hashlib.sha256(response.content).hexdigest(),
+              }
+
+          styles = getSampleStyleSheet()
+          title_style = ParagraphStyle(
+              'CNTitle', parent=styles['Title'], fontName='STSong-Light',
+              fontSize=18, leading=25, alignment=TA_CENTER, textColor=colors.HexColor('#1F2937'),
+              spaceAfter=8*mm,
+          )
+          subtitle_style = ParagraphStyle(
+              'CNSubtitle', parent=styles['Normal'], fontName='STSong-Light',
+              fontSize=9.5, leading=14, alignment=TA_CENTER, textColor=colors.HexColor('#9A3412'),
+              spaceAfter=6*mm,
+          )
+          body_style = ParagraphStyle(
+              'CNBody', parent=styles['BodyText'], fontName='STSong-Light',
+              fontSize=10.5, leading=18, alignment=TA_LEFT, firstLineIndent=21,
+              textColor=colors.HexColor('#111827'), spaceAfter=3.5*mm,
+          )
+          heading_style = ParagraphStyle(
+              'CNHeading', parent=styles['Heading2'], fontName='STSong-Light',
+              fontSize=12, leading=18, textColor=colors.HexColor('#1D4ED8'),
+              spaceBefore=3*mm, spaceAfter=2*mm,
+          )
+          note_style = ParagraphStyle(
+              'CNNote', parent=styles['BodyText'], fontName='STSong-Light',
+              fontSize=9, leading=14, textColor=colors.HexColor('#4B5563'),
+          )
+          source_style = ParagraphStyle(
+              'CNSource', parent=styles['BodyText'], fontName='STSong-Light',
+              fontSize=8, leading=12, textColor=colors.HexColor('#6B7280'),
+          )
+
+          def split_body(body):
+              # Preserve visible section labels where present and otherwise split into readable paragraphs.
+              section_terms = ['报告关键点：', '报告摘要：', '风险提示:', '风险提示：', '投资建议：']
+              for term in section_terms:
+                  body = body.replace(term, '\n' + term + '\n')
+              # Add paragraph breaks around major analytical sentences.
+              body = re.sub(r'([。！？；])\s*', r'\1\n', body)
+              pieces = [clean(x) for x in body.split('\n') if clean(x)]
+              # Merge very short sentence fragments to avoid excessive vertical gaps.
+              merged = []
+              buffer = ''
+              for piece in pieces:
+                  if piece in section_terms or piece.endswith('：') and len(piece) <= 12:
+                      if buffer:
+                          merged.append(buffer)
+                          buffer = ''
+                      merged.append(piece)
+                  elif len(buffer) + len(piece) < 130:
+                      buffer = (buffer + ' ' + piece).strip()
+                  else:
+                      if buffer:
+                          merged.append(buffer)
+                      buffer = piece
+              if buffer:
+                  merged.append(buffer)
+              return merged
+
+          class NumberedDocTemplate(BaseDocTemplate):
+              def __init__(self, filename, **kwargs):
+                  super().__init__(filename, **kwargs)
+                  frame = Frame(self.leftMargin, self.bottomMargin, self.width, self.height, id='normal')
+                  self.addPageTemplates(PageTemplate(id='main', frames=frame, onPage=self._footer))
+
+              def _footer(self, canvas, doc):
+                  canvas.saveState()
+                  canvas.setFont('STSong-Light', 8)
+                  canvas.setFillColor(colors.HexColor('#6B7280'))
+                  canvas.drawString(18*mm, 11*mm, '公开全文排版版 - 非原始券商PDF')
+                  canvas.drawRightString(A4[0]-18*mm, 11*mm, f'第 {doc.page} 页')
+                  canvas.restoreState()
+
+          def build_pdf(record):
+              path = REPORTS / record['filename']
+              doc = NumberedDocTemplate(
+                  str(path), pagesize=A4,
+                  leftMargin=20*mm, rightMargin=20*mm,
+                  topMargin=18*mm, bottomMargin=20*mm,
+                  title=record['title'], author=record['institution'],
+              )
+              story = []
+              story.append(Paragraph(escape(record['title']), title_style))
+              story.append(Paragraph('公开全文排版版（依据新浪财经公开展示内容整理；非原始券商PDF）', subtitle_style))
+
+              table_data = [
+                  [Paragraph('<b>机构</b>', note_style), Paragraph(escape(record['institution']), note_style),
+                   Paragraph('<b>研究员</b>', note_style), Paragraph(escape(record['researcher']), note_style)],
+                  [Paragraph('<b>日期</b>', note_style), Paragraph(escape(record['report_date']), note_style),
+                   Paragraph('<b>证券代码</b>', note_style), Paragraph('000504', note_style)],
+              ]
+              meta_table = Table(table_data, colWidths=[23*mm, 56*mm, 23*mm, 56*mm])
+              meta_table.setStyle(TableStyle([
+                  ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F8FAFC')),
+                  ('GRID', (0,0), (-1,-1), 0.4, colors.HexColor('#CBD5E1')),
+                  ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                  ('LEFTPADDING', (0,0), (-1,-1), 5),
+                  ('RIGHTPADDING', (0,0), (-1,-1), 5),
+                  ('TOPPADDING', (0,0), (-1,-1), 5),
+                  ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+              ]))
+              story.append(meta_table)
+              story.append(Spacer(1, 6*mm))
+
+              note_table = Table([[Paragraph('<b>历史口径说明：</b>' + escape(COMPANY_NOTE), note_style)]], colWidths=[158*mm])
+              note_table.setStyle(TableStyle([
+                  ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#FFF7ED')),
+                  ('BOX', (0,0), (-1,-1), 0.6, colors.HexColor('#FDBA74')),
+                  ('LEFTPADDING', (0,0), (-1,-1), 8),
+                  ('RIGHTPADDING', (0,0), (-1,-1), 8),
+                  ('TOPPADDING', (0,0), (-1,-1), 7),
+                  ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+              ]))
+              story.append(note_table)
+              story.append(Spacer(1, 5*mm))
+
+              for piece in split_body(record['body']):
+                  if piece in ['报告关键点：', '报告摘要：', '风险提示:', '风险提示：', '投资建议：'] or (piece.endswith('：') and len(piece) <= 12):
+                      story.append(Paragraph(escape(piece), heading_style))
+                  else:
+                      story.append(Paragraph(escape(piece), body_style))
+
+              story.append(Spacer(1, 5*mm))
+              story.append(Paragraph('来源页面：' + escape(record['source_url']), source_style))
+              story.append(Paragraph('文件性质：' + FILE_NATURE, source_style))
+              doc.build(story)
+              return path
+
+          records = [fetch_report(item) for item in selections]
+          manifest = []
+          render_paths = []
+          for record in records:
+              path = build_pdf(record)
+              reader = PdfReader(str(path))
+              if reader.is_encrypted:
+                  raise RuntimeError(f'Unexpected encrypted PDF: {path.name}')
+              pages = len(reader.pages)
+              if pages < 1:
+                  raise RuntimeError(f'Empty PDF: {path.name}')
+              data = path.read_bytes()
+              doc = pymupdf.open(str(path))
+              for label, index in [('first', 0), ('last', doc.page_count - 1)]:
+                  pix = doc[index].get_pixmap(matrix=pymupdf.Matrix(1.35, 1.35), alpha=False)
+                  render_path = RENDERS / f'{path.stem}_{label}.png'
+                  pix.save(str(render_path))
+                  render_paths.append(render_path)
+              doc.close()
+              rec = {
+                  'filename': path.name,
+                  'title': record['title'],
+                  'institution': record['institution'],
+                  'researcher': record['researcher'],
+                  'report_date': record['report_date'],
+                  'source_url': record['source_url'],
+                  'source_html_sha256': record['source_html_sha256'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'file_nature': FILE_NATURE,
+              }
+              manifest.append(rec)
+              print('VERIFIED', json.dumps(rec, ensure_ascii=False))
+
+          # Visual verification contact sheet.
+          thumbs = []
+          for image_path in render_paths:
+              image = Image.open(image_path).convert('RGB')
+              image.thumbnail((410, 570))
+              canvas = Image.new('RGB', (430, 620), 'white')
+              canvas.paste(image, ((430-image.width)//2, 8))
+              ImageDraw.Draw(canvas).text((10, 596), image_path.stem[:58], fill='black')
+              thumbs.append(canvas)
+              image.close()
+          cols = 2
+          rows_n = (len(thumbs)+cols-1)//cols
+          sheet = Image.new('RGB', (cols*430, rows_n*620), 'white')
+          for i, canvas in enumerate(thumbs):
+              sheet.paste(canvas, ((i%cols)*430, (i//cols)*620))
+              canvas.close()
+          contact = RENDERS / 'contact_sheet.jpg'
+          sheet.save(contact, 'JPEG', quality=90)
+          sheet.close()
+
+          readme = [
+              '南华生物（000504.SZ）历史券商研究资料包',
+              '',
+              '重要说明：',
+              '- 本次公开检索未找到以南华生物当前生物医药业务为对象、可直接下载的完整券商原始PDF。',
+              '- 本包收录同一证券代码000504在“赛迪传媒”时期的3份券商公开研究全文。',
+              '- PDF由新浪财经公开展示的全文重新排版生成，均明确标注为“公开全文排版版”，不是原始券商PDF。',
+              '- 这些报告分析的是历史传媒业务，不能直接用于判断南华生物当前业务与估值。',
+              '',
+              '文件清单：',
+          ]
+          for rec in manifest:
+              readme.append(f"- {rec['filename']} | {rec['institution']} | {rec['report_date']} | {rec['pages']}页 | SHA-256 {rec['sha256']}")
+          (REPORTS / '00_资料说明.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (REPORTS / '00_文件清单及校验值.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (REPORTS / '00_SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['filename']}" for r in manifest) + '\n', encoding='utf-8')
+
+          zip_path = OUT / 'nanhua_biological_historical_broker_reports_public_fulltext.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in sorted(REPORTS.iterdir(), key=lambda p: p.name):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          summary = {
+              'zip_filename': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'report_count': len(manifest),
+              'total_pages': sum(r['pages'] for r in manifest),
+              'reports': manifest,
+          }
+          (OUT / 'BUILD_SUMMARY.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps({k: summary[k] for k in ('zip_filename','zip_bytes','zip_sha256','report_count','total_pages')}, ensure_ascii=False))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanhua-biological-historical-broker-reports-public-fulltext
+          path: |
+            output/nanhua_biological_historical_broker_reports_public_fulltext.zip
+            output/BUILD_SUMMARY.json
+            output/renders/contact_sheet.jpg
+          retention-days: 2
+          compression-level: 0
