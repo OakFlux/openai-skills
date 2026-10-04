@@ -1,0 +1,365 @@
+name: Build Lanfeng Biochemical annual reports package 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lanfeng-biochemical-002513-annual-reports-2020-2025-20261004.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover, download, validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = '002513'
+          COMPANY = '蓝丰生化'
+          PACKAGE = '蓝丰生化_002513_2020-2025年报及最新季报'
+          ROOT = Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREVIEW_DIR = ROOT / '首页预览'
+          PREVIEW_DIR.mkdir(exist_ok=True)
+
+          annual_specs = [
+              {'variants':['2020年年度报告'], 'period':'2020', 'filename':'01_蓝丰生化_2020年年度报告.pdf', 'min_pages':80},
+              {'variants':['2021年年度报告'], 'period':'2021', 'filename':'02_蓝丰生化_2021年年度报告.pdf', 'min_pages':80},
+              {'variants':['2022年年度报告'], 'period':'2022', 'filename':'03_蓝丰生化_2022年年度报告.pdf', 'min_pages':80},
+              {'variants':['2023年年度报告'], 'period':'2023', 'filename':'04_蓝丰生化_2023年年度报告.pdf', 'min_pages':80},
+              {'variants':['2024年年度报告'], 'period':'2024', 'filename':'05_蓝丰生化_2024年年度报告.pdf', 'min_pages':80},
+              {'variants':['2025年年度报告'], 'period':'2025', 'filename':'06_蓝丰生化_2025年年度报告.pdf', 'min_pages':80},
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          all_rows: list[dict[str, Any]] = []
+          search_pages: list[dict[str, Any]] = []
+
+          for page in range(1, 51):
+              params = {
+                  'sr':'-1',
+                  'page_size':'100',
+                  'page_index':str(page),
+                  'ann_type':'A',
+                  'client_source':'web',
+                  'stock_list':STOCK_CODE,
+                  'f_node':'0',
+                  's_node':'0',
+              }
+              data = None
+              last: Any = None
+              for attempt in range(7):
+                  try:
+                      r = session.get(api, params=params, timeout=(20, 120))
+                      last = {'status':r.status_code,'text':r.text[:300]}
+                      if r.status_code == 200:
+                          data = r.json()
+                          break
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              if data is None:
+                  raise RuntimeError(f'Announcement API failed page {page}: {last}')
+              rows = ((data.get('data') or {}).get('list') or [])
+              search_pages.append({'page':page,'count':len(rows)})
+              if not rows:
+                  break
+              all_rows.extend(rows)
+              dates = [str(row.get('display_time') or '') for row in rows]
+              if page >= 8 and any(d.startswith('2019') or d.startswith('2018') for d in dates):
+                  break
+              time.sleep(0.10)
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', '', text or '')
+
+          def art_code(row: dict[str, Any]) -> str:
+              return str(row.get('art_code') or row.get('artCode') or '')
+
+          def date_value(row: dict[str, Any]) -> str:
+              return str(row.get('display_time') or '')
+
+          bad_common = [
+              '摘要','英文版','取消','问询','回复','审计报告','董事会','监事会',
+              '更正公告','提示性公告','社会责任报告','环境、社会及管治报告',
+              '可持续发展报告','独立董事述职报告','内部控制评价报告','财务决算报告',
+              '年度报告说明会','年度报告网上说明会','募集资金','会计师事务所',
+          ]
+
+          def choose_report(variants: list[str], period: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+              candidates: list[tuple[int, str, dict[str, Any], str]] = []
+              for row in all_rows:
+                  title_raw = str(row.get('title') or '')
+                  title = compact(title_raw)
+                  matched = next((key for key in variants if compact(key) in title), None)
+                  if not matched or any(x in title for x in bad_common):
+                      continue
+                  score = 50
+                  key = compact(matched)
+                  if title.endswith(key): score += 35
+                  if title == key: score += 20
+                  if title.startswith(COMPANY) or title.startswith('江苏蓝丰生物化工股份有限公司') or title.startswith('*ST蓝丰'):
+                      score += 15
+                  if any(x in title for x in ['修订版','更新后','更正后','修订稿']): score += 8
+                  if any(x in title for x in ['取消版','已取消']): score -= 100
+                  candidates.append((score, date_value(row), row, matched))
+              candidates.sort(key=lambda x:(x[0], x[1]), reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'Missing report: {variants}')
+              log = [
+                  {
+                      'period':period,
+                      'matched_variant':matched,
+                      'score':score,
+                      'date':date,
+                      'title':row.get('title'),
+                      'art_code':art_code(row),
+                  }
+                  for score,date,row,matched in candidates[:15]
+              ]
+              return candidates[0][2], log
+
+          def choose_latest_quarter() -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+              desired = [
+                  (['2026年第三季度报告','2026年三季度报告'], '2026Q3'),
+                  (['2026年第一季度报告','2026年一季度报告'], '2026Q1'),
+                  (['2025年第三季度报告','2025年三季度报告'], '2025Q3'),
+                  (['2025年第一季度报告','2025年一季度报告'], '2025Q1'),
+              ]
+              combined: list[dict[str, Any]] = []
+              for variants, period in desired:
+                  try:
+                      row, log = choose_report(variants, period)
+                      combined.extend(log)
+                      return row, period, combined
+                  except RuntimeError:
+                      continue
+              raise RuntimeError('Missing latest quarterly report')
+
+          def choose_latest_interim() -> tuple[dict[str, Any] | None, str | None, list[dict[str, Any]]]:
+              desired = [
+                  (['2026年半年度报告','2026年半年报'], '2026H1'),
+                  (['2025年半年度报告','2025年半年报'], '2025H1'),
+              ]
+              combined: list[dict[str, Any]] = []
+              for variants, period in desired:
+                  try:
+                      row, log = choose_report(variants, period)
+                      combined.extend(log)
+                      return row, period, combined
+                  except RuntimeError:
+                      continue
+              return None, None, combined
+
+          selected: list[dict[str, Any]] = []
+          candidate_logs: dict[str, Any] = {}
+
+          for spec in annual_specs:
+              row, log = choose_report(spec['variants'], spec['period'])
+              candidate_logs[f"{spec['period']}年年度报告"] = log
+              selected.append({
+                  'key':spec['variants'][0],
+                  'period':spec['period'],
+                  'filename':spec['filename'],
+                  'min_pages':spec['min_pages'],
+                  'doc_type':'年度报告',
+                  'row':row,
+              })
+
+          quarter_row, quarter_period, quarter_log = choose_latest_quarter()
+          candidate_logs['最新季报'] = quarter_log
+          selected.append({
+              'key':compact(str(quarter_row.get('title') or '')),
+              'period':quarter_period,
+              'filename':f'07_蓝丰生化_{quarter_period}_最新季报.pdf',
+              'min_pages':5,
+              'doc_type':'最新季报',
+              'row':quarter_row,
+          })
+
+          interim_row, interim_period, interim_log = choose_latest_interim()
+          candidate_logs['最新半年度报告'] = interim_log
+          if interim_row is not None:
+              selected.append({
+                  'key':compact(str(interim_row.get('title') or '')),
+                  'period':interim_period,
+                  'filename':f'08_蓝丰生化_{interim_period}_最新阶段性报告.pdf',
+                  'min_pages':20,
+                  'doc_type':'半年度报告',
+                  'row':interim_row,
+              })
+
+          def fetch_pdf(url: str, referer: str) -> tuple[bytes, dict[str, Any]]:
+              last: dict[str, Any] = {}
+              for attempt in range(8):
+                  try:
+                      rr = session.get(url, timeout=(30, 360), allow_redirects=True, headers={
+                          'User-Agent':session.headers['User-Agent'],
+                          'Referer':referer,
+                          'Accept':'application/pdf,*/*;q=0.8',
+                      })
+                      last = {
+                          'status':rr.status_code,
+                          'final_url':rr.url,
+                          'content_type':rr.headers.get('content-type',''),
+                          'bytes':len(rr.content),
+                      }
+                      if rr.status_code == 200 and rr.content[:5] == b'%PDF-' and len(rr.content) > 30_000:
+                          return rr.content, last
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(2 + attempt)
+              raise RuntimeError(f'PDF download failed {url}: {last}')
+
+          manifest: list[dict[str, Any]] = []
+          for spec in selected:
+              row = spec.pop('row')
+              art = art_code(row)
+              if not art:
+                  raise RuntimeError(f'No art code for {spec["filename"]}')
+              detail_page = f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{art}.html'
+              mirror_pdf = f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf'
+              data, download_meta = fetch_pdf(mirror_pdf, detail_page)
+              dest = ROOT / spec['filename']
+              dest.write_bytes(data)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'Too few pages {dest.name}: {pages} < {spec["min_pages"]}')
+
+              extracted = ''
+              for page in reader.pages[:min(12, pages)]:
+                  try:
+                      extracted += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              identity_ok = any(x in extracted for x in ['蓝丰生化','002513','江苏蓝丰','LANFENG'])
+              if not identity_ok:
+                  raise RuntimeError(f'Issuer identity check failed: {dest.name}')
+
+              subprocess.run(['qpdf','--check',str(dest)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = PREVIEW_DIR / dest.stem
+              subprocess.run([
+                  'pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',
+                  str(dest),str(prefix)
+              ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'Preview render failed: {dest.name}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  **spec,
+                  'announcement_title':row.get('title'),
+                  'announcement_date':row.get('display_time'),
+                  'art_code':art,
+                  'announcement_detail_page':detail_page,
+                  'mirror_pdf_url':mirror_pdf,
+                  'official_cninfo_index':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK_CODE}',
+                  'actual_pages':pages,
+                  'bytes':len(data),
+                  'sha256':sha,
+                  'identity_text_check':identity_ok,
+                  'download_meta':download_meta,
+                  'preview_file':str(Path('首页预览') / preview.name),
+                  'validation':['PDF header','announcement-title match','issuer identity','minimum page count','qpdf structure','first-page render'],
+              })
+
+          readme = [
+              '江苏蓝丰生物化工股份有限公司（002513.SZ）2020-2025年年度报告及最新季报资料包',
+              '整理日期：2026-10-04',
+              '',
+              '本包收录2020年至2025年全部完整年度报告，以及截至整理日最新的独立季度报告。',
+              '同时补充收录最新完整半年度报告，以覆盖更新的阶段性财务信息。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {item['filename']}",
+                  f"   公告标题：{item['announcement_title']}",
+                  f"   公告日期：{item['announcement_date']}；实际页数：{item['actual_pages']}页",
+                  f"   公告页面：{item['announcement_detail_page']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          readme += [
+              '来源说明：PDF由公开公告镜像下载，并与公司代码、公告标题和报告年份逐一匹配；包内保留公告页面及官方信息披露索引。',
+              '核验项目：PDF文件头、公告标题、公司名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC和SHA-256。',
+          ]
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'candidate_selection_log.json').write_text(json.dumps(candidate_logs, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'announcement_search_log.json').write_text(
+              json.dumps({'pages':search_pages,'rows_scanned':len(all_rows)}, ensure_ascii=False, indent=2),
+              encoding='utf-8'
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['filename']}\n" for item in manifest),
+              encoding='utf-8'
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{PACKAGE}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in z.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) < 7:
+                  raise RuntimeError(f'PDF count too low: {len(pdfs)}')
+
+          short_path = Path('lanfeng_reports.zip')
+          short_path.write_bytes(zip_path.read_bytes())
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'SHA256', zip_sha)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanfeng-biochemical-002513-2020-2025-annual-reports-latest-filings-final
+          path: |
+            蓝丰生化_002513_2020-2025年报及最新季报.zip
+            lanfeng_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
