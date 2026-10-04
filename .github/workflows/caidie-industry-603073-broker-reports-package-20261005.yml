@@ -1,0 +1,388 @@
+name: Build CaiDie Industry broker research package 20261005
+
+on:
+  push:
+    paths:
+      - '.github/workflows/caidie-industry-603073-broker-reports-package-20261005.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf reportlab
+
+      - name: Download public pages, build PDFs and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_CENTER, TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+          from reportlab.platypus import Image as RLImage
+          from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+          PACKAGE = '彩蝶实业_603073_券商公司覆盖及相关新股研究_公开资料版_3份'
+          ROOT = Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREVIEW_DIR = ROOT / '首页预览'
+          PREVIEW_DIR.mkdir(exist_ok=True)
+          WORK = Path('_work_caidie')
+          WORK.mkdir(exist_ok=True)
+
+          SESSION = requests.Session()
+          SESSION.trust_env = False
+          SESSION.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Origin':'https://www.sdyanbao.com',
+              'Referer':'https://www.sdyanbao.com/',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+              last: Any = None
+              for attempt in range(7):
+                  try:
+                      r = SESSION.post(url, json=payload, timeout=(20, 120))
+                      last = {'status':r.status_code,'text':r.text[:500]}
+                      if r.status_code == 200:
+                          return r.json()
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def fetch_image(url: str) -> bytes:
+              last: Any = None
+              headers = {
+                  'Referer':'https://www.sdyanbao.com/',
+                  'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+              }
+              for attempt in range(7):
+                  try:
+                      r = SESSION.get(url, headers=headers, timeout=(20,120), allow_redirects=True)
+                      last = {'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type')}
+                      if r.status_code == 200 and len(r.content) > 12_000:
+                          with Image.open(BytesIO(r.content)) as im:
+                              im.verify()
+                          return r.content
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'Image failed {url}: {last}')
+
+          def render_first_page(pdf_path: Path) -> Path:
+              prefix = PREVIEW_DIR / pdf_path.stem
+              subprocess.run(
+                  ['pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(pdf_path),str(prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              out = Path(str(prefix) + '.png')
+              if not out.exists() or out.stat().st_size < 10_000:
+                  raise RuntimeError(f'Preview render failed: {pdf_path.name}')
+              return out
+
+          def validate_pdf(pdf_path: Path, expected_pages: int | None = None) -> int:
+              reader = PdfReader(str(pdf_path), strict=False)
+              pages = len(reader.pages)
+              if expected_pages is not None and pages != expected_pages:
+                  raise RuntimeError(f'Page mismatch {pdf_path.name}: {pages} != {expected_pages}')
+              subprocess.run(['qpdf','--check',str(pdf_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              render_first_page(pdf_path)
+              return pages
+
+          def build_image_pdf(report_id: int, filename: str, page_limit: int = 10) -> dict[str, Any]:
+              response = post_json('https://api.sdyanbao.com/api/file/detail', {'id':report_id})
+              detail = response.get('data') if isinstance(response,dict) else None
+              if not isinstance(detail,dict):
+                  raise RuntimeError(f'Invalid detail for {report_id}: {response}')
+              page_url = str(detail.get('page_url') or '').rstrip('/')
+              total_pages = int(detail.get('page_count') or 0)
+              if not page_url or total_pages <= 0:
+                  raise RuntimeError(f'Invalid page metadata for {report_id}')
+              public_pages = min(page_limit,total_pages)
+              work_dir = WORK / str(report_id)
+              work_dir.mkdir(exist_ok=True)
+              image_paths: list[Path] = []
+              for pno in range(public_pages):
+                  raw = fetch_image(f'{page_url}/{pno}.png')
+                  src = work_dir / f'{pno:02d}_src.png'
+                  src.write_bytes(raw)
+                  with Image.open(src) as im:
+                      rgba = im.convert('RGBA')
+                      white = Image.new('RGBA',rgba.size,(255,255,255,255))
+                      white.alpha_composite(rgba)
+                      rgb = white.convert('RGB')
+                      jpg = work_dir / f'{pno:02d}.jpg'
+                      rgb.save(jpg,'JPEG',quality=95,subsampling=0)
+                      image_paths.append(jpg)
+              dest = ROOT / filename
+              images = [Image.open(p).convert('RGB') for p in image_paths]
+              try:
+                  images[0].save(dest,save_all=True,append_images=images[1:],resolution=150.0,quality=95)
+              finally:
+                  for im in images:
+                      im.close()
+              actual_pages = validate_pdf(dest,public_pages)
+              sha = hashlib.sha256(dest.read_bytes()).hexdigest()
+              return {
+                  'report_id':report_id,
+                  'source_name':detail.get('name'),
+                  'source_page':f'https://www.sdyanbao.com/detail/{report_id}',
+                  'page_image_base':page_url,
+                  'original_total_pages':total_pages,
+                  'public_pages_in_pdf':public_pages,
+                  'pdf_file':dest.name,
+                  'actual_pdf_pages':actual_pages,
+                  'bytes':dest.stat().st_size,
+                  'sha256':sha,
+              }
+
+          # 1. The only publicly indexed dedicated company-coverage report.
+          direct = build_image_pdf(
+              349995,
+              '01_华金证券_彩蝶实业_新股覆盖研究_公开页面完整10页_2023-02-06.pdf',
+              10,
+          )
+          direct.update({
+              'category':'直接公司覆盖报告',
+              'broker':'华金证券',
+              'title':'彩蝶实业（603073.SH）：新股覆盖研究',
+              'report_date':'2023-02-06',
+              'analyst':'李蕙',
+              'document_nature':'公开页面完整10页；未声称为券商原始附件',
+          })
+
+          # 2. A broader new-stock report whose first-page investment points explicitly list CaiDie Industry.
+          related_guohai = build_image_pdf(
+              363074,
+              '02_国海证券_中小盘新股研究月报_含彩蝶实业研究信息_公开预览前10页_2023-03-10.pdf',
+              10,
+          )
+          related_guohai.update({
+              'category':'相关新股专题研究',
+              'broker':'国海证券',
+              'title':'中小盘新股研究月报：新股研究——建议关注派瑞特气、日联科技、南芯科技、美利信',
+              'report_date':'2023-03-10',
+              'analyst':'杨阳、罗琨',
+              'relevance':'报告首页投资要点列示彩蝶实业（603073.SH），用于补充其上市阶段的新股市场背景。',
+              'document_nature':'原报告37页；本PDF为公开预览前10页，不是彩蝶实业单独深度报告。',
+          })
+
+          # 3. A generated public-information excerpt for a Huaan Securities IPO-tracking report.
+          huaan_id = 398960
+          detail_response = post_json('https://api.sdyanbao.com/api/file/detail', {'id':huaan_id})
+          huaan = detail_response.get('data') if isinstance(detail_response,dict) else None
+          if not isinstance(huaan,dict):
+              raise RuntimeError('Invalid Huaan report detail')
+          search_payload = {
+              'device':1,'hideTrader':0,'onlyTitle':0,'order':0,
+              'page':1,'pageSize':100,'keyword':'603073','pageCount':0,
+              'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':''
+          }
+          search_response = post_json('https://api.sdyanbao.com/api/file/search',search_payload)
+          relevant_snippet = ''
+          def walk(obj: Any) -> None:
+              nonlocal relevant_snippet
+              if relevant_snippet:
+                  return
+              if isinstance(obj,dict):
+                  if obj.get('id') == huaan_id:
+                      values = obj.get('content_array')
+                      if isinstance(values,list) and values:
+                          relevant_snippet = re.sub(r'<[^>]+>','',str(values[0]))
+                          return
+                  for value in obj.values():
+                      walk(value)
+              elif isinstance(obj,list):
+                  for value in obj:
+                      walk(value)
+          walk(search_response)
+          if '603073' not in relevant_snippet:
+              raise RuntimeError('Huaan CaiDie-specific search snippet not found')
+
+          cover_raw = fetch_image(str(huaan.get('page_url')).rstrip('/') + '/0.png')
+          cover_path = WORK / 'huaan_cover.png'
+          with Image.open(BytesIO(cover_raw)) as im:
+              rgba = im.convert('RGBA')
+              white = Image.new('RGBA',rgba.size,(255,255,255,255))
+              white.alpha_composite(rgba)
+              white.convert('RGB').save(cover_path,'PNG')
+
+          pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+          styles = getSampleStyleSheet()
+          title_style = ParagraphStyle(
+              'TitleCN',parent=styles['Title'],fontName='STSong-Light',fontSize=16,leading=23,
+              alignment=TA_CENTER,spaceAfter=10,
+          )
+          notice_style = ParagraphStyle(
+              'NoticeCN',parent=styles['Normal'],fontName='STSong-Light',fontSize=9,leading=14,
+              textColor=colors.HexColor('#555555'),borderColor=colors.HexColor('#BBBBBB'),
+              borderWidth=.6,borderPadding=7,backColor=colors.HexColor('#F5F5F5'),spaceAfter=10,wordWrap='CJK',
+          )
+          body_style = ParagraphStyle(
+              'BodyCN',parent=styles['BodyText'],fontName='STSong-Light',fontSize=10.5,leading=18,
+              alignment=TA_LEFT,spaceAfter=8,wordWrap='CJK',
+          )
+          meta_style = ParagraphStyle(
+              'MetaCN',parent=styles['Normal'],fontName='STSong-Light',fontSize=9.5,leading=15,wordWrap='CJK',
+          )
+          source_style = ParagraphStyle(
+              'SourceCN',parent=styles['Normal'],fontName='STSong-Light',fontSize=8,leading=12,
+              textColor=colors.HexColor('#555555'),wordWrap='CJK',
+          )
+          def esc(text: str) -> str:
+              return html.escape(text or '',quote=True)
+
+          huaan_pdf = ROOT / '03_华安证券_首批注册制主板新股上市首日表现亮眼_彩蝶实业相关摘录_公开资料整理版_2023-04-17.pdf'
+          doc = SimpleDocTemplate(
+              str(huaan_pdf),pagesize=A4,leftMargin=18*mm,rightMargin=18*mm,topMargin=16*mm,bottomMargin=16*mm,
+              title='华安证券新股跟踪报告——彩蝶实业相关公开摘录',author='华安证券',
+          )
+          story = [
+              Paragraph('华安证券新股跟踪报告——彩蝶实业相关公开摘录',title_style),
+              Paragraph(
+                  '资料性质说明：该报告不是彩蝶实业单独公司深度报告。本文件仅整理公开索引中的报告元数据、报告首页和与彩蝶实业（603073.SH）有关的公开检索信息，未绕过会员、登录或付费访问限制。',
+                  notice_style,
+              ),
+          ]
+          rows = [
+              ['券商机构','华安证券'],
+              ['报告题目','首批注册制主板新股上市首日表现亮眼——“打新定期跟踪”系列之一百二十一'],
+              ['报告日期','2023-04-17'],
+              ['分析师','严佳炜、钱静闲、吴正宇、骆昱杉'],
+              ['原报告页数',str(huaan.get('page_count') or 23) + '页'],
+          ]
+          table = Table([[Paragraph(esc(a),meta_style),Paragraph(esc(b),meta_style)] for a,b in rows],colWidths=[28*mm,128*mm],hAlign='LEFT')
+          table.setStyle(TableStyle([
+              ('FONTNAME',(0,0),(-1,-1),'STSong-Light'),('VALIGN',(0,0),(-1,-1),'TOP'),
+              ('GRID',(0,0),(-1,-1),.35,colors.HexColor('#CCCCCC')),
+              ('BACKGROUND',(0,0),(0,-1),colors.HexColor('#F1F1F1')),
+              ('LEFTPADDING',(0,0),(-1,-1),6),('RIGHTPADDING',(0,0),(-1,-1),6),
+              ('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),
+          ]))
+          story.extend([
+              table,Spacer(1,7*mm),
+              Paragraph('与彩蝶实业的关联',body_style),
+              Paragraph(
+                  '公开全文检索结果显示，报告在“近期各股票A类实际打新表现”表中列入彩蝶实业（603073.SH），可作为公司上市后打新表现与同期新股环境的补充资料。',
+                  body_style,
+              ),
+              Paragraph('公开检索片段（节选）',body_style),
+              Paragraph(esc(relevant_snippet[:650]),notice_style),
+              Paragraph('报告首页公开页面',body_style),
+          ])
+          with Image.open(cover_path) as im:
+              w,h = im.size
+          max_w,max_h = 170*mm,205*mm
+          scale = min(max_w/w,max_h/h)
+          story.append(RLImage(str(cover_path),width=w*scale,height=h*scale))
+          story.extend([
+              Spacer(1,5*mm),
+              Paragraph('来源页面：https://www.sdyanbao.com/detail/398960',source_style),
+          ])
+          doc.build(story)
+          huaan_pages = validate_pdf(huaan_pdf)
+          huaan_sha = hashlib.sha256(huaan_pdf.read_bytes()).hexdigest()
+          related_huaan = {
+              'report_id':huaan_id,
+              'category':'相关新股跟踪研究',
+              'broker':'华安证券',
+              'title':'首批注册制主板新股上市首日表现亮眼——“打新定期跟踪”系列之一百二十一',
+              'report_date':'2023-04-17',
+              'analyst':'严佳炜、钱静闲、吴正宇、骆昱杉',
+              'source_page':'https://www.sdyanbao.com/detail/398960',
+              'original_total_pages':int(huaan.get('page_count') or 23),
+              'pdf_file':huaan_pdf.name,
+              'actual_pdf_pages':huaan_pages,
+              'bytes':huaan_pdf.stat().st_size,
+              'sha256':huaan_sha,
+              'relevance':'公开检索显示报告的实际打新表现表列入彩蝶实业（603073.SH）。',
+              'document_nature':'公开资料整理版；不是彩蝶实业单独深度报告，也不是券商原始完整附件。',
+          }
+
+          manifest = [direct,related_guohai,related_huaan]
+          readme = [
+              '彩蝶实业（603073.SH）券商公司覆盖及相关新股研究公开资料包',
+              '整理日期：2026-10-05',
+              '',
+              '检索结论：公开个股研报索引中仅发现1份直接针对彩蝶实业的券商公司覆盖报告，即华金证券2023年新股覆盖研究。',
+              '为满足2-3份资料的需求，本包另收录2份明确包含彩蝶实业上市或打新信息的券商新股专题报告，并在文件名和清单中标明其为“相关研究”，未冒充公司深度报告。',
+              '',
+          ]
+          for i,item in enumerate(manifest,1):
+              readme += [
+                  f"{i}. {item['broker']}：《{item['title']}》",
+                  f"   类型：{item['category']}；日期：{item['report_date']}；分析师：{item['analyst']}",
+                  f"   文件：{item['pdf_file']}；本PDF页数：{item['actual_pdf_pages']}",
+                  f"   资料性质：{item['document_nature']}",
+                  f"   来源：{item['source_page']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          readme += [
+              '版权及使用说明：报告内容版权归原券商和作者所有，仅供研究参考，不构成投资建议。',
+              '核验项目：公开页面身份、图片完整性、PDF页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (ROOT/'00_文件清单与说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['pdf_file']}\n" for x in manifest),encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p,arcname=f'{PACKAGE}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'PDF count mismatch: {len(pdfs)}')
+          short_path = Path('caidie_reports.zip')
+          short_path.write_bytes(zip_path.read_bytes())
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'SHA256',zip_sha)
+          print(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: caidie-industry-603073-broker-research-package-final
+          path: |
+            彩蝶实业_603073_券商公司覆盖及相关新股研究_公开资料版_3份.zip
+            caidie_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
