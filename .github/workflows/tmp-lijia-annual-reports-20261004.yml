@@ -1,0 +1,491 @@
+name: Build Lijia 835237 Annual Reports Package
+
+on:
+  push:
+    branches:
+      - tmp-lijia-835237-annual-reports-20261004
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf pymupdf
+
+      - name: Discover, download, verify and package reports
+        shell: bash
+        run: |
+          cat > /tmp/build_lijia_reports.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODES = ('835237', '920237')
+          COMPANY = '力佳科技'
+          COMPANY_ALIASES = (
+              '力佳科技', '力佳电源', '力佳电源科技', '宜昌力佳科技',
+              '湖北力佳科技', '835237', '920237'
+          )
+          OUT = Path('output')
+          RAW = OUT / 'raw'
+          SELECTED = OUT / 'selected'
+          RENDERS = OUT / 'renders'
+          for p in (OUT, RAW, SELECTED, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36',
+              'Accept': 'application/json,text/plain,text/html,application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/notices/',
+          })
+
+          logs: list[str] = []
+          def log(msg: str) -> None:
+              print(msg, flush=True)
+              logs.append(msg)
+
+          def safe_name(text: str, limit: int = 120) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', text or '')
+              text = re.sub(r'\s+', '_', text).strip(' ._')
+              return (text or 'report')[:limit]
+
+          def normalize_title(text: str) -> str:
+              text = re.sub(r'<[^>]+>', '', text or '')
+              text = text.replace('&nbsp;', ' ')
+              return re.sub(r'\s+', '', text)
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def walk_strings(obj: Any) -> list[str]:
+              found: list[str] = []
+              if isinstance(obj, dict):
+                  for value in obj.values():
+                      found.extend(walk_strings(value))
+              elif isinstance(obj, list):
+                  for value in obj:
+                      found.extend(walk_strings(value))
+              elif isinstance(obj, str):
+                  found.append(obj)
+              return found
+
+          def fetch_announcements() -> list[dict]:
+              endpoint = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+              all_rows: list[dict] = []
+              for stock_code in STOCK_CODES:
+                  code_rows: list[dict] = []
+                  for page in range(1, 31):
+                      params = {
+                          'sr': '-1',
+                          'page_size': '100',
+                          'page_index': str(page),
+                          'ann_type': 'A',
+                          'client_source': 'web',
+                          'stock_list': stock_code,
+                      }
+                      r = session.get(endpoint, params=params, timeout=60)
+                      r.raise_for_status()
+                      data = r.json()
+                      rows = (((data or {}).get('data') or {}).get('list') or [])
+                      if not rows:
+                          break
+                      code_rows.extend(rows)
+                      log(f'Announcement API {stock_code} page {page}: {len(rows)} records')
+                      if len(rows) < 100:
+                          break
+                      time.sleep(0.15)
+                  log(f'Announcement API {stock_code}: {len(code_rows)} total records')
+                  all_rows.extend(code_rows)
+
+              dedup: dict[str, dict] = {}
+              for row in all_rows:
+                  key = str(row.get('art_code') or row.get('artCode') or row.get('notice_id') or row.get('title') or '')
+                  if key:
+                      dedup[key] = row
+              result = list(dedup.values())
+              result.sort(key=lambda r: row_date(r), reverse=True)
+              (OUT / 'announcement_index.json').write_text(
+                  json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+              log(f'Total unique announcements across codes: {len(result)}')
+              return result
+
+          def art_code(row: dict) -> str:
+              return str(row.get('art_code') or row.get('artCode') or row.get('notice_id') or '').strip()
+
+          def row_title(row: dict) -> str:
+              return str(row.get('title') or row.get('notice_title') or '').strip()
+
+          def row_date(row: dict) -> str:
+              raw = str(row.get('notice_date') or row.get('noticeDate') or row.get('display_time') or '').strip()
+              return raw[:10]
+
+          def annual_year(row: dict) -> int | None:
+              title = normalize_title(row_title(row))
+              m = re.search(r'(20\d{2})年年度报告', title)
+              return int(m.group(1)) if m else None
+
+          def annual_score(row: dict, year: int) -> tuple[int, str]:
+              title = normalize_title(row_title(row))
+              if f'{year}年年度报告' not in title:
+                  return (-100000, row_date(row))
+              bad = (
+                  '摘要', '审计报告', '内部控制', '社会责任', '环境社会', '问询函', '回复',
+                  '董事会', '监事会', '独立董事', '业绩说明会', '取消', '提示性公告',
+                  '更正公告', '补充公告', '差错更正说明', '事后审查', '年报说明会'
+              )
+              if any(x in title for x in bad):
+                  return (-90000, row_date(row))
+              score = 0
+              if re.search(rf'{year}年年度报告$', title):
+                  score += 1000
+              if re.search(rf'{year}年年度报告[（(](修订版|更正版|更新版|修订稿)[）)]$', title):
+                  score += 1200
+              if any(x in title for x in ('修订版', '更正版', '更新版', '修订稿')):
+                  score += 100
+              if any(alias in title for alias in ('力佳科技', '力佳电源')):
+                  score += 60
+              return (score, row_date(row))
+
+          def prospectus_score(row: dict) -> tuple[int, str]:
+              title = normalize_title(row_title(row))
+              if '招股说明书' not in title:
+                  return (-100000, row_date(row))
+              bad = ('摘要', '关于招股说明书', '声明', '提示性公告', '问询', '回复', '审阅报告', '法律意见')
+              if any(x in title for x in bad):
+                  return (-90000, row_date(row))
+              score = 0
+              if title.endswith('招股说明书'):
+                  score += 3000
+              if '招股说明书（注册稿）' in title or '招股说明书(注册稿)' in title:
+                  score += 2400
+              if '招股说明书（申报稿）' in title or '招股说明书(申报稿)' in title:
+                  score += 1000
+              if '向不特定合格投资者公开发行股票' in title:
+                  score += 600
+              if '北京证券交易所上市' in title:
+                  score += 500
+              if any(alias in title for alias in ('力佳科技', '力佳电源')):
+                  score += 60
+              return (score, row_date(row))
+
+          def quarterly_score(row: dict) -> tuple[int, str]:
+              title = normalize_title(row_title(row))
+              if not re.search(r'20\d{2}年(?:第一|第三)季度报告', title):
+                  return (-100000, row_date(row))
+              bad = ('摘要', '更正公告', '补充公告', '问询函', '回复', '董事会', '监事会', '提示性公告')
+              if any(x in title for x in bad):
+                  return (-90000, row_date(row))
+              score = 0
+              if re.search(r'20\d{2}年(?:第一|第三)季度报告$', title):
+                  score += 1000
+              if '第三季度报告' in title:
+                  score += 200
+              if any(alias in title for alias in ('力佳科技', '力佳电源')):
+                  score += 60
+              return (score, row_date(row))
+
+          def detail_urls(code: str) -> list[str]:
+              urls: list[str] = []
+              if not code:
+                  return urls
+              endpoint = 'https://np-cnotice-stock.eastmoney.com/api/content/ann'
+              try:
+                  r = session.get(endpoint, params={
+                      'art_code': code,
+                      'client_source': 'web',
+                      'page_index': '1',
+                  }, timeout=45)
+                  if r.ok:
+                      data = r.json()
+                      for value in walk_strings(data):
+                          v = value.strip()
+                          if '.pdf' not in v.lower():
+                              continue
+                          if v.startswith(('http://', 'https://')):
+                              urls.append(v)
+                          elif v.startswith('//'):
+                              urls.append('https:' + v)
+                          elif v.startswith('/'):
+                              urls.append(urljoin('https://np-cnotice-stock.eastmoney.com/', v))
+              except Exception as exc:
+                  log(f'Detail API failed for {code}: {exc}')
+              return urls
+
+          def candidate_urls(row: dict) -> list[str]:
+              code = art_code(row)
+              urls: list[str] = []
+              for value in walk_strings(row):
+                  v = value.strip()
+                  if '.pdf' in v.lower():
+                      if v.startswith(('http://', 'https://')):
+                          urls.append(v)
+                      elif v.startswith('//'):
+                          urls.append('https:' + v)
+              urls.extend(detail_urls(code))
+              if code:
+                  now = int(time.time() * 1000)
+                  urls.extend([
+                      f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf?{now}.pdf=',
+                      f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{now}.pdf=',
+                  ])
+              return list(dict.fromkeys(urls))
+
+          def download_pdf(row: dict, dst: Path) -> str | None:
+              for url in candidate_urls(row):
+                  try:
+                      with session.get(url, timeout=120, stream=True, allow_redirects=True) as r:
+                          r.raise_for_status()
+                          with dst.open('wb') as f:
+                              for chunk in r.iter_content(1024 * 256):
+                                  if chunk:
+                                      f.write(chunk)
+                      if dst.stat().st_size < 80_000:
+                          raise RuntimeError(f'file too small: {dst.stat().st_size}')
+                      with dst.open('rb') as f:
+                          if f.read(5) != b'%PDF-':
+                              raise RuntimeError('payload is not a PDF')
+                      return url
+                  except Exception as exc:
+                      log(f'Download failed {url}: {exc}')
+                      dst.unlink(missing_ok=True)
+              return None
+
+          def extract_opening_text(path: Path, pages_to_read: int = 10) -> tuple[str, int]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              parts: list[str] = []
+              for idx in range(min(pages_to_read, pages)):
+                  try:
+                      parts.append(reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              text = '\n'.join(parts)
+              if len(re.sub(r'\s+', '', text)) < 100:
+                  try:
+                      doc = pymupdf.open(path)
+                      parts = [doc.load_page(i).get_text('text') for i in range(min(pages_to_read, doc.page_count))]
+                      doc.close()
+                      text = '\n'.join(parts)
+                  except Exception:
+                      pass
+              return text, pages
+
+          def validate_pdf(path: Path, kind: str, expected_year: int | None = None) -> tuple[bool, int, str]:
+              try:
+                  opening, pages = extract_opening_text(path)
+                  min_pages = {'annual': 45, 'prospectus': 60, 'quarterly': 5}[kind]
+                  if pages < min_pages:
+                      return False, pages, f'{kind} report has fewer than {min_pages} pages'
+                  compact = re.sub(r'\s+', '', opening)
+                  if not any(alias in compact for alias in COMPANY_ALIASES):
+                      return False, pages, 'company identity not found in opening pages'
+                  if expected_year is not None and str(expected_year) not in compact[:20000]:
+                      log(f'Warning: expected year {expected_year} not found in opening text for {path.name}')
+                  doc = pymupdf.open(path)
+                  if doc.page_count != pages:
+                      return False, pages, 'page count mismatch'
+                  render_dir = RENDERS / path.stem
+                  render_dir.mkdir(parents=True, exist_ok=True)
+                  for idx in sorted(set([0, pages // 2, pages - 1])):
+                      pix = doc.load_page(idx).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                      out = render_dir / f'page-{idx+1:03d}.png'
+                      pix.save(out)
+                      if out.stat().st_size < 5_000:
+                          return False, pages, f'blank render page {idx+1}'
+                  doc.close()
+                  return True, pages, ''
+              except Exception as exc:
+                  return False, 0, f'{type(exc).__name__}: {exc}'
+
+          announcements = fetch_announcements()
+
+          # Log all relevant metadata for auditability.
+          for row in sorted(announcements, key=row_date):
+              title = normalize_title(row_title(row))
+              if any(k in title for k in ('年度报告', '招股说明书', '季度报告')):
+                  log(f'META | {row_date(row)} | {art_code(row)} | {row_title(row)}')
+
+          # Select one complete annual report per year, using any revised edition as the final version.
+          annual_candidates: dict[int, list[dict]] = {}
+          for row in announcements:
+              year = annual_year(row)
+              if year is not None and annual_score(row, year)[0] > -1000:
+                  annual_candidates.setdefault(year, []).append(row)
+
+          if not annual_candidates:
+              raise SystemExit('No complete annual report candidates found')
+
+          selected_rows: list[tuple[str, int | None, dict]] = []
+          for year in sorted(annual_candidates):
+              candidates = sorted(annual_candidates[year], key=lambda r: annual_score(r, year), reverse=True)
+              chosen = candidates[0]
+              selected_rows.append(('annual', year, chosen))
+              log(f'Selected annual {year}: {row_date(chosen)} | {art_code(chosen)} | {row_title(chosen)}')
+
+          prospectus_candidates = [r for r in announcements if prospectus_score(r)[0] > -1000]
+          if not prospectus_candidates:
+              raise SystemExit('No prospectus candidate found')
+          prospectus_candidates.sort(key=prospectus_score, reverse=True)
+          prospectus = prospectus_candidates[0]
+          selected_rows.append(('prospectus', None, prospectus))
+          log(f'Selected prospectus: {row_date(prospectus)} | {art_code(prospectus)} | {row_title(prospectus)}')
+
+          quarterly_candidates = [r for r in announcements if quarterly_score(r)[0] > -1000]
+          if not quarterly_candidates:
+              raise SystemExit('No quarterly report candidate found')
+          quarterly_candidates.sort(key=lambda r: (row_date(r), quarterly_score(r)[0]), reverse=True)
+          latest_quarterly = quarterly_candidates[0]
+          qtitle = normalize_title(row_title(latest_quarterly))
+          qyear_match = re.search(r'(20\d{2})年', qtitle)
+          qyear = int(qyear_match.group(1)) if qyear_match else None
+          selected_rows.append(('quarterly', qyear, latest_quarterly))
+          log(f'Selected latest quarterly: {row_date(latest_quarterly)} | {art_code(latest_quarterly)} | {row_title(latest_quarterly)}')
+
+          manifest: list[dict] = []
+          readme = [
+              '# 力佳科技／力佳电源（835237／920237）历年年度报告、招股说明书及最新季度报告',
+              '',
+              f'整理时间：{datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}',
+              '',
+              '本包按公开公告索引自动收录所有可核验的完整年度报告，每个年度保留最终或修订版本；另收录北交所上市招股说明书和截至整理日最新完整季度报告。',
+              '全部PDF均从公开公告附件直接下载，未使用网页摘要、预览截图或重排版文件替代。',
+              '每份PDF均检查文件头、页面树、公司标识，并渲染抽查首页、中间页及末页；ZIP已通过CRC完整性测试。',
+              '',
+          ]
+
+          annual_index = 1
+          for kind, year, row in selected_rows:
+              code = art_code(row)
+              title = row_title(row)
+              date = row_date(row)
+              temp = RAW / f'{code}.pdf'
+              url = download_pdf(row, temp)
+              if not url:
+                  raise SystemExit(f'Unable to download {title}')
+              ok, pages, reason = validate_pdf(temp, kind, year)
+              if not ok:
+                  raise SystemExit(f'Validation failed for {title}: {reason}')
+
+              if kind == 'annual':
+                  filename = f'{annual_index:02d}_{year}年年度报告.pdf'
+                  type_cn = '年度报告'
+                  annual_index += 1
+              elif kind == 'prospectus':
+                  filename = f'{annual_index:02d}_招股说明书.pdf'
+                  type_cn = '招股说明书'
+                  annual_index += 1
+              else:
+                  clean_title = normalize_title(title)
+                  m = re.search(r'(20\d{2}年(?:第一|第三)季度报告)', clean_title)
+                  period = m.group(1) if m else safe_name(title, 50)
+                  filename = f'{annual_index:02d}_{period}.pdf'
+                  type_cn = '最新季度报告'
+                  annual_index += 1
+
+              dst = SELECTED / filename
+              dst.write_bytes(temp.read_bytes())
+              item = {
+                  'type': type_cn,
+                  'report_year': year,
+                  'title': title,
+                  'announcement_date': date,
+                  'art_code': code,
+                  'pages': pages,
+                  'size_bytes': dst.stat().st_size,
+                  'package_filename': filename,
+                  'source_pdf_url': url,
+                  'sha256': sha256(dst),
+              }
+              manifest.append(item)
+              readme += [
+                  f'## {len(manifest)}. {title}',
+                  f'- 类型：{type_cn}',
+                  f'- 公告日期：{date}',
+                  f'- 页数：{pages}',
+                  f'- 文件：`{filename}`',
+                  f'- 原始公开PDF：{url}',
+                  f'- SHA-256：`{item["sha256"]}`',
+                  '',
+              ]
+
+          (SELECTED / 'README_文件清单与来源.md').write_text('\n'.join(readme), encoding='utf-8')
+          (SELECTED / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (SELECTED / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{x['sha256']}  {x['package_filename']}" for x in manifest) + '\n', encoding='utf-8')
+          (OUT / 'run.log').write_text('\n'.join(logs), encoding='utf-8')
+
+          first_year = min(x['report_year'] for x in manifest if x['type'] == '年度报告')
+          last_year = max(x['report_year'] for x in manifest if x['type'] == '年度报告')
+          zip_cn = OUT / f'力佳科技_835237_所有年报_{first_year}-{last_year}_招股说明书及最新季报_截至20261004.zip'
+          zip_en = OUT / f'Lijia_Technology_835237_All_Annual_Reports_{first_year}_{last_year}_Prospectus_and_Latest_Quarterly_20261004.zip'
+          for zp in (zip_cn, zip_en):
+              with zipfile.ZipFile(zp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for p in sorted(SELECTED.iterdir()):
+                      zf.write(p, arcname=p.name)
+              with zipfile.ZipFile(zp) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+              log(f'Created {zp.name}: {zp.stat().st_size} bytes; SHA256={sha256(zp)}')
+
+          summary = {
+              'company': COMPANY,
+              'stock_codes': list(STOCK_CODES),
+              'count': len(manifest),
+              'annual_years': [x['report_year'] for x in manifest if x['type'] == '年度报告'],
+              'prospectus_title': prospectus and row_title(prospectus),
+              'latest_quarter_title': row_title(latest_quarterly),
+              'latest_quarter_announcement_date': row_date(latest_quarterly),
+              'reports': manifest,
+              'zip_cn': str(zip_cn),
+              'zip_cn_sha256': sha256(zip_cn),
+              'zip_en': str(zip_en),
+              'zip_en_sha256': sha256(zip_en),
+          }
+          (OUT / 'package_summary.json').write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_lijia_reports.py
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lijia-835237-Annual-Reports-Package
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/run.log
+            output/announcement_index.json
+          if-no-files-found: error
+          retention-days: 3
