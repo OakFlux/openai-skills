@@ -1,0 +1,399 @@
+name: Package AllTest Biotech annual reports prospectus and latest quarter
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/alltest-biotech-filings-20261004.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CODE = '688606'
+          COMPANY = '奥泰生物'
+          FULL_NAME = '杭州奥泰生物技术股份有限公司'
+          AS_OF = dt.date(2026, 10, 4)
+          OUT = Path('artifact_out')
+          WORK = Path('alltest_filings_work')
+          PACKAGE = WORK / '奥泰生物_688606.SH_全部年报_招股说明书_最新季报'
+          VERIFY = WORK / 'verify'
+          for path in (OUT, PACKAGE, VERIFY):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(
+              total=6, connect=6, read=6, status=6,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'], raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def clean_title(value: str) -> str:
+              text = html.unescape(value or '')
+              text = re.sub(r'<[^>]+>', '', text)
+              return re.sub(r'\s+', '', text).strip()
+
+          announcements: list[dict] = []
+          for page in range(1, 61):
+              params = {
+                  'sr': '-1', 'page_size': '100', 'page_index': str(page),
+                  'ann_type': 'A', 'client_source': 'web', 'stock_list': CODE,
+              }
+              response = session.get(
+                  'https://np-anotice-stock.eastmoney.com/api/security/ann',
+                  params=params, timeout=(25, 120),
+              )
+              response.raise_for_status()
+              rows = (response.json().get('data') or {}).get('list') or []
+              print('ANNOUNCEMENT_PAGE', page, 'ROWS', len(rows), flush=True)
+              if not rows:
+                  break
+              for row in rows:
+                  item = dict(row)
+                  item['_title'] = clean_title(row.get('title') or row.get('title_ch') or '')
+                  item['_date'] = str(row.get('notice_date') or row.get('display_time') or '')[:10]
+                  announcements.append(item)
+              page_dates = [str(row.get('notice_date') or row.get('display_time') or '')[:10] for row in rows]
+              if page_dates and min(page_dates) < '2018-01-01':
+                  break
+              time.sleep(0.2)
+
+          if not announcements:
+              raise RuntimeError('No announcements returned for AllTest Biotech')
+
+          dedup = {}
+          for item in announcements:
+              key = str(item.get('art_code') or item.get('artCode') or item.get('announcementId') or (item['_title'], item['_date']))
+              dedup[key] = item
+          announcements = list(dedup.values())
+          (WORK / 'announcement_index.json').write_text(json.dumps(announcements, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          excluded_common = (
+              '摘要', '英文版', '审计报告', '审核报告', '鉴证报告', '问询函', '回复',
+              '取消', '提示性公告', '董事会决议', '监事会决议', '更正公告',
+              '补充公告', '说明公告', '内部控制', '社会责任报告', '独立董事述职',
+          )
+
+          def score_version(title: str, phrase: str) -> int:
+              score = 0
+              exacts = {
+                  phrase, f'{COMPANY}:{phrase}', f'{COMPANY}：{phrase}',
+                  f'{FULL_NAME}:{phrase}', f'{FULL_NAME}：{phrase}', f'{CODE}:{phrase}',
+              }
+              if title in exacts:
+                  score += 1000
+              if title.endswith(phrase):
+                  score += 250
+              if any(key in title for key in ('修订版', '更正后', '更新后')):
+                  score += 120
+              if '正文' in title:
+                  score -= 20
+              return score
+
+          def choose_annual(year: int) -> dict:
+              phrase = f'{year}年年度报告'
+              candidates = []
+              for item in announcements:
+                  title = item['_title']
+                  if phrase not in title or any(word in title for word in excluded_common):
+                      continue
+                  candidates.append((score_version(title, phrase), item['_date'], item))
+              if not candidates:
+                  nearby = [x['_title'] for x in announcements if str(year) in x['_title'] and '年度报告' in x['_title']][:40]
+                  raise RuntimeError(f'Missing annual report {year}: {nearby}')
+              candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
+              return candidates[0][2]
+
+          def choose_prospectus() -> dict:
+              excluded = excluded_common + (
+                  '招股说明书摘要', '申报稿', '意向书', '预披露', '反馈意见',
+                  '审核意见', '问询回复', '注册稿', '上会稿', '附录',
+              )
+              candidates = []
+              for item in announcements:
+                  title = item['_title']
+                  if '招股说明书' not in title or any(word in title for word in excluded):
+                      continue
+                  score = 0
+                  if '首次公开发行股票' in title:
+                      score += 500
+                  if '科创板上市' in title:
+                      score += 300
+                  if title.endswith('招股说明书'):
+                      score += 250
+                  if '2021-03-01' <= item['_date'] <= '2021-03-25':
+                      score += 250
+                  candidates.append((score, item['_date'], item))
+              if not candidates:
+                  nearby = [x['_title'] for x in announcements if '招股' in x['_title']][:60]
+                  raise RuntimeError(f'Missing final prospectus: {nearby}')
+              candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
+              return candidates[0][2]
+
+          def quarter_period(title: str):
+              match = re.search(r'(20\d{2})年(第一|一|第三|三)季度报告', title)
+              if not match:
+                  return None
+              year = int(match.group(1))
+              quarter = 1 if match.group(2) in ('第一', '一') else 3
+              return year, quarter
+
+          def choose_latest_quarter() -> tuple[dict, int, int]:
+              candidates = []
+              for item in announcements:
+                  title = item['_title']
+                  period = quarter_period(title)
+                  if not period or any(word in title for word in excluded_common):
+                      continue
+                  year, quarter = period
+                  variants = [f'{year}年第一季度报告', f'{year}年一季度报告'] if quarter == 1 else [f'{year}年第三季度报告', f'{year}年三季度报告']
+                  vscore = max(score_version(title, phrase) for phrase in variants)
+                  candidates.append((year, quarter, vscore, item['_date'], item))
+              if not candidates:
+                  nearby = [x['_title'] for x in announcements if '季度报告' in x['_title'] or '一季度报告' in x['_title'] or '三季度报告' in x['_title']][:60]
+                  raise RuntimeError(f'Missing quarterly report: {nearby}')
+              candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3]), reverse=True)
+              year, quarter, _, _, item = candidates[0]
+              return item, year, quarter
+
+          selected = [
+              {
+                  'kind': 'prospectus', 'label': '首次公开发行股票并在科创板上市招股说明书',
+                  'item': choose_prospectus(), 'min_pages': 250,
+              }
+          ]
+          for year in range(2020, 2026):
+              selected.append({
+                  'kind': 'annual', 'year': year, 'label': f'{year}年年度报告',
+                  'item': choose_annual(year), 'min_pages': 80,
+              })
+          quarter_item, quarter_year, quarter_no = choose_latest_quarter()
+          quarter_cn = '第一季度' if quarter_no == 1 else '第三季度'
+          selected.append({
+              'kind': 'quarter', 'year': quarter_year, 'quarter': quarter_no,
+              'label': f'{quarter_year}年{quarter_cn}报告',
+              'item': quarter_item, 'min_pages': 6,
+          })
+
+          print('SELECTED', json.dumps([
+              {'label': entry['label'], 'title': entry['item']['_title'], 'date': entry['item']['_date']}
+              for entry in selected
+          ], ensure_ascii=False, indent=2), flush=True)
+
+          def candidate_urls(item: dict) -> list[str]:
+              urls = []
+              for key in ('attach_url', 'adjunct_url', 'pdf_url', 'url'):
+                  value = item.get(key)
+                  if isinstance(value, str) and value:
+                      if value.startswith('http'):
+                          urls.append(value)
+                      elif value.lower().endswith('.pdf'):
+                          urls.append(urljoin('https://pdf.dfcfw.com/', value.lstrip('/')))
+              code = item.get('art_code') or item.get('artCode') or item.get('announcementId')
+              if code:
+                  urls.extend([
+                      f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{code}_01.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{code}_01.pdf',
+                  ])
+              return list(dict.fromkeys(urls))
+
+          def download_validate(entry: dict, dest: Path, index: int) -> tuple[str, int, int, str]:
+              item = entry['item']
+              last_error = None
+              for url in candidate_urls(item):
+                  try:
+                      print('TRY_DOWNLOAD', item['_title'], url, flush=True)
+                      response = session.get(
+                          url,
+                          headers={'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},
+                          timeout=(30, 300),
+                      )
+                      response.raise_for_status()
+                      blob = response.content
+                      if not blob.startswith(b'%PDF'):
+                          raise RuntimeError(f'not PDF; head={blob[:40]!r}')
+                      if len(blob) < 100_000:
+                          raise RuntimeError(f'file too small: {len(blob)} bytes')
+                      dest.write_bytes(blob)
+
+                      check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+                      if check.returncode not in (0, 3):
+                          raise RuntimeError('qpdf failed: ' + check.stderr[-800:])
+
+                      reader = PdfReader(str(dest), strict=False)
+                      pages = len(reader.pages)
+                      if pages < entry['min_pages']:
+                          raise RuntimeError(f'page count {pages} below {entry["min_pages"]}')
+
+                      text_path = VERIFY / f'{index:02d}.txt'
+                      subprocess.run(
+                          ['pdftotext', '-f', '1', '-l', str(min(20, pages)), str(dest), str(text_path)],
+                          capture_output=True, text=True, check=False,
+                      )
+                      text = text_path.read_text(encoding='utf-8', errors='ignore') if text_path.exists() else ''
+                      compact = re.sub(r'\s+', '', text)
+                      identity_ok = COMPANY in compact or FULL_NAME in compact or CODE in compact
+                      if entry['kind'] == 'annual':
+                          period_ok = str(entry['year']) in compact and '年度报告' in compact
+                      elif entry['kind'] == 'quarter':
+                          period_ok = str(entry['year']) in compact and ('季度报告' in compact or '一季度报告' in compact or '三季度报告' in compact)
+                      else:
+                          period_ok = '招股说明书' in compact and ('首次公开发行' in compact or '科创板' in compact)
+                      if not identity_ok or not period_ok:
+                          raise RuntimeError(f'text identity/period check failed: identity={identity_ok}, period={period_ok}')
+
+                      first_prefix = VERIFY / f'{index:02d}_first'
+                      last_prefix = VERIFY / f'{index:02d}_last'
+                      first = subprocess.run(
+                          ['pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '80', str(dest), str(first_prefix)],
+                          capture_output=True, text=True,
+                      )
+                      last = subprocess.run(
+                          ['pdftoppm', '-f', str(pages), '-l', str(pages), '-singlefile', '-png', '-r', '80', str(dest), str(last_prefix)],
+                          capture_output=True, text=True,
+                      )
+                      first_png = Path(str(first_prefix) + '.png')
+                      last_png = Path(str(last_prefix) + '.png')
+                      if first.returncode != 0 or last.returncode != 0 or not first_png.exists() or not last_png.exists() or first_png.stat().st_size < 5000 or last_png.stat().st_size < 5000:
+                          raise RuntimeError('first/last page rendering failed')
+
+                      digest = hashlib.sha256(blob).hexdigest()
+                      return url, pages, len(blob), digest
+                  except Exception as exc:
+                      last_error = exc
+                      if dest.exists():
+                          dest.unlink()
+                      print('DOWNLOAD_FAILED', url, repr(exc), flush=True)
+              raise RuntimeError(f'Unable to download {item["_title"]}: {last_error}')
+
+          manifest = []
+          sha_lines = []
+          for index, entry in enumerate(selected, start=1):
+              if entry['kind'] == 'prospectus':
+                  filename = f'{index:02d}_奥泰生物_首次公开发行股票并在科创板上市招股说明书.pdf'
+              elif entry['kind'] == 'annual':
+                  filename = f'{index:02d}_奥泰生物_{entry["year"]}年年度报告.pdf'
+              else:
+                  filename = f'{index:02d}_奥泰生物_{entry["year"]}年{quarter_cn}报告.pdf'
+              dest = PACKAGE / filename
+              source_url, pages, size, digest = download_validate(entry, dest, index)
+              item = entry['item']
+              record = {
+                  'file_name': filename,
+                  'document_type': entry['kind'],
+                  'label': entry['label'],
+                  'announcement_title': item['_title'],
+                  'announcement_date': item['_date'],
+                  'announcement_code': item.get('art_code') or item.get('artCode') or item.get('announcementId'),
+                  'source_pdf_url': source_url,
+                  'pages': pages,
+                  'bytes': size,
+                  'sha256': digest,
+              }
+              manifest.append(record)
+              sha_lines.append(f'{digest}  {filename}')
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(manifest) != 8:
+              raise RuntimeError(f'Expected 8 PDFs, obtained {len(manifest)}')
+
+          readme = [
+              '# 奥泰生物（688606.SH）全部年报、招股说明书及最新季报',
+              '',
+              f'打包日期：{AS_OF.isoformat()}',
+              '',
+              '本资料包包含正式版首次公开发行股票并在科创板上市招股说明书、2020—2025年六份完整年度报告，以及截至打包日公告目录中报告期最新的季度报告一份。',
+              '奥泰生物于2021年上市，因此2020年年度报告是上市后首次披露的年度报告。',
+              '已排除年报摘要、英文版、单独审计附件、招股说明书申报稿/注册稿/意向书/摘要、半年报及公告说明文件。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for record in manifest:
+              readme.append(f'- {record["file_name"]}（{record["pages"]}页；公告日期 {record["announcement_date"]}）')
+          readme += [
+              '',
+              '## 来源与校验',
+              '',
+              '文件来自东方财富公告镜像，对应上市公司公开披露原件。每份PDF均完成文件头、文件大小、公司及报告期文本、实际页数、qpdf结构检查和首末页渲染验证。',
+              '原始公告标题、公告日期、PDF地址、页数、文件大小和SHA-256见 manifest.json；校验值另见 SHA256SUMS.txt。',
+              '',
+              '材料仅供研究与存档，不构成投资建议。',
+          ]
+          (PACKAGE / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (PACKAGE / 'manifest.json').write_text(json.dumps({
+              'company': COMPANY, 'full_name': FULL_NAME, 'ticker': '688606.SH',
+              'package_date': AS_OF.isoformat(), 'reports': manifest,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          (PACKAGE / 'SHA256SUMS.txt').write_text('\n'.join(sha_lines) + '\n', encoding='utf-8')
+
+          chinese_zip = OUT / '奥泰生物_688606.SH_全部年报_招股说明书_最新季报.zip'
+          with zipfile.ZipFile(chinese_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(PACKAGE.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{PACKAGE.name}/{path.relative_to(PACKAGE)}')
+          with zipfile.ZipFile(chinese_zip, 'r') as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs, expected 8')
+
+          english_zip = OUT / 'AllTest_Biotech_688606_All_Annual_Reports_Prospectus_Latest_Quarter.zip'
+          shutil.copy2(chinese_zip, english_zip)
+          print('FINAL_ZIP', chinese_zip, chinese_zip.stat().st_size, hashlib.sha256(chinese_zip.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: alltest-biotech-filings-artifact
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
