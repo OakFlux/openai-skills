@@ -1,0 +1,301 @@
+name: Build ST Guangtang 000911 annual reports package 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/st-guangtang-000911-annual-reports-2020-2025-latest-20261004.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Discover, download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = 'ST广糖_000911_2020-2025年报及2026最新季报与半年报'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          ANNUAL_LIST = 'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/000911/page_type/ndbg.phtml'
+          Q1_LIST = 'https://money.finance.sina.com.cn/corp/view/vCB_BulletinYi.php?page_type=yjdbg&stockid=000911&type=list'
+          H1_LIST = 'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_BulletinZhong/stockid/000911/page_type/zqbg.phtml'
+
+          def get(url: str, *, stream: bool = False):
+              errors = []
+              for attempt in range(1, 5):
+                  try:
+                      response = session.get(url, timeout=(30, 600), allow_redirects=True, stream=stream)
+                      response.raise_for_status()
+                      return response
+                  except Exception as exc:
+                      errors.append(f'attempt {attempt}: {exc!r}')
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'GET failed: {url}: {errors}')
+
+          def soup_from(url: str) -> BeautifulSoup:
+              response = get(url)
+              raw = response.content
+              for encoding in ('gb18030', 'utf-8'):
+                  try:
+                      text = raw.decode(encoding)
+                      break
+                  except UnicodeDecodeError:
+                      continue
+              else:
+                  text = raw.decode('utf-8', errors='replace')
+              return BeautifulSoup(text, 'lxml')
+
+          def find_annual_links() -> dict[int, tuple[str, str]]:
+              soup = soup_from(ANNUAL_LIST)
+              found: dict[int, tuple[str, str]] = {}
+              for anchor in soup.find_all('a', href=True):
+                  label = re.sub(r'\s+', '', anchor.get_text(' ', strip=True))
+                  match = re.search(r'(202[0-5])年年度报告', label)
+                  if not match or '摘要' in label:
+                      continue
+                  year = int(match.group(1))
+                  found[year] = (label, urljoin(ANNUAL_LIST, anchor['href']))
+              missing = sorted(set(range(2020, 2026)) - set(found))
+              if missing:
+                  raise RuntimeError(f'annual report links missing for years: {missing}; found={found}')
+              return found
+
+          def find_latest_link(list_url: str, year: int, phrases: tuple[str, ...]) -> tuple[str, str]:
+              soup = soup_from(list_url)
+              candidates = []
+              for anchor in soup.find_all('a', href=True):
+                  label = re.sub(r'\s+', '', anchor.get_text(' ', strip=True))
+                  if str(year) not in label or '摘要' in label:
+                      continue
+                  if any(phrase in label for phrase in phrases):
+                      candidates.append((label, urljoin(list_url, anchor['href'])))
+              if not candidates:
+                  raise RuntimeError(f'no matching report at {list_url}; year={year}; phrases={phrases}')
+              return candidates[0]
+
+          def extract_pdf_url(detail_url: str) -> str:
+              soup = soup_from(detail_url)
+              for anchor in soup.find_all('a', href=True):
+                  label = re.sub(r'\s+', '', anchor.get_text(' ', strip=True))
+                  href = anchor['href']
+                  if '下载公告' in label or ('file.finance.sina.com.cn' in href and href.lower().endswith('.pdf')):
+                      return urljoin(detail_url, href)
+              for anchor in soup.find_all('a', href=True):
+                  href = anchor['href']
+                  if 'file.finance.sina.com.cn' in href and '.pdf' in href.lower():
+                      return urljoin(detail_url, href)
+              raise RuntimeError(f'PDF link not found on detail page: {detail_url}')
+
+          annual_links = find_annual_links()
+          q1_label, q1_detail = find_latest_link(Q1_LIST, 2026, ('一季度报告', '第一季度报告'))
+          h1_label, h1_detail = find_latest_link(H1_LIST, 2026, ('半年度报告', '中期报告'))
+
+          tasks = []
+          for index, year in enumerate(range(2020, 2026), start=1):
+              label, detail_url = annual_links[year]
+              company_name = '南宁糖业' if year <= 2022 else '广农糖业'
+              tasks.append({
+                  'order': index,
+                  'type': '年度报告',
+                  'period': f'{year}年度',
+                  'title': label,
+                  'detail_url': detail_url,
+                  'filename': f'{index:02d}_{company_name}_000911_{year}年年度报告.pdf',
+                  'min_pages': 100,
+                  'min_bytes': 1_000_000,
+              })
+
+          tasks.extend([
+              {
+                  'order': 7,
+                  'type': '季度报告',
+                  'period': '2026年第一季度',
+                  'title': q1_label,
+                  'detail_url': q1_detail,
+                  'filename': '07_广农糖业_000911_2026年第一季度报告.pdf',
+                  'min_pages': 5,
+                  'min_bytes': 100_000,
+              },
+              {
+                  'order': 8,
+                  'type': '半年度报告',
+                  'period': '2026年半年度',
+                  'title': h1_label,
+                  'detail_url': h1_detail,
+                  'filename': '08_ST广糖_000911_2026年半年度报告.pdf',
+                  'min_pages': 80,
+                  'min_bytes': 1_000_000,
+              },
+          ])
+
+          def download_pdf(pdf_url: str, destination: Path, min_bytes: int) -> str:
+              errors = []
+              variants = [pdf_url]
+              if '%3A' in pdf_url:
+                  variants.append(pdf_url.replace('%3A', ':'))
+              variants = list(dict.fromkeys(variants))
+              for url in variants:
+                  for attempt in range(1, 5):
+                      temp = destination.with_suffix(destination.suffix + '.part')
+                      temp.unlink(missing_ok=True)
+                      try:
+                          with session.get(
+                              url,
+                              headers={'Referer': 'https://vip.stock.finance.sina.com.cn/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                              timeout=(30, 600),
+                              allow_redirects=True,
+                              stream=True,
+                          ) as response:
+                              print('DOWNLOAD', destination.name, 'attempt', attempt, 'status', response.status_code, url, 'final', response.url, flush=True)
+                              response.raise_for_status()
+                              with temp.open('wb') as fh:
+                                  for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          size = temp.stat().st_size
+                          with temp.open('rb') as fh:
+                              header = fh.read(8)
+                          if size < min_bytes or not header.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF response: size={size}, header={header!r}')
+                          temp.replace(destination)
+                          return str(response.url)
+                      except Exception as exc:
+                          errors.append(f'{url} attempt {attempt}: {exc!r}')
+                          temp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {destination.name}: {errors}')
+
+          records = []
+          hashes = set()
+          for task in tasks:
+              pdf_url = extract_pdf_url(task['detail_url'])
+              destination = OUT / task['filename']
+              final_url = download_pdf(pdf_url, destination, task['min_bytes'])
+
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages < task['min_pages']:
+                  raise RuntimeError(f'page count too small for {destination.name}: {pages}')
+
+              check = subprocess.run(['qpdf', '--warning-exit-0', '--check', str(destination)], capture_output=True, text=True)
+              if check.returncode != 0:
+                  raise RuntimeError(f'qpdf validation failed for {destination.name}: {check.stderr[-2000:]}')
+
+              render_root = OUT / (destination.stem + '_render_check')
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '96', str(destination), str(render_root)],
+                  capture_output=True,
+                  text=True,
+              )
+              render_file = Path(str(render_root) + '.png')
+              if render.returncode != 0 or not render_file.exists() or render_file.stat().st_size < 8_000:
+                  raise RuntimeError(f'first-page render failed for {destination.name}: {render.stderr[-1000:]}')
+              render_size = render_file.stat().st_size
+              render_file.unlink(missing_ok=True)
+
+              data = destination.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'duplicate PDF detected: {destination.name}')
+              hashes.add(digest)
+
+              record = {
+                  'filename': destination.name,
+                  'type': task['type'],
+                  'period': task['period'],
+                  'title': task['title'],
+                  'detail_url': task['detail_url'],
+                  'source_pdf_url': final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_size,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              'ST广糖（000911.SZ；公司全称：广西农投糖业集团股份有限公司）2020-2025年年度报告及2026年最新定期报告',
+              '整理日期：2026-10-04',
+              '',
+              '收录内容：2020-2025年完整年度报告、2026年第一季度报告，以及截至整理日更近期的2026年半年度报告。',
+              '名称说明：2020-2022年报告披露时公司证券简称为“南宁糖业”；2023-2025年报告使用“广农糖业”；2026年半年度报告披露时证券简称为“*ST广糖”。',
+              '来源：新浪财经公司公告文件服务器，公告原始披露来源为巨潮资讯网/深圳证券交易所。',
+              '全部PDF均完成文件头、文件大小、页数、qpdf结构、首页渲染、SHA-256及ZIP CRC检查。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. {record['title']}",
+                  f"   文件：{record['filename']}",
+                  f"   类型：{record['type']}；报告期：{record['period']}；页数：{record['pages']}；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   公告页：{record['detail_url']}",
+                  f"   PDF来源：{record['source_pdf_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+
+          (OUT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'expected 8 PDFs, found {len(pdfs)}')
+
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(records), 'SHA256', hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload completed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: st-guangtang-000911-annual-reports-package-20261004
+          path: ST广糖_000911_2020-2025年报及2026最新季报与半年报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
