@@ -1,0 +1,487 @@
+name: Package PharmaBlock Financial Reports
+
+on:
+  push:
+    branches:
+      - tmp-pharmablock-300725-financial-reports-20261005
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf pymupdf
+
+      - name: Download, verify, and package official reports
+        shell: bash
+        run: |
+          cat > /tmp/build_pharmablock_financials.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+
+          STOCK = "300725"
+          COMPANY = "药石科技"
+          FULL_COMPANY = "南京药石科技股份有限公司"
+          ALIASES = (COMPANY, FULL_COMPANY, STOCK)
+          YEARS = list(range(2020, 2026))
+
+          OUT = Path("output")
+          RAW = OUT / "raw"
+          FINAL = OUT / "final"
+          RENDERS = OUT / "renders"
+          for p in (OUT, RAW, FINAL, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          logs: list[str] = []
+          def log(message: str) -> None:
+              print(message, flush=True)
+              logs.append(message)
+
+          def clean_title(value: Any) -> str:
+              text = html.unescape(str(value or ""))
+              text = re.sub(r"<[^>]+>", "", text)
+              return re.sub(r"\s+", " ", text).strip()
+
+          def safe_name(value: str, limit: int = 120) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", value)
+              value = re.sub(r"\s+", "_", value).strip(" ._")
+              return (value or "report")[:limit]
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def fetch_szse_announcements() -> list[dict[str, Any]]:
+              endpoint = "https://www.szse.cn/api/disc/announcement/annList"
+              headers = {
+                  "Content-Type": "application/json",
+                  "Referer": "https://www.szse.cn/disclosure/listed/notice/index.html",
+                  "Origin": "https://www.szse.cn",
+                  "Accept": "application/json, text/plain, */*",
+              }
+              all_rows: list[dict[str, Any]] = []
+              for page in range(1, 31):
+                  body = {
+                      "channelCode": ["listedNotice_disc"],
+                      "pageSize": 100,
+                      "pageNum": page,
+                      "stock": [STOCK],
+                  }
+                  data = None
+                  last_error: Exception | None = None
+                  for attempt in range(5):
+                      try:
+                          r = session.post(endpoint, json=body, headers=headers, timeout=60)
+                          r.raise_for_status()
+                          data = r.json()
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          time.sleep(1.5 * (attempt + 1))
+                  if not isinstance(data, dict):
+                      raise RuntimeError(f"SZSE announcement API failed on page {page}: {last_error}")
+                  rows = data.get("data") or []
+                  if not rows:
+                      break
+                  all_rows.extend(rows)
+                  log(f"SZSE page {page}: {len(rows)} announcements")
+                  if len(rows) < 100:
+                      break
+              (OUT / "szse_announcements.json").write_text(
+                  json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              return all_rows
+
+          def fetch_eastmoney_announcements() -> list[dict[str, Any]]:
+              endpoint = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+              all_rows: list[dict[str, Any]] = []
+              for page in range(1, 31):
+                  params = {
+                      "sr": -1,
+                      "page_size": 100,
+                      "page_index": page,
+                      "ann_type": "A",
+                      "client_source": "web",
+                      "stock_list": STOCK,
+                      "f_node": 0,
+                      "s_node": 0,
+                  }
+                  r = session.get(
+                      endpoint,
+                      params=params,
+                      timeout=60,
+                      headers={"Referer": "https://data.eastmoney.com/"},
+                  )
+                  r.raise_for_status()
+                  payload = r.json() or {}
+                  rows = ((payload.get("data") or {}).get("list") or [])
+                  if not rows:
+                      break
+                  all_rows.extend(rows)
+                  log(f"Eastmoney page {page}: {len(rows)} announcements")
+                  if len(rows) < 100:
+                      break
+              (OUT / "eastmoney_announcements.json").write_text(
+                  json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              return all_rows
+
+          def normalize_szse(row: dict[str, Any]) -> dict[str, Any] | None:
+              title = clean_title(row.get("title"))
+              attach = str(row.get("attachPath") or "")
+              date = str(row.get("publishTime") or "")[:10]
+              if not title or not attach:
+                  return None
+              return {
+                  "title": title,
+                  "date": date,
+                  "url": "https://disc.static.szse.cn/download" + attach,
+                  "key": attach,
+                  "source": "深圳证券交易所",
+              }
+
+          def normalize_eastmoney(row: dict[str, Any]) -> dict[str, Any] | None:
+              title = clean_title(row.get("title"))
+              art_code = str(row.get("art_code") or "")
+              date = str(row.get("notice_date") or "")[:10]
+              if not title or not art_code:
+                  return None
+              return {
+                  "title": title,
+                  "date": date,
+                  "url": f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf",
+                  "key": art_code,
+                  "source": "东方财富公告镜像",
+              }
+
+          BAD_TITLE_WORDS = (
+              "摘要", "英文", "关于", "提示性公告", "审计报告", "问询函", "回复",
+              "取消", "独立董事", "董事会", "监事会", "更正公告", "补充公告",
+              "财务报表更正", "年度报告说明会", "业绩说明会", "社会责任报告",
+              "环境、社会及治理", "ESG", "可持续发展报告",
+          )
+
+          def annual_year(title: str) -> int | None:
+              compact = re.sub(r"\s+", "", title)
+              match = re.search(r"(202[0-5])年年度报告", compact)
+              if not match:
+                  return None
+              year = int(match.group(1))
+              if year not in YEARS:
+                  return None
+              if any(word in compact for word in BAD_TITLE_WORDS):
+                  return None
+              return year
+
+          def annual_score(item: dict[str, Any]) -> tuple[int, str]:
+              title = item["title"]
+              score = 0
+              if any(word in title for word in ("更正后", "更正版", "修订版", "补充版", "更新后")):
+                  score += 1000
+              if "全文" in title:
+                  score += 120
+              if title.endswith("年度报告"):
+                  score += 40
+              if item["source"] == "深圳证券交易所":
+                  score += 30
+              return score, item.get("date") or ""
+
+          def quarterly_year_and_rank(title: str) -> tuple[int, int] | None:
+              compact = re.sub(r"\s+", "", title)
+              if any(word in compact for word in BAD_TITLE_WORDS):
+                  return None
+              m = re.search(r"(20\d{2})年(第一季度|第三季度|一季度|三季度)报告", compact)
+              if not m:
+                  return None
+              year = int(m.group(1))
+              period = m.group(2)
+              rank = 3 if period in ("第三季度", "三季度") else 1
+              return year, rank
+
+          def quarterly_score(item: dict[str, Any]) -> tuple[str, int, int]:
+              title = item["title"]
+              parsed = quarterly_year_and_rank(title) or (0, 0)
+              version = 0
+              if any(word in title for word in ("更正后", "更正版", "修订版", "补充版", "更新后")):
+                  version += 100
+              if item["source"] == "深圳证券交易所":
+                  version += 10
+              return item.get("date") or "", parsed[0] * 10 + parsed[1], version
+
+          def select_reports(items: list[dict[str, Any]]) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+              annuals: dict[int, dict[str, Any]] = {}
+              for item in items:
+                  year = annual_year(item["title"])
+                  if year is None:
+                      continue
+                  current = annuals.get(year)
+                  if current is None or annual_score(item) > annual_score(current):
+                      annuals[year] = item
+
+              quarters = [item for item in items if quarterly_year_and_rank(item["title"]) is not None]
+              quarters.sort(key=quarterly_score, reverse=True)
+              if not quarters:
+                  raise RuntimeError("No quarterly report found")
+
+              missing = [year for year in YEARS if year not in annuals]
+              if missing:
+                  raise RuntimeError(f"Missing annual reports for years: {missing}")
+              return annuals, quarters[0]
+
+          def download(url: str, destination: Path) -> None:
+              headers = {
+                  "Referer": "https://www.szse.cn/" if "szse.cn" in url else "https://data.eastmoney.com/",
+                  "Accept": "application/pdf,*/*",
+              }
+              last_error: Exception | None = None
+              for attempt in range(6):
+                  try:
+                      with session.get(url, headers=headers, timeout=150, stream=True, allow_redirects=True) as r:
+                          r.raise_for_status()
+                          with destination.open("wb") as f:
+                              for chunk in r.iter_content(1024 * 512):
+                                  if chunk:
+                                      f.write(chunk)
+                      if destination.stat().st_size < 50_000:
+                          raise RuntimeError(f"file too small: {destination.stat().st_size}")
+                      with destination.open("rb") as f:
+                          if f.read(5) != b"%PDF-":
+                              raise RuntimeError("not a PDF payload")
+                      return
+                  except Exception as exc:
+                      last_error = exc
+                      destination.unlink(missing_ok=True)
+                      time.sleep(2 * (attempt + 1))
+              raise RuntimeError(f"Download failed after retries: {url}: {last_error}")
+
+          def verify_pdf(
+              path: Path,
+              expected_year: int,
+              quarterly: bool,
+              expected_title: str,
+          ) -> dict[str, Any]:
+              reader = PdfReader(str(path), strict=False)
+              pages_pypdf = len(reader.pages)
+              if pages_pypdf < (5 if quarterly else 30):
+                  raise RuntimeError(f"Unexpectedly short PDF: {pages_pypdf} pages")
+
+              doc = fitz.open(path)
+              pages_fitz = doc.page_count
+              if pages_fitz != pages_pypdf:
+                  raise RuntimeError(f"Page count mismatch: pypdf={pages_pypdf}, fitz={pages_fitz}")
+
+              text_parts: list[str] = []
+              for idx in range(min(12, pages_fitz)):
+                  try:
+                      text_parts.append(doc.load_page(idx).get_text("text"))
+                  except Exception:
+                      pass
+              opening = re.sub(r"\s+", "", "\n".join(text_parts))
+              if not any(alias in opening for alias in ALIASES):
+                  raise RuntimeError("Company identity not found in opening pages")
+              if str(expected_year) not in opening:
+                  raise RuntimeError(f"Expected report year {expected_year} not found in opening pages")
+              if quarterly:
+                  if not any(marker in opening for marker in ("季度报告", "一季度报告", "三季度报告")):
+                      raise RuntimeError("Quarterly-report marker not found in opening pages")
+              else:
+                  if "年度报告" not in opening:
+                      raise RuntimeError("Annual-report marker not found in opening pages")
+
+              render_dir = RENDERS / safe_name(path.stem)
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for idx in sorted(set([0, pages_fitz // 2, pages_fitz - 1])):
+                  pix = doc.load_page(idx).get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+                  png = render_dir / f"page_{idx + 1:04d}.png"
+                  pix.save(png)
+                  if png.stat().st_size < 4_000:
+                      raise RuntimeError(f"Rendered page is suspiciously small: {png}")
+              doc.close()
+              return {
+                  "pages": pages_fitz,
+                  "size_bytes": path.stat().st_size,
+                  "sha256": sha256(path),
+                  "verified_title": expected_title,
+              }
+
+          szse_rows = fetch_szse_announcements()
+          items = [x for x in (normalize_szse(row) for row in szse_rows) if x]
+          try:
+              annuals, latest_quarter = select_reports(items)
+          except Exception as primary_exc:
+              log(f"SZSE selection incomplete: {primary_exc}; using Eastmoney fallback")
+              east_rows = fetch_eastmoney_announcements()
+              fallback_items = [x for x in (normalize_eastmoney(row) for row in east_rows) if x]
+              seen = {(item["title"], item["date"]) for item in items}
+              items.extend(item for item in fallback_items if (item["title"], item["date"]) not in seen)
+              annuals, latest_quarter = select_reports(items)
+
+          quarter_parsed = quarterly_year_and_rank(latest_quarter["title"])
+          if quarter_parsed is None:
+              raise RuntimeError("Could not parse selected quarterly report title")
+          quarter_year = quarter_parsed[0]
+
+          selected: list[tuple[str, int, dict[str, Any], bool]] = []
+          for year in YEARS:
+              selected.append((f"{year}年年度报告", year, annuals[year], False))
+          selected.append((latest_quarter["title"], quarter_year, latest_quarter, True))
+
+          manifest: list[dict[str, Any]] = []
+          readme = [
+              f"# {COMPANY}（{STOCK}）2020-2025年报及最新季度报告",
+              "",
+              f"整理时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+              "",
+              "收录原则：年度报告优先采用深圳证券交易所公开的完整PDF；若同一年度存在补充版、修订版、更新后版本或更正后版本，则优先采用较新的完整版本。",
+              f"最新季度报告按公告日期和报告期排序选取；本次选中：{latest_quarter['title']}。",
+              "",
+          ]
+
+          total_pages = 0
+          for idx, (label, expected_year, item, quarterly) in enumerate(selected, 1):
+              title = item["title"]
+              raw_path = RAW / f"{idx:02d}_{safe_name(label)}.pdf"
+              log(f"Downloading {title} from {item['source']}: {item['url']}")
+              download(item["url"], raw_path)
+              meta = verify_pdf(
+                  raw_path,
+                  expected_year=expected_year,
+                  quarterly=quarterly,
+                  expected_title=title,
+              )
+              total_pages += meta["pages"]
+
+              if quarterly:
+                  exact_label = re.sub(r"\s+", "", title)
+                  exact_label = re.sub(r"[（）()]", "_", exact_label)
+                  filename = f"{idx:02d}_{COMPANY}_{safe_name(exact_label, 70)}.pdf"
+              else:
+                  version_note = ""
+                  if any(word in title for word in ("更正后", "更正版", "修订版", "补充版", "更新后")):
+                      version_note = "_修订或更新版本"
+                  filename = f"{idx:02d}_{COMPANY}_{expected_year}年年度报告{version_note}.pdf"
+
+              final_path = FINAL / filename
+              final_path.write_bytes(raw_path.read_bytes())
+              final_sha = sha256(final_path)
+
+              entry = {
+                  "sequence": idx,
+                  "type": "季度报告" if quarterly else "年度报告",
+                  "report_year": expected_year,
+                  "title": title,
+                  "announcement_date": item["date"],
+                  "source": item["source"],
+                  "source_url": item["url"],
+                  "filename": filename,
+                  "pages": meta["pages"],
+                  "size_bytes": final_path.stat().st_size,
+                  "sha256": final_sha,
+              }
+              manifest.append(entry)
+              readme += [
+                  f"## {idx}. {title}",
+                  f"- 公告日期：{item['date']}",
+                  f"- 来源：{item['source']}",
+                  f"- 页数：{meta['pages']}",
+                  f"- 文件：`{filename}`",
+                  f"- 原始PDF：{item['url']}",
+                  f"- SHA-256：`{final_sha}`",
+                  "",
+              ]
+
+          readme += [
+              "## 完整性检查",
+              f"- PDF数量：{len(manifest)}",
+              f"- 总页数：{total_pages}",
+              "- 每份PDF均检查文件头、页面树、公司名称/证券代码、报告年份和报告类型。",
+              "- 每份PDF均渲染抽查首页、中间页和末页。",
+              "- ZIP生成后执行CRC完整性测试。",
+              "",
+          ]
+
+          (FINAL / "README_文件清单与来源.md").write_text("\n".join(readme), encoding="utf-8")
+          (FINAL / "manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          (FINAL / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{x['sha256']}  {x['filename']}" for x in manifest) + "\n",
+              encoding="utf-8",
+          )
+          (OUT / "run.log").write_text("\n".join(logs), encoding="utf-8")
+
+          zip_cn = OUT / f"{COMPANY}_{STOCK}_2020-2025年报及最新季报_20261005.zip"
+          zip_en = OUT / "PharmaBlock_300725_Annual_Reports_2020_2025_and_Latest_Quarterly_20261005.zip"
+          for zip_path in (zip_cn, zip_en):
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for file_path in sorted(FINAL.iterdir()):
+                      zf.write(file_path, arcname=file_path.name)
+              with zipfile.ZipFile(zip_path) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f"ZIP CRC failure: {bad}")
+              log(f"Created {zip_path.name}: {zip_path.stat().st_size} bytes; SHA256={sha256(zip_path)}")
+
+          summary = {
+              "company": COMPANY,
+              "stock_code": STOCK,
+              "count": len(manifest),
+              "total_pages": total_pages,
+              "latest_quarter_title": latest_quarter["title"],
+              "latest_quarter_date": latest_quarter["date"],
+              "reports": manifest,
+              "zip_cn": str(zip_cn),
+              "zip_cn_sha256": sha256(zip_cn),
+              "zip_en": str(zip_en),
+              "zip_en_sha256": sha256(zip_en),
+          }
+          (OUT / "package_summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_pharmablock_financials.py
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PharmaBlock-300725-Annual-and-Quarterly-Reports
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/run.log
+            output/szse_announcements.json
+            output/eastmoney_announcements.json
+          if-no-files-found: error
+          retention-days: 3
