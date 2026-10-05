@@ -1,0 +1,389 @@
+name: Build Chervon Auto 603982 reports package 20261005
+
+on:
+  push:
+    paths:
+      - '.github/workflows/chervon-auto-603982-reports-package-20261005.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '603982'
+          SHORT = '泉峰汽车'
+          FULL = '南京泉峰汽车精密技术股份有限公司'
+          TODAY = '2026-10-05'
+          ANNUAL_YEARS = list(range(2019, 2026))
+
+          WORK = Path('chervon_auto_work')
+          RAW = WORK / 'raw'
+          FINAL = WORK / 'final'
+          ART = Path('artifact_out')
+          for p in (RAW, FINAL, ART):
+              p.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          # Keep the GitHub runner proxy enabled; it is more reliable for these endpoints.
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/json,text/plain,application/pdf,*/*',
+              'Referer': 'https://data.eastmoney.com/notices/',
+          })
+
+          def norm_title(x: str) -> str:
+              x = re.sub(r'<[^>]+>', '', str(x or ''))
+              x = x.replace('：', ':').replace('（', '(').replace('）', ')')
+              return re.sub(r'\s+', '', x)
+
+          def safe(x: str, n: int = 120) -> str:
+              x = re.sub(r'[\\/:*?"<>|]+', '_', str(x or '')).strip(' ._')
+              return x[:n] or 'document'
+
+          def api_page(page: int) -> list[dict]:
+              params = {
+                  'sr': '-1',
+                  'page_size': '100',
+                  'page_index': str(page),
+                  'ann_type': 'A',
+                  'client_source': 'web',
+                  'stock_list': CODE,
+                  'f_node': '0',
+                  's_node': '0',
+              }
+              last = None
+              for host in (
+                  'https://np-anotice-stock.eastmoney.com/api/security/ann',
+                  'https://np-cnotice-stock.eastmoney.com/api/security/ann',
+              ):
+                  for attempt in range(1, 4):
+                      try:
+                          r = s.get(host, params=params, timeout=(20, 120))
+                          print('ANN_API', host, page, attempt, r.status_code, len(r.content), r.url, flush=True)
+                          r.raise_for_status()
+                          j = r.json()
+                          data = j.get('data') or {}
+                          rows = data.get('list') or data.get('data') or []
+                          if isinstance(rows, list):
+                              return rows
+                      except Exception as exc:
+                          last = exc
+                          print('ANN_API_ERR', host, page, attempt, repr(exc), flush=True)
+                          time.sleep(attempt)
+              raise RuntimeError(f'announcement API failed: {last!r}')
+
+          rows: list[dict] = []
+          seen_art = set()
+          for page in range(1, 15):
+              batch = api_page(page)
+              if not batch:
+                  break
+              new_count = 0
+              for row in batch:
+                  art = str(row.get('art_code') or row.get('artCode') or row.get('infoCode') or row.get('notice_id') or '')
+                  if not art or art in seen_art:
+                      continue
+                  seen_art.add(art)
+                  rows.append(row)
+                  new_count += 1
+              print('PAGE_ROWS', page, len(batch), 'NEW', new_count, flush=True)
+              if len(batch) < 100:
+                  break
+
+          (WORK / 'all_announcements.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('TOTAL_ANNOUNCEMENTS', len(rows), flush=True)
+
+          def get_art(row: dict) -> str:
+              return str(row.get('art_code') or row.get('artCode') or row.get('infoCode') or row.get('notice_id') or '')
+
+          def get_title(row: dict) -> str:
+              return str(row.get('title') or row.get('notice_title') or row.get('art_title') or '')
+
+          def get_date(row: dict) -> str:
+              x = str(row.get('notice_date') or row.get('display_time') or row.get('displayTime') or row.get('publishDate') or row.get('date') or '')
+              m = re.search(r'20\d{2}[-/]\d{2}[-/]\d{2}', x)
+              return m.group(0).replace('/', '-') if m else x[:10]
+
+          def is_bad_document_title(title: str) -> bool:
+              bad = ['摘要', '英文版', '取消', '问询函', '回复', '保荐', '法律意见', '核查意见', '提示性公告']
+              return any(k in title for k in bad)
+
+          annual_candidates: dict[int, list[dict]] = {y: [] for y in ANNUAL_YEARS}
+          prospectus_candidates: list[dict] = []
+          quarter_candidates: list[dict] = []
+          half_candidates: list[dict] = []
+
+          for row in rows:
+              title = norm_title(get_title(row))
+              if not title:
+                  continue
+              for year in ANNUAL_YEARS:
+                  if f'{year}年年度报告' in title and not any(k in title for k in ['摘要', '英文版']):
+                      annual_candidates[year].append(row)
+              if '招股说明书' in title and not is_bad_document_title(title):
+                  prospectus_candidates.append(row)
+              if ('第一季度报告' in title or '第三季度报告' in title) and not any(k in title for k in ['摘要', '英文版']):
+                  quarter_candidates.append(row)
+              if '半年度报告' in title and not any(k in title for k in ['摘要', '英文版']):
+                  half_candidates.append(row)
+
+          annual_by_year: dict[int, dict] = {}
+          for year, items in annual_candidates.items():
+              if not items:
+                  continue
+              # Prefer a later corrected/revised full report when one exists.
+              annual_by_year[year] = sorted(items, key=lambda r: get_date(r), reverse=True)[0]
+
+          missing = [y for y in ANNUAL_YEARS if y not in annual_by_year]
+          if missing:
+              print('MISSING_ANNUALS', missing, flush=True)
+              for row in rows:
+                  t = norm_title(get_title(row))
+                  if '年度报告' in t:
+                      print('ANNUAL_META', get_art(row), get_date(row), get_title(row), flush=True)
+              raise RuntimeError(f'Missing annual report metadata for years: {missing}')
+
+          def prospectus_rank(row: dict):
+              t = norm_title(get_title(row))
+              d = get_date(row)
+              score = 0
+              if '首次公开发行股票招股说明书' in t or '首次公开发行股票并上市招股说明书' in t:
+                  score += 100
+              if SHORT in t:
+                  score += 20
+              if any(k in t for k in ['申报稿', '预披露', '上会稿', '注册稿']):
+                  score -= 50
+              return (score, d)
+
+          if not prospectus_candidates:
+              print('PROSPECTUS_NOT_FOUND', flush=True)
+              for row in rows:
+                  t = norm_title(get_title(row))
+                  if '招股' in t:
+                      print('PROSPECTUS_META', get_art(row), get_date(row), get_title(row), flush=True)
+              raise RuntimeError('No prospectus metadata found')
+          prospectus = sorted(prospectus_candidates, key=prospectus_rank, reverse=True)[0]
+
+          def quarter_key(row: dict):
+              t = norm_title(get_title(row))
+              year_m = re.search(r'(20\d{2})年', t)
+              year = int(year_m.group(1)) if year_m else 0
+              q = 3 if '第三季度报告' in t else 1
+              return (year, q, get_date(row))
+
+          latest_quarter = sorted(quarter_candidates, key=quarter_key, reverse=True)[0] if quarter_candidates else None
+          latest_half = sorted(half_candidates, key=lambda r: get_date(r), reverse=True)[0] if half_candidates else None
+          if latest_quarter is None:
+              raise RuntimeError('No quarterly report metadata found')
+
+          selections: list[dict] = []
+          for year in ANNUAL_YEARS:
+              selections.append({'kind': f'{year}年年度报告', 'row': annual_by_year[year]})
+          selections.append({'kind': '首次公开发行招股说明书', 'row': prospectus})
+          selections.append({'kind': '最新季度报告', 'row': latest_quarter})
+          if latest_half and get_art(latest_half) != get_art(latest_quarter):
+              selections.append({'kind': '最新半年度报告（补充）', 'row': latest_half})
+
+          print('SELECTIONS_METADATA', flush=True)
+          for item in selections:
+              row = item['row']
+              print(json.dumps({
+                  'kind': item['kind'], 'art': get_art(row),
+                  'title': get_title(row), 'date': get_date(row)
+              }, ensure_ascii=False), flush=True)
+
+          def recursive_pdf_urls(obj) -> list[str]:
+              found: list[str] = []
+              if isinstance(obj, dict):
+                  for v in obj.values():
+                      found.extend(recursive_pdf_urls(v))
+              elif isinstance(obj, list):
+                  for v in obj:
+                      found.extend(recursive_pdf_urls(v))
+              elif isinstance(obj, str):
+                  text = obj.replace('\\/', '/')
+                  if '.pdf' in text.lower():
+                      found.extend(re.findall(r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?', text, flags=re.I))
+                      if text.lower().endswith('.pdf') and not text.startswith('http'):
+                          found.append(urljoin('https://np-cnotice-stock.eastmoney.com/', text))
+              return found
+
+          def detail_urls(art: str) -> list[str]:
+              candidates: list[str] = []
+              for host in ('np-cnotice-stock.eastmoney.com', 'np-anotice-stock.eastmoney.com'):
+                  url = f'https://{host}/api/content/ann'
+                  try:
+                      r = s.get(url, params={'art_code': art, 'client_source': 'web', 'page_index': '1'}, timeout=(15, 60))
+                      print('DETAIL_API', art, host, r.status_code, len(r.content), flush=True)
+                      if r.status_code == 200 and r.content:
+                          candidates.extend(recursive_pdf_urls(r.json()))
+                  except Exception as exc:
+                      print('DETAIL_ERR', art, host, repr(exc), flush=True)
+              return candidates
+
+          def download_pdf(row: dict, target: Path) -> str:
+              art = get_art(row)
+              urls: list[str] = []
+              urls.extend(recursive_pdf_urls(row))
+              urls.extend(detail_urls(art))
+              urls.extend([
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_01.pdf',
+              ])
+              urls = list(dict.fromkeys(u for u in urls if u))
+              errors = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          r = s.get(url, timeout=(25, 180), allow_redirects=True)
+                          print('PDF_GET', art, attempt, r.status_code, len(r.content), url, 'FINAL', r.url, flush=True)
+                          if r.status_code == 200 and len(r.content) > 50_000 and r.content.startswith(b'%PDF-'):
+                              target.write_bytes(r.content)
+                              return str(r.url)
+                      except Exception as exc:
+                          errors.append(f'{url}: {exc!r}')
+                      time.sleep(attempt)
+              raise RuntimeError('No valid PDF for ' + art + '; ' + '; '.join(errors[-5:]))
+
+          records = []
+          seen_sha = set()
+          for idx, item in enumerate(selections, 1):
+              row = item['row']
+              art = get_art(row)
+              title = get_title(row).strip()
+              date = get_date(row)
+              tmp = RAW / f'{idx:02d}_{art}.pdf'
+              source = download_pdf(row, tmp)
+
+              reader = PdfReader(str(tmp), strict=False)
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'Unexpected page count {pages} for {title}')
+
+              text_parts = []
+              check_pages = list(range(min(10, pages)))
+              if pages > 12:
+                  check_pages += [pages - 1]
+              for pno in dict.fromkeys(check_pages):
+                  try:
+                      text_parts.append(reader.pages[pno].extract_text() or '')
+                  except Exception:
+                      pass
+              sample = '\n'.join(text_parts)
+              identity = CODE in sample or SHORT in sample or FULL in sample
+              if not identity:
+                  raise RuntimeError(f'Company identity check failed for {title}')
+
+              q = subprocess.run(['qpdf', '--check', str(tmp)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {title}: {q.stderr[-1000:]}')
+
+              data = tmp.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in seen_sha:
+                  raise RuntimeError(f'Duplicate PDF detected: {title}')
+              seen_sha.add(sha)
+
+              filename = f'{idx:02d}_{safe(item["kind"])}_{safe(title)}.pdf'
+              shutil.copy2(tmp, FINAL / filename)
+              records.append({
+                  'filename': filename,
+                  'kind': item['kind'],
+                  'title': title,
+                  'announcement_date': date,
+                  'art_code': art,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'source_url': source,
+              })
+
+          package_name = f'泉峰汽车_603982_全部年报_招股说明书_最新季报_截至{TODAY}'
+          readme = [
+              f'{FULL}（{CODE}.SH，证券简称：{SHORT}）资料包',
+              f'整理日期：{TODAY}',
+              '',
+              '收录范围：',
+              f'1. 公司上市后已披露的全部完整年度报告：{ANNUAL_YEARS[0]}—{ANNUAL_YEARS[-1]}年。',
+              '2. 首次公开发行股票招股说明书。',
+              '3. 截至整理日最新季度报告。',
+              '4. 另收录最新半年度报告作为补充（如已披露），便于获得更新的经营数据。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(records, 1):
+              readme += [
+                  f'{i}. {rec["filename"]}',
+                  f'   类型：{rec["kind"]}',
+                  f'   标题：{rec["title"]}',
+                  f'   公告日期：{rec["announcement_date"]}；页数：{rec["pages"]}',
+                  f'   来源：{rec["source_url"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  '',
+              ]
+          readme += [
+              '说明：年度报告均为完整版本，已排除年度报告摘要和英文版；若存在后续修订版，则优先采用日期较新的完整文件。',
+              '完整性检查：已验证PDF文件头、公司名称/证券代码、实际页数、qpdf结构、重复文件及SHA-256；ZIP已通过CRC测试。',
+          ]
+          (FINAL / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records), encoding='utf-8')
+
+          zip_path = ART / f'{package_name}.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(FINAL.iterdir()):
+                  zf.write(p, arcname=f'{package_name}/{p.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_count = sum(1 for name in zf.namelist() if name.lower().endswith('.pdf'))
+              if pdf_count != len(records):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(records)}')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_RECORDS', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'SHA256', zip_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: chervon-auto-603982-reports-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
