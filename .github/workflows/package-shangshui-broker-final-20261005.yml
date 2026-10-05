@@ -1,0 +1,217 @@
+name: Package final Shangshui broker research reports
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/shangshui-broker-final-20261005.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          reports = [
+              {
+                  'info_code': 'AP202604051821026909',
+                  'broker': '华金证券',
+                  'title': '新股覆盖研究：尚水智能',
+                  'publish_date': '2026-04-06',
+                  'authors': ['李蕙'],
+                  'expected_min_pages': 10,
+              },
+              {
+                  'info_code': 'AP202603311820930976',
+                  'broker': '申万宏源',
+                  'title': '注册制新股纵览：尚水智能，深耕锂电池前段设备',
+                  'publish_date': '2026-03-31',
+                  'authors': ['彭文玉', '朱敏', '任奕璇'],
+                  'expected_min_pages': 10,
+              },
+              {
+                  'info_code': 'AP202603311820928451',
+                  'broker': '国泰海通',
+                  'title': 'IPO专题：新股精要—国内锂电池前段智能制造设备领先企业尚水智能',
+                  'publish_date': '2026-03-31',
+                  'authors': [],
+                  'expected_min_pages': 5,
+              },
+          ]
+
+          ROOT = Path('work')
+          PDF_DIR = ROOT / 'pdfs'
+          VERIFY = ROOT / 'verify'
+          FINAL = ROOT / '尚水智能_301513.SZ_券商研究报告_3份'
+          ART = Path('artifact_out')
+          for path in (PDF_DIR, VERIFY, FINAL, ART):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(total=5, connect=5, read=5, status=5, backoff_factor=1.0,
+                        status_forcelist=[429,500,502,503,504], allowed_methods=['GET'], raise_on_status=False)
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=6, pool_maxsize=6))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:110]
+
+          def download(info_code: str, dest: Path) -> str:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_01.pdf',
+              ]
+              last = None
+              for url in urls:
+                  try:
+                      r = session.get(url, headers={'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'}, timeout=(30,240))
+                      print('DOWNLOAD', info_code, r.status_code, len(r.content), url, flush=True)
+                      if r.status_code == 200 and len(r.content) > 70_000 and r.content.startswith(b'%PDF'):
+                          dest.write_bytes(r.content)
+                          return url
+                  except Exception as exc:
+                      last = exc
+                      print('DOWNLOAD_ERROR', info_code, url, repr(exc), flush=True)
+              raise RuntimeError(f'No valid PDF for {info_code}: {last!r}')
+
+          records = []
+          for index, report in enumerate(reports, start=1):
+              tmp = PDF_DIR / f'{report["info_code"]}.pdf'
+              source_url = download(report['info_code'], tmp)
+
+              check = subprocess.run(['qpdf','--check',str(tmp)], capture_output=True, text=True)
+              if check.returncode not in (0,3):
+                  raise RuntimeError(f'qpdf failed for {report["info_code"]}: {check.stderr[-800:]}')
+
+              reader = PdfReader(str(tmp), strict=False)
+              pages = len(reader.pages)
+              if pages < report['expected_min_pages']:
+                  raise RuntimeError(f'{report["info_code"]} has only {pages} pages')
+
+              sample_indices = list(range(min(15, pages)))
+              if pages > 18:
+                  sample_indices += list(range(max(0, pages-3), pages))
+              parts = []
+              for p in dict.fromkeys(sample_indices):
+                  try:
+                      parts.append(reader.pages[p].extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', '\n'.join(parts))
+              identity_ok = '尚水智能' in compact or '301513' in compact or '深圳市尚水智能股份有限公司' in compact
+              research_ok = any(term in compact for term in ('证券研究报告','新股研究','新股覆盖','注册制新股','IPO专题','公司研究','分析师'))
+              broker_ok = report['broker'].replace('证券','') in compact or report['broker'] in compact
+              if not identity_ok or not research_ok:
+                  raise RuntimeError(f'identity/research validation failed for {report["info_code"]}: identity={identity_ok}, research={research_ok}, broker={broker_ok}')
+
+              first_prefix = VERIFY / f'{index:02d}_first'
+              last_prefix = VERIFY / f'{index:02d}_last'
+              first = subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','90',str(tmp),str(first_prefix)], capture_output=True, text=True)
+              lastp = subprocess.run(['pdftoppm','-f',str(pages),'-l',str(pages),'-singlefile','-png','-r','90',str(tmp),str(last_prefix)], capture_output=True, text=True)
+              first_png = Path(str(first_prefix)+'.png')
+              last_png = Path(str(last_prefix)+'.png')
+              if first.returncode != 0 or lastp.returncode != 0 or not first_png.exists() or not last_png.exists() or first_png.stat().st_size < 5000 or last_png.stat().st_size < 5000:
+                  raise RuntimeError(f'page render validation failed for {report["info_code"]}')
+
+              filename = f'{index:02d}_{report["publish_date"]}_{safe(report["broker"])}_{safe(report["title"])}.pdf'
+              shutil.copy2(tmp, FINAL / filename)
+              data = tmp.read_bytes()
+              record = {
+                  **report,
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'source_url': source_url,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 3:
+              raise RuntimeError(f'Expected three reports, got {len(records)}')
+
+          readme = [
+              '尚水智能（301513.SZ）券商研究报告合集',
+              '整理日期：2026-10-05',
+              '',
+              '本包收录三份尚水智能公司专属新股研究报告。均为完整PDF，不含网页摘要、公司公告、保荐书或无关行业报告。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(records, 1):
+              readme.extend([
+                  f'{i}. {rec["filename"]}',
+                  f'   券商：{rec["broker"]}',
+                  f'   标题：{rec["title"]}',
+                  f'   日期：{rec["publish_date"]}；页数：{rec["pages"]}',
+                  f'   分析师：{"、".join(rec["authors"]) if rec["authors"] else "报告内列示"}',
+                  f'   来源：{rec["source_url"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  '',
+              ])
+          readme.append('完整性核验：已检查PDF文件头、公司身份、券商研究属性、实际页数、qpdf结构、首末页渲染、SHA-256及ZIP CRC。')
+          (FINAL/'00_文件清单与范围说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL/'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records), encoding='utf-8')
+
+          chinese_zip = ART / '尚水智能_301513.SZ_券商深度报告_3份.zip'
+          with zipfile.ZipFile(chinese_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for path in sorted(FINAL.iterdir()):
+                  zf.write(path, arcname=f'{FINAL.name}/{path.name}')
+          with zipfile.ZipFile(chinese_zip, 'r') as zf:
+              bad = zf.testzip()
+              pdf_count = sum(1 for n in zf.namelist() if n.lower().endswith('.pdf'))
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed at {bad}')
+              if pdf_count != 3:
+                  raise RuntimeError(f'ZIP has {pdf_count} PDFs')
+
+          english_zip = ART / 'Shangshui_301513_Broker_Research_3_Reports.zip'
+          shutil.copy2(chinese_zip, english_zip)
+          print('FINAL_ZIP', chinese_zip, chinese_zip.stat().st_size, hashlib.sha256(chinese_zip.read_bytes()).hexdigest(), flush=True)
+          print('BACKUP_ZIP', english_zip, english_zip.stat().st_size, hashlib.sha256(english_zip.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: shangshui-broker-final-artifact
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
