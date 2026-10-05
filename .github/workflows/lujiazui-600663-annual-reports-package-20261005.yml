@@ -1,0 +1,345 @@
+name: Build Lujiazui 600663 annual reports package 20261005
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lujiazui-600663-annual-reports-package-20261005.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Discover, download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, parse_qs
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '陆家嘴_600663_2020-2025年报及2026最新季报与半年报'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          annual_list = 'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/600663/page_type/ndbg.phtml'
+          q1_list = 'https://money.finance.sina.com.cn/corp/view/vCB_BulletinYi.php?page_type=yjdbg&stockid=600663&type=list'
+          q3_list = 'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_BulletinSan/stockid/600663/page_type/sjdbg.phtml'
+          h1_list = 'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_BulletinZhong/stockid/600663/page_type/zqbg.phtml'
+
+          def fetch_soup(url: str) -> BeautifulSoup:
+              errors = []
+              for attempt in range(1, 5):
+                  try:
+                      r = session.get(url, timeout=(30, 180), allow_redirects=True)
+                      print('PAGE', r.status_code, len(r.content), url, 'final', r.url, flush=True)
+                      r.raise_for_status()
+                      return BeautifulSoup(r.content.decode('gb18030', errors='replace'), 'lxml')
+                  except Exception as exc:
+                      errors.append(f'attempt {attempt}: {exc!r}')
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'failed to fetch {url}: {errors}')
+
+          def normalize(text: str) -> str:
+              return re.sub(r'\s+', '', text or '')
+
+          def detail_id(url: str) -> int:
+              try:
+                  return int(parse_qs(urlparse(url).query).get('id', ['0'])[0])
+              except Exception:
+                  return 0
+
+          def collect_links(list_url: str) -> list[dict]:
+              soup = fetch_soup(list_url)
+              rows = []
+              seen = set()
+              for a in soup.find_all('a', href=True):
+                  label = normalize(a.get_text(' ', strip=True))
+                  href = urljoin(list_url, a['href'])
+                  if 'vCB_AllBulletinDetail.php' not in href:
+                      continue
+                  key = (label, href)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  rows.append({'label': label, 'url': href, 'id': detail_id(href)})
+              return rows
+
+          annual_rows = collect_links(annual_list)
+          q1_rows = collect_links(q1_list)
+          q3_rows = collect_links(q3_list)
+          h1_rows = collect_links(h1_list)
+
+          exclusion_terms = ['摘要', '英文版', '说明会', '预约', '延期', '问询', '回复', '审计报告', '责任追究制度']
+          revision_terms = ['更正后', '修订版', '修订稿', '更新版', '更正版', '更正']
+
+          def choose_annual(year: int) -> dict:
+              token = f'{year}年年度报告'
+              candidates = []
+              for row in annual_rows:
+                  label = row['label']
+                  if '陆家嘴' not in label or token not in label:
+                      continue
+                  if any(term in label for term in exclusion_terms):
+                      continue
+                  score = row['id']
+                  if any(term in label for term in revision_terms):
+                      score += 10**12
+                  candidates.append((score, row))
+              if not candidates:
+                  raise RuntimeError(f'annual report not found for {year}')
+              candidates.sort(key=lambda x: x[0], reverse=True)
+              return candidates[0][1]
+
+          selected = []
+          for year in range(2020, 2026):
+              row = choose_annual(year)
+              selected.append({
+                  'filename': f'{year-2019:02d}_陆家嘴_600663_{year}年年度报告.pdf',
+                  'title': row['label'],
+                  'type': '年度报告',
+                  'period': f'{year}年度',
+                  'detail_url': row['url'],
+                  'min_pages': 50,
+                  'min_bytes': 700_000,
+              })
+
+          def choose_quarter() -> dict:
+              q_candidates = []
+              for rows, rank, tokens in [
+                  (q3_rows, 3, ['2026年第三季度报告', '2026年三季度报告']),
+                  (q1_rows, 1, ['2026年第一季度报告', '2026年一季度报告']),
+              ]:
+                  for row in rows:
+                      label = row['label']
+                      if '陆家嘴' not in label:
+                          continue
+                      if any(t in label for t in tokens) and not any(term in label for term in exclusion_terms):
+                          q_candidates.append((rank, row['id'], row))
+              if not q_candidates:
+                  raise RuntimeError('2026 quarterly report not found')
+              q_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+              return q_candidates[0][2]
+
+          quarter = choose_quarter()
+          q_period = '2026年第三季度' if ('第三季度' in quarter['label'] or '三季度' in quarter['label']) else '2026年第一季度'
+          selected.append({
+              'filename': f'07_陆家嘴_600663_{q_period}报告.pdf',
+              'title': quarter['label'],
+              'type': '季度报告',
+              'period': q_period,
+              'detail_url': quarter['url'],
+              'min_pages': 8,
+              'min_bytes': 100_000,
+          })
+
+          h1_candidates = []
+          for row in h1_rows:
+              label = row['label']
+              if '陆家嘴' in label and '2026年半年度报告' in label and not any(term in label for term in exclusion_terms):
+                  h1_candidates.append((row['id'], row))
+          if not h1_candidates:
+              raise RuntimeError('2026 half-year report not found')
+          h1_candidates.sort(key=lambda x: x[0], reverse=True)
+          h1 = h1_candidates[0][1]
+          selected.append({
+              'filename': '08_陆家嘴_600663_2026年半年度报告.pdf',
+              'title': h1['label'],
+              'type': '半年度报告',
+              'period': '2026年半年度',
+              'detail_url': h1['url'],
+              'min_pages': 50,
+              'min_bytes': 700_000,
+          })
+
+          print('SELECTED', json.dumps(selected, ensure_ascii=False, indent=2), flush=True)
+
+          def extract_pdf_url(detail_url: str) -> str:
+              soup = fetch_soup(detail_url)
+              candidates = []
+              for a in soup.find_all('a', href=True):
+                  label = normalize(a.get_text(' ', strip=True))
+                  href = urljoin(detail_url, a['href'])
+                  if '下载公告' in label:
+                      candidates.insert(0, href)
+                  elif '.pdf' in href.lower() and any(host in href for host in ['file.finance.sina.com.cn', 'cninfo.com.cn', 'sse.com.cn']):
+                      candidates.append(href)
+              if not candidates:
+                  raise RuntimeError(f'PDF URL not found: {detail_url}')
+              return candidates[0]
+
+          def expanded_urls(url: str) -> list[str]:
+              variants = [url]
+              if '%3A' in url:
+                  variants.append(url.replace('%3A', ':'))
+              if url.startswith('http://'):
+                  variants.append('https://' + url[len('http://'):])
+              return list(dict.fromkeys(variants))
+
+          def download_pdf(url: str, destination: Path, min_bytes: int) -> str:
+              errors = []
+              for candidate in expanded_urls(url):
+                  for attempt in range(1, 4):
+                      temp = destination.with_suffix(destination.suffix + '.part')
+                      temp.unlink(missing_ok=True)
+                      try:
+                          with session.get(
+                              candidate,
+                              headers={
+                                  'Referer': 'https://vip.stock.finance.sina.com.cn/',
+                                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                              },
+                              stream=True,
+                              allow_redirects=True,
+                              timeout=(30, 900),
+                          ) as response:
+                              print('DOWNLOAD', destination.name, 'attempt', attempt, 'status', response.status_code, candidate, 'final', response.url, flush=True)
+                              response.raise_for_status()
+                              with temp.open('wb') as fh:
+                                  for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          size = temp.stat().st_size
+                          with temp.open('rb') as fh:
+                              header = fh.read(8)
+                          if size < min_bytes or not header.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF: size={size}, header={header!r}')
+                          temp.replace(destination)
+                          return str(response.url)
+                      except Exception as exc:
+                          errors.append(f'{candidate} attempt {attempt}: {exc!r}')
+                          temp.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f'download failed for {destination.name}: {errors}')
+
+          records = []
+          hashes = set()
+          for task in selected:
+              pdf_url = extract_pdf_url(task['detail_url'])
+              destination = OUT / task['filename']
+              final_url = download_pdf(pdf_url, destination, task['min_bytes'])
+
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages < task['min_pages']:
+                  raise RuntimeError(f'page count too small for {destination.name}: {pages}')
+
+              check = subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(destination)],
+                  capture_output=True,
+                  text=True,
+              )
+              if check.returncode != 0:
+                  raise RuntimeError(f'qpdf validation failed for {destination.name}: {check.stderr[-2000:]}')
+
+              render_root = OUT / (destination.stem + '_render_check')
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '96', str(destination), str(render_root)],
+                  capture_output=True,
+                  text=True,
+              )
+              render_file = Path(str(render_root) + '.png')
+              if render.returncode != 0 or not render_file.exists() or render_file.stat().st_size < 8_000:
+                  raise RuntimeError(f'first-page render failed for {destination.name}: {render.stderr[-1000:]}')
+              render_size = render_file.stat().st_size
+              render_file.unlink(missing_ok=True)
+
+              data = destination.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'duplicate PDF detected: {destination.name}')
+              hashes.add(digest)
+
+              record = {
+                  'filename': destination.name,
+                  'title': task['title'],
+                  'type': task['type'],
+                  'period': task['period'],
+                  'detail_url': task['detail_url'],
+                  'source_pdf_url': final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_size,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '上海陆家嘴金融贸易区开发股份有限公司（600663.SH）2020—2025年年度报告及2026年最新定期报告',
+              '整理日期：2026-10-05',
+              '',
+              '收录范围：2020—2025年完整年度报告、截至整理日可获取的2026年最新季度报告，以及时间更近的2026年半年度报告。',
+              '来源：上海证券交易所公告文件经新浪财经公司公告页面公开镜像获取。',
+              '全部PDF均完成文件头、文件大小、页数、qpdf结构、首页渲染、SHA-256及ZIP CRC检查。',
+              '',
+              '文件清单：',
+          ]
+          for idx, record in enumerate(records, 1):
+              readme.extend([
+                  f"{idx}. {record['title']}",
+                  f"   文件：{record['filename']}",
+                  f"   类型：{record['type']}；报告期：{record['period']}；页数：{record['pages']}；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   公告页：{record['detail_url']}",
+                  f"   PDF来源：{record['source_pdf_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+
+          (OUT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'expected 8 PDFs, found {len(pdfs)}')
+
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(records), 'SHA256', hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload completed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lujiazui-600663-annual-reports-20261005
+          path: 陆家嘴_600663_2020-2025年报及2026最新季报与半年报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
