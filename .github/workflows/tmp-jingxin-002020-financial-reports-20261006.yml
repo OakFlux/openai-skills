@@ -1,0 +1,382 @@
+name: Package Jingxin Pharma Financial Reports
+
+on:
+  push:
+    branches:
+      - tmp-jingxin-002020-financial-reports-20261006
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf pymupdf
+
+      - name: Download, verify and package reports
+        shell: bash
+        run: |
+          cat > /tmp/build_jingxin.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+
+          STOCK = "002020"
+          COMPANY = "京新药业"
+          ALIASES = ("京新药业", "浙江京新药业股份有限公司", "002020")
+          YEARS = list(range(2020, 2026))
+
+          OUT = Path("output")
+          RAW = OUT / "raw"
+          FINAL = OUT / "final"
+          RENDERS = OUT / "renders"
+          for p in (OUT, RAW, FINAL, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          logs: list[str] = []
+          def log(msg: str) -> None:
+              print(msg, flush=True)
+              logs.append(msg)
+
+          def clean_title(value: Any) -> str:
+              text = html.unescape(str(value or ""))
+              text = re.sub(r"<[^>]+>", "", text)
+              return re.sub(r"\s+", " ", text).strip()
+
+          def safe_name(value: str, limit: int = 120) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", value)
+              value = re.sub(r"\s+", "_", value).strip(" ._")
+              return (value or "report")[:limit]
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          MANUAL = {
+              2020: {
+                  "title": "京新药业：2020年年度报告",
+                  "date": "2021-03-30",
+                  "url": "https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2021/2021-3/2021-03-30/6989237.PDF",
+                  "source": "新浪财经公告镜像",
+              },
+              2021: {
+                  "title": "京新药业：2021年年度报告",
+                  "date": "2022-03-30",
+                  "url": "https://static.cninfo.com.cn/finalpage/2022-03-30/1212724599.PDF",
+                  "source": "巨潮资讯",
+              },
+              2022: {
+                  "title": "京新药业：2022年年度报告",
+                  "date": "2023-03-30",
+                  "url": "https://static.cninfo.com.cn/finalpage/2023-03-30/1216255871.PDF",
+                  "source": "巨潮资讯",
+              },
+              2023: {
+                  "title": "京新药业：2023年年度报告",
+                  "date": "2024-03-30",
+                  "url": "https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2024/2024-3/2024-03-30/9922553.PDF",
+                  "source": "新浪财经公告镜像",
+              },
+              2024: {
+                  "title": "京新药业：2024年年度报告",
+                  "date": "2025-04-03",
+                  "url": "https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2025/2025-4/2025-04-03/10844124.PDF",
+                  "source": "新浪财经公告镜像",
+              },
+              2025: {
+                  "title": "京新药业：2025年年度报告",
+                  "date": "2026-04-24",
+                  "url": "https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2026/2026-4/2026-04-24/12171829.PDF",
+                  "source": "新浪财经公告镜像",
+              },
+              "2026Q1": {
+                  "title": "京新药业：2026年第一季度报告",
+                  "date": "2026-04-24",
+                  "url": "https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2026/2026-4/2026-04-24/12171686.PDF",
+                  "source": "新浪财经公告镜像",
+              },
+          }
+
+          def fetch_szse() -> list[dict[str, Any]]:
+              endpoint = "https://www.szse.cn/api/disc/announcement/annList"
+              headers = {
+                  "Content-Type": "application/json",
+                  "Referer": "https://www.szse.cn/disclosure/listed/notice/index.html",
+                  "Origin": "https://www.szse.cn",
+                  "Accept": "application/json, text/plain, */*",
+              }
+              rows: list[dict[str, Any]] = []
+              for page in range(1, 21):
+                  body = {"channelCode": ["listedNotice_disc"], "pageSize": 100, "pageNum": page, "stock": [STOCK]}
+                  data = None
+                  last_error = None
+                  for attempt in range(4):
+                      try:
+                          r = session.post(endpoint, json=body, headers=headers, timeout=60)
+                          r.raise_for_status()
+                          data = r.json()
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          time.sleep(1.5 * (attempt + 1))
+                  if not isinstance(data, dict):
+                      log(f"SZSE API page {page} failed: {last_error}")
+                      break
+                  page_rows = data.get("data") or []
+                  if not page_rows:
+                      break
+                  rows.extend(page_rows)
+                  log(f"SZSE page {page}: {len(page_rows)} rows")
+                  if len(page_rows) < 100:
+                      break
+              (OUT / "szse_announcements.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+              return rows
+
+          def normalize_szse(row: dict[str, Any]) -> dict[str, Any] | None:
+              title = clean_title(row.get("title"))
+              attach = str(row.get("attachPath") or "")
+              date = str(row.get("publishTime") or "")[:10]
+              if not title or not attach:
+                  return None
+              return {
+                  "title": title,
+                  "date": date,
+                  "url": "https://disc.static.szse.cn/download" + attach,
+                  "source": "深圳证券交易所",
+              }
+
+          BAD_WORDS = (
+              "摘要", "英文", "审计报告", "问询函", "回复", "提示性公告", "董事会", "监事会",
+              "社会责任", "环境、社会", "独立董事", "财务报表更正", "更正公告", "取消",
+          )
+
+          def annual_year(title: str) -> int | None:
+              compact = re.sub(r"\s+", "", title)
+              m = re.search(r"(202[0-5])年年度报告", compact)
+              if not m or any(w in compact for w in BAD_WORDS):
+                  return None
+              year = int(m.group(1))
+              return year if year in YEARS else None
+
+          def annual_score(item: dict[str, Any]) -> tuple[int, str]:
+              title = item["title"]
+              score = 0
+              if any(x in title for x in ("修订版", "更正后", "补充版", "更新后")):
+                  score += 1000
+              if "全文" in title:
+                  score += 100
+              if item.get("source") == "深圳证券交易所":
+                  score += 20
+              return score, item.get("date") or ""
+
+          def is_quarterly(title: str) -> bool:
+              compact = re.sub(r"\s+", "", title)
+              if any(w in compact for w in BAD_WORDS):
+                  return False
+              return bool(re.search(r"20\d{2}年(?:第一季度|第三季度|一季度|三季度)报告", compact))
+
+          def select(items: list[dict[str, Any]]) -> tuple[dict[int, dict[str, Any]], dict[str, Any] | None]:
+              annuals: dict[int, dict[str, Any]] = {}
+              for item in items:
+                  y = annual_year(item["title"])
+                  if y is None:
+                      continue
+                  if y not in annuals or annual_score(item) > annual_score(annuals[y]):
+                      annuals[y] = item
+              quarters = [x for x in items if is_quarterly(x["title"])]
+              quarters.sort(key=lambda x: (x.get("date") or "", x.get("title") or ""), reverse=True)
+              return annuals, quarters[0] if quarters else None
+
+          def download_one(urls: list[str], destination: Path) -> str:
+              errors = []
+              for url in urls:
+                  headers = {
+                      "Accept": "application/pdf,*/*",
+                      "Referer": "https://www.szse.cn/" if "szse.cn" in url else "https://finance.sina.com.cn/",
+                  }
+                  for attempt in range(4):
+                      try:
+                          with session.get(url, headers=headers, timeout=120, stream=True, allow_redirects=True) as r:
+                              r.raise_for_status()
+                              with destination.open("wb") as f:
+                                  for chunk in r.iter_content(1024 * 512):
+                                      if chunk:
+                                          f.write(chunk)
+                          if destination.stat().st_size < 50_000:
+                              raise RuntimeError(f"file too small: {destination.stat().st_size}")
+                          with destination.open("rb") as f:
+                              if f.read(5) != b"%PDF-":
+                                  raise RuntimeError("not a PDF payload")
+                          return url
+                      except Exception as exc:
+                          errors.append(f"{url}: {exc}")
+                          destination.unlink(missing_ok=True)
+                          time.sleep(2 * (attempt + 1))
+              raise RuntimeError("all download URLs failed: " + " | ".join(errors[-8:]))
+
+          def verify(path: Path, expected_year: int | None, quarterly: bool) -> dict[str, Any]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < (5 if quarterly else 40):
+                  raise RuntimeError(f"unexpected page count: {pages}")
+              doc = fitz.open(path)
+              if doc.page_count != pages:
+                  raise RuntimeError(f"page count mismatch: fitz={doc.page_count}, pypdf={pages}")
+              text_parts = []
+              for idx in range(min(12, pages)):
+                  text_parts.append(doc.load_page(idx).get_text("text"))
+              compact = re.sub(r"\s+", "", "\n".join(text_parts))
+              if not any(alias in compact for alias in ALIASES):
+                  raise RuntimeError("company identity not found in opening pages")
+              if expected_year is not None and str(expected_year) not in compact:
+                  raise RuntimeError(f"year {expected_year} not found in opening pages")
+              if quarterly and not any(x in compact for x in ("第一季度报告", "第三季度报告", "一季度报告", "三季度报告")):
+                  raise RuntimeError("quarterly marker not found")
+              render_dir = RENDERS / path.stem
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for idx in sorted(set([0, pages // 2, pages - 1])):
+                  pix = doc.load_page(idx).get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+                  png = render_dir / f"page_{idx+1:04d}.png"
+                  pix.save(png)
+                  if png.stat().st_size < 4_000:
+                      raise RuntimeError(f"suspicious render: {png}")
+              doc.close()
+              return {"pages": pages, "size_bytes": path.stat().st_size, "sha256": sha256(path)}
+
+          szse_rows = fetch_szse()
+          items = [x for x in (normalize_szse(r) for r in szse_rows) if x]
+          annuals, latest_quarter = select(items)
+
+          for year in YEARS:
+              if year not in annuals:
+                  annuals[year] = dict(MANUAL[year])
+                  log(f"Using verified manual fallback for {year}")
+          if latest_quarter is None or latest_quarter.get("date", "") < MANUAL["2026Q1"]["date"]:
+              latest_quarter = dict(MANUAL["2026Q1"])
+              log("Using verified manual fallback for latest quarterly report")
+
+          selected: list[tuple[str, int | None, dict[str, Any], bool, dict[str, Any]]] = []
+          for year in YEARS:
+              selected.append((f"{year}年年度报告", year, annuals[year], False, MANUAL[year]))
+          selected.append(("2026年第一季度报告", None, latest_quarter, True, MANUAL["2026Q1"]))
+
+          manifest: list[dict[str, Any]] = []
+          readme = [
+              "# 京新药业（002020）2020-2025年报及最新季度报告",
+              "",
+              f"整理时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+              "",
+              "收录文件：2020-2025年完整年度报告，以及截至整理日最新的2026年第一季度报告。",
+              "优先使用深圳证券交易所公开附件；若源站接口未返回或直接附件下载失败，则使用已核验的巨潮资讯或公开公告镜像。",
+              "所有PDF均保持原始内容，未重排、未转换。",
+              "",
+          ]
+
+          total_pages = 0
+          for idx, (label, year, item, quarterly, fallback) in enumerate(selected, 1):
+              raw_path = RAW / f"{idx:02d}.pdf"
+              urls = []
+              for u in (item.get("url"), fallback.get("url")):
+                  if u and u not in urls:
+                      urls.append(u)
+              used_url = download_one(urls, raw_path)
+              meta = verify(raw_path, expected_year=year, quarterly=quarterly)
+              total_pages += meta["pages"]
+              filename = f"{idx:02d}_京新药业_{safe_name(label, 60)}.pdf"
+              final_path = FINAL / filename
+              final_path.write_bytes(raw_path.read_bytes())
+              rec = {
+                  "filename": filename,
+                  "label": label,
+                  "title": item.get("title") or fallback.get("title"),
+                  "announcement_date": item.get("date") or fallback.get("date"),
+                  "source": item.get("source") or fallback.get("source"),
+                  "download_url": used_url,
+                  **meta,
+              }
+              manifest.append(rec)
+              readme += [
+                  f"## {idx}. {label}",
+                  f"- 公告标题：{rec['title']}",
+                  f"- 披露日期：{rec['announcement_date']}",
+                  f"- 来源：{rec['source']}",
+                  f"- 页数：{rec['pages']}",
+                  f"- 文件：`{filename}`",
+                  f"- 原始PDF：{rec['download_url']}",
+                  f"- SHA-256：`{rec['sha256']}`",
+                  "",
+              ]
+
+          readme += [f"合计：{len(manifest)}份PDF，{total_pages}页。", ""]
+          (FINAL / "README_文件清单与来源.md").write_text("\n".join(readme), encoding="utf-8")
+          (FINAL / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          (FINAL / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{x['sha256']}  {x['filename']}" for x in manifest) + "\n", encoding="utf-8"
+          )
+          (OUT / "run.log").write_text("\n".join(logs), encoding="utf-8")
+
+          zip_cn = OUT / "京新药业_002020_2020-2025年报及2026年第一季度报告_20261006.zip"
+          zip_en = OUT / "Jingxin_Pharma_002020_Annual_Reports_2020_2025_and_2026Q1_20261006.zip"
+          for zpath in (zip_cn, zip_en):
+              with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for p in sorted(FINAL.iterdir()):
+                      zf.write(p, arcname=p.name)
+              with zipfile.ZipFile(zpath) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f"ZIP CRC failure: {bad}")
+              log(f"Created {zpath.name}: {zpath.stat().st_size} bytes; SHA256={sha256(zpath)}")
+
+          summary = {
+              "count": len(manifest),
+              "total_pages": total_pages,
+              "reports": manifest,
+              "zip_cn": str(zip_cn),
+              "zip_cn_sha256": sha256(zip_cn),
+              "zip_en": str(zip_en),
+              "zip_en_sha256": sha256(zip_en),
+          }
+          (OUT / "package_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_jingxin.py
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jingxin-002020-Annual-and-Quarterly-Reports
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/run.log
+          if-no-files-found: error
+          retention-days: 3
