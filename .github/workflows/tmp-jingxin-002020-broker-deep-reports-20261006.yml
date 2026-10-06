@@ -1,0 +1,430 @@
+name: Package Jingxin Pharma Broker Deep Reports
+
+on:
+  push:
+    branches:
+      - tmp-jingxin-002020-broker-deep-reports-20261006
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf pymupdf
+
+      - name: Discover, download, verify and package reports
+        shell: bash
+        run: |
+          cat > /tmp/build_jingxin_reports.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+
+          STOCK = "002020"
+          COMPANY = "京新药业"
+          ALIASES = ("京新药业", "浙江京新药业股份有限公司", "002020")
+          OUT = Path("output")
+          RAW = OUT / "raw"
+          FINAL = OUT / "final"
+          RENDERS = OUT / "renders"
+          for p in (OUT, RAW, FINAL, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+              "Accept": "application/json,text/plain,text/html,application/pdf,*/*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Referer": "https://data.eastmoney.com/report/",
+          })
+
+          logs: list[str] = []
+          def log(msg: str) -> None:
+              print(msg, flush=True)
+              logs.append(msg)
+
+          def safe_name(text: str, limit: int = 110) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text or "")
+              text = re.sub(r"\s+", "_", text).strip(" ._")
+              return (text or "report")[:limit]
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def parse_json_response(resp: requests.Response) -> dict[str, Any]:
+              try:
+                  return resp.json()
+              except Exception:
+                  text = resp.text.strip()
+                  m = re.search(r"^[^(]*\((.*)\)\s*;?$", text, re.S)
+                  if not m:
+                      raise
+                  return json.loads(m.group(1))
+
+          def fetch_metadata() -> list[dict[str, Any]]:
+              rows: list[dict[str, Any]] = []
+              endpoint = "https://reportapi.eastmoney.com/report/list"
+              for page in range(1, 10):
+                  params = {
+                      "industryCode": "*", "pageSize": "100", "industry": "*",
+                      "rating": "*", "ratingChange": "*", "beginTime": "2000-01-01",
+                      "endTime": "2026-10-06", "pageNo": str(page), "fields": "",
+                      "qType": "0", "orgCode": "", "code": STOCK, "rcode": "",
+                      "p": str(page), "pageNum": str(page), "pageNumber": str(page),
+                  }
+                  try:
+                      r = session.get(endpoint, params=params, timeout=60)
+                      r.raise_for_status()
+                      data = parse_json_response(r)
+                  except Exception as exc:
+                      log(f"GET API page {page} failed: {exc}")
+                      break
+                  page_rows = data.get("data") or data.get("result") or []
+                  if isinstance(page_rows, str):
+                      page_rows = json.loads(page_rows)
+                  if not page_rows:
+                      break
+                  rows.extend(page_rows)
+                  log(f"GET API page {page}: {len(page_rows)} rows")
+                  if len(page_rows) < 100:
+                      break
+                  time.sleep(0.4)
+
+              # POST fallback sometimes returns records omitted by GET.
+              endpoint2 = "https://reportapi.eastmoney.com/report/list2"
+              for page in range(1, 10):
+                  payload = {
+                      "pageSize": 100, "pageNo": page, "p": page, "pageNum": page,
+                      "pageNumber": page, "beginTime": "2000-01-01",
+                      "endTime": "2026-10-06", "code": STOCK,
+                      "industryCode": "*", "rating": None, "ratingChange": None,
+                      "orgCode": None, "rcode": "",
+                  }
+                  data = None
+                  for mode in ("json", "form"):
+                      try:
+                          r = session.post(endpoint2,
+                                           json=payload if mode == "json" else None,
+                                           data=payload if mode == "form" else None,
+                                           timeout=60)
+                          r.raise_for_status()
+                          data = parse_json_response(r)
+                          if isinstance(data, dict):
+                              break
+                      except Exception as exc:
+                          log(f"POST API {mode} page {page} failed: {exc}")
+                  if not isinstance(data, dict):
+                      break
+                  page_rows = data.get("data") or data.get("result") or []
+                  if isinstance(page_rows, str):
+                      page_rows = json.loads(page_rows)
+                  if not page_rows:
+                      break
+                  rows.extend(page_rows)
+                  log(f"POST API page {page}: {len(page_rows)} rows")
+                  if len(page_rows) < 100:
+                      break
+                  time.sleep(0.4)
+
+              dedup: dict[str, dict[str, Any]] = {}
+              for row in rows:
+                  key = str(row.get("infoCode") or row.get("encodeUrl") or row.get("title") or "")
+                  if key:
+                      dedup[key] = row
+              result = list(dedup.values())
+              (OUT / "eastmoney_metadata.json").write_text(
+                  json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+              log(f"Unique metadata records: {len(result)}")
+              return result
+
+          PRIORITY_PHRASES = (
+              "深度研究报告", "公司深度报告", "深度报告", "首次覆盖报告", "公司首次覆盖报告",
+              "专注中枢神经与心脑血管，研发加码",
+              "创新药渐入佳境，成品药稳中有增",
+              "成品药稳中有增，失眠新药放量可期",
+          )
+          COMMENTARY_WORDS = (
+              "年报点评", "季报点评", "半年报点评", "中报点评", "一季报", "三季报",
+              "Q1", "Q2", "Q3", "Q4", "业绩点评", "信息更新", "事件点评",
+          )
+
+          def page_meta(row: dict[str, Any]) -> int:
+              for key in ("attachPages", "pageCount", "pages"):
+                  try:
+                      return int(row.get(key) or 0)
+                  except Exception:
+                      pass
+              return 0
+
+          def score(row: dict[str, Any]) -> float:
+              title = str(row.get("title") or "")
+              pages = page_meta(row)
+              date = str(row.get("publishDate") or "")[:10]
+              s = min(pages, 80) * 5.0
+              if "深度研究报告" in title: s += 1300
+              if "公司深度报告" in title: s += 1250
+              if "深度报告" in title: s += 1100
+              if "公司首次覆盖报告" in title: s += 1050
+              if "首次覆盖报告" in title: s += 1000
+              if "首次覆盖" in title: s += 850
+              for phrase in PRIORITY_PHRASES:
+                  if phrase in title:
+                      s += 500
+              if any(word in title for word in COMMENTARY_WORDS):
+                  s -= 650
+              if pages and pages < 10:
+                  s -= 800
+              if date.startswith("2026"): s += 90
+              elif date.startswith("2025"): s += 80
+              elif date.startswith("2024"): s += 70
+              elif date.startswith("2023"): s += 50
+              return s
+
+          def pdf_urls(info: str, row: dict[str, Any]) -> list[str]:
+              urls: list[str] = []
+              for value in row.values():
+                  if isinstance(value, str) and value.startswith(("http://", "https://")) and ".pdf" in value.lower():
+                      urls.append(value)
+              if info:
+                  urls += [
+                      f"https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf",
+                      f"https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?download=1",
+                      f"https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf",
+                  ]
+              return list(dict.fromkeys(urls))
+
+          def download_pdf(info: str, row: dict[str, Any], destination: Path) -> str | None:
+              for url in pdf_urls(info, row):
+                  try:
+                      with session.get(url, stream=True, timeout=120, allow_redirects=True,
+                                       headers={"Referer": "https://data.eastmoney.com/report/"}) as r:
+                          r.raise_for_status()
+                          with destination.open("wb") as f:
+                              for chunk in r.iter_content(1024 * 512):
+                                  if chunk:
+                                      f.write(chunk)
+                      if destination.stat().st_size < 80_000:
+                          raise RuntimeError(f"file too small: {destination.stat().st_size}")
+                      with destination.open("rb") as f:
+                          if f.read(5) != b"%PDF-":
+                              raise RuntimeError("not a PDF payload")
+                      return url
+                  except Exception as exc:
+                      log(f"Download failed {url}: {exc}")
+                      destination.unlink(missing_ok=True)
+              return None
+
+          def validate_pdf(path: Path) -> dict[str, Any]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < 10:
+                  raise RuntimeError(f"too few pages: {pages}")
+              doc = fitz.open(path)
+              if doc.page_count != pages:
+                  raise RuntimeError("page count mismatch")
+              text_parts: list[str] = []
+              for idx in range(min(10, pages)):
+                  try:
+                      text_parts.append(doc.load_page(idx).get_text("text"))
+                  except Exception:
+                      pass
+              opening = re.sub(r"\s+", "", "\n".join(text_parts))
+              if not any(alias in opening for alias in ALIASES):
+                  raise RuntimeError("company identity not found in first pages")
+              render_dir = RENDERS / safe_name(path.stem)
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for idx in sorted(set([0, pages // 2, pages - 1])):
+                  pix = doc.load_page(idx).get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+                  png = render_dir / f"page_{idx + 1:03d}.png"
+                  pix.save(png)
+                  if png.stat().st_size < 4_000:
+                      raise RuntimeError(f"suspicious render: {png}")
+              doc.close()
+              return {"pages": pages, "size_bytes": path.stat().st_size, "sha256": sha256(path)}
+
+          rows = fetch_metadata()
+          ordered = sorted(rows, key=score, reverse=True)
+          for row in ordered[:50]:
+              log("META | " + " | ".join([
+                  str(row.get("publishDate") or "")[:10],
+                  str(row.get("orgSName") or row.get("orgName") or ""),
+                  str(page_meta(row)),
+                  str(row.get("infoCode") or ""),
+                  str(row.get("title") or ""),
+                  f"score={score(row):.1f}",
+              ]))
+
+          accepted: list[dict[str, Any]] = []
+          for row in ordered:
+              if len(accepted) >= 12:
+                  break
+              info = str(row.get("infoCode") or "")
+              title = str(row.get("title") or "").strip()
+              pages = page_meta(row)
+              if not info or not title:
+                  continue
+              substantive = (
+                  any(k in title for k in ("深度", "首次覆盖"))
+                  or any(k in title for k in PRIORITY_PHRASES)
+                  or pages >= 18
+              )
+              if not substantive:
+                  continue
+              if any(word in title for word in COMMENTARY_WORDS) and pages < 18:
+                  continue
+              destination = RAW / f"{info}.pdf"
+              url = download_pdf(info, row, destination)
+              if not url:
+                  continue
+              try:
+                  meta = validate_pdf(destination)
+              except Exception as exc:
+                  log(f"Rejected {info} {title}: {exc}")
+                  destination.unlink(missing_ok=True)
+                  continue
+              rec = {
+                  "title": title,
+                  "org": str(row.get("orgSName") or row.get("orgName") or "").strip(),
+                  "date": str(row.get("publishDate") or "")[:10],
+                  "authors": str(row.get("researcher") or row.get("researcherName") or "").strip(),
+                  "info_code": info,
+                  "download_url": url,
+                  "score": score(row) + meta["pages"] * 2,
+                  "source_path": str(destination),
+                  **meta,
+              }
+              accepted.append(rec)
+              log(f"Accepted {rec['date']} {rec['org']} {rec['title']} [{rec['pages']} pages]")
+
+          accepted.sort(key=lambda x: x["score"], reverse=True)
+          (OUT / "accepted_candidates.json").write_text(
+              json.dumps(accepted, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          selected: list[dict[str, Any]] = []
+          seen_title: set[str] = set()
+          seen_org: set[str] = set()
+          # Pass 1: favor distinct brokers and explicit depth/first-coverage reports.
+          for rec in accepted:
+              key = re.sub(r"\s+", "", rec["title"])
+              explicit = any(k in rec["title"] for k in ("深度", "首次覆盖")) or any(k in rec["title"] for k in PRIORITY_PHRASES)
+              if not explicit or key in seen_title or rec["org"] in seen_org:
+                  continue
+              selected.append(rec)
+              seen_title.add(key)
+              seen_org.add(rec["org"])
+              if len(selected) >= 3:
+                  break
+          # Pass 2: fill with the best remaining substantive reports if needed.
+          if len(selected) < 3:
+              for rec in accepted:
+                  key = re.sub(r"\s+", "", rec["title"])
+                  if key in seen_title:
+                      continue
+                  selected.append(rec)
+                  seen_title.add(key)
+                  if len(selected) >= 3:
+                      break
+
+          if len(selected) < 2:
+              raise RuntimeError(f"Only {len(selected)} valid substantive broker PDFs found")
+
+          manifest: list[dict[str, Any]] = []
+          readme = [
+              "# 京新药业（002020）券商深度及首次覆盖报告",
+              "",
+              f"整理时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+              "",
+              "收录标准：公开渠道可直接下载的完整券商原始PDF；优先选择深度研究、公司深度和首次覆盖报告。",
+              "未用网页摘要、公众号文章、上市公司公告或重新排版材料补足数量。",
+              "",
+          ]
+          total_pages = 0
+          for idx, rec in enumerate(selected, 1):
+              src = Path(rec["source_path"])
+              filename = f"{idx:02d}_{safe_name(rec['org'], 30)}_{safe_name(rec['date'], 12)}_{safe_name(rec['title'], 90)}.pdf"
+              dst = FINAL / filename
+              dst.write_bytes(src.read_bytes())
+              total_pages += rec["pages"]
+              item = {k: v for k, v in rec.items() if k not in ("source_path", "score")}
+              item["package_filename"] = filename
+              item["sha256"] = sha256(dst)
+              manifest.append(item)
+              readme += [
+                  f"## {idx}. {rec['title']}",
+                  f"- 机构：{rec['org']}",
+                  f"- 日期：{rec['date']}",
+                  f"- 分析师：{rec['authors'] or '未在元数据中列明'}",
+                  f"- 页数：{rec['pages']}",
+                  f"- 文件：`{filename}`",
+                  f"- 原始公开PDF：{rec['download_url']}",
+                  f"- SHA-256：`{item['sha256']}`",
+                  "",
+              ]
+
+          (FINAL / "README_文件清单与来源.md").write_text("\n".join(readme), encoding="utf-8")
+          (FINAL / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          (FINAL / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{x['sha256']}  {x['package_filename']}" for x in manifest) + "\n",
+              encoding="utf-8")
+          (OUT / "run.log").write_text("\n".join(logs), encoding="utf-8")
+
+          zip_cn = OUT / f"京新药业_002020_券商深度报告_原始PDF_{len(manifest)}份_20261006.zip"
+          zip_en = OUT / f"Jingxin_Pharma_002020_Broker_Deep_Reports_Original_PDFs_{len(manifest)}_20261006.zip"
+          for zp in (zip_cn, zip_en):
+              with zipfile.ZipFile(zp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for p in sorted(FINAL.iterdir()):
+                      zf.write(p, arcname=p.name)
+              with zipfile.ZipFile(zp) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f"ZIP CRC failure: {bad}")
+              log(f"Created {zp.name}: {zp.stat().st_size} bytes; SHA256={sha256(zp)}")
+
+          summary = {
+              "count": len(manifest),
+              "total_pages": total_pages,
+              "reports": manifest,
+              "zip_cn": str(zip_cn), "zip_cn_sha256": sha256(zip_cn),
+              "zip_en": str(zip_en), "zip_en_sha256": sha256(zip_en),
+          }
+          (OUT / "package_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_jingxin_reports.py
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jingxin-002020-Broker-Deep-Reports
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/run.log
+            output/eastmoney_metadata.json
+            output/accepted_candidates.json
+          if-no-files-found: error
+          retention-days: 3
