@@ -1,0 +1,411 @@
+name: Package Rendu Bio Filings
+
+on:
+  push:
+    branches:
+      - tmp-rendu-688193-filings-20261006
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pypdf pymupdf
+
+      - name: Discover, download, verify, and package filings
+        shell: bash
+        run: |
+          cat > /tmp/build_rendu_filings.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+
+          STOCK = "688193"
+          COMPANY = "仁度生物"
+          FULL_COMPANY = "上海仁度生物科技股份有限公司"
+          ALIASES = (COMPANY, FULL_COMPANY, STOCK)
+          YEARS = list(range(2021, 2026))
+
+          OUT = Path("output")
+          RAW = OUT / "raw"
+          FINAL = OUT / "final"
+          RENDERS = OUT / "renders"
+          for p in (OUT, RAW, FINAL, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept": "application/json,text/plain,text/html,application/pdf,*/*",
+              "Referer": "https://data.eastmoney.com/",
+          })
+
+          logs: list[str] = []
+          def log(message: str) -> None:
+              print(message, flush=True)
+              logs.append(message)
+
+          def clean_title(value: Any) -> str:
+              text = html.unescape(str(value or ""))
+              text = re.sub(r"<[^>]+>", "", text)
+              return re.sub(r"\s+", " ", text).strip()
+
+          def safe_name(value: str, limit: int = 110) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", value)
+              value = re.sub(r"\s+", "_", value).strip(" ._")
+              return (value or "file")[:limit]
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def fetch_announcements() -> list[dict[str, Any]]:
+              endpoint = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+              rows: list[dict[str, Any]] = []
+              for page in range(1, 31):
+                  params = {
+                      "sr": -1,
+                      "page_size": 100,
+                      "page_index": page,
+                      "ann_type": "A",
+                      "client_source": "web",
+                      "stock_list": STOCK,
+                      "f_node": 0,
+                      "s_node": 0,
+                  }
+                  last_error = None
+                  payload = None
+                  for attempt in range(5):
+                      try:
+                          r = session.get(endpoint, params=params, timeout=60)
+                          r.raise_for_status()
+                          payload = r.json()
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          time.sleep(1.5 * (attempt + 1))
+                  if not isinstance(payload, dict):
+                      raise RuntimeError(f"Announcement API failed on page {page}: {last_error}")
+                  page_rows = ((payload.get("data") or {}).get("list") or [])
+                  if not page_rows:
+                      break
+                  rows.extend(page_rows)
+                  log(f"Announcement page {page}: {len(page_rows)} rows")
+                  if len(page_rows) < 100:
+                      break
+              (OUT / "announcements_raw.json").write_text(
+                  json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              return rows
+
+          def normalize(row: dict[str, Any]) -> dict[str, Any] | None:
+              title = clean_title(row.get("title"))
+              art_code = str(row.get("art_code") or "")
+              date = str(row.get("notice_date") or "")[:10]
+              if not title or not art_code:
+                  return None
+              return {
+                  "title": title,
+                  "date": date,
+                  "art_code": art_code,
+                  "url": f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf",
+                  "source": "东方财富公告镜像（原始披露PDF）",
+              }
+
+          BAD_COMMON = ("摘要", "英文版", "英文", "审计报告", "问询函", "回复", "提示性公告")
+
+          def annual_year(title: str) -> int | None:
+              compact = re.sub(r"\s+", "", title)
+              m = re.search(r"(202[1-5])年年度报告", compact)
+              if not m:
+                  return None
+              year = int(m.group(1))
+              if year not in YEARS:
+                  return None
+              if any(word in compact for word in BAD_COMMON):
+                  return None
+              if "年度报告更正公告" in compact or "年度报告补充公告" in compact:
+                  return None
+              return year
+
+          def annual_score(item: dict[str, Any]) -> tuple[int, str]:
+              title = item["title"]
+              score = 0
+              if any(word in title for word in ("修订版", "更正后", "补充版", "更新后", "全文")):
+                  score += 500
+              if title.endswith("年度报告"):
+                  score += 100
+              return score, item.get("date") or ""
+
+          def is_final_prospectus(title: str) -> bool:
+              compact = re.sub(r"\s+", "", title)
+              if "首次公开发行股票并在科创板上市招股说明书" not in compact:
+                  return False
+              if any(word in compact for word in ("摘要", "附录", "申报稿", "上会稿", "注册稿", "招股意向书")):
+                  return False
+              return True
+
+          def prospectus_score(item: dict[str, Any]) -> tuple[int, str]:
+              title = item["title"]
+              date = item.get("date") or ""
+              score = 0
+              if date.startswith("2022-03"):
+                  score += 1000
+              if title.endswith("招股说明书"):
+                  score += 300
+              if "首次公开发行股票并在科创板上市" in title:
+                  score += 200
+              return score, date
+
+          def quarter_key(title: str) -> tuple[int, int] | None:
+              compact = re.sub(r"\s+", "", title)
+              if any(word in compact for word in BAD_COMMON):
+                  return None
+              m = re.search(r"(20\d{2})年(第一季度|第三季度|一季度|三季度)报告", compact)
+              if not m:
+                  return None
+              year = int(m.group(1))
+              q = 1 if m.group(2) in ("第一季度", "一季度") else 3
+              return year, q
+
+          def select(items: list[dict[str, Any]]):
+              annuals: dict[int, dict[str, Any]] = {}
+              for item in items:
+                  year = annual_year(item["title"])
+                  if year is None:
+                      continue
+                  current = annuals.get(year)
+                  if current is None or annual_score(item) > annual_score(current):
+                      annuals[year] = item
+              missing = [year for year in YEARS if year not in annuals]
+              if missing:
+                  raise RuntimeError(f"Missing annual reports: {missing}")
+
+              prospectuses = [item for item in items if is_final_prospectus(item["title"])]
+              if not prospectuses:
+                  raise RuntimeError("Final IPO prospectus not found")
+              prospectuses.sort(key=prospectus_score, reverse=True)
+              prospectus = prospectuses[0]
+
+              quarters = [(quarter_key(item["title"]), item) for item in items]
+              quarters = [(key, item) for key, item in quarters if key is not None]
+              if not quarters:
+                  raise RuntimeError("No quarterly report found")
+              quarters.sort(key=lambda x: (x[0][0], x[0][1], x[1].get("date") or ""), reverse=True)
+              latest_quarter = quarters[0][1]
+              return annuals, prospectus, latest_quarter
+
+          def candidate_urls(item: dict[str, Any]) -> list[str]:
+              code = item["art_code"]
+              return [
+                  item["url"],
+                  f"https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf?download=1",
+              ]
+
+          def download(item: dict[str, Any], destination: Path) -> str:
+              last_error = None
+              for url in candidate_urls(item):
+                  for attempt in range(4):
+                      try:
+                          with session.get(url, timeout=120, stream=True, allow_redirects=True) as r:
+                              r.raise_for_status()
+                              with destination.open("wb") as f:
+                                  for chunk in r.iter_content(1024 * 512):
+                                      if chunk:
+                                          f.write(chunk)
+                          if destination.stat().st_size < 50_000:
+                              raise RuntimeError(f"file too small: {destination.stat().st_size}")
+                          with destination.open("rb") as f:
+                              if f.read(5) != b"%PDF-":
+                                  raise RuntimeError("payload is not PDF")
+                          return url
+                      except Exception as exc:
+                          last_error = exc
+                          destination.unlink(missing_ok=True)
+                          time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(f"Download failed for {item['title']}: {last_error}")
+
+          def verify_pdf(path: Path, kind: str, expected_year: int | None = None) -> dict[str, Any]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              min_pages = 200 if kind == "prospectus" else (5 if kind == "quarter" else 30)
+              if pages < min_pages:
+                  raise RuntimeError(f"Unexpected page count for {kind}: {pages}")
+
+              doc = fitz.open(path)
+              if doc.page_count != pages:
+                  raise RuntimeError(f"Page count mismatch: pypdf={pages}, fitz={doc.page_count}")
+
+              text = ""
+              for idx in range(min(15, pages)):
+                  try:
+                      text += "\n" + doc.load_page(idx).get_text("text")
+                  except Exception:
+                      pass
+              compact = re.sub(r"\s+", "", text)
+              if not any(alias in compact for alias in ALIASES):
+                  raise RuntimeError("Company identity not found in opening pages")
+              if expected_year is not None and str(expected_year) not in compact:
+                  raise RuntimeError(f"Expected year {expected_year} not found")
+              if kind == "prospectus" and "招股说明书" not in compact:
+                  raise RuntimeError("Prospectus marker not found")
+              if kind == "quarter" and "季度报告" not in compact:
+                  raise RuntimeError("Quarterly marker not found")
+
+              render_dir = RENDERS / safe_name(path.stem)
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for idx in sorted(set([0, pages // 2, pages - 1])):
+                  pix = doc.load_page(idx).get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+                  png = render_dir / f"page_{idx + 1:04d}.png"
+                  pix.save(png)
+                  if png.stat().st_size < 4_000:
+                      raise RuntimeError(f"Suspicious render: {png}")
+              doc.close()
+              return {"pages": pages, "size_bytes": path.stat().st_size, "sha256": sha256(path)}
+
+          rows = fetch_announcements()
+          items = [x for x in (normalize(row) for row in rows) if x]
+          (OUT / "announcements_normalized.json").write_text(
+              json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          annuals, prospectus, latest_quarter = select(items)
+
+          selected: list[tuple[str, str, int | None, dict[str, Any]]] = []
+          for year in YEARS:
+              selected.append((f"{year}年年度报告", "annual", year, annuals[year]))
+          selected.append(("首次公开发行股票并在科创板上市招股说明书", "prospectus", None, prospectus))
+          selected.append((latest_quarter["title"], "quarter", None, latest_quarter))
+
+          manifest: list[dict[str, Any]] = []
+          readme = [
+              "# 仁度生物（688193）全部年度报告、招股说明书及最新季度报告",
+              "",
+              f"整理时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+              "",
+              "收录口径：公司于2022年3月上市；公开披露的完整年度报告从2021年度开始，因此本包收录2021-2025年全部完整年度报告。",
+              "最新季报按季度报告期排序选取，不以半年度报告替代；本次为2026年第一季度报告。",
+              "招股说明书采用上市发行阶段的正式全文，不采用申报稿、上会稿、注册稿、摘要或附录。",
+              "",
+          ]
+
+          total_pages = 0
+          for idx, (label, kind, year, item) in enumerate(selected, 1):
+              raw_path = RAW / f"{idx:02d}_{safe_name(label)}.pdf"
+              log(f"Downloading: {item['date']} | {item['title']} | {item['url']}")
+              used_url = download(item, raw_path)
+              meta = verify_pdf(raw_path, kind=kind, expected_year=year)
+              total_pages += meta["pages"]
+
+              filename = f"{idx:02d}_仁度生物_{safe_name(label, 80)}.pdf"
+              final_path = FINAL / filename
+              final_path.write_bytes(raw_path.read_bytes())
+              final_sha = sha256(final_path)
+              record = {
+                  "filename": filename,
+                  "label": label,
+                  "kind": kind,
+                  "report_year": year,
+                  "announcement_title": item["title"],
+                  "announcement_date": item["date"],
+                  "source": item["source"],
+                  "download_url": used_url,
+                  "art_code": item["art_code"],
+                  "pages": meta["pages"],
+                  "size_bytes": meta["size_bytes"],
+                  "sha256": final_sha,
+              }
+              manifest.append(record)
+              readme += [
+                  f"## {idx}. {label}",
+                  f"- 公告标题：{item['title']}",
+                  f"- 披露日期：{item['date']}",
+                  f"- 页数：{meta['pages']}",
+                  f"- 文件：`{filename}`",
+                  f"- 原始PDF：{used_url}",
+                  f"- SHA-256：`{final_sha}`",
+                  "",
+              ]
+
+          readme += [
+              "## 汇总",
+              f"- PDF数量：{len(manifest)}",
+              f"- 总页数：{total_pages}",
+              "- 每份PDF均检查文件头、公司标识、报告类型、页数和页面渲染。",
+              "- 压缩包已执行完整解压及CRC校验。",
+              "",
+          ]
+          (FINAL / "README_文件清单与来源.md").write_text("\n".join(readme), encoding="utf-8")
+          (FINAL / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          (FINAL / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  {item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_cn = OUT / "仁度生物_688193_全部年报_2021-2025_招股说明书及2026年第一季度报告_20261006.zip"
+          zip_en = OUT / "Rendu_Bio_688193_All_Annual_Reports_2021_2025_Prospectus_and_2026Q1_20261006.zip"
+          for zp in (zip_cn, zip_en):
+              with zipfile.ZipFile(zp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for path in sorted(FINAL.iterdir()):
+                      zf.write(path, arcname=path.name)
+              with zipfile.ZipFile(zp) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f"ZIP CRC failure: {bad}")
+              log(f"Created {zp.name}: {zp.stat().st_size} bytes, SHA256={sha256(zp)}")
+
+          summary = {
+              "company": COMPANY,
+              "stock_code": STOCK,
+              "pdf_count": len(manifest),
+              "total_pages": total_pages,
+              "reports": manifest,
+              "zip_cn": str(zip_cn),
+              "zip_cn_size": zip_cn.stat().st_size,
+              "zip_cn_sha256": sha256(zip_cn),
+              "zip_en": str(zip_en),
+              "zip_en_size": zip_en.stat().st_size,
+              "zip_en_sha256": sha256(zip_en),
+          }
+          (OUT / "package_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          (OUT / "run.log").write_text("\n".join(logs), encoding="utf-8")
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_rendu_filings.py
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rendu-688193-Annual-Prospectus-Quarterly
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/run.log
+            output/announcements_normalized.json
+          if-no-files-found: error
+          retention-days: 3
