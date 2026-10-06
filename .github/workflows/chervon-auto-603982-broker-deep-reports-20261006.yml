@@ -1,0 +1,319 @@
+name: Build Chervon Auto 603982 broker deep reports 20261006
+
+on:
+  push:
+    paths:
+      - '.github/workflows/chervon-auto-603982-broker-deep-reports-20261006.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '603982'
+          COMPANY = '泉峰汽车'
+          FULL = '南京泉峰汽车精密技术股份有限公司'
+          TODAY = '2026-10-06'
+
+          WORK = Path('chervon_broker_work')
+          RAW = WORK / 'raw'
+          FINAL = WORK / 'final'
+          ART = Path('artifact_out')
+          for p in (RAW, FINAL, ART):
+              p.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/json,text/plain,application/pdf,*/*',
+              'Referer': 'https://data.eastmoney.com/report/',
+          })
+
+          def clean(x: str) -> str:
+              x = re.sub(r'<[^>]+>', '', str(x or ''))
+              x = x.replace('：', ':').replace('，', ',').replace('（', '(').replace('）', ')')
+              return re.sub(r'\s+', '', x).lower()
+
+          def safe(x: str, n: int = 110) -> str:
+              x = re.sub(r'[\\/:*?"<>|]+', '_', str(x or '')).strip(' ._')
+              return x[:n] or 'report'
+
+          def query_page(page: int) -> list[dict]:
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2018-01-01', 'endTime': TODAY,
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': CODE, 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      r = s.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=(20, 120))
+                      print('REPORT_API', page, attempt, r.status_code, len(r.content), r.url, flush=True)
+                      r.raise_for_status()
+                      return r.json().get('data') or []
+                  except Exception as exc:
+                      last = exc
+                      print('REPORT_API_ERR', page, attempt, repr(exc), flush=True)
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'report API failed: {last!r}')
+
+          rows = []
+          for page in range(1, 8):
+              batch = query_page(page)
+              rows.extend(batch)
+              if len(batch) < 100:
+                  break
+
+          uniq = {}
+          for row in rows:
+              key = str(row.get('infoCode') or row.get('id') or json.dumps(row, ensure_ascii=False))
+              uniq[key] = row
+          rows = list(uniq.values())
+          (WORK / 'all_report_metadata.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('REPORT_METADATA_COUNT', len(rows), flush=True)
+          for row in rows:
+              print('META', json.dumps({k: row.get(k) for k in ('infoCode','title','orgSName','publishDate','attachPages','stockName','stockCode')}, ensure_ascii=False), flush=True)
+
+          deep_terms = [
+              '深度', '首次覆盖', '公司研究', '新股覆盖', '投资价值',
+              '新能源汽车', '新能源', '轻量化', '铝合金', '压铸', '一体化压铸',
+              '电驱', '三电', '汽车零部件', '成长', '全球化', '产能扩张'
+          ]
+          shallow_terms = [
+              '点评', '季报', '年报', '中报', '半年报', '业绩预告', '业绩快报',
+              '公告点评', '跟踪报告', '可转债', '定增', '简评'
+          ]
+
+          def score_row(row: dict) -> int:
+              title = clean(row.get('title'))
+              pages = int(row.get('attachPages') or 0)
+              score = 0
+              if '深度' in title:
+                  score += 80
+              if '首次覆盖' in title:
+                  score += 75
+              if '公司研究' in title:
+                  score += 35
+              if '新股覆盖' in title:
+                  score += 25
+              for term in deep_terms:
+                  if clean(term) in title:
+                      score += 9
+              for term in shallow_terms:
+                  if clean(term) in title:
+                      score -= 25
+              if pages >= 35:
+                  score += 45
+              elif pages >= 25:
+                  score += 35
+              elif pages >= 18:
+                  score += 27
+              elif pages >= 12:
+                  score += 18
+              elif pages >= 10:
+                  score += 10
+              else:
+                  score -= 80
+              date = str(row.get('publishDate') or '')
+              try:
+                  year = int(date[:4])
+              except Exception:
+                  year = 0
+              score += max(0, min(12, year - 2014))
+              return score
+
+          ranked = sorted(rows, key=lambda r: (score_row(r), int(r.get('attachPages') or 0), str(r.get('publishDate') or '')), reverse=True)
+          candidates = [r for r in ranked if int(r.get('attachPages') or 0) >= 10][:25]
+          print('CANDIDATE_METADATA', flush=True)
+          for row in candidates:
+              print(json.dumps({
+                  'score': score_row(row), 'infoCode': row.get('infoCode'), 'title': row.get('title'),
+                  'broker': row.get('orgSName'), 'date': row.get('publishDate'), 'pages': row.get('attachPages')
+              }, ensure_ascii=False), flush=True)
+
+          def download_pdf(info: str, target: Path) -> str:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_01.pdf',
+              ]
+              errors = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          r = s.get(url, timeout=(25, 180), allow_redirects=True)
+                          print('PDF_GET', info, attempt, r.status_code, len(r.content), url, 'FINAL', r.url, flush=True)
+                          if r.status_code == 200 and len(r.content) > 100_000 and r.content.startswith(b'%PDF-'):
+                              target.write_bytes(r.content)
+                              return str(r.url)
+                      except Exception as exc:
+                          errors.append(f'{url}: {exc!r}')
+                      time.sleep(attempt)
+              raise RuntimeError('No valid PDF for ' + info + '; ' + '; '.join(errors[-5:]))
+
+          valid = []
+          seen_sha = set()
+          for idx, row in enumerate(candidates, 1):
+              info = str(row.get('infoCode') or '')
+              if not info:
+                  continue
+              title = str(row.get('title') or info).strip()
+              broker = str(row.get('orgSName') or row.get('orgName') or '未知券商').strip()
+              date = str(row.get('publishDate') or '')[:10]
+              tmp = RAW / f'{idx:02d}_{info}.pdf'
+              try:
+                  source = download_pdf(info, tmp)
+                  reader = PdfReader(str(tmp), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 10:
+                      raise RuntimeError(f'report too short: {pages} pages')
+
+                  parts = []
+                  indices = list(range(min(18, pages)))
+                  if pages > 20:
+                      indices += list(range(max(0, pages - 4), pages))
+                  for pno in dict.fromkeys(indices):
+                      try:
+                          parts.append(reader.pages[pno].extract_text() or '')
+                      except Exception:
+                          pass
+                  sample = '\n'.join(parts)
+                  identity = CODE in sample or COMPANY in sample or FULL in sample
+                  if not identity:
+                      raise RuntimeError('company identity check failed')
+                  research = any(k in sample for k in ['证券研究报告', '公司研究', '深度研究', '首次覆盖', '研究报告'])
+                  if not research:
+                      print('WARN_RESEARCH_MARKER_NOT_FOUND', title, flush=True)
+
+                  q = subprocess.run(['qpdf', '--check', str(tmp)], capture_output=True, text=True)
+                  if q.returncode not in (0, 3):
+                      raise RuntimeError('qpdf failed: ' + q.stderr[-1000:])
+
+                  data = tmp.read_bytes()
+                  sha = hashlib.sha256(data).hexdigest()
+                  if sha in seen_sha:
+                      raise RuntimeError('duplicate PDF')
+                  seen_sha.add(sha)
+                  valid.append({
+                      'tmp': tmp, 'info_code': info, 'title': title, 'broker': broker,
+                      'publish_date': date, 'pages': pages, 'bytes': len(data),
+                      'sha256': sha, 'source_url': source, 'score': score_row(row),
+                  })
+                  print('VALID', json.dumps({k: valid[-1][k] for k in ('broker','title','publish_date','pages','score')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('CANDIDATE_FAILED', info, title, repr(exc), flush=True)
+                  tmp.unlink(missing_ok=True)
+
+          if len(valid) < 2:
+              raise RuntimeError(f'Only {len(valid)} validated reports found')
+
+          valid.sort(key=lambda r: (r['score'], r['pages'], r['publish_date']), reverse=True)
+          selected = []
+          used_brokers = set()
+          for rec in valid:
+              if rec['broker'] in used_brokers:
+                  continue
+              selected.append(rec)
+              used_brokers.add(rec['broker'])
+              if len(selected) == 3:
+                  break
+          if len(selected) < 3:
+              for rec in valid:
+                  if rec not in selected:
+                      selected.append(rec)
+                  if len(selected) == 3:
+                      break
+          selected = selected[:3]
+
+          package_name = f'泉峰汽车_603982_券商深度报告_{len(selected)}份'
+          package_dir = FINAL / package_name
+          package_dir.mkdir(parents=True, exist_ok=True)
+
+          for idx, rec in enumerate(selected, 1):
+              filename = f'{idx:02d}_{safe(rec["publish_date"])}_{safe(rec["broker"])}_{safe(rec["title"])}.pdf'
+              shutil.copy2(rec['tmp'], package_dir / filename)
+              rec['filename'] = filename
+              rec.pop('tmp', None)
+
+          readme = [
+              f'{FULL}（{CODE}.SH，证券简称：{COMPANY}）券商深度报告合集',
+              f'整理日期：{TODAY}',
+              '',
+              '筛选标准：优先完整公司深度报告、首次覆盖或较长公司专题，排除数页季报/年报点评；尽量选择不同券商。',
+              '',
+              '文件清单：',
+          ]
+          for idx, rec in enumerate(selected, 1):
+              readme += [
+                  f'{idx}. {rec["filename"]}',
+                  f'   券商：{rec["broker"]}',
+                  f'   标题：{rec["title"]}',
+                  f'   日期：{rec["publish_date"]}；页数：{rec["pages"]}',
+                  f'   来源：{rec["source_url"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  '',
+              ]
+          readme += ['完整性检查：已验证PDF文件头、公司名称/证券代码、实际页数、qpdf结构、重复文件及SHA-256；ZIP已完成CRC测试。']
+          (package_dir / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (package_dir / 'manifest.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          (package_dir / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in selected), encoding='utf-8')
+
+          zip_path = ART / f'{package_name}.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(package_dir.iterdir()):
+                  zf.write(p, arcname=f'{package_name}/{p.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_count = sum(1 for name in zf.namelist() if name.lower().endswith('.pdf'))
+              if pdf_count != len(selected):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(selected)}')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_RECORDS', json.dumps(selected, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'SHA256', zip_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: chervon-auto-603982-broker-deep-reports-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
