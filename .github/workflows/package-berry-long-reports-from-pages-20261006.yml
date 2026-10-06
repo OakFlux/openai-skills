@@ -1,0 +1,248 @@
+name: Package Berry Genomics long broker reports from public pages
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/berry-long-reports-pages-20261006.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF and image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Download page images, build PDFs and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          REPORTS = [
+              {
+                  'filename': '01_东北证券_2025-08-28_解码生命经纬智绘基因新篇.pdf',
+                  'broker': '东北证券',
+                  'title': '解码生命经纬，智绘基因新篇',
+                  'report_date': '2025-08-28',
+                  'pages': 35,
+                  'analysts': ['吴源恒'],
+                  'rating': '增持（首次）',
+                  'report_page': 'https://www.sgpjbg.com/baogao/887730.html',
+                  'image_base': 'https://file.sgpjbg.com/fileroot2/2025-8/29/25072825-59dd-4422-be19-697d3faf48cc/25072825-59dd-4422-be19-697d3faf48cc',
+              },
+              {
+                  'filename': '02_海通证券_2020-09-29_基因测序行业的领头羊研发创新和渠道优势双轮驱动发展.pdf',
+                  'broker': '海通证券',
+                  'title': '基因测序行业的领头羊，研发创新和渠道优势双轮驱动发展',
+                  'report_date': '2020-09-29',
+                  'pages': 37,
+                  'analysts': ['郑琴', '余文心'],
+                  'rating': '优于大市（首次）',
+                  'report_page': 'https://www.sgpjbg.com/baogao/20299.html',
+                  'image_base': 'https://file.sgpjbg.com/fileroot1/2020-9/30/e85c3d66-01c0-475e-9cce-657756cc91b2/e85c3d66-01c0-475e-9cce-657756cc91b2',
+              },
+              {
+                  'filename': '03_国信证券_2020-04-07_肿瘤早筛蓄势待发.pdf',
+                  'broker': '国信证券',
+                  'title': '肿瘤早筛，蓄势待发',
+                  'report_date': '2020-04-07',
+                  'pages': 82,
+                  'analysts': ['朱寒青', '谢长雁'],
+                  'rating': '买入（维持）',
+                  'report_page': 'https://www.sgpjbg.com/baogao/4277.html',
+                  'image_base': 'https://file.sgpjbg.com/fileroot1/2020-7/30/6b3ad467-91c2-4bb8-9f78-343bc49970fd/6b3ad467-91c2-4bb8-9f78-343bc49970fd',
+              },
+          ]
+
+          ROOT = Path('work')
+          PACKAGE_NAME = '贝瑞基因_000710.SZ_券商深度报告_3份'
+          PACKAGE = ROOT / PACKAGE_NAME
+          VERIFY = ROOT / 'verify'
+          ART = Path('artifact_out')
+          for path in (PACKAGE, VERIFY, ART):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(
+              total=8, connect=8, read=8, status=8,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'], raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=12, pool_maxsize=12))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def fetch_page(report: dict, page_no: int, outdir: Path) -> Path:
+              base = report['image_base']
+              variants = [
+                  f'{base}{page_no}.gif',
+                  f'{base}{page_no}.jpg',
+                  f'{base}{page_no}.jpeg',
+                  f'{base}{page_no}.png',
+                  f'{base}_{page_no}.gif',
+              ]
+              errors = []
+              for url in variants:
+                  try:
+                      response = session.get(
+                          url,
+                          headers={'Referer': report['report_page'], 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'},
+                          timeout=(25, 180),
+                      )
+                      blob = response.content
+                      if response.status_code != 200 or len(blob) < 4_000:
+                          errors.append(f'{url}: HTTP {response.status_code}, {len(blob)} bytes')
+                          continue
+                      try:
+                          image = Image.open(io.BytesIO(blob))
+                          image.load()
+                      except Exception as exc:
+                          errors.append(f'{url}: invalid image {exc!r}')
+                          continue
+                      width, height = image.size
+                      if width < 600 or height < 800:
+                          errors.append(f'{url}: dimensions {width}x{height}')
+                          continue
+
+                      # Keep JPEG bytes unchanged. Convert palette/other formats only when necessary.
+                      if blob[:2] == b'\xff\xd8':
+                          target = outdir / f'{page_no:03d}.jpg'
+                          target.write_bytes(blob)
+                      else:
+                          target = outdir / f'{page_no:03d}.jpg'
+                          rgb = image.convert('RGB')
+                          rgb.save(target, format='JPEG', quality=97, subsampling=0, optimize=True)
+                      print('PAGE_OK', report['broker'], page_no, url, width, height, target.stat().st_size, flush=True)
+                      return target
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError(f'Unable to retrieve page {page_no} for {report["title"]}: ' + ' | '.join(errors))
+
+          records = []
+          sha_lines = []
+          for index, report in enumerate(REPORTS, start=1):
+              page_dir = ROOT / f'pages_{index:02d}'
+              page_dir.mkdir(parents=True, exist_ok=True)
+              image_paths = [fetch_page(report, page_no, page_dir) for page_no in range(1, report['pages'] + 1)]
+              if len(image_paths) != report['pages']:
+                  raise RuntimeError(f'Page-image count mismatch for {report["title"]}')
+
+              pdf_path = PACKAGE / report['filename']
+              pdf_path.write_bytes(img2pdf.convert([str(path) for path in image_paths]))
+              if not pdf_path.read_bytes().startswith(b'%PDF'):
+                  raise RuntimeError(f'Output is not PDF: {pdf_path}')
+
+              check = subprocess.run(['qpdf', '--check', str(pdf_path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {pdf_path.name}: {check.stderr[-1000:]}')
+              actual_pages = len(PdfReader(str(pdf_path), strict=False).pages)
+              if actual_pages != report['pages']:
+                  raise RuntimeError(f'PDF page count mismatch for {pdf_path.name}: {actual_pages} != {report["pages"]}')
+
+              first_prefix = VERIFY / f'{index:02d}_first'
+              last_prefix = VERIFY / f'{index:02d}_last'
+              first = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '80', str(pdf_path), str(first_prefix)],
+                  capture_output=True, text=True,
+              )
+              last = subprocess.run(
+                  ['pdftoppm', '-f', str(actual_pages), '-l', str(actual_pages), '-singlefile', '-png', '-r', '80', str(pdf_path), str(last_prefix)],
+                  capture_output=True, text=True,
+              )
+              first_png = Path(str(first_prefix) + '.png')
+              last_png = Path(str(last_prefix) + '.png')
+              if first.returncode != 0 or last.returncode != 0 or not first_png.exists() or not last_png.exists() or first_png.stat().st_size < 5_000 or last_png.stat().st_size < 5_000:
+                  raise RuntimeError(f'First/last page render failed for {pdf_path.name}')
+
+              blob = pdf_path.read_bytes()
+              digest = hashlib.sha256(blob).hexdigest()
+              record = {
+                  **report,
+                  'actual_pages': actual_pages,
+                  'bytes': len(blob),
+                  'sha256': digest,
+                  'assembly_note': '按公开在线阅读器的原始逐页图像顺序合成为PDF；页面内容未修改。',
+              }
+              records.append(record)
+              sha_lines.append(f'{digest}  {report["filename"]}')
+              print('REPORT_OK', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '贝瑞基因（000710.SZ）券商深度报告合集',
+              '整理日期：2026-10-06',
+              '',
+              '本包收录三份公司专属长篇研究报告，分别为35、37和82页。',
+              '由于报告站点的原始PDF下载端点要求登录，本资料包依据其公开在线阅读器提供的原始逐页图像，按页码顺序合成为PDF；没有删页、改页或加入网页摘要。',
+              '',
+              '文件清单：',
+          ]
+          for i, record in enumerate(records, start=1):
+              readme.extend([
+                  f'{i}. {record["filename"]}',
+                  f'   券商：{record["broker"]}',
+                  f'   标题：{record["title"]}',
+                  f'   报告日期：{record["report_date"]}；页数：{record["actual_pages"]}',
+                  f'   分析师：{"、".join(record["analysts"])}；评级：{record["rating"]}',
+                  f'   报告页：{record["report_page"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+          readme.append('完整性核验：逐页下载成功、连续页码检查、Pillow图像解码、qpdf结构检查、PDF页数核对、首末页渲染、SHA-256及ZIP CRC。')
+          (PACKAGE / '00_文件清单与范围说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (PACKAGE / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (PACKAGE / 'SHA256SUMS.txt').write_text('\n'.join(sha_lines) + '\n', encoding='utf-8')
+
+          chinese_zip = ART / f'{PACKAGE_NAME}.zip'
+          with zipfile.ZipFile(chinese_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(PACKAGE.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE_NAME}/{path.name}')
+          with zipfile.ZipFile(chinese_zip, 'r') as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure at {bad}')
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs, expected 3')
+
+          english_zip = ART / 'Berry_Genomics_000710_Broker_Deep_Research_3_Reports.zip'
+          shutil.copy2(chinese_zip, english_zip)
+          print('FINAL_ZIP', chinese_zip, chinese_zip.stat().st_size, hashlib.sha256(chinese_zip.read_bytes()).hexdigest(), flush=True)
+          print('BACKUP_ZIP', english_zip, english_zip.stat().st_size, hashlib.sha256(english_zip.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: berry-long-reports-artifact
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
