@@ -1,0 +1,330 @@
+name: Package Bingshan 000530 Reports V2
+
+on:
+  push:
+    branches:
+      - tmp-bingshan-000530-reports-20261012
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pymupdf pypdf
+
+      - name: Download official reports and build ZIP
+        shell: bash
+        run: |
+          cat > /tmp/build_bingshan_v2.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from typing import Any
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY = '冰山冷热'
+          CODE_A = '000530'
+          CODE_B = '200530'
+          OUT = Path('output_v2')
+          FINAL = OUT / 'final'
+          RENDERS = OUT / 'renders'
+          for p in (OUT, FINAL, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          # Annual-report announcement IDs were resolved from CNINFO's official disclosure API.
+          annual_specs = [
+              (2020, '2021-04-24', '1209787041', 'https://static.cninfo.com.cn/finalpage/2021-04-24/1209787041.PDF'),
+              (2021, '2022-04-23', '1213060612', 'https://static.cninfo.com.cn/finalpage/2022-04-23/1213060612.PDF'),
+              (2022, '2023-04-26', '1216581741', 'https://static.cninfo.com.cn/finalpage/2023-04-26/1216581741.PDF'),
+              (2023, '2024-04-26', '1219817540', 'https://static.cninfo.com.cn/finalpage/2024-04-26/1219817540.PDF'),
+              (2024, '2025-04-24', '1223234968', 'https://static.cninfo.com.cn/finalpage/2025-04-24/1223234968.PDF'),
+              (2025, '2026-04-24', '1225165559', 'https://static.cninfo.com.cn/finalpage/2026-04-24/1225165559.PDF'),
+          ]
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'Origin': 'https://www.cninfo.com.cn',
+              'X-Requested-With': 'XMLHttpRequest',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def clean_title(v: str) -> str:
+              return html.unescape(re.sub(r'<[^>]+>', '', v or '')).strip()
+
+          def get(url: str, timeout: int = 120) -> requests.Response:
+              last: Exception | None = None
+              for attempt in range(6):
+                  try:
+                      r = s.get(url, timeout=timeout, headers={'Accept': 'application/pdf,application/json,*/*', 'Referer': 'https://www.cninfo.com.cn/'})
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}: {r.text[:200]}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(f'GET failed: {url}: {last}')
+
+          def post(data: dict[str, Any]) -> dict[str, Any]:
+              last: Exception | None = None
+              for attempt in range(6):
+                  try:
+                      r = s.post('https://www.cninfo.com.cn/new/hisAnnouncement/query', data=data, timeout=60)
+                      if r.status_code == 200:
+                          return r.json()
+                      last = RuntimeError(f'HTTP {r.status_code}: {r.text[:200]}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(f'POST failed: {last}')
+
+          # Resolve CNINFO organization ID.
+          get('https://www.cninfo.com.cn/', timeout=60)
+          stock_data = get('https://www.cninfo.com.cn/new/data/szse_stock.json', timeout=60).json()
+          stock_rows = stock_data.get('stockList') or stock_data.get('data') or []
+          stock_row = next((x for x in stock_rows if str(x.get('code') or '') == CODE_A), None)
+          if not stock_row:
+              raise RuntimeError('Unable to resolve company in CNINFO stock list')
+          org_id = str(stock_row.get('orgId'))
+          print('orgId:', org_id)
+
+          # Search all 2025-2026 disclosures, because post-2021 quarterly reports are not
+          # consistently returned by the legacy quarterly category filters.
+          announcements: list[dict[str, Any]] = []
+          page = 1
+          while True:
+              payload = {
+                  'pageNum': page,
+                  'pageSize': 30,
+                  'column': 'szse',
+                  'tabName': 'fulltext',
+                  'plate': 'szse',
+                  'stock': f'{CODE_A},{org_id}',
+                  'searchkey': '',
+                  'secid': '',
+                  'category': '',
+                  'trade': '',
+                  'seDate': '2025-01-01~2026-12-31',
+                  'sortName': 'time',
+                  'sortType': 'desc',
+                  'isHLtitle': 'true',
+              }
+              data = post(payload)
+              batch = data.get('announcements') or []
+              announcements.extend(batch)
+              total = int(data.get('totalAnnouncement') or len(announcements))
+              print('announcement page', page, 'rows', len(batch), 'total', total)
+              if not batch or len(announcements) >= total or page >= 30:
+                  break
+              page += 1
+
+          # Supports both “第一季度报告” and “一季度报告”, likewise for Q3.
+          q_re = re.compile(r'(20\d{2})年(?:第)?(一|三|1|3)季度报告')
+          q_candidates = []
+          seen_ids = set()
+          for row in announcements:
+              aid = str(row.get('announcementId') or '')
+              if aid in seen_ids:
+                  continue
+              seen_ids.add(aid)
+              title = clean_title(str(row.get('announcementTitle') or ''))
+              m = q_re.search(title)
+              if not m:
+                  continue
+              if any(x in title for x in ['摘要', '英文版', '更正公告', '取消', '问询函', '回复']):
+                  continue
+              year = int(m.group(1))
+              quarter = 1 if m.group(2) in ('一', '1') else 3
+              canonical = f'{year}年第{"一" if quarter == 1 else "三"}季度报告'
+              score = 0
+              if title == canonical:
+                  score += 100
+              if title == m.group(0):
+                  score += 90
+              if '全文' in title:
+                  score += 20
+              if '正文' in title:
+                  score += 10
+              if any(x in title for x in ['更正后', '修订版', '更新后', '补充版']):
+                  score += 30
+              t = int(row.get('announcementTime') or 0)
+              q_candidates.append((year, quarter, score, t, row, title))
+
+          print('Quarterly candidates:')
+          for x in sorted(q_candidates, reverse=True):
+              print(x[0], x[1], x[2], x[5], x[4].get('adjunctUrl'))
+          if not q_candidates:
+              raise RuntimeError('No quarterly report located in 2025-2026 disclosures')
+          q_candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+          q_year, q_no, _, q_time, q_row, q_title = q_candidates[0]
+          q_label = f'{q_year}年第{"一" if q_no == 1 else "三"}季度报告'
+          q_url = 'https://static.cninfo.com.cn/' + str(q_row.get('adjunctUrl') or '').lstrip('/')
+          q_date = datetime.fromtimestamp(q_time / 1000, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d')
+          print('Selected latest quarterly:', q_title, q_date, q_url)
+          if q_year < 2026:
+              raise RuntimeError(f'Latest quarterly selection is unexpectedly old: {q_title}')
+
+          specs = []
+          for idx, (year, date, aid, url) in enumerate(annual_specs, 1):
+              specs.append({
+                  'filename': f'{idx:02d}_{COMPANY}_{year}年年度报告.pdf',
+                  'title': f'{year}年年度报告',
+                  'type': '年度报告',
+                  'date': date,
+                  'announcement_id': aid,
+                  'url': url,
+              })
+          specs.append({
+              'filename': f'07_{COMPANY}_{q_label}.pdf',
+              'title': q_title,
+              'type': '季度报告',
+              'date': q_date,
+              'announcement_id': str(q_row.get('announcementId') or ''),
+              'url': q_url,
+          })
+
+          manifest = []
+          for spec in specs:
+              data = get(spec['url']).content
+              if len(data) < 100_000 or not data.startswith(b'%PDF'):
+                  raise RuntimeError(f"Invalid PDF {spec['title']}: {len(data)} bytes")
+              path = FINAL / spec['filename']
+              path.write_bytes(data)
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < 5:
+                  raise RuntimeError(f"Suspicious page count {spec['title']}: {pages}")
+
+              doc = pymupdf.open(path)
+              sample_pages = sorted(set([0, min(2, pages - 1), pages // 2, pages - 1]))
+              sample_text = ''
+              render_dir = RENDERS / re.sub(r'[^0-9A-Za-z\u4e00-\u9fff_-]+', '_', path.stem)
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for pageno in sample_pages:
+                  pg = doc.load_page(pageno)
+                  sample_text += pg.get_text('text')[:6000]
+                  pix = pg.get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  render_path = render_dir / f'page-{pageno + 1:04d}.png'
+                  pix.save(render_path)
+                  if render_path.stat().st_size < 8000:
+                      raise RuntimeError(f"Suspicious render {spec['title']} page {pageno + 1}")
+              doc.close()
+              if not any(x in sample_text for x in [COMPANY, CODE_A, CODE_B, '冰山集团']):
+                  print('WARNING: company marker not found in sampled text:', spec['title'])
+
+              item = {
+                  'filename': spec['filename'],
+                  'company': COMPANY,
+                  'stock_code_a': CODE_A,
+                  'stock_code_b': CODE_B,
+                  'report_type': spec['type'],
+                  'announcement_title': spec['title'],
+                  'announcement_date': spec['date'],
+                  'announcement_id': spec['announcement_id'],
+                  'source_url': spec['url'],
+                  'pages': pages,
+                  'size_bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+              }
+              manifest.append(item)
+              print(json.dumps(item, ensure_ascii=False))
+
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['filename']}" for x in manifest) + '\n', encoding='utf-8')
+
+          readme = [
+              f'# {COMPANY}（{CODE_A}/{CODE_B}）2020—2025年报及最新季度报告',
+              '',
+              f'本包包含2020—2025年完整年度报告6份，以及截至2026-10-12检索到的最新季度报告《{q_label}》1份。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for i, x in enumerate(manifest, 1):
+              readme += [
+                  f"### {i}. {x['announcement_title']}",
+                  f"- 公告日期：{x['announcement_date']}",
+                  f"- 页数：{x['pages']}",
+                  f"- 文件：`{x['filename']}`",
+                  f"- 巨潮资讯附件：{x['source_url']}",
+                  f"- SHA-256：`{x['sha256']}`",
+                  '',
+              ]
+          readme += [
+              '## 校验记录',
+              '',
+              '- 7份文件均为巨潮资讯网公开公告原始PDF附件。',
+              '- 已检查PDF文件头、页数和可解析性。',
+              '- 已渲染抽查每份报告的首页、前部页、中间页和末页。',
+              '- ZIP已通过完整CRC检测。',
+          ]
+          (FINAL / 'README_文件清单与来源.md').write_text('\n'.join(readme), encoding='utf-8')
+
+          zip_cn = OUT / f'{COMPANY}_{CODE_A}_2020-2025年报及{q_label}_20261012.zip'
+          zip_en = OUT / f'Bingshan_Cold_Heat_{CODE_A}_Annual_Reports_2020_2025_and_{q_year}Q{q_no}_20261012.zip'
+          for zp in (zip_cn, zip_en):
+              with zipfile.ZipFile(zp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for p in sorted(FINAL.iterdir()):
+                      zf.write(p, arcname=p.name)
+              with zipfile.ZipFile(zp, 'r') as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC error: {bad}')
+
+          summary = {
+              'company': COMPANY,
+              'stock_code_a': CODE_A,
+              'stock_code_b': CODE_B,
+              'latest_quarterly_title': q_label,
+              'report_count': len(manifest),
+              'total_pages': sum(x['pages'] for x in manifest),
+              'reports': manifest,
+              'zip_cn': str(zip_cn),
+              'zip_cn_size': zip_cn.stat().st_size,
+              'zip_cn_sha256': sha256(zip_cn),
+              'zip_en': str(zip_en),
+              'zip_en_size': zip_en.stat().st_size,
+              'zip_en_sha256': sha256(zip_en),
+          }
+          (OUT / 'package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_bingshan_v2.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bingshan-000530-Reports-V2
+          path: |
+            output_v2/*.zip
+            output_v2/package_summary.json
+            output_v2/renders/**/*.png
+          if-no-files-found: error
+          retention-days: 3
