@@ -1,0 +1,377 @@
+name: Build Huaying Technology 000536 broker deep report package 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/huaying-000536-broker-deep-reports-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf beautifulsoup4 lxml
+
+      - name: Discover, download, validate, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CODE = '000536'
+          COMPANY = '华映科技'
+          TODAY = dt.date(2026, 10, 12)
+          ROOT = Path('huaying_broker_work')
+          DL = ROOT / 'downloads'
+          FINAL = ROOT / 'final'
+          ART = Path('artifact_out')
+          for p in (DL, FINAL, ART):
+              p.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/json,text/plain,text/html,application/pdf,*/*',
+              'Referer': 'https://data.eastmoney.com/',
+          })
+
+          def clean(v) -> str:
+              return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', html.unescape(str(v or '')))).strip()
+
+          def safe(v: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', v).strip(' ._')[:105]
+
+          metadata: list[dict] = []
+
+          # 1) Eastmoney stock-research API.
+          for page in range(1, 8):
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2008-01-01', 'endTime': TODAY.isoformat(),
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': CODE, 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+              try:
+                  r = s.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=(20, 120))
+                  print('EASTMONEY_LIST', page, r.status_code, len(r.content), r.url, flush=True)
+                  if r.status_code != 200:
+                      break
+                  j = r.json()
+                  rows = j.get('data') or []
+                  for row in rows:
+                      blob = json.dumps(row, ensure_ascii=False)
+                      if CODE in blob or COMPANY in blob:
+                          row = dict(row)
+                          row['_source'] = 'eastmoney'
+                          metadata.append(row)
+                  if len(rows) < 100:
+                      break
+              except Exception as e:
+                  print('EASTMONEY_ERR', page, repr(e), flush=True)
+                  break
+
+          # 2) Eastmoney list2 API, useful for newer reports.
+          for page in range(1, 8):
+              body = {
+                  'pageSize': 100, 'pageNo': page, 'p': page,
+                  'pageNum': page, 'pageNumber': page,
+                  'beginTime': '2008-01-01', 'endTime': TODAY.isoformat(),
+                  'code': CODE, 'industryCode': '*', 'rating': None,
+                  'ratingChange': None, 'orgCode': None, 'rcode': ''
+              }
+              try:
+                  r = s.post('https://reportapi.eastmoney.com/report/list2', json=body, timeout=(20, 120), headers={'Content-Type':'application/json','Referer':'https://data.eastmoney.com/report/'})
+                  print('EASTMONEY_LIST2', page, r.status_code, len(r.content), flush=True)
+                  if r.status_code != 200:
+                      break
+                  j = r.json()
+                  rows = j.get('data') or []
+                  for row in rows:
+                      blob = json.dumps(row, ensure_ascii=False)
+                      if CODE in blob or COMPANY in blob:
+                          row = dict(row)
+                          row['_source'] = 'eastmoney'
+                          metadata.append(row)
+                  if len(rows) < 100:
+                      break
+              except Exception as e:
+                  print('EASTMONEY_LIST2_ERR', page, repr(e), flush=True)
+                  break
+
+          # 3) Public fxbaogao anonymous search API. It often exposes direct public PDF paths.
+          fx_endpoint = 'https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          fx_bodies = []
+          for page in range(1, 8):
+              fx_bodies.append({'stockCodes':[CODE], 'pageNum':page, 'pageSize':100, 'order':1})
+          for q in [COMPANY, '华映科技 公司深度', '华映科技 首次覆盖', '华映科技 显示面板']:
+              fx_bodies.append({'keywords':q, 'pageNum':1, 'pageSize':100, 'order':1})
+          for i, body in enumerate(fx_bodies, 1):
+              try:
+                  r = s.post(fx_endpoint, json=body, timeout=(20, 120), headers={'Content-Type':'application/json','Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/'})
+                  print('FX_SEARCH', i, r.status_code, len(r.content), json.dumps(body, ensure_ascii=False), flush=True)
+                  if r.status_code != 200:
+                      continue
+                  j = r.json()
+                  rows = ((j.get('data') or {}).get('dataList') or [])
+                  for row in rows:
+                      blob = json.dumps(row, ensure_ascii=False)
+                      if CODE in blob or COMPANY in blob:
+                          row = dict(row)
+                          row['_source'] = 'fxbaogao'
+                          metadata.append(row)
+              except Exception as e:
+                  print('FX_SEARCH_ERR', i, repr(e), flush=True)
+
+          # 4) Public Nxny index is used only as metadata discovery; downloads remain public-only.
+          try:
+              r = s.get(f'https://www.nxny.com/stock/stock_{CODE}/', timeout=(20, 90), headers={'Referer':'https://www.nxny.com/'})
+              print('NXNY_STOCK', r.status_code, len(r.content), r.url, flush=True)
+              if r.status_code == 200:
+                  text = r.content.decode('gb18030', errors='replace')
+                  soup = BeautifulSoup(text, 'lxml')
+                  for a in soup.find_all('a', href=True):
+                      label = clean(a.get_text(' ', strip=True))
+                      href = urllib.parse.urljoin(r.url, a['href'])
+                      m = re.search(r'/report/view_(\d+)\.html', href)
+                      if m and (COMPANY in label or CODE in label):
+                          metadata.append({'_source':'nxny','report_id':m.group(1),'title':label,'detail_url':href})
+          except Exception as e:
+              print('NXNY_ERR', repr(e), flush=True)
+
+          # De-duplicate raw metadata and print for audit.
+          unique = {}
+          for row in metadata:
+              src = row.get('_source')
+              key = (
+                  src,
+                  str(row.get('infoCode') or row.get('docId') or row.get('reportId') or row.get('id') or row.get('report_id') or ''),
+                  clean(row.get('title') or row.get('reportTitle') or row.get('name') or ''),
+              )
+              unique[key] = row
+          metadata = list(unique.values())
+          (ROOT/'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('METADATA_COUNT', len(metadata), flush=True)
+          for row in metadata:
+              print('META', json.dumps(row, ensure_ascii=False)[:12000], flush=True)
+
+          deep_terms = ['深度','首次覆盖','公司深度','投资价值','显示面板','面板龙头','IGZO','转型','重组','产业链','核心竞争力','价值重估','成长空间','液晶模组','液晶面板']
+          shallow_terms = ['点评','季报','年报点评','中报点评','半年报点评','三季报','一季报','业绩预告','快报','公告点评','周报','日报']
+
+          def normalized_meta(row: dict) -> dict:
+              src = row.get('_source')
+              title = clean(row.get('title') or row.get('reportTitle') or row.get('name') or '')
+              broker = clean(row.get('orgSName') or row.get('orgName') or row.get('publishOrgName') or row.get('authorOrgName') or row.get('sourceName') or '')
+              date = clean(row.get('publishDate') or row.get('pubTimeStr') or row.get('publishTime') or row.get('date') or '')[:10]
+              pages = row.get('attachPages') or row.get('pageNum') or row.get('pages') or 0
+              try: pages = int(pages)
+              except Exception: pages = 0
+              return {'source':src,'title':title,'broker':broker,'date':date,'pages_meta':pages,'raw':row}
+
+          metas = [normalized_meta(r) for r in metadata]
+          metas = [m for m in metas if m['title'] and (COMPANY in m['title'] or CODE in json.dumps(m['raw'], ensure_ascii=False))]
+
+          def meta_score(m: dict) -> int:
+              title=m['title']; pages=m['pages_meta']; date=m['date']
+              score=sum(8 for t in deep_terms if t in title)
+              if '深度' in title: score += 60
+              if '首次覆盖' in title: score += 55
+              if '公司研究' in title: score += 20
+              score -= sum(15 for t in shallow_terms if t in title)
+              score += 35 if pages>=35 else 28 if pages>=25 else 20 if pages>=18 else 12 if pages>=12 else 5
+              if re.match(r'20\d{2}', date): score += max(0, min(12, int(date[:4])-2014))
+              return score
+          metas.sort(key=lambda m:(meta_score(m),m['pages_meta'],m['date']), reverse=True)
+
+          def try_write_pdf(url: str, target: Path, referer: str | None = None) -> bool:
+              if not url: return False
+              headers = {'Referer':referer} if referer else {}
+              try:
+                  r=s.get(url,timeout=(20,180),allow_redirects=True,headers=headers)
+                  print('PDF_TRY',r.status_code,len(r.content),url,'FINAL',r.url,flush=True)
+                  if r.status_code==200 and len(r.content)>70000 and r.content.startswith(b'%PDF-'):
+                      target.write_bytes(r.content)
+                      return True
+              except Exception as e:
+                  print('PDF_TRY_ERR',url,repr(e),flush=True)
+              return False
+
+          def candidate_urls(m: dict) -> list[str]:
+              row=m['raw']; src=m['source']; urls=[]
+              if src=='eastmoney':
+                  info=str(row.get('infoCode') or row.get('infocode') or '')
+                  if info:
+                      urls += [
+                          f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                          f'https://pdf.dfcfw.com/pdf/H3_{info}_01.pdf',
+                          f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+                          f'https://pdf.dfcfw.com/pdf/H2_{info}_01.pdf',
+                      ]
+                  for k in ('pdfUrl','attachUrl','url','fileUrl'):
+                      u=row.get(k)
+                      if isinstance(u,str) and u.startswith('http'): urls.append(u)
+              elif src=='fxbaogao':
+                  p=str(row.get('pdfPath') or row.get('filePath') or row.get('path') or '')
+                  if p:
+                      if p.startswith('http'): urls.append(p)
+                      else:
+                          p=p.lstrip('/')
+                          urls += [
+                              'https://dr.fxbaogao.com/'+p,
+                              'https://public.fxbaogao.com/'+p,
+                              'https://report.fxbaogao.com/'+p,
+                              'https://oss-buy.hufangde.com/'+p,
+                          ]
+                  for k in ('pdfUrl','downloadUrl','fileUrl','url'):
+                      u=row.get(k)
+                      if isinstance(u,str) and u.startswith('http'): urls.append(u)
+              return list(dict.fromkeys(urls))
+
+          valid=[]; seen_sha=set()
+          for idx,m in enumerate(metas[:180],1):
+              title=m['title']; row=m['raw']; src=m['source']
+              target=DL/f'cand_{idx:03d}.pdf'
+              got=False; used_url=''
+              for u in candidate_urls(m):
+                  if try_write_pdf(u,target,'https://data.eastmoney.com/' if src=='eastmoney' else 'https://www.fxbaogao.com/'):
+                      got=True; used_url=u; break
+              if not got:
+                  continue
+              try:
+                  reader=PdfReader(str(target),strict=False)
+                  pages=len(reader.pages)
+                  sample=[]
+                  indices=list(range(min(14,pages)))
+                  if pages>16: indices += list(range(max(0,pages-3),pages))
+                  for pi in dict.fromkeys(indices):
+                      try: sample.append(reader.pages[pi].extract_text() or '')
+                      except Exception: pass
+                  text='\n'.join(sample)
+                  identity=(COMPANY in text or CODE in text or 'CPT TECHNOLOGY' in text.upper())
+                  research=any(k in text for k in ('证券研究报告','公司研究','深度研究','首次覆盖','投资评级','研究报告')) or any(k in title for k in ('深度','首次覆盖','公司研究'))
+                  if not identity or not research or pages<8:
+                      print('REJECT',title,pages,identity,research,flush=True)
+                      target.unlink(missing_ok=True); continue
+                  q=subprocess.run(['qpdf','--check',str(target)],capture_output=True,text=True)
+                  if q.returncode not in (0,3):
+                      raise RuntimeError(q.stderr[-800:])
+                  data=target.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+                  if sha in seen_sha:
+                      target.unlink(missing_ok=True); continue
+                  seen_sha.add(sha)
+                  broker=m['broker']
+                  if not broker:
+                      # Try to infer broker from cover text.
+                      for b in ['华泰证券','中信证券','中信建投','招商证券','广发证券','国海证券','国泰君安','国泰海通','海通证券','申万宏源','长江证券','东吴证券','东方证券','银河证券','兴业证券','国金证券','民生证券','开源证券','太平洋证券','东北证券','光大证券','安信证券','国盛证券','方正证券','天风证券','西南证券']:
+                          if b in text:
+                              broker=b; break
+                  rec={
+                      'title':title,'broker':broker or '未知券商','date':m['date'],
+                      'pages':pages,'bytes':len(data),'sha256':sha,'source_url':used_url,
+                      'score':meta_score(m)+(30 if pages>=30 else 22 if pages>=20 else 12),
+                      'path':str(target),'metadata_source':src,
+                  }
+                  valid.append(rec)
+                  print('VALID',json.dumps(rec,ensure_ascii=False),flush=True)
+              except Exception as e:
+                  print('VALIDATE_ERR',title,repr(e),flush=True)
+                  target.unlink(missing_ok=True)
+
+          if len(valid)<2:
+              raise RuntimeError(f'Only {len(valid)} complete public broker reports found')
+
+          valid.sort(key=lambda x:(x['score'],x['pages'],x['date']),reverse=True)
+          selected=[]; brokers=set()
+          for rec in valid:
+              if rec['broker'] in brokers and len(valid)>=3:
+                  continue
+              selected.append(rec); brokers.add(rec['broker'])
+              if len(selected)==3: break
+          if len(selected)<2:
+              selected=valid[:min(3,len(valid))]
+          elif len(selected)<3:
+              for rec in valid:
+                  if rec not in selected:
+                      selected.append(rec)
+                  if len(selected)==3: break
+
+          package=f'华映科技_000536_券商深度报告_{len(selected)}份'
+          folder=FINAL/package; folder.mkdir(parents=True,exist_ok=True)
+          manifest=[]
+          for i,rec in enumerate(selected,1):
+              fname=f'{i:02d}_{safe(rec["date"] or "日期未知")}_{safe(rec["broker"])}_{safe(rec["title"])}.pdf'
+              shutil.copy2(rec['path'],folder/fname)
+              item={k:v for k,v in rec.items() if k not in ('path','score')}
+              item['filename']=fname
+              manifest.append(item)
+
+          lines=[
+              '华映科技（000536.SZ）券商深度研究报告合集',
+              f'整理日期：{TODAY.isoformat()}',
+              '',
+              '筛选口径：仅收录公开渠道可直接取得的完整PDF；核验公司名称/证券代码、券商研究属性、实际页数和PDF结构；优先公司深度、首次覆盖及长篇专题，排除公告、财报原文和数页短评。',
+              '',
+              '文件清单：'
+          ]
+          for i,r in enumerate(manifest,1):
+              lines += [
+                  f'{i}. {r["filename"]}',
+                  f'   券商：{r["broker"]}',
+                  f'   标题：{r["title"]}',
+                  f'   日期：{r["date"] or "未标明"}；页数：{r["pages"]}',
+                  f'   公开来源：{r["source_url"]}',
+                  f'   SHA-256：{r["sha256"]}',
+                  ''
+              ]
+          lines += ['完整性检查：PDF文件头、页数、公司身份、研究报告标识、qpdf结构、重复文件和ZIP CRC均已检查。']
+          (folder/'00_文件清单与来源说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (folder/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (folder/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in manifest),encoding='utf-8')
+
+          zp=ART/f'{package}.zip'
+          with zipfile.ZipFile(zp,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as zf:
+              for p in sorted(folder.iterdir()):
+                  zf.write(p,arcname=p.name)
+          with zipfile.ZipFile(zp) as zf:
+              bad=zf.testzip()
+              if bad: raise RuntimeError('ZIP CRC failure '+bad)
+          print('SELECTED_FINAL',json.dumps(manifest,ensure_ascii=False,indent=2),flush=True)
+          print('FINAL_ZIP',zp.name,zp.stat().st_size,hashlib.sha256(zp.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: huaying-000536-broker-deep-reports
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
