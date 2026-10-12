@@ -1,4 +1,4 @@
-name: Inspect Guoguang Chain broker reports
+name: Build Guoguang Chain broker research package
 
 on:
   push:
@@ -6,27 +6,332 @@ on:
       - '.github/workflows/guoguang-605188-broker-pack-20261012.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  inspect:
+  package:
     runs-on: ubuntu-latest
     steps:
-      - name: Query report metadata
+      - name: Install validators
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
-          import json, requests, time
-          s=requests.Session(); s.trust_env=False
-          s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/'})
-          api='https://reportapi.eastmoney.com/report/list'
-          for qtype in ['0','1','2']:
-              print('QTYPE',qtype)
-              for page in range(1,8):
-                  params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':'2008-01-01','endTime':'2026-10-12','pageNo':str(page),'fields':'','qType':qtype,'orgCode':'','code':'605188','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
-                  r=s.get(api,params=params,timeout=120)
-                  print('STATUS',page,r.status_code,len(r.content)); r.raise_for_status()
-                  rows=r.json().get('data') or []
-                  print('COUNT',len(rows))
-                  for row in rows:
-                      print('ROW',json.dumps(row,ensure_ascii=False))
-                  if len(rows)<100: break
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          TODAY = '2026-10-12'
+          PACKAGE = '国光连锁_605188_券商研究资料_1份公司报告_2份区域商超同业深度'
+          WORK = Path('guoguang_broker_work')
+          DOWNLOADS = WORK / 'downloads'
+          FINAL = WORK / 'final' / PACKAGE
+          ART = Path('artifact_out')
+          VERIFY = Path('verification_renders')
+          for directory in (DOWNLOADS, FINAL, ART, VERIFY):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept': 'application/json,text/plain,application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:105]
+
+          def api_rows(code: str) -> list[dict]:
+              rows_all: list[dict] = []
+              for page in range(1, 7):
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2008-01-01', 'endTime': TODAY,
+                      'pageNo': str(page), 'fields': '', 'qType': '0',
+                      'orgCode': '', 'code': code, 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  }
+                  response = session.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=(25, 180))
+                  print('API', code, page, response.status_code, len(response.content), flush=True)
+                  response.raise_for_status()
+                  batch = response.json().get('data') or []
+                  rows_all.extend(batch)
+                  if len(batch) < 100:
+                      break
                   time.sleep(1)
+              unique: dict[str, dict] = {}
+              for row in rows_all:
+                  key = str(row.get('infoCode') or json.dumps(row, ensure_ascii=False, sort_keys=True))
+                  unique[key] = row
+              return list(unique.values())
+
+          def pdf_urls(info_code: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_01.pdf',
+              ]
+
+          def download_pdf(info_code: str, target: Path) -> str:
+              last = None
+              for attempt in range(1, 4):
+                  for url in pdf_urls(info_code):
+                      try:
+                          response = session.get(url, timeout=(30, 300), allow_redirects=True)
+                          print('PDF', info_code, attempt, response.status_code, len(response.content), url, flush=True)
+                          if response.status_code == 200 and len(response.content) > 80_000 and response.content.startswith(b'%PDF-'):
+                              target.write_bytes(response.content)
+                              return str(response.url)
+                      except Exception as exc:
+                          last = exc
+                  time.sleep(attempt)
+              raise RuntimeError(f'No valid PDF for {info_code}: {last!r}')
+
+          def sample_text(path: Path, max_pages: int = 30) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              indices = list(range(min(max_pages, pages)))
+              if pages > max_pages + 3:
+                  indices.extend(range(max(0, pages - 3), pages))
+              parts: list[str] = []
+              for index in dict.fromkeys(indices):
+                  try:
+                      parts.append(reader.pages[index].extract_text() or '')
+                  except Exception:
+                      pass
+              return pages, '\n'.join(parts)
+
+          def validate(record: dict, path: Path, peer: bool) -> dict:
+              pages, text = sample_text(path)
+              low = text.lower()
+              if pages < int(record['min_pages']):
+                  raise RuntimeError(f'Unexpectedly short PDF {path.name}: {pages}')
+              identity = record['stock_name'] in text or record['stock_code'] in text
+              research = any(marker in text for marker in ['证券研究报告', '公司研究', '投资评级', '首次覆盖', '深度报告', '新股询价']) or 'equity research' in low
+              if not identity or not research:
+                  raise RuntimeError(f'Identity/research validation failed for {path.name}: identity={identity}, research={research}')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {path.name}: {check.stderr[-800:]}')
+              raw = path.read_bytes()
+              return {
+                  **record,
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'peer_report': peer,
+              }
+
+          direct = {
+              'stock_code': '605188',
+              'stock_name': '国光连锁',
+              'broker': '华鑫证券',
+              'publish_date': '2020-06-17',
+              'title': '新股询价报告：国光连锁',
+              'info_code': 'AP202006171385550607',
+              'document_type': '国光连锁公司直接研究（新股询价报告，非长篇深度）',
+              'relevance': '直接研究国光连锁，覆盖发行定价、区域零售业务与基础财务情况。',
+              'min_pages': 3,
+          }
+
+          completed: list[dict] = []
+          seen_hashes: set[str] = set()
+          metadata_archive: dict[str, list[dict]] = {}
+
+          direct_path = DOWNLOADS / f'{direct["info_code"]}.pdf'
+          direct_url = download_pdf(direct['info_code'], direct_path)
+          direct_validated = validate(direct, direct_path, peer=False)
+          direct_validated['source_url'] = direct_url
+          seen_hashes.add(direct_validated['sha256'])
+          completed.append({'record': direct_validated, 'path': direct_path})
+          print('VALIDATED_DIRECT', json.dumps(direct_validated, ensure_ascii=False), flush=True)
+
+          peer_specs = [
+              {
+                  'stock_code': '603708',
+                  'stock_name': '家家悦',
+                  'document_type': '区域商超同业长篇深度/首次覆盖报告',
+                  'relevance': '区域连锁商超龙头，与国光连锁在生鲜经营、区域密集开店、供应链和门店效率方面可比性较高。',
+                  'keywords': ['首次覆盖', '深度报告', '公司深度', '区域', '生鲜', '供应链', '商超'],
+              },
+              {
+                  'stock_code': '002697',
+                  'stock_name': '红旗连锁',
+                  'document_type': '区域零售同业长篇深度/首次覆盖报告',
+                  'relevance': '区域零售连锁企业，可用于比较区域密度、门店网络、商品周转、现金流和本地化经营。',
+                  'keywords': ['首次覆盖', '深度报告', '公司深度', '区域', '连锁', '门店'],
+              },
+              {
+                  'stock_code': '601366',
+                  'stock_name': '利群股份',
+                  'document_type': '区域零售同业长篇深度/首次覆盖报告',
+                  'relevance': '区域商业零售企业，具有供应链、物流配送及多业态布局，可用于比较区域扩张与成本效率。',
+                  'keywords': ['首次覆盖', '深度报告', '公司深度', '供应链', '物流', '零售'],
+              },
+              {
+                  'stock_code': '000759',
+                  'stock_name': '中百集团',
+                  'document_type': '区域商超同业长篇深度/首次覆盖报告',
+                  'relevance': '省域商超运营企业，可用于比较区域商超主业、门店调整、供应链和经营效率。',
+                  'keywords': ['首次覆盖', '深度报告', '公司深度', '商超', '门店', '供应链'],
+              },
+          ]
+
+          chosen_peers: list[dict] = []
+          for spec in peer_specs:
+              rows = api_rows(spec['stock_code'])
+              metadata_archive[spec['stock_code']] = rows
+              scored: list[tuple[int, dict]] = []
+              for row in rows:
+                  title = str(row.get('title') or '').strip()
+                  pages = int(row.get('attachPages') or 0)
+                  if not title or pages < 16:
+                      continue
+                  if any(term in title for term in ['季报点评', '年报点评', '中报点评', '事件点评', '业绩预告', '业绩快报', '信息更新报告', '点评报告']):
+                      continue
+                  score = pages
+                  if any(term in title for term in ['首次覆盖', '深度报告', '公司深度', '深度研究']):
+                      score += 100
+                  score += sum(24 for term in spec['keywords'] if term in title)
+                  date = str(row.get('publishDate') or '')[:10]
+                  if date >= '2022-01-01':
+                      score += 25
+                  elif date >= '2020-01-01':
+                      score += 15
+                  scored.append((score, row))
+              scored.sort(key=lambda item: item[0], reverse=True)
+
+              for score, row in scored[:20]:
+                  info_code = str(row.get('infoCode') or '')
+                  if not info_code:
+                      continue
+                  temp = DOWNLOADS / f'{spec["stock_code"]}_{info_code}.pdf'
+                  try:
+                      source_url = download_pdf(info_code, temp)
+                      candidate = {
+                          'stock_code': spec['stock_code'],
+                          'stock_name': spec['stock_name'],
+                          'broker': str(row.get('orgSName') or row.get('orgName') or '未知券商'),
+                          'publish_date': str(row.get('publishDate') or '')[:10],
+                          'title': str(row.get('title') or '').strip(),
+                          'info_code': info_code,
+                          'document_type': spec['document_type'],
+                          'relevance': spec['relevance'],
+                          'min_pages': 16,
+                          'selection_score': score,
+                      }
+                      validated = validate(candidate, temp, peer=True)
+                      validated['source_url'] = source_url
+                      if validated['sha256'] in seen_hashes:
+                          temp.unlink(missing_ok=True)
+                          continue
+                      seen_hashes.add(validated['sha256'])
+                      completed.append({'record': validated, 'path': temp})
+                      chosen_peers.append(validated)
+                      print('VALIDATED_PEER', json.dumps(validated, ensure_ascii=False), flush=True)
+                      break
+                  except Exception as exc:
+                      print('PEER_REJECT', spec['stock_name'], row.get('title'), repr(exc), flush=True)
+                      temp.unlink(missing_ok=True)
+              if len(chosen_peers) >= 2:
+                  break
+
+          if len(chosen_peers) < 2:
+              raise RuntimeError(f'Only {len(chosen_peers)} validated peer deep reports found')
+
+          manifest: list[dict] = []
+          for index, item in enumerate(completed[:3], 1):
+              record = item['record']
+              tag = '公司直接研究' if not record['peer_report'] else '同业深度'
+              filename = f'{index:02d}_{tag}_{safe(record["publish_date"])}_{safe(record["broker"])}_{safe(record["stock_name"])}_{safe(record["title"])}.pdf'
+              shutil.copy2(item['path'], FINAL / filename)
+              manifest.append({**record, 'filename': filename})
+
+          readme = [
+              '国光连锁（605188.SH）券商研究资料包',
+              f'整理日期：{TODAY}',
+              '',
+              '检索结论与口径说明：',
+              '1. 按证券代码605188检索公开券商研报库，仅找到1份公司专属报告，即华鑫证券2020年新股询价报告，共3页；未发现可直接下载并核验的国光连锁公司专属长篇深度或首次覆盖报告。',
+              '2. 为满足2-3份研究资料需求，另收录2份区域商超/零售同业的完整长篇深度或首次覆盖报告，用于比较区域密集开店、生鲜经营、供应链、门店效率和现金流。',
+              '3. 同业报告不是券商对国光连锁本身的评级、目标价或盈利预测，文件名已明确标记“同业深度”。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(manifest, 1):
+              readme += [
+                  f'{index}. {record["filename"]}',
+                  f'   类型：{record["document_type"]}',
+                  f'   公司：{record["stock_name"]}（{record["stock_code"]}）',
+                  f'   券商：{record["broker"]}；日期：{record["publish_date"]}；页数：{record["pages"]}',
+                  f'   标题：{record["title"]}',
+                  f'   与国光连锁的关系：{record["relevance"]}',
+                  f'   来源：{record["source_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ]
+          readme.append('完整性核验：已检查PDF文件头、公司身份、券商研究标识、实际页数、qpdf结构、重复文件和SHA-256；最终ZIP已通过CRC测试。')
+          (FINAL / '00_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / '原始研报检索元数据.json').write_text(json.dumps(metadata_archive, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in manifest), encoding='utf-8')
+
+          for index, record in enumerate(manifest, 1):
+              source = FINAL / record['filename']
+              prefix = VERIFY / f'{index:02d}'
+              result = subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '110', str(source), str(prefix)], capture_output=True, text=True)
+              if result.returncode != 0:
+                  raise RuntimeError(f'Render failed for {source.name}: {result.stderr[-800:]}')
+
+          zip_path = ART / f'{PACKAGE}.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(FINAL.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'Expected 3 PDFs, found {len(pdfs)}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'SHA256', zip_sha, flush=True)
           PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guoguang-605188-broker-research-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload verification renders
+        uses: actions/upload-artifact@v4
+        with:
+          name: guoguang-605188-broker-research-renders
+          path: verification_renders/*.png
+          retention-days: 30
+          compression-level: 0
