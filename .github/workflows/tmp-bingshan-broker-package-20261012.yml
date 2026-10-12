@@ -1,0 +1,228 @@
+name: Package Bingshan Broker Deep Reports
+
+on:
+  push:
+    branches:
+      - tmp-bingshan-000530-broker-reports-20261012
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools
+        run: |
+          python -m pip install requests pymupdf pypdf
+      - name: Download, verify and package reports
+        shell: bash
+        run: |
+          cat > /tmp/package_bingshan_broker.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('output_broker')
+          FINAL = OUT / 'final'
+          RENDERS = OUT / 'renders'
+          for p in (OUT, FINAL, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          specs = [
+              {
+                  'filename': '01_信达证券_2023-06-27_公司深度报告_聚焦冷热事业_百年冰山再出发.pdf',
+                  'institution': '信达证券',
+                  'date': '2023-06-27',
+                  'title': '公司深度报告：聚焦冷热事业，百年冰山再出发',
+                  'analysts': '罗岸阳、尹圣迪',
+                  'report_type': '公司深度报告 / 首次覆盖',
+                  'company_name_at_publication': '冰山冷热',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP202306271591738514_1.pdf?1687937064000.pdf',
+                  'source_page': 'https://data.eastmoney.com/report/info/AP202306271591738514.html',
+                  'min_pages': 25,
+              },
+              {
+                  'filename': '02_信达证券_2017-07-13_首次覆盖报告_冷链先锋_新大冷.pdf',
+                  'institution': '信达证券',
+                  'date': '2017-07-13',
+                  'title': '首次覆盖报告：冷链先锋“新大冷”',
+                  'analysts': '罗岸阳等',
+                  'report_type': '首次覆盖报告',
+                  'company_name_at_publication': '大冷股份',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP201707130715044967_1.pdf?1601214328000.pdf',
+                  'source_page': 'https://data.eastmoney.com/report/info/AP201707130715044967.html',
+                  'min_pages': 15,
+              },
+          ]
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/pdf,application/octet-stream,*/*',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download(url: str) -> bytes:
+              last = None
+              for i in range(6):
+                  try:
+                      r = s.get(url, timeout=120)
+                      print('GET', r.status_code, r.url, 'bytes', len(r.content))
+                      if r.status_code == 200 and r.content.startswith(b'%PDF'):
+                          return r.content
+                      last = RuntimeError(f'HTTP {r.status_code}, head={r.content[:32]!r}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1.5 * (i + 1))
+              raise RuntimeError(f'Download failed: {url}: {last}')
+
+          manifest = []
+          for spec in specs:
+              data = download(spec['url'])
+              if len(data) < 150_000:
+                  raise RuntimeError(f"Suspiciously small PDF: {spec['title']}: {len(data)} bytes")
+              path = FINAL / spec['filename']
+              path.write_bytes(data)
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f"Expected a long-form report, got only {pages} pages: {spec['title']}")
+
+              doc = pymupdf.open(path)
+              sample_pages = sorted(set([0, min(1, pages - 1), pages // 2, pages - 1]))
+              sample_text = ''
+              render_dir = RENDERS / re.sub(r'[^0-9A-Za-z\u4e00-\u9fff_-]+', '_', path.stem)
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for pageno in sample_pages:
+                  page = doc.load_page(pageno)
+                  sample_text += page.get_text('text')[:8000]
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(1.05, 1.05), alpha=False)
+                  render = render_dir / f'page-{pageno + 1:03d}.png'
+                  pix.save(render)
+                  if render.stat().st_size < 10_000:
+                      raise RuntimeError(f"Suspicious render: {spec['title']} page {pageno + 1}")
+              doc.close()
+
+              if '000530' not in sample_text:
+                  raise RuntimeError(f"Stock code 000530 not found in sampled report text: {spec['title']}")
+              if not any(name in sample_text for name in ['冰山冷热', '大冷股份']):
+                  raise RuntimeError(f"Company name not found in sampled report text: {spec['title']}")
+
+              item = {
+                  'filename': spec['filename'],
+                  'company': '冰山冷热',
+                  'stock_code': '000530',
+                  'company_name_at_publication': spec['company_name_at_publication'],
+                  'institution': spec['institution'],
+                  'date': spec['date'],
+                  'title': spec['title'],
+                  'analysts': spec['analysts'],
+                  'report_type': spec['report_type'],
+                  'pages': pages,
+                  'size_bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'source_page': spec['source_page'],
+                  'source_pdf': spec['url'],
+                  'format': '券商原始PDF',
+              }
+              manifest.append(item)
+              print(json.dumps(item, ensure_ascii=False))
+
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{x['sha256']}  {x['filename']}" for x in manifest) + '\n',
+              encoding='utf-8'
+          )
+
+          readme = [
+              '# 冰山冷热（000530）券商深度及首次覆盖报告',
+              '',
+              f"本包包含 {len(manifest)} 份券商长篇公司研究报告，共 {sum(x['pages'] for x in manifest)} 页。",
+              '',
+              '说明：公司证券代码始终为000530。2017年报告发布时，公司证券简称为“大冷股份”；其后更名为“冰山冷热”。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for i, x in enumerate(manifest, 1):
+              readme += [
+                  f"### {i}. {x['institution']}｜{x['date']}｜{x['title']}",
+                  f"- 报告类型：{x['report_type']}",
+                  f"- 报告发布时公司简称：{x['company_name_at_publication']}",
+                  f"- 分析师：{x['analysts']}",
+                  f"- 页数：{x['pages']}",
+                  f"- 文件：`{x['filename']}`",
+                  f"- 公开索引：{x['source_page']}",
+                  f"- SHA-256：`{x['sha256']}`",
+                  '',
+              ]
+          readme += [
+              '## 校验记录',
+              '',
+              '- 两份文件均由东方财富公开研报附件直接下载，为券商原始PDF。',
+              '- 已核验证券代码、公司名称、PDF页数及可解析性。',
+              '- 已渲染抽查每份报告的首页、第二页、中间页和末页。',
+              '- ZIP已通过完整CRC检测。',
+          ]
+          (FINAL / 'README_文件清单与来源.md').write_text('\n'.join(readme), encoding='utf-8')
+
+          zip_cn = OUT / '冰山冷热_000530_券商深度及首次覆盖报告_原始PDF_2份_20261012.zip'
+          zip_en = OUT / 'Bingshan_000530_Broker_Deep_and_Initiation_Reports_2_20261012.zip'
+          for zp in (zip_cn, zip_en):
+              with zipfile.ZipFile(zp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for path in sorted(FINAL.iterdir()):
+                      zf.write(path, arcname=path.name)
+              with zipfile.ZipFile(zp, 'r') as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          summary = {
+              'company': '冰山冷热',
+              'stock_code': '000530',
+              'report_count': len(manifest),
+              'total_pages': sum(x['pages'] for x in manifest),
+              'reports': manifest,
+              'zip_cn': str(zip_cn),
+              'zip_cn_size': zip_cn.stat().st_size,
+              'zip_cn_sha256': sha256(zip_cn),
+              'zip_en': str(zip_en),
+              'zip_en_size': zip_en.stat().st_size,
+              'zip_en_sha256': sha256(zip_en),
+          }
+          (OUT / 'package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/package_bingshan_broker.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bingshan-000530-Broker-Deep-Reports
+          path: |
+            output_broker/*.zip
+            output_broker/package_summary.json
+            output_broker/renders/**/*.png
+          if-no-files-found: error
+          retention-days: 3
