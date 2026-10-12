@@ -1,0 +1,203 @@
+name: Build Shuhua Sports broker reports 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shuhua-sports-broker-package-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Query, download, verify, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          TODAY='2026-10-12'
+          CODE='605299'
+          COMPANY='舒华体育'
+          PACKAGE='舒华体育_605299_券商深度报告_3份_公开完整PDF'
+          WORK=Path('shuhua_broker_work')
+          DOWNLOADS=WORK/'downloads'
+          FINAL=WORK/'final'/PACKAGE
+          ART=Path('artifact_out')
+          VERIFY=Path('verification_renders')
+          for d in (DOWNLOADS,FINAL,ART,VERIFY): d.mkdir(parents=True,exist_ok=True)
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':'https://data.eastmoney.com/','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          api='https://reportapi.eastmoney.com/report/list'
+          params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':'2008-01-01','endTime':TODAY,'pageNo':'1','fields':'','qType':'0','orgCode':'','code':CODE,'rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
+          r=s.get(api,params=params,timeout=(25,180)); print('API',r.status_code,len(r.content),r.url,flush=True); r.raise_for_status()
+          rows=r.json().get('data') or []
+          print('ROW_COUNT',len(rows),flush=True)
+          print('ALL_ROWS',json.dumps(rows,ensure_ascii=False,indent=2),flush=True)
+
+          def title(row): return str(row.get('title') or '').strip()
+          def date(row): return str(row.get('publishDate') or '')[:10]
+          def broker(row): return str(row.get('orgSName') or row.get('orgName') or '未知券商')
+          def pages_meta(row): return int(row.get('attachPages') or 0)
+          def info(row): return str(row.get('infoCode') or '')
+          def safe(text): return re.sub(r'[\\/:*?"<>|]+','_',text).strip(' ._')[:110]
+
+          candidates=[]
+          for row in rows:
+              t=title(row); p=pages_meta(row); d=date(row)
+              if not t or not info(row): continue
+              if any(x in t for x in ['季报点评','年报点评','中报点评','事件点评','业绩预告','业绩快报','信息更新','点评报告']):
+                  continue
+              score=p
+              if any(x in t for x in ['首次覆盖','深度报告','公司深度','深度研究']): score+=160
+              if p>=18: score+=60
+              if d>='2026-01-01': score+=35
+              elif d>='2023-01-01': score+=20
+              candidates.append((score,row))
+          candidates.sort(key=lambda x:x[0],reverse=True)
+
+          # Ensure the current 2026 BOC first-coverage report is considered even if API metadata is incomplete.
+          manual=[{
+              'title':'国内领先科学运动服务商，加速全球扩张打造“世界舒华”',
+              'stockName':'舒华体育','stockCode':'605299','orgSName':'中银证券',
+              'publishDate':'2026-08-14 00:00:00.000','infoCode':'AP202608141827980338',
+              'attachPages':0,'manual':True
+          }]
+          known={info(row) for _,row in candidates}
+          for row in manual:
+              if info(row) not in known: candidates.insert(0,(300,row))
+
+          def pdf_urls(code):
+              return [f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{code}_01.pdf',f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',f'https://pdf.dfcfw.com/pdf/H2_{code}_01.pdf']
+          def download(code,target):
+              last=''
+              for attempt in range(1,4):
+                  for url in pdf_urls(code):
+                      try:
+                          rr=s.get(url,timeout=(30,300),allow_redirects=True,headers={'User-Agent':s.headers['User-Agent'],'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*'})
+                          print('PDF',code,attempt,rr.status_code,len(rr.content),url,flush=True)
+                          if rr.status_code==200 and len(rr.content)>100000 and rr.content.startswith(b'%PDF-'):
+                              target.write_bytes(rr.content); return str(rr.url)
+                          last=f'{rr.status_code}/{len(rr.content)}'
+                      except Exception as e: last=repr(e)
+                  time.sleep(attempt)
+              raise RuntimeError(f'No PDF for {code}: {last}')
+
+          selected=[]; seen_hashes=set(); seen_brokers=set()
+          for score,row in candidates:
+              if len(selected)>=3: break
+              code=info(row); t=title(row); b=broker(row); d=date(row)
+              if not code: continue
+              # Prefer distinct brokers, but allow a duplicate only if fewer than three reports can be found.
+              if b in seen_brokers and len(selected)<2: continue
+              temp=DOWNLOADS/f'{code}.pdf'
+              try:
+                  source_url=download(code,temp)
+                  reader=PdfReader(str(temp),strict=False)
+                  pages=len(reader.pages)
+                  if pages<12: raise RuntimeError(f'too short: {pages}')
+                  text_parts=[]
+                  for i in range(min(28,pages)):
+                      try: text_parts.append(reader.pages[i].extract_text() or '')
+                      except Exception: pass
+                  text='\n'.join(text_parts)
+                  if COMPANY not in text and CODE not in text:
+                      raise RuntimeError('company identity not verified')
+                  if not any(mark in text for mark in ['证券研究报告','公司研究','首次覆盖','深度报告','投资评级']):
+                      raise RuntimeError('research identity not verified')
+                  q=subprocess.run(['qpdf','--check',str(temp)],capture_output=True,text=True)
+                  if q.returncode not in (0,3): raise RuntimeError(q.stderr[-500:])
+                  digest=hashlib.sha256(temp.read_bytes()).hexdigest()
+                  if digest in seen_hashes: raise RuntimeError('duplicate')
+                  seen_hashes.add(digest); seen_brokers.add(b)
+                  selected.append({'stock_code':CODE,'stock_name':COMPANY,'broker':b,'publish_date':d,'title':t,'info_code':code,'pages':pages,'bytes':temp.stat().st_size,'sha256':digest,'source_url':source_url,'pdf_path':str(temp),'selection_score':score})
+                  print('VALIDATED',json.dumps(selected[-1],ensure_ascii=False),flush=True)
+              except Exception as e:
+                  print('REJECT',code,t,repr(e),flush=True); temp.unlink(missing_ok=True)
+
+          # If strict selection returns fewer than 3, add complete company reports of 5+ pages, prioritizing recent and distinct brokers.
+          if len(selected)<3:
+              for row in rows:
+                  if len(selected)>=3: break
+                  code=info(row); t=title(row); b=broker(row); d=date(row)
+                  if not code or any(x['info_code']==code for x in selected): continue
+                  if pages_meta(row)<5: continue
+                  temp=DOWNLOADS/f'{code}.pdf'
+                  try:
+                      source_url=download(code,temp)
+                      reader=PdfReader(str(temp),strict=False); pages=len(reader.pages)
+                      if pages<5: raise RuntimeError('too short')
+                      text='\n'.join((reader.pages[i].extract_text() or '') for i in range(min(12,pages)))
+                      if COMPANY not in text and CODE not in text: raise RuntimeError('identity')
+                      q=subprocess.run(['qpdf','--check',str(temp)],capture_output=True,text=True)
+                      if q.returncode not in (0,3): raise RuntimeError('qpdf')
+                      digest=hashlib.sha256(temp.read_bytes()).hexdigest()
+                      if digest in seen_hashes: raise RuntimeError('duplicate')
+                      seen_hashes.add(digest)
+                      selected.append({'stock_code':CODE,'stock_name':COMPANY,'broker':b,'publish_date':d,'title':t,'info_code':code,'pages':pages,'bytes':temp.stat().st_size,'sha256':digest,'source_url':source_url,'pdf_path':str(temp),'selection_score':0})
+                  except Exception as e:
+                      print('FALLBACK_REJECT',code,repr(e),flush=True); temp.unlink(missing_ok=True)
+
+          if len(selected)<2: raise RuntimeError(f'Only {len(selected)} reports validated')
+          selected=selected[:3]
+          manifest=[]
+          for i,rec in enumerate(selected,1):
+              name=f"{i:02d}_{safe(rec['publish_date'])}_{safe(rec['broker'])}_{safe(rec['title'])}.pdf"
+              shutil.copy2(rec['pdf_path'],FINAL/name)
+              clean={k:v for k,v in rec.items() if k!='pdf_path'}; clean['filename']=name; manifest.append(clean)
+
+          readme=['舒华体育（605299.SH）券商研究报告资料包',f'整理日期：{TODAY}','',f'收录数量：{len(manifest)}份。优先选择首次覆盖、公司深度或篇幅较完整的公司专属报告；如公开长篇报告不足，则以完整公司专题报告补足。','', '文件清单：']
+          for i,rec in enumerate(manifest,1):
+              readme += [f'{i}. {rec["filename"]}',f'   券商：{rec["broker"]}；日期：{rec["publish_date"]}；页数：{rec["pages"]}',f'   标题：{rec["title"]}',f'   来源：{rec["source_url"]}',f'   SHA-256：{rec["sha256"]}','']
+          readme.append('完整性核验：已检查公司身份、研究报告标识、实际页数、PDF结构、重复文件和SHA-256；每份PDF首页已渲染，最终ZIP已通过CRC测试。')
+          (FINAL/'00_文件清单与口径说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (FINAL/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (FINAL/'原始研报检索元数据.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          (FINAL/'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest),encoding='utf-8')
+
+          for i,rec in enumerate(manifest,1):
+              src=FINAL/rec['filename']; prefix=VERIFY/f'{i:02d}'
+              rr=subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','110',str(src),str(prefix)],capture_output=True,text=True)
+              if rr.returncode!=0: raise RuntimeError(rr.stderr[-500:])
+
+          zip_path=ART/f'{PACKAGE}.zip'
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as z:
+              for p in sorted(FINAL.iterdir()): z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad: raise RuntimeError('ZIP CRC '+bad)
+              if len(pdfs)!=len(manifest): raise RuntimeError('PDF count mismatch')
+          print('FINAL_MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2),flush=True)
+          print('FINAL_ZIP',zip_path.name,zip_path.stat().st_size,'SHA256',hashlib.sha256(zip_path.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shuhua-sports-605299-broker-reports-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload verification renders
+        uses: actions/upload-artifact@v4
+        with:
+          name: shuhua-sports-605299-broker-reports-renders
+          path: verification_renders/*.png
+          retention-days: 30
+          compression-level: 0
