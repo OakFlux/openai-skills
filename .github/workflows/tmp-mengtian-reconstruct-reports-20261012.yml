@@ -1,0 +1,378 @@
+name: Build Mengtian Public Reading Reports
+
+on:
+  push:
+    branches:
+      - tmp-mengtian-603216-broker-reports-20261012
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests beautifulsoup4 pillow pymupdf pypdf
+
+      - name: Reconstruct reports from public reading pages
+        shell: bash
+        run: |
+          cat > /tmp/build_mengtian_public_reports.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import zipfile
+          from dataclasses import dataclass
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          FINAL = OUT / 'final'
+          DEBUG = OUT / 'debug'
+          RAWIMG = OUT / 'page_images'
+          RENDERS = OUT / 'renders'
+          for p in (OUT, FINAL, DEBUG, RAWIMG, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          })
+
+          @dataclass
+          class ReportSpec:
+              slug: str
+              detail_url: str
+              institution: str
+              date: str
+              title: str
+              analysts: str
+              expected_pages: int
+              filename: str
+
+          specs = [
+              ReportSpec(
+                  slug='tianfeng_20220119',
+                  detail_url='https://www.sgpjbg.com/baogao/59821.html',
+                  institution='天风证券',
+                  date='2022-01-19',
+                  title='从木门到全屋木作，上市后进入新发展阶段',
+                  analysts='范张翔、尉鹏洁',
+                  expected_pages=20,
+                  filename='01_天风证券_2022-01-19_从木门到全屋木作_上市后进入新发展阶段_公开阅读版.pdf',
+              ),
+              ReportSpec(
+                  slug='cms_20211212',
+                  detail_url='https://www.sgpjbg.com/baogao/57012.html',
+                  institution='招商证券',
+                  date='2021-12-12',
+                  title='新股分析：木门行业领军企业，产品渠道拓展未来成长可期',
+                  analysts='赵中平、李宏鹏',
+                  expected_pages=20,
+                  filename='02_招商证券_2021-12-12_新股分析_木门行业领军企业_产品渠道拓展未来成长可期_公开阅读版.pdf',
+              ),
+          ]
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def ordered_unique(values):
+              seen = set(); out = []
+              for v in values:
+                  if v and v not in seen:
+                      seen.add(v); out.append(v)
+              return out
+
+          def collect_image_urls(html: str, base_url: str) -> list[dict]:
+              soup = BeautifulSoup(html, 'html.parser')
+              records = []
+              position = 0
+              for tag in soup.find_all(True):
+                  position += 1
+                  attrs = []
+                  for attr in ('src', 'data-src', 'data-original', 'href', 'data', 'url'):
+                      value = tag.get(attr)
+                      if isinstance(value, str):
+                          attrs.append((attr, urljoin(base_url, value.strip())))
+                  for attr, url in attrs:
+                      if '/FileUpload/Images/' not in url:
+                          continue
+                      if not re.search(r'\.(?:png|jpe?g|webp|gif)(?:\?|$)', url, re.I):
+                          continue
+                      parent = tag.parent
+                      parent_info = ''
+                      if parent:
+                          parent_info = f"{parent.name}#{parent.get('id','')}.{'.'.join(parent.get('class',[]) or [])}"
+                      records.append({
+                          'url': url,
+                          'position': position,
+                          'tag': tag.name,
+                          'attr': attr,
+                          'tag_id': tag.get('id',''),
+                          'tag_class': ' '.join(tag.get('class',[]) or []),
+                          'parent': parent_info,
+                          'alt': tag.get('alt',''),
+                      })
+              # Also capture URLs embedded in scripts or JSON not exposed as attrs.
+              for match in re.finditer(r'https?://[^\"\'<>\s]+/FileUpload/Images/[^\"\'<>\s]+?\.(?:png|jpe?g|webp|gif)(?:\?[^\"\'<>\s]*)?', html, re.I):
+                  records.append({
+                      'url': match.group(0), 'position': 10_000_000 + match.start(),
+                      'tag': 'raw', 'attr': 'raw', 'tag_id': '', 'tag_class': '',
+                      'parent': '', 'alt': '',
+                  })
+              by_url = {}
+              for rec in records:
+                  old = by_url.get(rec['url'])
+                  if old is None or rec['position'] < old['position']:
+                      by_url[rec['url']] = rec
+              return sorted(by_url.values(), key=lambda x: x['position'])
+
+          def download_image(url: str, referer: str) -> tuple[bytes, dict]:
+              headers = {'Referer': referer, 'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'}
+              r = session.get(url, headers=headers, timeout=60)
+              r.raise_for_status()
+              data = r.content
+              with Image.open(io.BytesIO(data)) as img:
+                  img.load()
+                  meta = {
+                      'width': img.width,
+                      'height': img.height,
+                      'mode': img.mode,
+                      'format': img.format,
+                      'bytes': len(data),
+                      'ratio': img.height / max(img.width, 1),
+                  }
+              return data, meta
+
+          def select_report_pages(candidates: list[dict], expected: int) -> list[dict]:
+              # The public reader page contains report pages plus small UI/related-report images.
+              # Report pages are large portrait images. Preserve HTML occurrence order.
+              large = [x for x in candidates if x.get('ok') and x['width'] >= 650 and x['height'] >= 850 and 1.15 <= x['ratio'] <= 1.8]
+              # Remove exact duplicate bytes while preserving order.
+              unique = []
+              seen = set()
+              for x in large:
+                  digest = x['sha256']
+                  if digest in seen:
+                      continue
+                  seen.add(digest); unique.append(x)
+              if len(unique) == expected:
+                  return unique
+
+              # Prefer a contiguous run of expected large images in source order.
+              # Report pages normally share one source directory or URL prefix.
+              groups = {}
+              for x in unique:
+                  key = x['url'].rsplit('/', 1)[0]
+                  groups.setdefault(key, []).append(x)
+              exact_groups = [g for g in groups.values() if len(g) == expected]
+              if exact_groups:
+                  exact_groups.sort(key=lambda g: min(y['position'] for y in g))
+                  return sorted(exact_groups[0], key=lambda y: y['position'])
+
+              # Score all sliding windows by common directory, dimensions consistency, and source adjacency.
+              best = None
+              for i in range(0, max(0, len(unique) - expected + 1)):
+                  win = unique[i:i+expected]
+                  dirs = len(set(x['url'].rsplit('/',1)[0] for x in win))
+                  widths = [x['width'] for x in win]; heights = [x['height'] for x in win]
+                  consistency = (max(widths)-min(widths)) + (max(heights)-min(heights))
+                  span = max(x['position'] for x in win) - min(x['position'] for x in win)
+                  score = dirs * 1_000_000 + consistency * 100 + span
+                  if best is None or score < best[0]:
+                      best = (score, win)
+              if best is not None:
+                  return sorted(best[1], key=lambda y: y['position'])
+              return []
+
+          def images_to_pdf(images: list[dict], pdf_path: Path) -> None:
+              doc = pymupdf.open()
+              for item in images:
+                  data = Path(item['local_path']).read_bytes()
+                  with Image.open(io.BytesIO(data)) as img:
+                      w, h = img.width, img.height
+                  # Use each source page's native aspect ratio and an A4-height scale.
+                  page_h = 842.0
+                  page_w = page_h * w / h
+                  page = doc.new_page(width=page_w, height=page_h)
+                  page.insert_image(page.rect, stream=data, keep_proportion=True)
+              doc.save(pdf_path, garbage=4, deflate=True)
+              doc.close()
+
+          manifest = []
+          debug_all = {}
+
+          for spec in specs:
+              r = session.get(spec.detail_url, timeout=60)
+              r.raise_for_status()
+              r.encoding = r.apparent_encoding or 'utf-8'
+              html = r.text
+              (DEBUG / f'{spec.slug}.html').write_text(html, encoding='utf-8')
+              records = collect_image_urls(html, spec.detail_url)
+              candidate_rows = []
+              img_dir = RAWIMG / spec.slug
+              img_dir.mkdir(parents=True, exist_ok=True)
+              for idx, rec in enumerate(records, 1):
+                  row = dict(rec)
+                  try:
+                      data, meta = download_image(rec['url'], spec.detail_url)
+                      suffix = '.' + (meta['format'] or 'png').lower().replace('jpeg','jpg')
+                      local = img_dir / f'{idx:03d}{suffix}'
+                      local.write_bytes(data)
+                      row.update(meta)
+                      row['ok'] = True
+                      row['local_path'] = str(local)
+                      row['sha256'] = hashlib.sha256(data).hexdigest()
+                  except Exception as exc:
+                      row.update({'ok': False, 'error': f'{type(exc).__name__}: {exc}'})
+                  candidate_rows.append(row)
+
+              selected = select_report_pages(candidate_rows, spec.expected_pages)
+              debug_all[spec.slug] = {
+                  'detail_url': spec.detail_url,
+                  'candidate_count': len(candidate_rows),
+                  'large_candidate_count': sum(1 for x in candidate_rows if x.get('ok') and x.get('width',0)>=650 and x.get('height',0)>=850 and 1.15<=x.get('ratio',0)<=1.8),
+                  'selected_count': len(selected),
+                  'candidates': candidate_rows,
+                  'selected': selected,
+              }
+              (DEBUG / f'{spec.slug}_candidates.json').write_text(
+                  json.dumps(debug_all[spec.slug], ensure_ascii=False, indent=2), encoding='utf-8'
+              )
+              print(f'{spec.slug}: total={len(candidate_rows)}, selected={len(selected)}')
+              for x in selected:
+                  print('SELECT', spec.slug, x['position'], x['width'], x['height'], x['url'])
+              if len(selected) != spec.expected_pages:
+                  raise RuntimeError(f'{spec.slug}: expected {spec.expected_pages} report pages, selected {len(selected)}')
+
+              pdf_path = FINAL / spec.filename
+              images_to_pdf(selected, pdf_path)
+              reader = PdfReader(str(pdf_path), strict=False)
+              pages = len(reader.pages)
+              if pages != spec.expected_pages:
+                  raise RuntimeError(f'{spec.slug}: generated PDF has {pages} pages')
+              doc = pymupdf.open(pdf_path)
+              render_dir = RENDERS / spec.slug
+              render_dir.mkdir(parents=True, exist_ok=True)
+              for pageno in sorted(set([0, pages // 2, pages - 1])):
+                  pix = doc.load_page(pageno).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  render = render_dir / f'page-{pageno+1:03d}.png'
+                  pix.save(render)
+                  if render.stat().st_size < 10_000:
+                      raise RuntimeError(f'{spec.slug}: suspicious generated render {pageno+1}')
+              doc.close()
+
+              manifest.append({
+                  'filename': spec.filename,
+                  'company': '梦天家居',
+                  'stock_code': '603216',
+                  'institution': spec.institution,
+                  'date': spec.date,
+                  'title': spec.title,
+                  'analysts': spec.analysts,
+                  'pages': pages,
+                  'format_note': '依据公开在线阅读页面逐页合并的PDF阅读版；非券商原始PDF文件容器，未改写页面内容。',
+                  'source_page': spec.detail_url,
+                  'page_image_sources': [x['url'] for x in selected],
+                  'size_bytes': pdf_path.stat().st_size,
+                  'sha256': sha256(pdf_path),
+              })
+
+          (DEBUG / 'all_candidates.json').write_text(json.dumps(debug_all, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{x['sha256']}  {x['filename']}" for x in manifest) + '\n', encoding='utf-8'
+          )
+          readme = [
+              '# 梦天家居（603216）券商研究报告公开阅读版',
+              '',
+              '本包收录2份可公开核验的券商长篇公司研究报告。',
+              '',
+              '重要说明：公开来源未提供无需登录即可直接取得的原始PDF附件。本包依据报告公开在线阅读页面的逐页图像，按原顺序合并为PDF阅读版；页面内容未改写，但文件并非券商原始PDF容器。',
+              '',
+          ]
+          for i, x in enumerate(manifest, 1):
+              readme += [
+                  f"## {i}. {x['institution']}｜{x['date']}｜{x['title']}",
+                  f"- 分析师：{x['analysts']}",
+                  f"- 页数：{x['pages']}",
+                  f"- 文件：`{x['filename']}`",
+                  f"- 公开阅读页：{x['source_page']}",
+                  f"- SHA-256：`{x['sha256']}`",
+                  '',
+              ]
+          readme += [
+              '## 校验',
+              '',
+              '- 两份PDF均为20页。',
+              '- 已检查生成PDF的文件结构，并渲染抽查首页、中间页及末页。',
+              '- ZIP已执行完整解压与CRC检测。',
+          ]
+          (FINAL / 'README_文件清单与版本说明.md').write_text('\n'.join(readme), encoding='utf-8')
+
+          zip_cn = OUT / '梦天家居_603216_券商研究报告_公开阅读版_2份_20261012.zip'
+          zip_en = OUT / 'Mengtian_Home_603216_Broker_Research_Public_Reading_PDFs_2_20261012.zip'
+          for zp in (zip_cn, zip_en):
+              with zipfile.ZipFile(zp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for path in sorted(FINAL.iterdir()):
+                      zf.write(path, arcname=path.name)
+              with zipfile.ZipFile(zp) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          summary = {
+              'report_count': len(manifest),
+              'total_pages': sum(x['pages'] for x in manifest),
+              'reports': manifest,
+              'zip_cn': str(zip_cn), 'zip_cn_size': zip_cn.stat().st_size, 'zip_cn_sha256': sha256(zip_cn),
+              'zip_en': str(zip_en), 'zip_en_size': zip_en.stat().st_size, 'zip_en_sha256': sha256(zip_en),
+          }
+          (OUT / 'package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_mengtian_public_reports.py
+
+      - name: Upload final package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mengtian-603216-Public-Reading-Reports
+          path: |
+            output/*.zip
+            output/package_summary.json
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mengtian-603216-Reconstruction-Diagnostics
+          path: |
+            output/debug/*.json
+            output/renders/**/*.png
+          if-no-files-found: warn
+          retention-days: 3
