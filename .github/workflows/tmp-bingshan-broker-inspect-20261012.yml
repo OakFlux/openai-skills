@@ -1,0 +1,142 @@
+name: Inspect Bingshan Broker Reports
+
+on:
+  push:
+    branches:
+      - tmp-bingshan-000530-broker-reports-20261012
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: python -m pip install requests beautifulsoup4
+      - name: Query public research-report sources
+        shell: bash
+        run: |
+          cat > /tmp/inspect_bingshan.py <<'PY'
+          from __future__ import annotations
+          import json, re, sys, time
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          out = Path('output')
+          out.mkdir(exist_ok=True)
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/stock.jshtml?encodeUrl=000530',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def get(url, **kwargs):
+              last = None
+              for i in range(5):
+                  try:
+                      r = s.get(url, timeout=60, **kwargs)
+                      print('GET', r.status_code, r.url, 'bytes', len(r.content))
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}: {r.text[:200]}')
+                  except Exception as e:
+                      last = e
+                  time.sleep(1.5*(i+1))
+              raise RuntimeError(f'GET failed {url}: {last}')
+
+          all_rows = []
+          for page in range(1, 20):
+              params = {
+                  'cb': 'datatable'+str(page),
+                  'pageSize': 50,
+                  'pageNo': page,
+                  'fields': '',
+                  'qType': 0,
+                  'orgCode': '',
+                  'code': '000530',
+                  'industryCode': '',
+                  'industry': '',
+                  'rating': '',
+                  'ratingChange': '',
+                  'beginTime': '2010-01-01',
+                  'endTime': '2026-12-31',
+              }
+              r = get('https://reportapi.eastmoney.com/report/list', params=params)
+              text = r.text.strip()
+              (out/f'reportapi_page_{page}.txt').write_text(text, encoding='utf-8')
+              m = re.match(r'^[^(]+\((.*)\)\s*;?$', text, flags=re.S)
+              payload = m.group(1) if m else text
+              data = json.loads(payload)
+              rows = data.get('data') or data.get('result') or []
+              print('PAGE', page, 'rows', len(rows), 'keys', list(data)[:20])
+              all_rows.extend(rows)
+              total = int(data.get('total') or data.get('Total') or data.get('count') or len(all_rows))
+              if not rows or len(all_rows) >= total:
+                  break
+
+          # de-duplicate and print compact records
+          seen = set(); compact = []
+          for row in all_rows:
+              key = str(row.get('infoCode') or row.get('encodeUrl') or row.get('title') or '')
+              if key in seen: continue
+              seen.add(key)
+              c = {
+                  'infoCode': row.get('infoCode'),
+                  'title': row.get('title'),
+                  'orgSName': row.get('orgSName'),
+                  'publishDate': row.get('publishDate'),
+                  'researcher': row.get('researcher'),
+                  'stockName': row.get('stockName'),
+                  'stockCode': row.get('stockCode'),
+                  'predictNextTwoYearEps': row.get('predictNextTwoYearEps'),
+                  'ratingName': row.get('ratingName'),
+                  'emRatingName': row.get('emRatingName'),
+                  'encodeUrl': row.get('encodeUrl'),
+                  'raw': row,
+              }
+              compact.append(c)
+          compact.sort(key=lambda x: str(x.get('publishDate') or ''), reverse=True)
+          (out/'eastmoney_reports.json').write_text(json.dumps(compact, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('TOTAL UNIQUE', len(compact))
+          for c in compact:
+              print('REPORT', c['publishDate'], c['orgSName'], c['title'], c['infoCode'], c['encodeUrl'])
+
+          # Resolve PDF links from every Eastmoney report page.
+          resolved = []
+          for c in compact:
+              code = c.get('infoCode') or c.get('encodeUrl')
+              if not code:
+                  continue
+              if not str(code).startswith('AP'):
+                  code = 'AP' + str(code)
+              info_url = f'https://data.eastmoney.com/report/info/{code}.html'
+              try:
+                  r = get(info_url)
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  links = []
+                  for a in soup.find_all('a', href=True):
+                      href = a['href']
+                      if 'pdf.dfcfw.com' in href:
+                          links.append(href)
+                  links = list(dict.fromkeys(links))
+                  resolved.append({'infoCode': code, 'title': c.get('title'), 'orgSName': c.get('orgSName'), 'publishDate': c.get('publishDate'), 'info_url': info_url, 'pdf_links': links})
+                  print('PDFLINK', code, links)
+              except Exception as e:
+                  resolved.append({'infoCode': code, 'title': c.get('title'), 'error': repr(e)})
+                  print('RESOLVE ERROR', code, repr(e))
+          (out/'resolved_pdf_links.json').write_text(json.dumps(resolved, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+          python /tmp/inspect_bingshan.py
+      - name: Upload inspection data
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bingshan-Broker-Report-Inspection
+          path: output/*
+          if-no-files-found: error
+          retention-days: 3
