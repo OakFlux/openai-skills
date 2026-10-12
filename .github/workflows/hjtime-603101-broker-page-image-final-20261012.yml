@@ -1,0 +1,290 @@
+name: Build HJTime broker reports from public page images 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hjtime-603101-broker-page-image-final-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF and image validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests Pillow img2pdf pypdf
+
+      - name: Download all pages, assemble PDFs, verify and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import concurrent.futures
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          CODE = '603101'
+          COMPANY = '汇嘉时代'
+          FULL = '新疆汇嘉时代百货股份有限公司'
+          REPORTS = [
+              {
+                  'doc_id': '5271496',
+                  'date_path': '2026/02/12',
+                  'broker': '广发证券',
+                  'publish_date': '2026-02-12',
+                  'title': '新疆零售龙头行稳致远，胖改驱动业态提质',
+                  'pages': 29,
+              },
+              {
+                  'doc_id': '5261391',
+                  'date_path': '2026/02/09',
+                  'broker': '国盛证券',
+                  'publish_date': '2026-02-09',
+                  'title': '首次覆盖报告：新疆零售龙头，创新转型价值重估',
+                  'pages': 16,
+              },
+          ]
+
+          work = Path('hjtime_page_image_work')
+          image_root = work / 'images'
+          pdf_root = work / 'pdfs'
+          render_root = work / 'renders'
+          final = work / 'final'
+          art = Path('artifact_out')
+          for path in (image_root, pdf_root, render_root, final, art):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'image/avif,image/webp,image/png,image/*,*/*',
+              'Origin': 'https://www.fxbaogao.com',
+              'Referer': 'https://www.fxbaogao.com/',
+          })
+
+          def safe(value: str, limit: int = 110) -> str:
+              text = re.sub(r'[\\/:*?"<>|]+', '_', str(value or '')).strip(' ._')
+              return text[:limit] or 'report'
+
+          def download_page(report: dict, page_number: int, destination: Path) -> dict:
+              url = (
+                  f'https://public.fxbaogao.com/report-image/{report["date_path"]}/'
+                  f'{report["doc_id"]}-{page_number}.png'
+              )
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      response = session.get(url, timeout=(15, 120), allow_redirects=True)
+                      print('IMAGE_GET', report['doc_id'], page_number, attempt, response.status_code,
+                            len(response.content), response.headers.get('content-type'), url, flush=True)
+                      if (response.status_code == 200 and len(response.content) > 20_000
+                              and response.content.startswith(b'\x89PNG\r\n\x1a\n')):
+                          destination.write_bytes(response.content)
+                          with Image.open(destination) as image:
+                              width, height = image.size
+                              image.verify()
+                          if width < 900 or height < 1100:
+                              raise RuntimeError(f'Image resolution too low: {width}x{height}')
+                          return {
+                              'page': page_number,
+                              'url': str(response.url),
+                              'bytes': len(response.content),
+                              'width': width,
+                              'height': height,
+                              'sha256': hashlib.sha256(response.content).hexdigest(),
+                          }
+                  except Exception as exc:
+                      last = exc
+                      print('IMAGE_ERR', report['doc_id'], page_number, attempt, repr(exc), flush=True)
+              raise RuntimeError(f'Cannot download page {page_number} of {report["doc_id"]}: {last!r}')
+
+          records = []
+          all_pdf_hashes = set()
+          for report_index, report in enumerate(REPORTS, 1):
+              report_images = image_root / report['doc_id']
+              report_images.mkdir(parents=True, exist_ok=True)
+              page_jobs = []
+              for page_number in range(1, report['pages'] + 1):
+                  destination = report_images / f'{page_number:03d}.png'
+                  page_jobs.append((page_number, destination))
+
+              page_records = []
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                  futures = {
+                      executor.submit(download_page, report, page_number, destination): page_number
+                      for page_number, destination in page_jobs
+                  }
+                  for future in concurrent.futures.as_completed(futures):
+                      page_records.append(future.result())
+              page_records.sort(key=lambda item: item['page'])
+
+              expected_pages = list(range(1, report['pages'] + 1))
+              actual_pages = [item['page'] for item in page_records]
+              if actual_pages != expected_pages:
+                  raise RuntimeError(f'Page sequence mismatch for {report["doc_id"]}: {actual_pages}')
+              if len({item['sha256'] for item in page_records}) != report['pages']:
+                  raise RuntimeError(f'Duplicate page images detected for {report["doc_id"]}')
+
+              image_paths = [str(report_images / f'{page_number:03d}.png') for page_number in expected_pages]
+              pdf_name = (
+                  f'{report_index:02d}_{report["publish_date"]}_{safe(report["broker"])}_'
+                  f'{safe(report["title"])}_完整页图版.pdf'
+              )
+              pdf_path = pdf_root / pdf_name
+              pdf_bytes = img2pdf.convert(image_paths)
+              pdf_path.write_bytes(pdf_bytes)
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              actual_pdf_pages = len(reader.pages)
+              if actual_pdf_pages != report['pages']:
+                  raise RuntimeError(
+                      f'PDF page count mismatch for {report["doc_id"]}: '
+                      f'{actual_pdf_pages} vs {report["pages"]}'
+                  )
+              qpdf = subprocess.run(
+                  ['qpdf', '--check', str(pdf_path)], capture_output=True, text=True
+              )
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {pdf_name}: {qpdf.stderr[-1000:]}')
+
+              # Render-first verification: render the first and last pages and verify non-empty PNGs.
+              report_render = render_root / report['doc_id']
+              report_render.mkdir(parents=True, exist_ok=True)
+              for page_number, label in ((1, 'first'), (report['pages'], 'last')):
+                  prefix = report_render / label
+                  command = [
+                      'pdftoppm', '-f', str(page_number), '-l', str(page_number),
+                      '-singlefile', '-png', '-r', '120', str(pdf_path), str(prefix)
+                  ]
+                  rendered = subprocess.run(command, capture_output=True, text=True)
+                  if rendered.returncode != 0:
+                      raise RuntimeError(f'pdftoppm failed for {pdf_name}: {rendered.stderr[-1000:]}')
+                  rendered_png = Path(str(prefix) + '.png')
+                  if not rendered_png.exists() or rendered_png.stat().st_size < 20_000:
+                      raise RuntimeError(f'Render verification failed for {pdf_name}, page {page_number}')
+                  with Image.open(rendered_png) as image:
+                      width, height = image.size
+                      if width < 900 or height < 1100:
+                          raise RuntimeError(
+                              f'Rendered page resolution too low for {pdf_name}: {width}x{height}'
+                          )
+
+              pdf_data = pdf_path.read_bytes()
+              pdf_sha = hashlib.sha256(pdf_data).hexdigest()
+              if pdf_sha in all_pdf_hashes:
+                  raise RuntimeError('Duplicate assembled PDF detected')
+              all_pdf_hashes.add(pdf_sha)
+              shutil.copy2(pdf_path, final / pdf_name)
+
+              records.append({
+                  'filename': pdf_name,
+                  'broker': report['broker'],
+                  'title': report['title'],
+                  'publish_date': report['publish_date'],
+                  'pages': actual_pdf_pages,
+                  'bytes': len(pdf_data),
+                  'sha256': pdf_sha,
+                  'doc_id': report['doc_id'],
+                  'source_type': 'public full-page report images reassembled into PDF',
+                  'source_pattern': (
+                      f'https://public.fxbaogao.com/report-image/{report["date_path"]}/'
+                      f'{report["doc_id"]}-{{page}}.png'
+                  ),
+                  'first_page_url': page_records[0]['url'],
+                  'last_page_url': page_records[-1]['url'],
+                  'page_images': page_records,
+              })
+
+          readme = [
+              f'{FULL}（{CODE}.SH，证券简称：{COMPANY}）券商深度报告合集',
+              '整理日期：2026-10-12',
+              '',
+              '收录报告：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme += [
+                  f'{index}. {record["filename"]}',
+                  f'   券商：{record["broker"]}',
+                  f'   标题：{record["title"]}',
+                  f'   日期：{record["publish_date"]}；页数：{record["pages"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ]
+          readme += [
+              '版本说明：公开平台的原始PDF下载端点需要动态签名，无法匿名直接取得；本包根据公开可访问的完整逐页报告图像，按原页序无删减合成为PDF。',
+              '两份PDF均覆盖报告的全部页面，不是摘要或节选。页内版式、图表、文字和券商原始页眉页脚均保留。该版本为图像型PDF，不含可搜索文字层。',
+              '完整性检查：逐页验证PNG文件头、分辨率和SHA-256；验证页码连续且无重复；验证PDF页数、qpdf结构；重新渲染首尾页检查；ZIP通过CRC测试。',
+          ]
+
+          (final / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          manifest = []
+          for record in records:
+              compact = dict(record)
+              compact['page_images'] = [
+                  {
+                      'page': page['page'],
+                      'url': page['url'],
+                      'bytes': page['bytes'],
+                      'width': page['width'],
+                      'height': page['height'],
+                      'sha256': page['sha256'],
+                  }
+                  for page in record['page_images']
+              ]
+              manifest.append(compact)
+          (final / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (final / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{record["sha256"]}  {record["filename"]}\n' for record in records),
+              encoding='utf-8',
+          )
+
+          package_name = '汇嘉时代_603101_券商深度报告_2份_完整页图版'
+          zip_path = art / f'{package_name}.zip'
+          with zipfile.ZipFile(
+              zip_path, 'w', compression=zipfile.ZIP_DEFLATED,
+              compresslevel=6, allowZip64=True
+          ) as archive:
+              for path in sorted(final.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdf_count = sum(1 for name in archive.namelist() if name.lower().endswith('.pdf'))
+              if pdf_count != 2:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count}')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_RECORDS', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'SHA256', zip_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hjtime-603101-broker-page-image-reports-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
