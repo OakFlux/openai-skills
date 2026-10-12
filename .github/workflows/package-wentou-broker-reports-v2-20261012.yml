@@ -1,0 +1,188 @@
+name: Package verified Wentou broker reports
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/wentou-broker-reports-v2-20261012.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          reports = [
+              {
+                  'info_code': 'AP201709010844838675',
+                  'broker': '山西证券',
+                  'title': '影投业务高增长，耀莱影城&都玩网络业绩稳定',
+                  'publish_date': '2017-09-01',
+                  'authors': ['徐雪洁'],
+                  'rating': '增持',
+                  'expected_pages': 5,
+              },
+              {
+                  'info_code': 'AP201708300839006374',
+                  'broker': '华鑫证券',
+                  'title': '业绩稳步增长，影视游戏共发展',
+                  'publish_date': '2017-08-30',
+                  'authors': ['于芳'],
+                  'rating': '增持',
+                  'expected_pages': 5,
+              },
+          ]
+
+          ROOT = Path('work')
+          PDF_DIR = ROOT / 'pdfs'
+          VERIFY = ROOT / 'verify'
+          FINAL = ROOT / '文投控股_600715.SH_券商研究报告_2份'
+          ART = Path('artifact_out')
+          for path in (PDF_DIR, VERIFY, FINAL, ART):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(total=5, connect=5, read=5, status=5, backoff_factor=1.0,
+                        status_forcelist=[429, 500, 502, 503, 504],
+                        allowed_methods=['GET'], raise_on_status=False)
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', str(text)).strip(' ._')[:110]
+
+          records = []
+          sha_lines = []
+          for index, report in enumerate(reports, start=1):
+              info = report['info_code']
+              url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              tmp = PDF_DIR / f'{info}.pdf'
+              response = session.get(url, headers={'Accept': 'application/pdf,*/*;q=0.8'}, timeout=(30, 240))
+              print('DOWNLOAD', info, response.status_code, len(response.content), url, flush=True)
+              response.raise_for_status()
+              blob = response.content
+              if not blob.startswith(b'%PDF') or len(blob) < 100_000:
+                  raise RuntimeError(f'Invalid PDF for {info}: {len(blob)} bytes')
+              tmp.write_bytes(blob)
+
+              check = subprocess.run(['qpdf', '--check', str(tmp)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {info}: {check.stderr[-800:]}')
+
+              reader = PdfReader(str(tmp), strict=False)
+              pages = len(reader.pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(f'Unexpected page count for {info}: {pages}')
+              text = ''.join((page.extract_text() or '') for page in reader.pages)
+              compact = re.sub(r'\s+', '', text)
+              identity_ok = '文投控股' in compact or '600715' in compact or '文投控股股份有限公司' in compact
+              research_ok = any(term in compact for term in ('证券研究报告', '公司研究', '投资评级', '分析师'))
+              broker_ok = report['broker'].replace('证券', '') in compact or report['broker'] in compact
+              if not identity_ok or not research_ok or not broker_ok:
+                  raise RuntimeError(f'Identity/research validation failed for {info}: identity={identity_ok}, research={research_ok}, broker={broker_ok}')
+
+              first_prefix = VERIFY / f'{index:02d}_first'
+              last_prefix = VERIFY / f'{index:02d}_last'
+              first = subprocess.run(['pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '90', str(tmp), str(first_prefix)], capture_output=True, text=True)
+              last = subprocess.run(['pdftoppm', '-f', str(pages), '-l', str(pages), '-singlefile', '-png', '-r', '90', str(tmp), str(last_prefix)], capture_output=True, text=True)
+              if first.returncode != 0 or last.returncode != 0:
+                  raise RuntimeError(f'Page render failed for {info}')
+
+              filename = f'{index:02d}_{report["publish_date"]}_{safe(report["broker"])}_{safe(report["title"])}.pdf'
+              shutil.copy2(tmp, FINAL / filename)
+              sha = hashlib.sha256(blob).hexdigest()
+              record = {
+                  **report,
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(blob),
+                  'sha256': sha,
+                  'source_url': url,
+              }
+              records.append(record)
+              sha_lines.append(f'{sha}  {filename}')
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '文投控股（600715.SH）券商研究报告合集',
+              '整理日期：2026-10-12',
+              '',
+              '公开研报数据库中可直接取得并通过文件核验的文投控股公司报告仅有四份，均为2017年的5页公司研究报告。',
+              '本包选择两家不同券商的两份完整PDF；它们具有实质公司分析内容，但不属于20页以上的长篇首次覆盖或深度报告。',
+              '未使用网页摘要、行情快讯、无关行业报告或重复机构报告凑数。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(records, 1):
+              readme.extend([
+                  f'{i}. {rec["filename"]}',
+                  f'   券商：{rec["broker"]}',
+                  f'   标题：{rec["title"]}',
+                  f'   日期：{rec["publish_date"]}；页数：{rec["pages"]}',
+                  f'   分析师：{"、".join(rec["authors"])}；评级：{rec["rating"]}',
+                  f'   来源：{rec["source_url"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  '',
+              ])
+          readme.append('完整性核验：已检查PDF文件头、公司身份、券商研究属性、机构名称、实际页数、qpdf结构、首末页渲染、SHA-256及ZIP CRC。')
+          (FINAL / '00_文件清单与范围说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text('\n'.join(sha_lines) + '\n', encoding='utf-8')
+
+          chinese_zip = ART / '文投控股_600715.SH_券商研究报告_2份.zip'
+          with zipfile.ZipFile(chinese_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(FINAL.iterdir()):
+                  zf.write(path, arcname=f'{FINAL.name}/{path.name}')
+          with zipfile.ZipFile(chinese_zip, 'r') as zf:
+              bad = zf.testzip()
+              pdf_count = sum(1 for n in zf.namelist() if n.lower().endswith('.pdf'))
+              if bad or pdf_count != 2:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdf_count={pdf_count}')
+
+          english_zip = ART / 'Wentou_Holdings_600715_Broker_Research_2_Reports.zip'
+          shutil.copy2(chinese_zip, english_zip)
+          print('FINAL_ZIP', chinese_zip, chinese_zip.stat().st_size, hashlib.sha256(chinese_zip.read_bytes()).hexdigest(), flush=True)
+          print('BACKUP_ZIP', english_zip, english_zip.stat().st_size, hashlib.sha256(english_zip.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: wentou-broker-final-artifact
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
