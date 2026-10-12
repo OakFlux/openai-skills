@@ -1,0 +1,119 @@
+name: Diagnose Tianwei Hibor search
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/tianwei-hibor-search-20261012.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect Hibor search endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import json, pathlib, re, urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=pathlib.Path('hibor_diag'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          def fetch(name,url,method='GET',data=None,params=None):
+            try:
+              r=s.request(method,url,data=data,params=params,timeout=(20,120),allow_redirects=True)
+              (out/f'{name}.html').write_bytes(r.content)
+              print('FETCH',name,method,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              return r
+            except Exception as e:
+              print('ERROR',name,repr(e),url,flush=True); return None
+
+          pages=[]
+          for name,url in [('home','https://www.hibor.com.cn/'),('mobile','https://wap.hibor.com.cn/')]:
+            r=fetch(name,url)
+            if r is None: continue
+            soup=BeautifulSoup(r.text,'lxml')
+            for form in soup.find_all('form'):
+              rec={'page':name,'action':urllib.parse.urljoin(r.url,form.get('action') or ''),'method':(form.get('method') or 'get').upper(),'inputs':[]}
+              for inp in form.find_all(['input','select','textarea']):
+                rec['inputs'].append({'tag':inp.name,'name':inp.get('name'),'value':inp.get('value'),'type':inp.get('type'),'id':inp.get('id')})
+              pages.append(rec); print('FORM',json.dumps(rec,ensure_ascii=False),flush=True)
+            for sc in soup.find_all('script',src=True):
+              src=urllib.parse.urljoin(r.url,sc['src'])
+              if src.startswith('http'):
+                print('SCRIPT_SRC',name,src,flush=True)
+                try:
+                  js=s.get(src,timeout=(15,60))
+                  if js.status_code==200 and len(js.content)<5_000_000:
+                    safe=re.sub(r'[^A-Za-z0-9_.-]+','_',src.split('/')[-1] or 'script')[:100]
+                    (out/f'{name}_{safe}').write_bytes(js.content)
+                    txt=js.text
+                    if any(k.lower() in txt.lower() for k in ('search','elasticsearch','keyword','query')):
+                      for m in re.findall(r'[^\n;]{0,180}(?:search|elasticsearch|keyword|query)[^\n;]{0,260}',txt,flags=re.I):
+                        print('JS_SEARCH',m[:600].replace('\n',' '),flush=True)
+                except Exception as e: print('SCRIPT_ERROR',repr(e),src,flush=True)
+          (out/'forms.json').write_text(json.dumps(pages,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          q='天微电子'
+          title='军用灭火防爆系统龙头'
+          candidates=[]
+          # Use discovered forms first.
+          for i,f in enumerate(pages):
+            names=[x.get('name') for x in f['inputs'] if x.get('name')]
+            fields={}
+            for n in names:
+              ln=n.lower()
+              if any(k in ln for k in ('key','word','search','query','title','kw')): fields[n]=q
+              elif ln in ('page','p','pageindex','pageno'): fields[n]='1'
+              else:
+                item=next((x for x in f['inputs'] if x.get('name')==n),None)
+                if item and item.get('value') is not None: fields[n]=item['value']
+            if fields:
+              candidates.append((f'form_{i}',f['action'],f['method'],fields))
+          # Probe common routes and both GET/POST parameter names.
+          roots=['https://www.hibor.com.cn','https://wap.hibor.com.cn','https://mb.hibor.com.cn','https://wt.hibor.com.cn']
+          routes=['/search','/search.html','/Search','/searchresult','/searchresult.html','/elasticsearch','/reportsearch','/reportsearch.html','/searchreport','/searchreport.html','/reportlists','/reportlist','/repinfosearch']
+          for root in roots:
+            for route in routes:
+              for key in ['key','keyword','keywords','q','query','searchkey','searchKey','title','wd','kw']:
+                candidates.append((f'probe_{len(candidates)}',root+route,'GET',{key:q}))
+          seen=set(); results=[]
+          for name,url,method,fields in candidates:
+            sig=(url,method,tuple(sorted(fields.items())))
+            if sig in seen: continue
+            seen.add(sig)
+            try:
+              if method=='POST': r=s.post(url,data=fields,timeout=(10,45),allow_redirects=True)
+              else: r=s.get(url,params=fields,timeout=(10,45),allow_redirects=True)
+              text=r.text
+              hit=('天微电子' in text or '军用灭火防爆系统龙头' in text or '688511' in text)
+              if hit or (r.status_code==200 and len(r.content)>5000 and '搜索' in text):
+                rec={'name':name,'status':r.status_code,'url':r.url,'bytes':len(r.content),'hit':hit,'fields':fields}
+                results.append(rec); print('SEARCH_RESULT',json.dumps(rec,ensure_ascii=False),flush=True)
+                fn=f'result_{len(results):03d}.html'; (out/fn).write_bytes(r.content)
+                soup=BeautifulSoup(text,'lxml')
+                for a in soup.find_all('a',href=True):
+                  label=' '.join(a.get_text(' ',strip=True).split())
+                  href=urllib.parse.urljoin(r.url,a['href'])
+                  if any(k in (label+' '+href) for k in ('天微电子','688511','军用灭火','repinfodetail')):
+                    print('HIT_LINK',label,href,flush=True)
+            except Exception as e: pass
+          (out/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: tianwei-hibor-search-diagnostics
+          path: hibor_diag/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
