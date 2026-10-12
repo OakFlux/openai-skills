@@ -1,0 +1,416 @@
+name: Build Tianwei Electronics 688511 public research package 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianwei-electronics-688511-public-research-package-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf beautifulsoup4 lxml reportlab
+
+      - name: Download, build and validate package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader, PdfWriter
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_CENTER, TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+          from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+          PACKAGE = '天微电子_688511_券商深度及相关军工行业研究_3份'
+          ROOT = Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREVIEW_DIR = ROOT / '首页预览'
+          SOURCE_DIR = ROOT / '来源记录'
+          PREVIEW_DIR.mkdir(exist_ok=True)
+          SOURCE_DIR.mkdir(exist_ok=True)
+          WORK = Path('_work_tianwei_public_research')
+          WORK.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def get_response(url: str, referer: str | None = None, accept: str = '*/*', minimum: int = 1) -> requests.Response:
+              last = None
+              headers = {'User-Agent': session.headers['User-Agent'], 'Accept': accept}
+              if referer:
+                  headers['Referer'] = referer
+              for attempt in range(7):
+                  try:
+                      r = session.get(url, headers=headers, timeout=(25, 180), allow_redirects=True)
+                      last = {
+                          'status': r.status_code,
+                          'bytes': len(r.content),
+                          'type': r.headers.get('content-type', ''),
+                          'final_url': r.url,
+                      }
+                      if r.status_code == 200 and len(r.content) >= minimum:
+                          return r
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'Download failed: {url}; last={last}')
+
+          def sha256_file(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def image_bytes_to_rgb_jpeg(raw: bytes, dest: Path) -> tuple[int, int]:
+              with Image.open(BytesIO(raw)) as im:
+                  im.load()
+                  rgba = im.convert('RGBA')
+                  bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+                  bg.alpha_composite(rgba)
+                  rgb = bg.convert('RGB')
+                  rgb.save(dest, 'JPEG', quality=95, subsampling=0)
+                  return rgb.size
+
+          def render_and_validate_pdf(path: Path, min_pages: int = 1) -> dict:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'PDF has too few pages: {path.name}: {pages} < {min_pages}')
+              subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(path)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              prefix = PREVIEW_DIR / path.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(path), str(prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'First-page render failed: {path.name}')
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256_file(path),
+                  'preview_file': str(Path('首页预览') / preview.name),
+              }
+
+          pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+          base_styles = getSampleStyleSheet()
+          title_style = ParagraphStyle(
+              'ChineseTitle', parent=base_styles['Title'], fontName='STSong-Light',
+              fontSize=16, leading=23, alignment=TA_CENTER, spaceAfter=10, wordWrap='CJK',
+          )
+          body_style = ParagraphStyle(
+              'ChineseBody', parent=base_styles['BodyText'], fontName='STSong-Light',
+              fontSize=10.5, leading=17, alignment=TA_LEFT, spaceAfter=8, wordWrap='CJK',
+          )
+          notice_style = ParagraphStyle(
+              'Notice', parent=body_style, fontSize=9.5, leading=15,
+              borderColor=colors.HexColor('#BBBBBB'), borderWidth=0.7,
+              borderPadding=7, backColor=colors.HexColor('#F4F4F4'),
+          )
+          meta_style = ParagraphStyle(
+              'Meta', parent=body_style, fontSize=9.5, leading=15,
+          )
+
+          def esc(text: str) -> str:
+              return html.escape(text or '', quote=True)
+
+          def build_direct_cover_and_notice() -> dict:
+              detail_url = 'https://www.baogaobox.com/reports/240622000020971.html'
+              login_js_url = 'https://www.baogaobox.com/e/member/login/loginjs_report.php?id=20971'
+              cover_url = 'https://zy.baogaobox.com/file/p/2024/06-24/imguh6a1626h5plhqkyt9xid00020971.webp'
+
+              page = get_response(detail_url, referer='https://www.baogaobox.com/', accept='text/html,*/*', minimum=10_000)
+              page_text = page.content.decode(page.encoding or 'utf-8', 'replace')
+              (SOURCE_DIR / '01_天风证券_天微电子_来源页面.html').write_text(page_text, encoding='utf-8')
+              login_js = get_response(login_js_url, referer=detail_url, accept='text/javascript,text/html,*/*', minimum=50)
+              login_text = login_js.content.decode(login_js.encoding or 'utf-8', 'replace')
+              (SOURCE_DIR / '01_天风证券_访问状态说明.js.txt').write_text(login_text, encoding='utf-8')
+
+              cover_resp = get_response(cover_url, referer=detail_url, accept='image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8', minimum=20_000)
+              cover_src = WORK / 'tianwei_cover.webp'
+              cover_src.write_bytes(cover_resp.content)
+              cover_jpg = WORK / 'tianwei_cover.jpg'
+              width, height = image_bytes_to_rgb_jpeg(cover_resp.content, cover_jpg)
+              if width < 500 or height < 700:
+                  raise RuntimeError(f'Cover image unexpectedly small: {width}x{height}')
+
+              cover_pdf = WORK / 'tianwei_cover.pdf'
+              with Image.open(cover_jpg) as im:
+                  im.convert('RGB').save(cover_pdf, 'PDF', resolution=150.0)
+
+              notice_pdf = WORK / 'tianwei_notice.pdf'
+              doc = SimpleDocTemplate(
+                  str(notice_pdf), pagesize=A4,
+                  leftMargin=19*mm, rightMargin=19*mm, topMargin=18*mm, bottomMargin=18*mm,
+                  title='天微电子券商深度报告公开来源说明',
+                  author='资料整理',
+              )
+              story = [
+                  Paragraph('天微电子（688511）券商深度报告公开来源说明', title_style),
+                  Paragraph(
+                      '文件性质说明：本文件的第一页为公开研报页面展示的报告封面。原报告共18页；公开页面与其登录状态脚本明确显示，其余17页需要注册账户后获取。此文件不是券商原始完整PDF，也未绕过任何登录、会员或下载权限。',
+                      notice_style,
+                  ),
+                  Spacer(1, 5*mm),
+              ]
+              rows = [
+                  ('报告标题', '天微电子（688511）：军用灭火防爆系统龙头，下游景气度传导助力业绩腾飞'),
+                  ('研究机构', '天风证券'),
+                  ('发布日期', '2024-06-22'),
+                  ('研究员', '王泽宇、杨英杰'),
+                  ('原报告页数', '18页'),
+                  ('公开可取得内容', '报告封面1页及公开元数据'),
+                  ('来源页面', detail_url),
+              ]
+              table = Table(
+                  [[Paragraph(esc(a), meta_style), Paragraph(esc(b), meta_style)] for a, b in rows],
+                  colWidths=[33*mm, 118*mm], hAlign='LEFT',
+              )
+              table.setStyle(TableStyle([
+                  ('FONTNAME', (0,0), (-1,-1), 'STSong-Light'),
+                  ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                  ('GRID', (0,0), (-1,-1), 0.35, colors.HexColor('#CCCCCC')),
+                  ('BACKGROUND', (0,0), (0,-1), colors.HexColor('#F2F2F2')),
+                  ('LEFTPADDING', (0,0), (-1,-1), 6),
+                  ('RIGHTPADDING', (0,0), (-1,-1), 6),
+                  ('TOPPADDING', (0,0), (-1,-1), 5),
+                  ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+              ]))
+              story.append(table)
+              story.append(Spacer(1, 7*mm))
+              story.append(Paragraph(
+                  '公开检索结果：以证券代码688511检索的公开企业研究索引仅列出上述1篇直接公司覆盖报告。为满足“2-3份”的资料需求，本资料包另外收录2份明确包含天微电子数据或同业比较的军工行业专题报告，并在文件名及清单中标注为“相关行业研究”，不将其冒充公司单独深度报告。',
+                  body_style,
+              ))
+              story.append(Paragraph(
+                  '版权与用途：报告观点及版权归原券商和研究员所有，仅供研究参考，不构成投资建议。',
+                  body_style,
+              ))
+              doc.build(story)
+
+              output = ROOT / '01_天风证券_天微电子_军用灭火防爆系统龙头_公开封面与来源说明_原报告18页.pdf'
+              writer = PdfWriter()
+              for source_pdf in [cover_pdf, notice_pdf]:
+                  r = PdfReader(str(source_pdf), strict=False)
+                  for page_obj in r.pages:
+                      writer.add_page(page_obj)
+              with output.open('wb') as f:
+                  writer.write(f)
+              info = render_and_validate_pdf(output, min_pages=2)
+              return {
+                  'order': 1,
+                  'issuer': '天微电子（688511）',
+                  'broker': '天风证券',
+                  'date': '2024-06-22',
+                  'analysts': '王泽宇、杨英杰',
+                  'title': '天微电子（688511）：军用灭火防爆系统龙头，下游景气度传导助力业绩腾飞',
+                  'original_pages': 18,
+                  'public_pages_in_pdf': 1,
+                  'file': output.name,
+                  'document_nature': '直接公司深度报告的公开封面与来源说明；非完整原始PDF',
+                  'source_page': detail_url,
+                  'cover_url': cover_url,
+                  'access_status': login_text.strip(),
+                  **info,
+              }
+
+          def locate_report_image_start(html_text: str, detail_id: int, base_url: str) -> tuple[str, str] | None:
+              soup = BeautifulSoup(html_text, 'lxml')
+              candidates: list[str] = []
+              for tag in soup.find_all(True):
+                  for attr in ('src', 'data-src', 'data-original', 'data-url', 'href'):
+                      value = tag.get(attr)
+                      if isinstance(value, str) and value.strip():
+                          candidates.append(urljoin(base_url, value.strip()))
+              candidates.extend(re.findall(r'https?://[^\s"\'<>]+', html_text))
+              normalized: list[str] = []
+              for value in candidates:
+                  value = html.unescape(value).replace('\\/', '/')
+                  value = value.split('?')[0]
+                  normalized.append(value)
+              patterns = [
+                  re.compile(rf'(.+/){detail_id}-1\.(png|jpg|jpeg|webp)$', re.I),
+                  re.compile(rf'(.+/){detail_id}_1\.(png|jpg|jpeg|webp)$', re.I),
+              ]
+              for value in normalized:
+                  for pat in patterns:
+                      m = pat.match(value)
+                      if m:
+                          separator = '-' if f'{detail_id}-1.' in value else '_'
+                          return m.group(1) + str(detail_id) + separator, m.group(2).lower()
+              return None
+
+          def build_fxbaogao_public_report(detail_id: int, order: int, broker: str, title: str, date: str, filename: str, relation_note: str) -> dict:
+              detail_url = f'https://www.fxbaogao.com/detail/{detail_id}'
+              response = get_response(detail_url, referer='https://www.fxbaogao.com/', accept='text/html,*/*', minimum=10_000)
+              html_text = response.content.decode(response.encoding or 'utf-8', 'replace')
+              source_html = SOURCE_DIR / f'{order:02d}_fxbaogao_{detail_id}.html'
+              source_html.write_text(html_text, encoding='utf-8')
+
+              start = locate_report_image_start(html_text, detail_id, response.url)
+              if start is None:
+                  raise RuntimeError(f'Could not locate public page image sequence for Fxbaogao detail {detail_id}')
+              prefix, extension = start
+              report_work = WORK / f'fx_{detail_id}'
+              report_work.mkdir(exist_ok=True)
+              images: list[Path] = []
+              page_meta: list[dict] = []
+              seen_hashes: set[str] = set()
+              for page_no in range(1, 121):
+                  url = f'{prefix}{page_no}.{extension}'
+                  try:
+                      r = get_response(url, referer=detail_url, accept='image/avif,image/webp,image/apng,image/png,image/jpeg,*/*;q=0.8', minimum=5_000)
+                      digest = hashlib.sha256(r.content).hexdigest()
+                      if digest in seen_hashes:
+                          break
+                      seen_hashes.add(digest)
+                      jpg = report_work / f'{page_no:03d}.jpg'
+                      width, height = image_bytes_to_rgb_jpeg(r.content, jpg)
+                      if width < 700 or height < 850:
+                          jpg.unlink(missing_ok=True)
+                          break
+                      images.append(jpg)
+                      page_meta.append({
+                          'page': page_no, 'url': url, 'bytes': len(r.content),
+                          'width': width, 'height': height, 'sha256': digest,
+                      })
+                  except Exception:
+                      break
+                  time.sleep(0.05)
+              if len(images) < 5:
+                  raise RuntimeError(f'Too few public report pages for detail {detail_id}: {len(images)}')
+
+              output = ROOT / filename
+              opened = [Image.open(path).convert('RGB') for path in images]
+              try:
+                  opened[0].save(output, save_all=True, append_images=opened[1:], resolution=150.0, quality=95)
+              finally:
+                  for image in opened:
+                      image.close()
+              info = render_and_validate_pdf(output, min_pages=len(images))
+              return {
+                  'order': order,
+                  'issuer': '天微电子（688511）相关军工行业研究',
+                  'broker': broker,
+                  'date': date,
+                  'title': title,
+                  'file': output.name,
+                  'document_nature': '公开逐页图像整理版；相关行业专题研究，非天微电子单独公司深度报告',
+                  'relation_note': relation_note,
+                  'source_page': detail_url,
+                  'source_html_file': str(Path('来源记录') / source_html.name),
+                  'public_page_images': page_meta,
+                  **info,
+              }
+
+          manifest: list[dict] = []
+          manifest.append(build_direct_cover_and_notice())
+          manifest.append(build_fxbaogao_public_report(
+              detail_id=3160614,
+              order=2,
+              broker='中泰证券',
+              title='国防军工行业军工板块2021Q4&2022Q1业绩专题报告：板块持续高景气，军工确定性投资价值凸现',
+              date='2022-05-05',
+              filename='02_中泰证券_国防军工板块2021Q4及2022Q1业绩专题_相关行业研究_公开页面版.pdf',
+              relation_note='报告的军工板块个股业绩与估值表中列有688511.SH天微电子。',
+          ))
+          manifest.append(build_fxbaogao_public_report(
+              detail_id=4623838,
+              order=3,
+              broker='中原证券',
+              title='国防军工行业专题研究：否极泰来，圆满收官',
+              date='2024-12-11',
+              filename='03_中原证券_国防军工行业专题研究_否极泰来圆满收官_相关行业研究_公开页面版.pdf',
+              relation_note='报告的2024年军工上市公司行情回顾中明确列有688511.SH天微电子。',
+          ))
+
+          readme = [
+              '天微电子（688511.SH）券商深度及相关军工行业研究资料包',
+              '整理日期：2026-10-12',
+              '',
+              '检索结论：公开企业研究索引中仅找到1份直接针对天微电子的券商公司深度报告，即天风证券2024年报告。该报告原文共18页，但公开页面仅展示封面，登录状态脚本显示其余17页需要注册账户后取得。本包未绕过登录、会员或下载权限。',
+              '',
+              '为满足2-3份资料需求，本包另收录2份明确包含天微电子数据或同业比较的军工行业专题报告。它们属于相关行业研究，不是天微电子单独公司深度报告；文件名和清单均已明确标注。',
+              '',
+          ]
+          for item in manifest:
+              readme += [
+                  f"{item['order']}. {item['broker']}：《{item['title']}》",
+                  f"   日期：{item['date']}；文件性质：{item['document_nature']}",
+                  f"   本包文件：{item['file']}；PDF页数：{item['pages']}页",
+                  f"   来源页面：{item['source_page']}",
+              ]
+              if item.get('relation_note'):
+                  readme.append(f"   与天微电子的关系：{item['relation_note']}")
+              readme += [f"   SHA-256：{item['sha256']}", '']
+          readme += [
+              '包内附来源网页HTML、报告首页预览、manifest.json及SHA256SUMS.txt。',
+              '核验项目：来源页面、图像尺寸与去重、PDF页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+              '报告内容与版权归原券商和作者所有，仅供研究参考，不构成投资建议。',
+          ]
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['file']}\n" for item in manifest), encoding='utf-8'
+          )
+
+          zpath = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{PACKAGE}/{path.relative_to(ROOT)}')
+          with zipfile.ZipFile(zpath) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad or len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdf_count={len(pdfs)}')
+          short = Path('tianwei_research_reports.zip')
+          short.write_bytes(zpath.read_bytes())
+          print('FINAL_ZIP', zpath, zpath.stat().st_size, 'SHA256', hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: tianwei-electronics-688511-public-research-package-final
+          path: |
+            天微电子_688511_券商深度及相关军工行业研究_3份.zip
+            tianwei_research_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
