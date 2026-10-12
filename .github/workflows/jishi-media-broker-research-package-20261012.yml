@@ -1,0 +1,337 @@
+name: Build Jishi Media broker research package 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jishi-media-broker-research-package-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          TODAY = '2026-10-12'
+          PACKAGE = '吉视传媒_601929_券商研究资料_2份公司报告_1份广电同业深度'
+          WORK = Path('jishi_media_research_work')
+          DOWNLOADS = WORK / 'downloads'
+          FINAL = WORK / 'final' / PACKAGE
+          ART = Path('artifact_out')
+          VERIFY = Path('verification_renders')
+          for directory in (DOWNLOADS, FINAL, ART, VERIFY):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept': 'application/json,text/plain,application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          direct_records = [
+              {
+                  'stock_code': '601929',
+                  'stock_name': '吉视传媒',
+                  'broker': '中邮证券',
+                  'publish_date': '2024-10-28',
+                  'title': '整合省内IPTV优质资产，增持回购奠定长期信心',
+                  'info_code': 'AP202410281640535006',
+                  'document_type': '吉视传媒公司研究报告（完整短篇）',
+                  'relevance': '直接研究吉视传媒，覆盖IPTV资产整合、回购增持、盈利预测及风险提示。',
+                  'min_pages': 4,
+              },
+              {
+                  'stock_code': '601929',
+                  'stock_name': '吉视传媒',
+                  'broker': '中邮证券',
+                  'publish_date': '2023-11-24',
+                  'title': '定位社会信息化转型，全面布局数字业务',
+                  'info_code': 'AP202311241612228358',
+                  'document_type': '吉视传媒首次覆盖报告（完整短篇）',
+                  'relevance': '直接研究吉视传媒，覆盖有线电视主业、数字吉林、政企信息化及数据要素布局。',
+                  'min_pages': 4,
+              },
+          ]
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:110]
+
+          def api_rows(code: str) -> list[dict]:
+              rows_all: list[dict] = []
+              for page in range(1, 6):
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2017-01-01', 'endTime': TODAY,
+                      'pageNo': str(page), 'fields': '', 'qType': '0',
+                      'orgCode': '', 'code': code, 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  }
+                  response = session.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=(25, 180))
+                  print('API', code, page, response.status_code, len(response.content), flush=True)
+                  response.raise_for_status()
+                  batch = response.json().get('data') or []
+                  rows_all.extend(batch)
+                  if len(batch) < 100:
+                      break
+                  time.sleep(1)
+              unique = {}
+              for row in rows_all:
+                  unique[str(row.get('infoCode') or json.dumps(row, ensure_ascii=False, sort_keys=True))] = row
+              return list(unique.values())
+
+          def pdf_urls(info_code: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_01.pdf',
+              ]
+
+          def download_pdf(info_code: str, target: Path) -> str:
+              last = None
+              for url in pdf_urls(info_code):
+                  try:
+                      response = session.get(url, timeout=(30, 300), allow_redirects=True)
+                      print('PDF', info_code, response.status_code, len(response.content), url, flush=True)
+                      if response.status_code == 200 and len(response.content) > 100_000 and response.content.startswith(b'%PDF-'):
+                          target.write_bytes(response.content)
+                          return str(response.url)
+                  except Exception as exc:
+                      last = exc
+              raise RuntimeError(f'No valid PDF for {info_code}: {last!r}')
+
+          def sample_text(path: Path, max_pages: int = 24) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              indices = list(range(min(max_pages, pages)))
+              if pages > max_pages + 2:
+                  indices.extend(range(max(0, pages - 2), pages))
+              parts: list[str] = []
+              for index in dict.fromkeys(indices):
+                  try:
+                      parts.append(reader.pages[index].extract_text() or '')
+                  except Exception:
+                      pass
+              return pages, '\n'.join(parts)
+
+          def validate(record: dict, path: Path, peer: bool = False) -> dict:
+              pages, text = sample_text(path)
+              low = text.lower()
+              if pages < int(record['min_pages']):
+                  raise RuntimeError(f'Unexpectedly short PDF {path.name}: {pages}')
+              identity = record['stock_name'] in text or record['stock_code'] in text
+              research = any(marker in text for marker in ['证券研究报告', '公司研究', '投资评级', '首次覆盖', '深度报告']) or 'equity research' in low
+              if not identity or not research:
+                  raise RuntimeError(f'Identity/research validation failed for {path.name}: identity={identity}, research={research}')
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {path.name}: {qpdf.stderr[-800:]}')
+              raw = path.read_bytes()
+              return {
+                  **record,
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'peer_report': peer,
+              }
+
+          completed: list[dict] = []
+          seen_hashes: set[str] = set()
+
+          for record in direct_records:
+              temp = DOWNLOADS / f'{record["info_code"]}.pdf'
+              source_url = download_pdf(record['info_code'], temp)
+              validated = validate(record, temp, peer=False)
+              validated['source_url'] = source_url
+              if validated['sha256'] in seen_hashes:
+                  raise RuntimeError('Duplicate direct report')
+              seen_hashes.add(validated['sha256'])
+              completed.append({'record': validated, 'path': temp})
+              print('VALIDATED_DIRECT', json.dumps(validated, ensure_ascii=False), flush=True)
+
+          # Add one long-form, directly comparable cable-TV-network operator report.
+          peer_specs = [
+              {
+                  'stock_code': '600037',
+                  'stock_name': '歌华有线',
+                  'document_type': '广电网络同业长篇深度/首次覆盖报告',
+                  'relevance': '北京市广电网络运营商，与吉视传媒同属区域有线电视网络运营企业，可用于比较电视主业、宽带通信、用户运营和国企改革逻辑。',
+                  'preferred': ['把握电视主业结构性机遇', '首次覆盖', '深度报告', '电视主业', '通信业务'],
+              },
+              {
+                  'stock_code': '600959',
+                  'stock_name': '江苏有线',
+                  'document_type': '广电网络同业长篇深度/首次覆盖报告',
+                  'relevance': '省级广电网络运营商，可用于比较有线电视、宽带、政企业务及数字化转型。',
+                  'preferred': ['首次覆盖', '深度报告', '广电网络', '数字化'],
+              },
+              {
+                  'stock_code': '000665',
+                  'stock_name': '湖北广电',
+                  'document_type': '广电网络同业长篇深度/首次覆盖报告',
+                  'relevance': '省级广电网络运营商，可用于比较有线电视、5G及政企业务转型。',
+                  'preferred': ['首次覆盖', '深度报告', '广电5G', '有线电视'],
+              },
+          ]
+
+          peer_validated = None
+          peer_path = None
+          metadata_archive: dict[str, list[dict]] = {}
+          for spec in peer_specs:
+              rows = api_rows(spec['stock_code'])
+              metadata_archive[spec['stock_code']] = rows
+              scored: list[tuple[int, dict]] = []
+              for row in rows:
+                  title = str(row.get('title') or '').strip()
+                  pages = int(row.get('attachPages') or 0)
+                  if not title or pages < 18:
+                      continue
+                  if any(term in title for term in ['季报点评', '年报点评', '中报点评', '事件点评', '业绩预告', '信息更新报告']):
+                      continue
+                  score = pages + sum(45 for term in spec['preferred'] if term in title)
+                  if any(term in title for term in ['首次覆盖', '深度报告', '公司深度']):
+                      score += 80
+                  scored.append((score, row))
+              scored.sort(key=lambda item: item[0], reverse=True)
+              for score, row in scored[:15]:
+                  info_code = str(row.get('infoCode') or '')
+                  temp = DOWNLOADS / f'{spec["stock_code"]}_{info_code}.pdf'
+                  try:
+                      source_url = download_pdf(info_code, temp)
+                      candidate = {
+                          'stock_code': spec['stock_code'],
+                          'stock_name': spec['stock_name'],
+                          'broker': str(row.get('orgSName') or row.get('orgName') or '未知券商'),
+                          'publish_date': str(row.get('publishDate') or '')[:10],
+                          'title': str(row.get('title') or '').strip(),
+                          'info_code': info_code,
+                          'document_type': spec['document_type'],
+                          'relevance': spec['relevance'],
+                          'min_pages': 18,
+                          'selection_score': score,
+                      }
+                      validated = validate(candidate, temp, peer=True)
+                      validated['source_url'] = source_url
+                      if validated['sha256'] in seen_hashes:
+                          temp.unlink(missing_ok=True)
+                          continue
+                      peer_validated = validated
+                      peer_path = temp
+                      print('VALIDATED_PEER', json.dumps(validated, ensure_ascii=False), flush=True)
+                      break
+                  except Exception as exc:
+                      print('PEER_REJECT', spec['stock_name'], row.get('title'), repr(exc), flush=True)
+                      temp.unlink(missing_ok=True)
+              if peer_validated:
+                  break
+
+          if not peer_validated or not peer_path:
+              raise RuntimeError('No validated long-form cable-network peer report found')
+          seen_hashes.add(peer_validated['sha256'])
+          completed.append({'record': peer_validated, 'path': peer_path})
+
+          manifest: list[dict] = []
+          for index, item in enumerate(completed, 1):
+              record = item['record']
+              tag = '公司报告' if not record['peer_report'] else '同业深度'
+              filename = f'{index:02d}_{tag}_{safe(record["publish_date"])}_{safe(record["broker"])}_{safe(record["stock_name"])}_{safe(record["title"])}.pdf'
+              shutil.copy2(item['path'], FINAL / filename)
+              record = {**record, 'filename': filename}
+              manifest.append(record)
+
+          readme = [
+              '吉视传媒（601929.SH）券商研究资料包',
+              f'整理日期：{TODAY}',
+              '',
+              '口径说明：',
+              '1. 经公开券商研报数据库按证券代码601929检索，可直接下载并核验的吉视传媒公司专属报告共2份，均为中邮证券完整5页公司研究，其中2023年报告为首次覆盖。',
+              '2. 公开渠道中未发现20页以上的吉视传媒公司专属长篇深度报告。为补充行业与商业模式研究，本包另收录1份同属区域广电网络运营商的长篇深度/首次覆盖报告。',
+              '3. 同业报告不是券商对吉视传媒本身的评级或盈利预测，文件名已标记“同业深度”。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(manifest, 1):
+              readme += [
+                  f'{index}. {record["filename"]}',
+                  f'   类型：{record["document_type"]}',
+                  f'   公司：{record["stock_name"]}（{record["stock_code"]}）',
+                  f'   券商：{record["broker"]}；日期：{record["publish_date"]}；页数：{record["pages"]}',
+                  f'   标题：{record["title"]}',
+                  f'   与吉视传媒的关系：{record["relevance"]}',
+                  f'   来源：{record["source_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ]
+          readme.append('完整性核验：已检查PDF文件头、公司身份、券商研究标识、实际页数、qpdf结构、重复文件及SHA-256；最终ZIP已通过CRC测试。')
+          (FINAL / '00_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(''.join(f'{record["sha256"]}  {record["filename"]}\n' for record in manifest), encoding='utf-8')
+          (FINAL / '同业研报检索元数据.json').write_text(json.dumps(metadata_archive, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          for index, record in enumerate(manifest, 1):
+              source = FINAL / record['filename']
+              prefix = VERIFY / f'{index:02d}'
+              result = subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '110', str(source), str(prefix)], capture_output=True, text=True)
+              if result.returncode != 0:
+                  raise RuntimeError(f'Render failed: {source.name}: {result.stderr[-800:]}')
+
+          zip_path = ART / f'{PACKAGE}.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(FINAL.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'Expected 3 PDFs, got {len(pdfs)}')
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'SHA256', hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jishi-media-601929-broker-research-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload verification renders
+        uses: actions/upload-artifact@v4
+        with:
+          name: jishi-media-601929-broker-research-renders
+          path: verification_renders/*.png
+          retention-days: 30
+          compression-level: 0
