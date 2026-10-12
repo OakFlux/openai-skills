@@ -1,0 +1,269 @@
+name: Package Mengtian Public Reading Reports V2
+
+on:
+  push:
+    branches:
+      - tmp-mengtian-603216-broker-reports-20261012
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pillow pymupdf pypdf
+
+      - name: Download pages and build verified package
+        shell: bash
+        run: |
+          cat > /tmp/build_mengtian.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import zipfile
+          from dataclasses import dataclass
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('output')
+          FINAL = OUT / 'final'
+          IMAGES = OUT / 'images'
+          RENDERS = OUT / 'renders'
+          for directory in (OUT, FINAL, IMAGES, RENDERS):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+          })
+          retry = Retry(total=5, connect=5, read=5, backoff_factor=1.0, status_forcelist=(429, 500, 502, 503, 504))
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+
+          @dataclass(frozen=True)
+          class Spec:
+              slug: str
+              root: str
+              referer: str
+              institution: str
+              date: str
+              title: str
+              analysts: str
+              pages: int
+              filename: str
+              source_page: str
+
+          specs = [
+              Spec(
+                  slug='tianfeng_20220119',
+                  root='https://file.sgpjbg.com/fileroot_temp1/2022-1/21/491c4d7b-b8ac-4745-b532-ec44622e21a7/491c4d7b-b8ac-4745-b532-ec44622e21a7',
+                  referer='https://m.sgpjbg.com/baogao/59821.html',
+                  institution='天风证券',
+                  date='2022-01-19',
+                  title='从木门到全屋木作，上市后进入新发展阶段',
+                  analysts='范张翔、尉鹏洁',
+                  pages=20,
+                  filename='01_天风证券_2022-01-19_从木门到全屋木作_上市后进入新发展阶段_公开阅读版.pdf',
+                  source_page='https://www.sgpjbg.com/baogao/59821.html',
+              ),
+              Spec(
+                  slug='cms_20211212',
+                  root='https://file.sgpjbg.com/fileroot_temp1/2021-12/13/1e36a52c-b28a-42c3-8ee2-17a139411d64/1e36a52c-b28a-42c3-8ee2-17a139411d64',
+                  referer='https://m.sgpjbg.com/baogao/57012.html',
+                  institution='招商证券',
+                  date='2021-12-12',
+                  title='新股分析：木门行业领军企业，产品渠道拓展未来成长可期',
+                  analysts='赵中平、李宏鹏',
+                  pages=20,
+                  filename='02_招商证券_2021-12-12_新股分析_木门行业领军企业_产品渠道拓展未来成长可期_公开阅读版.pdf',
+                  source_page='https://www.sgpjbg.com/baogao/57012.html',
+              ),
+          ]
+
+          def file_sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          manifest = []
+          for spec in specs:
+              page_dir = IMAGES / spec.slug
+              page_dir.mkdir(parents=True, exist_ok=True)
+              page_rows = []
+              seen = set()
+
+              for page_no in range(1, spec.pages + 1):
+                  source_url = f'{spec.root}{page_no}.gif'
+                  response = session.get(source_url, headers={'Referer': spec.referer}, timeout=60)
+                  response.raise_for_status()
+                  payload = response.content
+                  if len(payload) < 1_000:
+                      raise RuntimeError(f'{spec.slug} page {page_no}: response too small ({len(payload)} bytes)')
+
+                  with Image.open(io.BytesIO(payload)) as image:
+                      image.load()
+                      width, height = image.size
+                      if width < 700 or height < 900 or height <= width:
+                          raise RuntimeError(f'{spec.slug} page {page_no}: unexpected dimensions {width}x{height}')
+                      gray = image.convert('L')
+                      extrema = gray.getextrema()
+                      variance = float(ImageStat.Stat(gray).var[0])
+                      if extrema[0] == extrema[1] or variance < 1.0:
+                          raise RuntimeError(f'{spec.slug} page {page_no}: blank or near-blank image')
+                      rgb = image.convert('RGB')
+                      local_png = page_dir / f'{page_no:02d}.png'
+                      rgb.save(local_png, format='PNG', optimize=True)
+
+                  source_hash = hashlib.sha256(payload).hexdigest()
+                  if source_hash in seen:
+                      raise RuntimeError(f'{spec.slug} page {page_no}: duplicate page image')
+                  seen.add(source_hash)
+                  page_rows.append({
+                      'page': page_no,
+                      'source_url': source_url,
+                      'width': width,
+                      'height': height,
+                      'source_bytes': len(payload),
+                      'source_sha256': source_hash,
+                      'variance': variance,
+                      'local_png': str(local_png),
+                  })
+                  print(f'{spec.slug} page {page_no}: {width}x{height}, {len(payload)} bytes, variance={variance:.2f}')
+
+              pdf_path = FINAL / spec.filename
+              document = pymupdf.open()
+              document.set_metadata({
+                  'title': spec.title,
+                  'author': spec.institution,
+                  'subject': '梦天家居（603216）券商研究报告公开阅读版',
+                  'keywords': '梦天家居, 603216, 券商研报',
+              })
+              for row in page_rows:
+                  png_path = Path(row['local_png'])
+                  with Image.open(png_path) as image:
+                      width, height = image.size
+                  page_height = 842.0
+                  page_width = page_height * width / height
+                  page = document.new_page(width=page_width, height=page_height)
+                  page.insert_image(page.rect, filename=str(png_path), keep_proportion=True)
+              document.save(pdf_path, garbage=4, deflate=True)
+              document.close()
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              if len(reader.pages) != spec.pages:
+                  raise RuntimeError(f'{spec.slug}: expected {spec.pages} PDF pages, got {len(reader.pages)}')
+
+              render_dir = RENDERS / spec.slug
+              render_dir.mkdir(parents=True, exist_ok=True)
+              check_doc = pymupdf.open(pdf_path)
+              for pageno in (0, spec.pages // 2, spec.pages - 1):
+                  pixmap = check_doc.load_page(pageno).get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+                  render_path = render_dir / f'page-{pageno + 1:03d}.png'
+                  pixmap.save(render_path)
+                  with Image.open(render_path) as rendered:
+                      render_var = float(ImageStat.Stat(rendered.convert('L')).var[0])
+                  if render_var < 1.0:
+                      raise RuntimeError(f'{spec.slug}: suspicious blank render on page {pageno + 1}')
+              check_doc.close()
+
+              manifest.append({
+                  'filename': spec.filename,
+                  'company': '梦天家居',
+                  'stock_code': '603216',
+                  'institution': spec.institution,
+                  'date': spec.date,
+                  'title': spec.title,
+                  'analysts': spec.analysts,
+                  'pages': spec.pages,
+                  'format': '公开阅读版PDF（公开在线阅读页逐页合并）',
+                  'version_note': '非券商原始PDF文件容器；逐页图像按原顺序合并，未改写页面内容。',
+                  'source_page': spec.source_page,
+                  'page_sources': [row['source_url'] for row in page_rows],
+                  'size_bytes': pdf_path.stat().st_size,
+                  'sha256': file_sha256(pdf_path),
+              })
+
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['filename']}\n" for item in manifest),
+              encoding='utf-8',
+          )
+
+          readme = [
+              '# 梦天家居（603216）券商研究报告公开阅读版',
+              '',
+              '本包包含2份券商长篇公司研究报告，共40页。',
+              '',
+              '版本说明：公开来源未提供无需登录即可下载的券商原始PDF附件。本包使用公开在线阅读页提供的逐页图像，按原始页序合并为PDF阅读版；页面内容未改写。',
+              '',
+          ]
+          for index, item in enumerate(manifest, 1):
+              readme.extend([
+                  f"## {index}. {item['institution']}｜{item['date']}｜{item['title']}",
+                  f"- 分析师：{item['analysts']}",
+                  f"- 页数：{item['pages']}",
+                  f"- 文件：`{item['filename']}`",
+                  f"- 公开来源页面：{item['source_page']}",
+                  f"- SHA-256：`{item['sha256']}`",
+                  '',
+              ])
+          readme.extend([
+              '## 校验记录',
+              '',
+              '- 两份报告均取得1—20页，并通过页数、尺寸、非空白和重复页检查。',
+              '- 已渲染抽查每份PDF的首页、中间页和末页。',
+              '- ZIP已通过CRC完整性检测。',
+          ])
+          (FINAL / 'README_文件清单与版本说明.md').write_text('\n'.join(readme), encoding='utf-8')
+
+          package = OUT / '梦天家居_603216_券商深度报告_公开阅读版_2份_20261012.zip'
+          with zipfile.ZipFile(package, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(FINAL.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(package) as archive:
+              bad_file = archive.testzip()
+              if bad_file:
+                  raise RuntimeError(f'ZIP CRC failure: {bad_file}')
+
+          summary = {
+              'report_count': len(manifest),
+              'total_pages': sum(item['pages'] for item in manifest),
+              'reports': manifest,
+              'package': str(package),
+              'package_size_bytes': package.stat().st_size,
+              'package_sha256': file_sha256(package),
+          }
+          (OUT / 'package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_mengtian.py
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mengtian-603216-Broker-Public-Reading-Reports-V2
+          path: |
+            output/*.zip
+            output/package_summary.json
+            output/renders/**/*.png
+          if-no-files-found: error
+          retention-days: 7
