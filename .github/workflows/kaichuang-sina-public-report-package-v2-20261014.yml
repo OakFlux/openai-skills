@@ -1,0 +1,273 @@
+name: Package three public Kaichuang International brokerage reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/kaichuang-sina-public-report-package-v2-20261014.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Install PDF tools and Chinese fonts
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests beautifulsoup4 lxml weasyprint pypdf
+
+      - name: Fetch public pages, render PDFs, validate, and package
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html as html_lib
+          import json
+          import re
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup, Tag
+          from pypdf import PdfReader
+          from weasyprint import HTML
+
+          REPORTS = [
+              {
+                  'rid': '419673534621',
+                  'broker': '宏源证券股份有限公司',
+                  'researcher': '王凤华/李坤阳/史余森/岳苗/邓锐',
+                  'date': '2013-04-19',
+                  'title': '开创国际(600097)深度报告：近看政策扶持 远看产业延伸',
+              },
+              {
+                  'rid': '416325881525',
+                  'broker': '中国中金财富证券有限公司',
+                  'researcher': '王义国',
+                  'date': '2013-03-11',
+                  'title': '开创国际(600097)：金枪鱼捕捞量增长带动盈利持续上升',
+              },
+              {
+                  'rid': '430756307540',
+                  'broker': '宏源证券股份有限公司',
+                  'researcher': '王凤华/邓锐',
+                  'date': '2013-08-25',
+                  'title': '开创国际(600097)中报点评：主业萧条依旧 期待业务转型',
+              },
+          ]
+
+          PACKAGE = '开创国际_600097_券商研究报告公开网页归档版_3份'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(exist_ok=True)
+          RAW = OUT / '网页存档'
+          RAW.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://finance.sina.com.cn/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def decode(content: bytes) -> str:
+              for encoding in ('gb18030', 'gbk', 'utf-8'):
+                  try:
+                      return content.decode(encoding)
+                  except UnicodeDecodeError:
+                      pass
+              return content.decode('utf-8', errors='replace')
+
+          def clean(text: str) -> str:
+              text = html_lib.unescape(text).replace('\u3000', ' ').replace('\xa0', ' ')
+              text = re.sub(r'[ \t\r\f\v]+', ' ', text)
+              text = re.sub(r'\n{3,}', '\n\n', text)
+              return text.strip()
+
+          def choose_root(soup: BeautifulSoup) -> Tag:
+              candidates = []
+              for selector in ('#content', '.content', '.report_content', '.report-content', '.blk_container', '.main-content', '#main'):
+                  for node in soup.select(selector):
+                      length = len(clean(node.get_text('\n', strip=True)))
+                      if 450 <= length <= 50000:
+                          candidates.append((length, node))
+              if candidates:
+                  candidates.sort(key=lambda pair: pair[0])
+                  return candidates[0][1]
+              return soup.body or soup
+
+          def extract_paragraphs(soup: BeautifulSoup, expected_title: str) -> list[str]:
+              root = choose_root(soup)
+              for bad in root.select('script,style,noscript,form,iframe,nav,header,footer'):
+                  bad.decompose()
+              parts = []
+              for node in root.find_all(['p', 'div', 'td', 'li', 'h2', 'h3'], recursive=True):
+                  if node.find(['p', 'div', 'td', 'li', 'h2', 'h3'], recursive=False):
+                      continue
+                  text = clean(node.get_text(' ', strip=True))
+                  if len(text) < 8:
+                      continue
+                  if text == expected_title:
+                      continue
+                  if text in {'新浪财经', '返回首页', '打印', '关闭', '分享到'}:
+                      continue
+                  if any(term in text for term in ('新浪首页', '财经首页', '股票首页', '意见反馈')) and len(text) < 200:
+                      continue
+                  parts.append(text)
+              deduped = []
+              seen = set()
+              for item in parts:
+                  key = re.sub(r'\s+', '', item)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  deduped.append(item)
+              joined = '\n'.join(deduped)
+              if len(joined) < 450:
+                  deduped = [clean(line) for line in root.get_text('\n', strip=True).splitlines() if len(clean(line)) >= 8]
+              return deduped
+
+          def safe(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|]+', '_', value).strip()
+              value = re.sub(r'\s+', '', value)
+              return value[:72]
+
+          records = []
+          hashes = set()
+          for index, report in enumerate(REPORTS, start=1):
+              rid = report['rid']
+              url = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml'
+              response = session.get(url, timeout=90, allow_redirects=True)
+              print('FETCH', rid, response.status_code, len(response.content), response.url, flush=True)
+              response.raise_for_status()
+              text = decode(response.content)
+              soup = BeautifulSoup(text, 'lxml')
+              full_text = clean(soup.get_text('\n', strip=True))
+              if '开创国际' not in full_text and '600097' not in full_text:
+                  raise RuntimeError(f'Company identity not found in report page {rid}')
+              paragraphs = extract_paragraphs(soup, report['title'])
+              body = '\n'.join(paragraphs)
+              if len(body) < 450:
+                  raise RuntimeError(f'Visible report text is too short for {rid}: {len(body)} chars')
+
+              raw_html = RAW / f'{rid}.html'
+              raw_html.write_text(text, encoding='utf-8')
+
+              filename = f"{index:02d}_{safe(report['broker'])}_{report['date']}_{safe(report['title'])}_公开网页归档版.pdf"
+              pdf_path = OUT / filename
+              paragraphs_html = '\n'.join(f'<p>{html_lib.escape(paragraph)}</p>' for paragraph in paragraphs)
+              document = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+              @page {{ size: A4; margin: 17mm 16mm 18mm; @bottom-center {{ content: counter(page); font-size: 9pt; color: #666; }} }}
+              body {{ font-family: "Noto Sans CJK SC", "Noto Sans CJK", sans-serif; font-size: 10.3pt; line-height: 1.65; color: #111; }}
+              h1 {{ font-size: 17pt; line-height: 1.35; margin: 0 0 9pt; }}
+              .meta {{ border-top: 1px solid #555; border-bottom: 1px solid #aaa; padding: 7pt 0; margin-bottom: 10pt; font-size: 9.3pt; }}
+              .notice {{ background: #f1f1f1; padding: 8pt 10pt; margin-bottom: 11pt; font-size: 8.8pt; color: #444; }}
+              p {{ margin: 0 0 6pt; text-align: justify; }}
+              .source {{ margin-top: 14pt; padding-top: 7pt; border-top: 1px solid #aaa; font-size: 8.2pt; color: #555; word-break: break-all; }}
+              </style></head><body>
+              <h1>{html_lib.escape(report['title'])}</h1>
+              <div class="meta">机构：{html_lib.escape(report['broker'])}　研究员：{html_lib.escape(report['researcher'])}　日期：{report['date']}</div>
+              <div class="notice">版本说明：本文件依据新浪财经公开研究报告页面的可见正文制作，为网页打印归档版，并非券商原始排版 PDF；原报告中的图表、页码及部分内容可能未在公开页面展示。</div>
+              {paragraphs_html}
+              <div class="source">公开页面：{html_lib.escape(response.url)}<br>抓取日期：2026-10-14　新浪报告编号：{rid}</div>
+              </body></html>'''
+              HTML(string=document, base_url=str(Path.cwd())).write_pdf(str(pdf_path))
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              pages = len(reader.pages)
+              if pages < 1:
+                  raise RuntimeError(f'Empty PDF: {filename}')
+              sample = ''.join((reader.pages[i].extract_text() or '') for i in range(min(3, pages)))
+              compact = re.sub(r'\s+', '', sample)
+              if '开创国际' not in compact and '600097' not in compact:
+                  raise RuntimeError(f'PDF identity check failed: {filename}')
+              qpdf = subprocess.run(['qpdf', '--warning-exit-0', '--check', str(pdf_path)], capture_output=True, text=True)
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f'qpdf failed for {filename}: {qpdf.stderr[-1200:]}')
+              render_root = OUT / (pdf_path.stem + '_render')
+              render = subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120', str(pdf_path), str(render_root)], capture_output=True, text=True)
+              render_file = Path(str(render_root) + '.png')
+              if render.returncode != 0 or not render_file.exists() or render_file.stat().st_size < 8000:
+                  raise RuntimeError(f'First-page render failed for {filename}: {render.stderr[-1000:]}')
+              render_size = render_file.stat().st_size
+              render_file.unlink()
+
+              data = pdf_path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {filename}')
+              hashes.add(digest)
+              record = {
+                  'filename': filename,
+                  'company': '上海开创国际海洋资源股份有限公司',
+                  'stock_code': '600097.SH',
+                  'broker': report['broker'],
+                  'researcher': report['researcher'],
+                  'date': report['date'],
+                  'title': report['title'],
+                  'source_url': response.url,
+                  'sina_report_id': rid,
+                  'archive_type': '公开网页打印归档版（非券商原始排版PDF）',
+                  'visible_text_chars': len(body),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_size,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '开创国际（600097.SH）券商研究报告公开网页归档版',
+              '整理日期：2026-10-14',
+              '',
+              '本包收录3份新浪财经公开研究报告页面的PDF打印归档版。',
+              '原始券商PDF未在当前公开渠道直接提供；这些归档文件保存公开页面可见正文，不等同于券商原始版式，图表、分页及部分正文可能不完整。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, start=1):
+              readme.extend([
+                  f"{index}. {record['broker']}，{record['date']}，{record['pages']}页",
+                  f"   标题：{record['title']}",
+                  f"   研究员：{record['researcher']}",
+                  f"   文件：{record['filename']}",
+                  f"   公开来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          (OUT / '00_报告清单与版本说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{record['sha256']}  {record['filename']}\n" for record in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(OUT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{PACKAGE}/{path.relative_to(OUT)}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad or len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdf_count={len(pdfs)}')
+
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'SHA256', hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload completed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaichuang-international-600097-public-brokerage-reports-v2-20261014
+          path: 开创国际_600097_券商研究报告公开网页归档版_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
