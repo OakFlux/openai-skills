@@ -24,7 +24,8 @@ r = requests.get(REPORT_URL, headers=HEADERS, timeout=(20, 120), allow_redirects
 r.raise_for_status()
 text = r.content.decode(r.encoding or "utf-8", errors="replace")
 (OUT / "report_130314.html").write_text(text, encoding="utf-8")
-soup = BeautifulSoup(text, "html.parser")n
+soup = BeautifulSoup(text, "html.parser")
+
 print("STATUS", r.status_code, "BYTES", len(r.content), "FINAL", r.url)
 print("TITLE", soup.title.get_text(" ", strip=True) if soup.title else "")
 
@@ -57,7 +58,8 @@ results["bases"] = bases
 
 all_tests = []
 for base in bases:
-    base_rec = {"base": base, "pages": []}
+    base_rec: dict[str, object] = {"base": base, "pages": []}
+    pages_list: list[dict[str, object]] = []
     consecutive = 0
     for page in range(1, 36):
         ok = False
@@ -77,7 +79,7 @@ for base in bases:
                     continue
                 sha = hashlib.sha256(resp.content).hexdigest()
                 page_rec = {"page": page, "url": resp.url, "bytes": len(resp.content), "format": image.format, "width": w, "height": h, "sha256": sha}
-                base_rec["pages"].append(page_rec)
+                pages_list.append(page_rec)
                 print("OK", page_rec)
                 consecutive += 1
                 ok = True
@@ -88,6 +90,7 @@ for base in bases:
             print("MISS", page, attempts)
             base_rec["first_missing_page"] = page
             break
+    base_rec["pages"] = pages_list
     base_rec["consecutive_pages"] = consecutive
     print("SEQUENCE", base, consecutive)
     all_tests.append(base_rec)
