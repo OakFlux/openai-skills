@@ -1,0 +1,357 @@
+name: Build Xinbang Intelligent 301112 broker reports 20261014
+
+on:
+  push:
+    paths:
+      - '.github/workflows/xinbang-intelligent-301112-broker-reports-20261014.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Query download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          TODAY = '2026-10-14'
+          CODE = '301112'
+          COMPANY = '信邦智能'
+          FULL_COMPANY = '广州信邦智能装备股份有限公司'
+          PACKAGE = '信邦智能_301112_券商深度及覆盖报告_2至3份_公开完整PDF'
+          WORK = Path('xinbang_broker_work')
+          DOWNLOADS = WORK / 'downloads'
+          FINAL = WORK / 'final' / PACKAGE
+          ART = Path('artifact_out')
+          VERIFY = Path('verification_renders')
+          for directory in (DOWNLOADS, FINAL, ART, VERIFY):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://reportapi.eastmoney.com/report/list'
+          rows: list[dict[str, Any]] = []
+          seen_info: set[str] = set()
+          for qtype in ['0', '1', '2']:
+              for page in range(1, 8):
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2008-01-01', 'endTime': TODAY,
+                      'pageNo': str(page), 'fields': '', 'qType': qtype,
+                      'orgCode': '', 'code': CODE, 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  }
+                  response = session.get(api, params=params, timeout=(25, 180))
+                  print('API', qtype, page, response.status_code, len(response.content), response.url, flush=True)
+                  response.raise_for_status()
+                  batch = response.json().get('data') or []
+                  for row in batch:
+                      info_code = str(row.get('infoCode') or '')
+                      if info_code and info_code not in seen_info:
+                          seen_info.add(info_code)
+                          rows.append(row)
+                  if len(batch) < 100:
+                      break
+                  time.sleep(0.5)
+
+          if not rows:
+              raise RuntimeError('No broker-report metadata found for 信邦智能 301112')
+          print('ROW_COUNT', len(rows), flush=True)
+          print('ALL_ROWS', json.dumps(rows, ensure_ascii=False, indent=2), flush=True)
+
+          def title(row: dict[str, Any]) -> str:
+              return str(row.get('title') or '').strip()
+
+          def publish_date(row: dict[str, Any]) -> str:
+              return str(row.get('publishDate') or '')[:10]
+
+          def broker(row: dict[str, Any]) -> str:
+              return str(row.get('orgSName') or row.get('orgName') or '未知券商').strip()
+
+          def info_code(row: dict[str, Any]) -> str:
+              return str(row.get('infoCode') or '').strip()
+
+          def pages_meta(row: dict[str, Any]) -> int:
+              try:
+                  return int(row.get('attachPages') or 0)
+              except Exception:
+                  return 0
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:108]
+
+          short_terms = [
+              '季报点评', '年报点评', '中报点评', '事件点评', '公司事件点评',
+              '业绩预告', '业绩快报', '信息更新', '点评报告', '三季报点评',
+          ]
+
+          def candidate_score(row: dict[str, Any], strict: bool) -> int:
+              report_title = title(row)
+              pages = pages_meta(row)
+              date = publish_date(row)
+              if not report_title or not info_code(row):
+                  return -10000
+              if strict and any(term in report_title for term in short_terms):
+                  return -10000
+              if strict and pages < 10:
+                  return -10000
+              if not strict and pages < 5:
+                  return -10000
+              score = pages
+              if any(term in report_title for term in ['首次覆盖', '深度报告', '公司深度', '深度研究', '新股覆盖']):
+                  score += 190
+              if pages >= 20:
+                  score += 80
+              elif pages >= 12:
+                  score += 35
+              if date >= '2025-01-01':
+                  score += 40
+              elif date >= '2023-01-01':
+                  score += 25
+              if any(term in report_title for term in ['汽车智能制造', '机器人', '工业自动化', '智能装备', '产线']):
+                  score += 20
+              return score
+
+          def pdf_urls(code: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_01.pdf',
+              ]
+
+          def download(code: str, target: Path) -> str:
+              last = ''
+              for attempt in range(1, 5):
+                  for url in pdf_urls(code):
+                      try:
+                          response = session.get(url, timeout=(30, 300), allow_redirects=True, headers={
+                              'User-Agent': session.headers['User-Agent'],
+                              'Referer': 'https://data.eastmoney.com/',
+                              'Accept': 'application/pdf,*/*',
+                          })
+                          print('PDF', code, attempt, response.status_code, len(response.content), url, flush=True)
+                          if response.status_code == 200 and len(response.content) > 100_000 and response.content.startswith(b'%PDF-'):
+                              target.write_bytes(response.content)
+                              return str(response.url)
+                          last = f'{response.status_code}/{len(response.content)}'
+                      except Exception as exc:
+                          last = repr(exc)
+                  time.sleep(attempt)
+              raise RuntimeError(f'No complete PDF for {code}: {last}')
+
+          def validate(row: dict[str, Any], score: int) -> dict[str, Any]:
+              code = info_code(row)
+              temp = DOWNLOADS / f'{code}.pdf'
+              source_url = download(code, temp)
+              reader = PdfReader(str(temp), strict=False)
+              pages = len(reader.pages)
+              if pages < 5:
+                  raise RuntimeError(f'too short: {pages}')
+              parts: list[str] = []
+              for index in range(min(32, pages)):
+                  try:
+                      parts.append(reader.pages[index].extract_text() or '')
+                  except Exception:
+                      pass
+              text = '\n'.join(parts)
+              if COMPANY not in text and FULL_COMPANY not in text and CODE not in text:
+                  raise RuntimeError('company identity not verified')
+              if not any(mark in text for mark in ['证券研究报告', '公司研究', '首次覆盖', '深度报告', '投资评级', '研究报告', '新股研究']):
+                  raise RuntimeError('broker research identity not verified')
+              check = subprocess.run(['qpdf', '--check', str(temp)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed: {check.stderr[-800:]}')
+              raw = temp.read_bytes()
+              return {
+                  'stock_code': CODE,
+                  'stock_name': COMPANY,
+                  'broker': broker(row),
+                  'publish_date': publish_date(row),
+                  'title': title(row),
+                  'info_code': code,
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'source_url': source_url,
+                  'selection_score': score,
+                  'pdf_path': str(temp),
+                  'is_long_report': pages >= 10 and not any(term in title(row) for term in short_terms),
+              }
+
+          strict_candidates = sorted(
+              [(candidate_score(row, True), row) for row in rows if candidate_score(row, True) > -10000],
+              key=lambda item: item[0], reverse=True,
+          )
+          loose_candidates = sorted(
+              [(candidate_score(row, False), row) for row in rows if candidate_score(row, False) > -10000],
+              key=lambda item: item[0], reverse=True,
+          )
+
+          selected: list[dict[str, Any]] = []
+          seen_hashes: set[str] = set()
+          seen_brokers: set[str] = set()
+          rejected: list[dict[str, str]] = []
+
+          # Pass 1: strict long reports, prioritizing distinct brokers.
+          for distinct_only in [True, False]:
+              for score, row in strict_candidates:
+                  if len(selected) >= 3:
+                      break
+                  if any(item['info_code'] == info_code(row) for item in selected):
+                      continue
+                  if distinct_only and broker(row) in seen_brokers:
+                      continue
+                  try:
+                      record = validate(row, score)
+                      if record['sha256'] in seen_hashes:
+                          raise RuntimeError('duplicate PDF')
+                      if not record['is_long_report']:
+                          raise RuntimeError('not a long report')
+                      selected.append(record)
+                      seen_hashes.add(record['sha256'])
+                      seen_brokers.add(record['broker'])
+                      print('VALIDATED_STRICT', json.dumps(record, ensure_ascii=False), flush=True)
+                  except Exception as exc:
+                      rejected.append({'info_code': info_code(row), 'title': title(row), 'error': repr(exc)})
+                      print('REJECT_STRICT', info_code(row), title(row), repr(exc), flush=True)
+                      (DOWNLOADS / f'{info_code(row)}.pdf').unlink(missing_ok=True)
+              if len(selected) >= 3:
+                  break
+
+          # Pass 2: complete company reports of at least five pages if fewer than three long reports are public.
+          if len(selected) < 3:
+              for score, row in loose_candidates:
+                  if len(selected) >= 3:
+                      break
+                  if any(item['info_code'] == info_code(row) for item in selected):
+                      continue
+                  try:
+                      record = validate(row, score)
+                      if record['sha256'] in seen_hashes:
+                          raise RuntimeError('duplicate PDF')
+                      selected.append(record)
+                      seen_hashes.add(record['sha256'])
+                      seen_brokers.add(record['broker'])
+                      print('VALIDATED_FALLBACK', json.dumps(record, ensure_ascii=False), flush=True)
+                  except Exception as exc:
+                      rejected.append({'info_code': info_code(row), 'title': title(row), 'error': repr(exc)})
+                      print('REJECT_FALLBACK', info_code(row), title(row), repr(exc), flush=True)
+                      (DOWNLOADS / f'{info_code(row)}.pdf').unlink(missing_ok=True)
+
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} complete company reports validated; rejected={rejected}')
+
+          selected = selected[:3]
+          manifest: list[dict[str, Any]] = []
+          for index, record in enumerate(selected, 1):
+              tag = '深度覆盖' if record['is_long_report'] else '完整公司报告'
+              filename = f"{index:02d}_{tag}_{safe(record['publish_date'])}_{safe(record['broker'])}_{safe(record['title'])}.pdf"
+              shutil.copy2(record['pdf_path'], FINAL / filename)
+              clean = {key: value for key, value in record.items() if key != 'pdf_path'}
+              clean['filename'] = filename
+              manifest.append(clean)
+
+          long_count = sum(1 for item in manifest if item['is_long_report'])
+          readme = [
+              '信邦智能（301112.SZ；广州信邦智能装备股份有限公司）券商研究报告资料包',
+              f'整理日期：{TODAY}',
+              '',
+              f'收录数量：{len(manifest)}份；其中10页及以上、且非事件/财报短评的深度或覆盖报告{long_count}份。',
+              '优先收录公司专属首次覆盖、深度报告和新股覆盖；公开长篇报告不足时，以完整公司研究报告补足至2—3份。',
+              '未使用同业报告、媒体文章、网页摘要、仅含预览页或无法核验全文的文件。',
+              '',
+              '文件清单：',
+          ]
+          for index, item in enumerate(manifest, 1):
+              readme += [
+                  f'{index}. {item["filename"]}',
+                  f'   券商：{item["broker"]}；日期：{item["publish_date"]}；页数：{item["pages"]}',
+                  f'   标题：{item["title"]}',
+                  f'   类型：{"长篇深度/覆盖报告" if item["is_long_report"] else "完整公司研究报告"}',
+                  f'   来源：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ]
+          if rejected:
+              readme += ['部分未纳入候选及原因：'] + [f'- {item["title"]}：{item["error"]}' for item in rejected[:20]] + ['']
+          readme.append('完整性核验：已检查信邦智能/301112公司身份、券商研究报告标识、实际页数、PDF结构、重复文件及SHA-256；每份PDF首页已渲染，最终ZIP已通过CRC测试。')
+
+          (FINAL / '00_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / '原始研报检索元数据.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in manifest), encoding='utf-8')
+
+          for index, item in enumerate(manifest, 1):
+              source = FINAL / item['filename']
+              prefix = VERIFY / f'{index:02d}'
+              result = subprocess.run([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '110', str(source), str(prefix)
+              ], capture_output=True, text=True)
+              if result.returncode != 0:
+                  raise RuntimeError(f'Render failed for {source.name}: {result.stderr[-800:]}')
+
+          zip_path = ART / f'{PACKAGE}.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(FINAL.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              if len(pdfs) != len(manifest):
+                  raise RuntimeError(f'PDF count mismatch: {len(pdfs)} vs {len(manifest)}')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(manifest), 'SHA256', zip_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinbang-intelligent-301112-broker-reports-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload verification renders
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinbang-intelligent-301112-broker-reports-renders
+          path: verification_renders/*.png
+          retention-days: 30
+          compression-level: 0
