@@ -1,0 +1,118 @@
+name: Search web archives for Kaichuang International brokerage PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/kaichuang-archive-discovery-20261014.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Query Internet Archive and Common Crawl
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import json, re, time
+          from urllib.parse import quote, urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          cdx_patterns=[
+            '*.hibor.com.cn/*178938*','*.hibor.com.cn/*210263*','*.hibor.com.cn/*211839*',
+            '*.hibor.com.cn/*209931*','*.hibor.com.cn/*211932*','*.hibor.com.cn/*182952*',
+            '*.newone.com.cn/*600097*','*.cmschina.com.cn/*600097*','*.招商证券*600097*',
+            '*.china-invs.cn/*600097*','*.cjis.cn/*600097*','*.中投证券*600097*',
+            '*.ebscn.com/*600097*','*.光大证券*600097*',
+            '*.htsc.com.cn/*600097*','*.华泰证券*600097*',
+            '*.cgws.com/*600097*','*.cgws.com.cn/*600097*','*.长城证券*600097*',
+            '*.hysec.com/*600097*','*.hysec.com.cn/*600097*','*.宏源证券*600097*',
+            '*.cfzq.com/*600097*','*.财富证券*600097*',
+            '*/*开创国际*','*/*600097*.pdf',
+          ]
+          all_rows=[]; seen=set()
+          for pattern in cdx_patterns:
+            params={
+              'url':pattern,'output':'json','fl':'timestamp,original,mimetype,statuscode,digest,length',
+              'filter':['statuscode:200'],'collapse':'digest','limit':'5000',
+            }
+            try:
+              r=s.get('https://web.archive.org/cdx/search/cdx',params=params,timeout=120)
+              print('\nCDX',pattern,r.status_code,len(r.content),r.url,flush=True)
+              if r.status_code!=200:
+                print('CDX_BODY',r.text[:1000],flush=True); continue
+              data=r.json()
+              if not data or len(data)<2: continue
+              header=data[0]
+              for values in data[1:]:
+                row=dict(zip(header,values))
+                key=(row.get('timestamp'),row.get('original'))
+                if key in seen: continue
+                seen.add(key); all_rows.append(row)
+                low=(row.get('original','')+' '+row.get('mimetype','')).lower()
+                if any(k in low for k in ('600097','178938','210263','211839','209931','211932','182952','.pdf','开创')):
+                  print('CDX_ROW',json.dumps(row,ensure_ascii=False),flush=True)
+            except Exception as e: print('CDX_ERROR',pattern,repr(e),flush=True)
+            time.sleep(0.4)
+          print('\nCDX_TOTAL',len(all_rows),flush=True)
+
+          # Inspect snapshots of old Hibor detail pages for direct report asset links.
+          detail_ids=['178938','210263','211839','209931','211932','182952']
+          candidates=[]
+          for rid in detail_ids:
+            relevant=[x for x in all_rows if rid in x.get('original','') and ('docdetail' in x.get('original','').lower() or 'repinfodetail' in x.get('original','').lower())]
+            relevant=sorted(relevant,key=lambda x:x.get('timestamp',''))
+            for row in relevant[-8:]:
+              archived=f"https://web.archive.org/web/{row['timestamp']}id_/{row['original']}"
+              try:
+                rr=s.get(archived,timeout=120,allow_redirects=True)
+                print('\nSNAPSHOT',rid,row['timestamp'],rr.status_code,len(rr.content),rr.url,flush=True)
+                if rr.status_code!=200: continue
+                enc=rr.apparent_encoding or rr.encoding or 'utf-8'; text=rr.content.decode(enc,errors='replace')
+                soup=BeautifulSoup(text,'lxml')
+                for tag in soup.find_all(['a','iframe','embed','object','script','img']):
+                  for attr in ('href','src','data','value','onclick'):
+                    val=tag.get(attr)
+                    if not val: continue
+                    val=str(val)
+                    joined=(val+' '+tag.get_text(' ',strip=True)).lower()
+                    if any(k in joined for k in ('pdf','download','downfile','readfile','viewfile','reportfile','docfile','fileurl','报告原文')):
+                      resolved=urljoin(rr.url,val)
+                      rec={'rid':rid,'snapshot':archived,'tag':tag.name,'attr':attr,'value':val,'resolved':resolved,'label':tag.get_text(' ',strip=True)[:200]}
+                      candidates.append(rec); print('SNAP_ASSET',json.dumps(rec,ensure_ascii=False),flush=True)
+                for m in re.finditer(r'https?://[^\s"\'<>]+',text,re.I):
+                  u=m.group(0)
+                  if any(k in u.lower() for k in ('pdf','download','downfile','readfile','viewfile','reportfile','docfile')):
+                    rec={'rid':rid,'snapshot':archived,'resolved':u}
+                    candidates.append(rec); print('SNAP_URL',json.dumps(rec,ensure_ascii=False),flush=True)
+              except Exception as e: print('SNAP_ERROR',rid,archived,repr(e),flush=True)
+
+          # Common Crawl URL index query, focused on code and known report IDs.
+          try:
+            idx=s.get('https://index.commoncrawl.org/collinfo.json',timeout=60).json()
+            indexes=[x['id'] for x in idx[:3]]
+          except Exception as e:
+            print('CC_INDEX_ERROR',repr(e),flush=True); indexes=[]
+          cc_patterns=['*.hibor.com.cn/*178938*','*.hibor.com.cn/*210263*','*.hibor.com.cn/*211839*','*/*600097*.pdf']
+          for index_id in indexes:
+            endpoint=f'https://index.commoncrawl.org/{index_id}-index'
+            for pattern in cc_patterns:
+              try:
+                r=s.get(endpoint,params={'url':pattern,'output':'json','filter':'status:200','collapse':'digest'},timeout=90)
+                print('\nCC',index_id,pattern,r.status_code,len(r.content),flush=True)
+                if r.status_code==200:
+                  for line in r.text.splitlines()[:1000]:
+                    try:
+                      obj=json.loads(line); print('CC_ROW',json.dumps({k:obj.get(k) for k in ('url','timestamp','mime','status','digest','filename','offset','length')},ensure_ascii=False),flush=True)
+                    except: pass
+              except Exception as e: print('CC_ERROR',index_id,pattern,repr(e),flush=True)
+          PY
