@@ -1,0 +1,163 @@
+name: Package Sanwei Chemical reports via paginated global index
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/sanwei-global-index-reports-20261014.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Paginate index download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, shutil, subprocess, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY='三维化学'; CODE='002469'; ALIASES=('三维工程','山东三维化学集团股份有限公司','山东三维石化工程股份有限公司')
+          WINDOWS=[('2024-03-20','2024-04-05'),('2024-11-10','2024-11-20'),('2025-01-04','2025-01-10'),('2025-03-01','2025-04-05'),('2025-05-08','2025-05-20')]
+          TITLE_HINTS=('三维化学','三维工程','三业联动发展','硫磺回收','正丙醇','高弹性建筑化工小巨人','工程化工齐发展','工程+实业')
+          SHALLOW=('信息更新','季报','年报','中报','半年报','业绩快报','业绩预告','事件点评','点评','简评','快评','询价','申购')
+          ROOT=Path('work'); DL=ROOT/'downloads'; VERIFY=ROOT/'verify'; FINAL=ROOT/'final'; ART=Path('artifact_out')
+          for p in (DL,VERIFY,FINAL,ART): p.mkdir(parents=True,exist_ok=True)
+
+          s=requests.Session(); s.trust_env=False
+          retry=Retry(total=6,connect=6,read=6,status=6,backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=['GET'],raise_on_status=False)
+          s.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=16,pool_maxsize=16))
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Referer':'https://data.eastmoney.com/','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          rows=[]
+          for start,end in WINDOWS:
+              for page in range(1,61):
+                  params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':start,'endTime':end,'pageNo':str(page),'fields':'','qType':'0','orgCode':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+                  r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(25,180)); print('API',start,end,page,r.status_code,len(r.content),flush=True); r.raise_for_status()
+                  payload=r.json(); batch=payload.get('data') or []
+                  print('BATCH',len(batch),'TOTAL',payload.get('total'), 'PAGES',payload.get('TotalPage') or payload.get('totalPage'),flush=True)
+                  if not batch: break
+                  rows.extend(batch)
+                  if len(batch)<100: break
+
+          unique={}
+          for row in rows:
+              title=str(row.get('title') or '')
+              stock_name=str(row.get('stockName') or '')
+              stock_code=str(row.get('stockCode') or '')
+              relevant=(stock_code==CODE or COMPANY in stock_name or '三维工程' in stock_name or COMPANY in title or '三维工程' in title or any(h in title for h in TITLE_HINTS))
+              if not relevant: continue
+              key=str(row.get('infoCode') or row.get('id') or json.dumps(row,ensure_ascii=False)); unique[key]=row
+          metadata=list(unique.values()); metadata.sort(key=lambda x:str(x.get('publishDate') or ''),reverse=True)
+          print('MATCHED_METADATA',len(metadata),flush=True)
+          for row in metadata: print('META',json.dumps({k:row.get(k) for k in ('infoCode','title','orgSName','publishDate','attachPages','author','emRatingName','stockName','stockCode')},ensure_ascii=False),flush=True)
+          (ROOT/'metadata.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Ensure the known Guosen report is represented even if the index omits it.
+          if not any(str(x.get('infoCode'))=='AP202505161673828576' for x in metadata):
+              metadata.append({'infoCode':'AP202505161673828576','title':'受益于新疆煤化工建设提速，“工程+实业”携手并进','orgSName':'国信证券','publishDate':'2025-05-16','attachPages':37,'author':['任鹤','朱家琪'],'emRatingName':'增持','stockName':'三维化学','stockCode':'002469'})
+
+          def score(row):
+              title=str(row.get('title') or '')
+              try: pages=int(row.get('attachPages') or 0)
+              except: pages=0
+              v=pages*5
+              if '首次覆盖' in title: v+=300
+              if '深度' in title: v+=240
+              if any(x in title for x in ('三业联动发展','硫磺回收','高弹性建筑化工小巨人','工程化工齐发展','工程+实业')): v+=100
+              v-=sum(120 for x in SHALLOW if x in title)
+              return v,pages,str(row.get('publishDate') or '')
+
+          def download(info,path):
+              for prefix,suffix in [('H3','_1'),('H3','_01'),('H2','_1'),('H2','_01')]:
+                  url=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}{suffix}.pdf'
+                  r=s.get(url,headers={'Referer':'https://data.eastmoney.com/'},timeout=(30,240)); print('PDF',info,r.status_code,len(r.content),url,flush=True)
+                  if r.status_code==200 and r.content.startswith(b'%PDF') and len(r.content)>70000:
+                      path.write_bytes(r.content); return url
+              raise RuntimeError(f'No PDF for {info}')
+
+          valid=[]; seen=set()
+          for row in sorted(metadata,key=score,reverse=True):
+              info=str(row.get('infoCode') or '')
+              if not info: continue
+              title=str(row.get('title') or '').strip(); broker=str(row.get('orgSName') or row.get('orgName') or '未知机构').strip(); date=str(row.get('publishDate') or '')[:10]
+              if any(x in title for x in ('询价','申购')): continue
+              p=DL/f'{info}.pdf'
+              try:
+                  url=download(info,p); reader=PdfReader(str(p),strict=False); pages=len(reader.pages)
+                  if pages<6: p.unlink(missing_ok=True); continue
+                  sample=[]
+                  for i in list(range(min(25,pages)))+list(range(max(0,pages-3),pages)):
+                      try: sample.append(reader.pages[i].extract_text() or '')
+                      except: pass
+                  compact=re.sub(r'\s+','','\n'.join(sample))
+                  identity=(COMPANY in compact or CODE in compact or any(a in compact for a in ALIASES) or COMPANY in title or '三维工程' in title)
+                  research=any(x in compact for x in ('证券研究报告','公司研究','深度研究','首次覆盖','投资评级','分析师','研究报告'))
+                  if not identity or not research: print('REJECT',info,title,pages,identity,research,flush=True); p.unlink(missing_ok=True); continue
+                  q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+                  if q.returncode not in (0,3): raise RuntimeError('qpdf failed')
+                  first=subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','80',str(p),str(VERIFY/f'{info}_first')],capture_output=True,text=True)
+                  last=subprocess.run(['pdftoppm','-f',str(pages),'-l',str(pages),'-singlefile','-png','-r','80',str(p),str(VERIFY/f'{info}_last')],capture_output=True,text=True)
+                  if first.returncode or last.returncode: raise RuntimeError('render failed')
+                  data=p.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+                  if sha in seen: p.unlink(missing_ok=True); continue
+                  seen.add(sha); v,_,_=score(row)
+                  item={'info_code':info,'title':title,'broker':broker,'publish_date':date,'pages':pages,'bytes':len(data),'sha256':sha,'source_url':url,'rating':row.get('emRatingName'),'author':row.get('author'),'score':v,'file':str(p)}
+                  valid.append(item); print('VALID',json.dumps({k:item[k] for k in ('title','broker','publish_date','pages','score')},ensure_ascii=False),flush=True)
+              except Exception as exc: print('ERROR',info,title,repr(exc),flush=True); p.unlink(missing_ok=True)
+
+          long=[x for x in valid if x['pages']>=12 and not any(t in x['title'] for t in SHALLOW)]
+          if len(long)<2: long=[x for x in valid if x['pages']>=8]
+          long.sort(key=lambda x:(x['score'],x['pages'],x['publish_date']),reverse=True)
+          if len(long)<2: raise RuntimeError(f'Only {len(long)} usable company reports')
+          selected=[]; used=set()
+          for x in long:
+              if x['broker'] in used: continue
+              selected.append(x); used.add(x['broker'])
+              if len(selected)==3: break
+          for x in long:
+              if len(selected)==3: break
+              if x not in selected: selected.append(x)
+
+          def safe(t): return re.sub(r'[\\/:*?"<>|]+','_',str(t)).strip(' ._')[:105]
+          package_name=f'三维化学_002469.SZ_券商深度报告_{len(selected)}份'; d=FINAL/package_name; d.mkdir(parents=True,exist_ok=True); records=[]
+          for i,x in enumerate(selected,1):
+              fn=f'{i:02d}_{safe(x["publish_date"])}_{safe(x["broker"])}_{safe(x["title"])}.pdf'; shutil.copy2(x['file'],d/fn); rec={k:v for k,v in x.items() if k not in ('file','score')}; rec['filename']=fn; records.append(rec)
+          lines=['三维化学（002469.SZ，历史简称三维工程）券商深度报告合集','整理日期：2026-10-14','','本包优先收录首次覆盖、公司深度及完整专题报告，不使用网页摘要或行情快讯。','','文件清单：']
+          for i,r in enumerate(records,1): lines += [f'{i}. {r["filename"]}',f'   机构：{r["broker"]}',f'   标题：{r["title"]}',f'   日期：{r["publish_date"]}；页数：{r["pages"]}；评级：{r.get("rating") or "未标注"}',f'   来源：{r["source_url"]}',f'   SHA-256：{r["sha256"]}','']
+          lines.append('完整性核验：已检查公司身份、实际页数、PDF结构、首末页渲染、重复文件、SHA-256及ZIP CRC。')
+          (d/'00_文件清单与范围说明.txt').write_text('\n'.join(lines),encoding='utf-8'); (d/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8'); (d/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records),encoding='utf-8')
+          cz=ART/f'{package_name}.zip'
+          with zipfile.ZipFile(cz,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for p in sorted(d.iterdir()): z.write(p,arcname=f'{package_name}/{p.name}')
+          with zipfile.ZipFile(cz) as z:
+              bad=z.testzip(); count=sum(n.lower().endswith('.pdf') for n in z.namelist())
+              if bad or count!=len(records): raise RuntimeError(f'ZIP invalid {bad} {count}')
+          ez=ART/f'Sanwei_Chemical_002469_Broker_Deep_Research_{len(selected)}_Reports.zip'; shutil.copy2(cz,ez)
+          print('SELECTED_FINAL',json.dumps(records,ensure_ascii=False,indent=2),flush=True); print('FINAL_ZIP',cz,cz.stat().st_size,hashlib.sha256(cz.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanwei-global-index-reports-artifact
+          path: artifact_out/*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
