@@ -1,0 +1,288 @@
+name: Package expanded Sanwei Chemical broker reports
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/sanwei-chemical-broker-reports-v2-20261014.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover globally download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY = '三维化学'
+          CODE = '002469'
+          ALIASES = ('三维工程', '山东三维化学集团股份有限公司', '山东三维石化工程股份有限公司')
+          AS_OF = '2026-10-14'
+          DATE_WINDOWS = [
+              ('2024-03-27', '2024-03-29'),
+              ('2024-11-14', '2024-11-16'),
+              ('2025-03-04', '2025-03-06'),
+              ('2025-03-18', '2025-03-20'),
+              ('2025-03-26', '2025-04-03'),
+              ('2025-04-17', '2025-04-25'),
+              ('2025-05-10', '2025-05-17'),
+              ('2025-08-20', '2025-09-03'),
+              ('2026-04-09', '2026-04-11'),
+              ('2026-08-20', '2026-08-22'),
+          ]
+          TITLE_HINTS = (
+              '三维化学', '三维工程', '硫磺回收', '正丙醇',
+              '新疆煤化工', '建筑化工小巨人', '工程+实业', '工程化工齐发展',
+          )
+
+          WORK = Path('sanwei_v2_work')
+          DOWNLOADS = WORK / 'downloads'
+          VERIFY = WORK / 'verify'
+          FINAL_ROOT = WORK / 'final'
+          ART = Path('artifact_out')
+          for path in (DOWNLOADS, VERIFY, FINAL_ROOT, ART):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(total=6, connect=6, read=6, status=6, backoff_factor=1.0,
+                        status_forcelist=[429, 500, 502, 503, 504],
+                        allowed_methods=['GET'], raise_on_status=False)
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=12, pool_maxsize=12))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          raw_rows = []
+          queries = [(start, end, '') for start, end in DATE_WINDOWS]
+          queries.append(('2000-01-01', AS_OF, CODE))
+          for start, end, code in queries:
+              for page in range(1, 6):
+                  params = {
+                      'industryCode': '*', 'pageSize': '5000', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': start, 'endTime': end,
+                      'pageNo': str(page), 'fields': '', 'qType': '0',
+                      'orgCode': '', 'code': code, 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  }
+                  response = session.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=(25, 180))
+                  print('API', start, end, code or 'GLOBAL', page, response.status_code, len(response.content), flush=True)
+                  response.raise_for_status()
+                  batch = response.json().get('data') or []
+                  raw_rows.extend(batch)
+                  if len(batch) < 5000:
+                      break
+
+          unique = {}
+          for row in raw_rows:
+              blob = json.dumps(row, ensure_ascii=False)
+              title = str(row.get('title') or '')
+              stock_name = str(row.get('stockName') or '')
+              stock_code = str(row.get('stockCode') or '')
+              relevant = (
+                  CODE in blob or COMPANY in blob or any(alias in blob for alias in ALIASES)
+                  or any(hint in title for hint in TITLE_HINTS)
+                  or stock_code == CODE or COMPANY in stock_name or '三维工程' in stock_name
+              )
+              if not relevant:
+                  continue
+              key = str(row.get('infoCode') or row.get('id') or blob)
+              unique[key] = row
+
+          metadata = list(unique.values())
+          metadata.sort(key=lambda item: str(item.get('publishDate') or ''), reverse=True)
+          (WORK / 'all_metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('METADATA_COUNT', len(metadata), flush=True)
+          for row in metadata:
+              print('META', json.dumps({key: row.get(key) for key in (
+                  'infoCode', 'title', 'orgSName', 'publishDate', 'reportType',
+                  'attachPages', 'attachSize', 'author', 'emRatingName',
+                  'stockName', 'stockCode'
+              )}, ensure_ascii=False), flush=True)
+          if not metadata:
+              raise RuntimeError('No Sanwei Chemical metadata found in expanded search')
+
+          shallow_terms = ('信息更新', '季报', '年报', '中报', '半年报', '业绩快报', '业绩预告', '事件点评', '点评', '简评', '跟踪', '调研', '询价', '申购', '快评')
+          deep_terms = ('首次覆盖', '深度', '公司研究', '专题', '硫磺回收', '正丙醇', '新疆煤化工', '建筑化工小巨人', '工程+实业', '工程化工齐发展', '成长空间', '龙头')
+
+          def score(row: dict) -> tuple:
+              title = str(row.get('title') or '')
+              try:
+                  pages = int(row.get('attachPages') or 0)
+              except Exception:
+                  pages = 0
+              value = min(pages, 60) * 4
+              if '首次覆盖' in title:
+                  value += 260
+              if '深度' in title:
+                  value += 210
+              value += sum(24 for term in deep_terms if term in title)
+              value -= sum(90 for term in shallow_terms if term in title)
+              return value, pages, str(row.get('publishDate') or '')
+
+          def download_pdf(info: str, target: Path) -> str:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_01.pdf',
+              ]
+              for url in urls:
+                  response = session.get(url, headers={'Accept':'application/pdf,*/*;q=0.8'}, timeout=(30,240))
+                  print('PDF', info, response.status_code, len(response.content), url, flush=True)
+                  if response.status_code == 200 and response.content.startswith(b'%PDF') and len(response.content) > 70_000:
+                      target.write_bytes(response.content)
+                      return url
+              raise RuntimeError(f'No PDF found for {info}')
+
+          valid = []
+          seen = set()
+          for row in sorted(metadata, key=score, reverse=True):
+              info = str(row.get('infoCode') or '')
+              if not info:
+                  continue
+              title = str(row.get('title') or '').strip()
+              broker = str(row.get('orgSName') or row.get('orgName') or '未知机构').strip()
+              date = str(row.get('publishDate') or '')[:10]
+              target = DOWNLOADS / f'{info}.pdf'
+              try:
+                  source_url = download_pdf(info, target)
+                  reader = PdfReader(str(target), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 4:
+                      target.unlink(missing_ok=True)
+                      continue
+                  sample = []
+                  for i in list(range(min(25, pages))) + list(range(max(0, pages-3), pages)):
+                      try:
+                          sample.append(reader.pages[i].extract_text() or '')
+                      except Exception:
+                          pass
+                  compact = re.sub(r'\s+', '', '\n'.join(sample))
+                  identity = COMPANY in compact or CODE in compact or any(alias in compact for alias in ALIASES) or COMPANY in title or '三维工程' in title
+                  research = any(term in compact for term in ('证券研究报告','公司研究','深度研究','首次覆盖','投资评级','分析师','研究报告'))
+                  if not identity or not research:
+                      print('REJECT', info, title, pages, identity, research, flush=True)
+                      target.unlink(missing_ok=True)
+                      continue
+                  check = subprocess.run(['qpdf','--check',str(target)], capture_output=True, text=True)
+                  if check.returncode not in (0,3):
+                      raise RuntimeError('qpdf failed')
+                  first = subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','75',str(target),str(VERIFY/f'{info}_first')], capture_output=True, text=True)
+                  last = subprocess.run(['pdftoppm','-f',str(pages),'-l',str(pages),'-singlefile','-png','-r','75',str(target),str(VERIFY/f'{info}_last')], capture_output=True, text=True)
+                  if first.returncode != 0 or last.returncode != 0:
+                      raise RuntimeError('render failed')
+                  data = target.read_bytes()
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in seen:
+                      target.unlink(missing_ok=True)
+                      continue
+                  seen.add(digest)
+                  value, _, _ = score(row)
+                  item = {
+                      'info_code': info, 'title': title, 'broker': broker,
+                      'publish_date': date, 'pages': pages, 'bytes': len(data),
+                      'sha256': digest, 'source_url': source_url,
+                      'rating': row.get('emRatingName'), 'author': row.get('author'),
+                      'score': value, 'file': str(target),
+                  }
+                  valid.append(item)
+                  print('VALID', json.dumps({k:item[k] for k in ('title','broker','publish_date','pages','score')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('ERROR', info, title, repr(exc), flush=True)
+                  target.unlink(missing_ok=True)
+
+          if len(valid) < 2:
+              raise RuntimeError(f'Only {len(valid)} complete reports available')
+
+          valid.sort(key=lambda x:(x['pages'] >= 15, x['score'], x['pages'], x['publish_date']), reverse=True)
+          selected = []
+          used_brokers = set()
+          for item in valid:
+              if item['broker'] in used_brokers:
+                  continue
+              selected.append(item)
+              used_brokers.add(item['broker'])
+              if len(selected) == 3:
+                  break
+          for item in valid:
+              if len(selected) == 3:
+                  break
+              if item not in selected:
+                  selected.append(item)
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+','_',str(text)).strip(' ._')[:105]
+
+          package_name = f'三维化学_002469.SZ_券商研究报告_{len(selected)}份'
+          final_dir = FINAL_ROOT / package_name
+          final_dir.mkdir(parents=True, exist_ok=True)
+          records = []
+          for idx, item in enumerate(selected, 1):
+              filename = f'{idx:02d}_{safe(item["publish_date"])}_{safe(item["broker"])}_{safe(item["title"])}.pdf'
+              shutil.copy2(item['file'], final_dir/filename)
+              rec = {k:v for k,v in item.items() if k not in ('file','score')}
+              rec['filename'] = filename
+              records.append(rec)
+
+          lines = ['三维化学（002469.SZ，历史简称三维工程）券商研究报告合集', f'整理日期：{AS_OF}', '', '筛选说明：优先公司深度、首次覆盖和完整专题研究；如公开长篇报告不足3份，则以完整公司研究报告补足，不使用网页摘要或行情快讯。', '', '文件清单：']
+          for i, rec in enumerate(records,1):
+              lines += [f'{i}. {rec["filename"]}', f'   机构：{rec["broker"]}', f'   标题：{rec["title"]}', f'   日期：{rec["publish_date"]}；页数：{rec["pages"]}', f'   评级：{rec.get("rating") or "未标注"}；分析师：{rec.get("author") or "未标注"}', f'   来源：{rec["source_url"]}', f'   SHA-256：{rec["sha256"]}', '']
+          lines.append('完整性核验：已检查公司身份、实际页数、PDF结构、首末页渲染、重复文件、SHA-256及ZIP CRC。')
+          (final_dir/'00_文件清单与范围说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (final_dir/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (final_dir/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records),encoding='utf-8')
+
+          chinese_zip = ART/f'{package_name}.zip'
+          with zipfile.ZipFile(chinese_zip,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as zf:
+              for p in sorted(final_dir.iterdir()):
+                  zf.write(p,arcname=f'{package_name}/{p.name}')
+          with zipfile.ZipFile(chinese_zip,'r') as zf:
+              bad = zf.testzip()
+              count = sum(n.lower().endswith('.pdf') for n in zf.namelist())
+              if bad or count != len(records):
+                  raise RuntimeError(f'ZIP validation failed: {bad}, {count}')
+          english_zip = ART/f'Sanwei_Chemical_002469_Broker_Research_{len(selected)}_Reports.zip'
+          shutil.copy2(chinese_zip, english_zip)
+          print('SELECTED_FINAL',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+          print('FINAL_ZIP',chinese_zip,chinese_zip.stat().st_size,hashlib.sha256(chinese_zip.read_bytes()).hexdigest(),flush=True)
+          print('BACKUP_ZIP',english_zip,english_zip.stat().st_size,hashlib.sha256(english_zip.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanwei-chemical-broker-reports-v2-artifact
+          path: artifact_out/*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
