@@ -2,17 +2,18 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
+inner = "http://www.sgpjbg.com/sgpjbg/View.aspx?id=399121"
 URLS = [
-    "https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/795687742795/index.phtml",
-    "https://www.fxbaogao.com/detail/4736599",
-    "https://www.fxbaogao.com/detail/4665308",
-    "https://www.sgpjbg.com/bgdown/399121.html",
-    "https://www.sgpjbg.com/baogao/399121.html",
+    "https://www.fxbaogao.com/view?id=4736599",
+    "https://www.fxbaogao.com/view?id=4665308",
+    "https://www.sgpjbg.com/sgpjbg/View.aspx?id=399121",
+    "https://www.sgpjbg.com/BookRead.aspx?bhtype=2&url=" + quote(inner, safe=""),
+    "https://www.sgpjbg.com/baogao/651928.html",
 ]
 
 headers = {
@@ -41,15 +42,15 @@ for url in URLS:
         soup = BeautifulSoup(text, "html.parser")
         print("TITLE", soup.title.get_text(" ", strip=True) if soup.title else "")
         found = []
-        for tag in soup.find_all(["a", "iframe", "embed", "object", "script", "img", "source"]):
-            for attr in ("href", "src", "data", "data-src", "data-url", "url"):
+        for tag in soup.find_all(["a", "iframe", "embed", "object", "script", "img", "source", "link"]):
+            for attr in ("href", "src", "data", "data-src", "data-url", "url", "value"):
                 val = tag.get(attr)
                 if not val:
                     continue
                 full = urljoin(r.url, val)
                 label = tag.get_text(" ", strip=True)[:120]
                 low = full.lower()
-                if any(k in low for k in (".pdf", "download", "view", "report", "file", "attachment", "preview", "doc")) or any(k in label.lower() for k in ("下载", "pdf", "完整", "原文")):
+                if any(k in low for k in (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", "download", "view", "report", "file", "attachment", "preview", "page", "bookread", "flexpaper")) or any(k in label.lower() for k in ("下载", "pdf", "完整", "原文")):
                     found.append((tag.name, attr, full, label))
         seen = set()
         for item in found:
@@ -57,14 +58,28 @@ for url in URLS:
                 continue
             seen.add(item[2])
             print("LINK", item)
-        # Print contexts around likely binary/document markers.
-        for pattern in (r"\.pdf", r"download", r"fileUrl", r"pdfUrl", r"attachment", r"bgdown", r"view\?id", r"rptid"):
+        for pattern in (
+            r"\.pdf",
+            r"report-image",
+            r"fileroot",
+            r"page(?:url|image|src|count|index)?",
+            r"image(?:url|src|list)?",
+            r"download",
+            r"fileUrl",
+            r"pdfUrl",
+            r"attachment",
+            r"bookread",
+            r"view\.aspx",
+            r"399121",
+            r"4736599",
+            r"4665308",
+        ):
             hits = list(re.finditer(pattern, text, flags=re.I))
             print("PATTERN", pattern, "HITS", len(hits))
-            for m in hits[:12]:
-                start = max(0, m.start() - 220)
-                end = min(len(text), m.end() + 320)
+            for m in hits[:20]:
+                start = max(0, m.start() - 250)
+                end = min(len(text), m.end() + 420)
                 snippet = re.sub(r"\s+", " ", text[start:end])
-                print("SNIP", snippet[:700])
+                print("SNIP", snippet[:900])
     except Exception as exc:
         print("ERROR", type(exc).__name__, exc)
