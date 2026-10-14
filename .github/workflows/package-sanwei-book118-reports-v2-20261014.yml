@@ -1,0 +1,197 @@
+name: Package Sanwei Chemical reader reports v2
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/sanwei-book118-reports-v2-20261014.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install browser and PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pillow img2pdf playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Reconstruct and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, shutil, subprocess, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import img2pdf, requests
+          from PIL import Image, ImageStat
+          from playwright.sync_api import sync_playwright
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          ROOT=Path('work'); IMAGES=ROOT/'pages'; PACKAGE=ROOT/'三维化学_002469.SZ_券商深度报告_2份'; VERIFY=ROOT/'verify'; ART=Path('artifact_out')
+          for p in (IMAGES,PACKAGE,VERIFY,ART): p.mkdir(parents=True,exist_ok=True)
+          session=requests.Session(); session.trust_env=False
+          retry=Retry(total=6,connect=6,read=6,status=6,backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=['GET'],raise_on_status=False)
+          session.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=12,pool_maxsize=12))
+          session.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          guoxin_url='https://pdf.dfcfw.com/pdf/H3_AP202505161673828576_1.pdf'
+          guoxin=PACKAGE/'01_2025-05-16_国信证券_受益于新疆煤化工建设提速_工程加实业携手并进.pdf'
+          rr=session.get(guoxin_url,headers={'Referer':'https://data.eastmoney.com/'},timeout=(30,240)); print('GUOXIN',rr.status_code,len(rr.content),flush=True)
+          if rr.status_code!=200 or not rr.content.startswith(b'%PDF'): raise RuntimeError('Guosen download failed')
+          guoxin.write_bytes(rr.content)
+          gr=PdfReader(str(guoxin),strict=False)
+          gt=''.join((gr.pages[i].extract_text() or '') for i in range(min(8,len(gr.pages))))
+          if len(gr.pages)!=37 or '三维化学' not in re.sub(r'\s+','',gt): raise RuntimeError('Guosen validation failed')
+
+          reader_url='https://max.book118.com/html/2025/0518/6003105132011130.shtm'
+          image_urls=[]
+          with sync_playwright() as pw:
+              browser=pw.chromium.launch(headless=True,args=['--no-sandbox','--disable-dev-shm-usage'])
+              context=browser.new_context(viewport={'width':1440,'height':1100},user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',locale='zh-CN')
+              page=context.new_page()
+              page.on('console',lambda msg: print('BROWSER_CONSOLE',msg.type,msg.text,flush=True))
+              page.goto(reader_url,wait_until='domcontentloaded',timeout=180000); page.wait_for_timeout(6000)
+              print('TITLE',page.title(),flush=True)
+              print('INITIAL_ITEMS',page.locator('div.webpreview-item').count(),flush=True)
+
+              # Scroll to the end of currently loaded pages, then invoke the continue-preview control directly.
+              previous=-1
+              for round_no in range(1,16):
+                  items=page.locator('div.webpreview-item'); current=items.count()
+                  print('ROUND',round_no,'ITEMS_BEFORE',current,flush=True)
+                  if current:
+                      try: items.nth(current-1).scroll_into_view_if_needed(timeout=15000)
+                      except Exception as exc: print('LAST_SCROLL_ERROR',repr(exc),flush=True)
+                  page.evaluate('window.scrollTo(0, document.body.scrollHeight)'); page.wait_for_timeout(1800)
+
+                  for selector in ['#btn_preview_remain','button:has-text("继续阅读")','button:has-text("继续预览")','a:has-text("继续阅读")','a:has-text("继续预览")']:
+                      loc=page.locator(selector).first
+                      try:
+                          cnt=loc.count()
+                          if cnt:
+                              try: outer=loc.evaluate('(e)=>e.outerHTML')
+                              except Exception: outer=''
+                              print('CONTROL',selector,'COUNT',cnt,'VISIBLE',loc.is_visible(),'HTML',outer[:1000],flush=True)
+                      except Exception as exc:
+                          print('CONTROL_INSPECT_ERROR',selector,repr(exc),flush=True)
+
+                  clicked=False
+                  # JavaScript invocation works even when an overlay or viewport rule marks the button invisible.
+                  try:
+                      result=page.evaluate("""() => {
+                        const e=document.querySelector('#btn_preview_remain');
+                        if(!e) return 'missing';
+                        e.scrollIntoView({block:'center'});
+                        e.click();
+                        return 'clicked';
+                      }""")
+                      print('JS_BUTTON_RESULT',result,flush=True)
+                      clicked=(result=='clicked')
+                  except Exception as exc: print('JS_BUTTON_ERROR',repr(exc),flush=True)
+
+                  if not clicked:
+                      for selector in ['button:has-text("继续阅读")','button:has-text("继续预览")','a:has-text("继续阅读")','a:has-text("继续预览")']:
+                          try:
+                              loc=page.locator(selector).first
+                              if loc.count():
+                                  loc.click(force=True,timeout=5000); clicked=True; print('FALLBACK_CLICK',selector,flush=True); break
+                          except Exception as exc: print('FALLBACK_ERROR',selector,repr(exc),flush=True)
+                  page.wait_for_timeout(3000)
+                  new_count=page.locator('div.webpreview-item').count(); print('ITEMS_AFTER',new_count,flush=True)
+                  if new_count>=18: break
+                  if not clicked and new_count==current: break
+                  if new_count==previous and new_count==current: break
+                  previous=current
+
+              items=page.locator('div.webpreview-item'); total=items.count(); print('FINAL_ITEM_COUNT',total,flush=True)
+              if total<18:
+                  (VERIFY/'page.html').write_text(page.content(),encoding='utf-8')
+                  page.screenshot(path=str(VERIFY/'page.png'),full_page=True)
+                  # Print likely preview controls for diagnosis.
+                  for sel in ['button','a']:
+                      locs=page.locator(sel)
+                      for j in range(min(locs.count(),250)):
+                          try:
+                              txt=(locs.nth(j).inner_text() or '').strip()
+                              ident=locs.nth(j).get_attribute('id') or ''
+                              if '预览' in txt or '阅读' in txt or 'preview' in ident.lower(): print('CANDIDATE_CONTROL',sel,j,ident,txt[:200],flush=True)
+                          except Exception: pass
+                  raise RuntimeError(f'Only {total} preview items loaded')
+
+              for i in range(total):
+                  item=items.nth(i); item.scroll_into_view_if_needed(timeout=30000); page.wait_for_timeout(700)
+                  img=item.locator('img').first; src=None
+                  for _ in range(30):
+                      if img.count():
+                          src=img.get_attribute('src') or img.get_attribute('data-src') or img.get_attribute('data-original')
+                          if src and not src.startswith('data:') and 'loading' not in src.lower(): break
+                      page.wait_for_timeout(400)
+                  if not src: raise RuntimeError(f'Missing image source for page {i+1}')
+                  if src.startswith('//'): src='https:'+src
+                  elif src.startswith('/'): src=urljoin(reader_url,src)
+                  image_urls.append(src); print('PAGE',i+1,src,flush=True)
+              context.close(); browser.close()
+
+          image_urls=list(dict.fromkeys(image_urls)); print('URL_COUNT',len(image_urls),flush=True)
+          if len(image_urls)<18: raise RuntimeError(f'Only {len(image_urls)} unique image URLs')
+          files=[]
+          for i,url in enumerate(image_urls,1):
+              r=session.get(url,headers={'Referer':reader_url},timeout=(30,180)); print('IMG',i,r.status_code,len(r.content),flush=True)
+              if r.status_code!=200 or len(r.content)<10000: raise RuntimeError(f'Image {i} download failed')
+              im=Image.open(io.BytesIO(r.content)); im.load()
+              if im.width<600 or im.height<700 or ImageStat.Stat(im.convert('L')).var[0]<20: raise RuntimeError(f'Image {i} invalid {im.size}')
+              out=IMAGES/f'{i:03d}.jpg'; im.convert('RGB').save(out,'JPEG',quality=96,optimize=True); files.append(out)
+
+          tianfeng=PACKAGE/'02_2025-05-11_天风证券_高弹性建筑化工小巨人_业绩增长潜力可期.pdf'
+          tianfeng.write_bytes(img2pdf.convert([str(p) for p in files]))
+          tr=PdfReader(str(tianfeng),strict=False); tp=len(tr.pages); print('TIANFENG_PAGES',tp,flush=True)
+          if tp<18 or tp>22: raise RuntimeError(f'Unexpected Tianfeng page count {tp}')
+
+          meta=[
+            {'path':guoxin,'broker':'国信证券','title':'受益于新疆煤化工建设提速，“工程+实业”携手并进','date':'2025-05-16','rating':'增持','analysts':['任鹤','朱家琪'],'source':guoxin_url,'source_type':'原始PDF'},
+            {'path':tianfeng,'broker':'天风证券','title':'高弹性建筑化工小巨人，业绩增长潜力可期','date':'2025-05-11','rating':'买入','analysts':[],'source':reader_url,'source_type':'公开在线阅读器有序页面重建PDF'}]
+          records=[]
+          for idx,m in enumerate(meta,1):
+              p=m['path']; q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(f'qpdf failed {p.name}')
+              pc=len(PdfReader(str(p),strict=False).pages)
+              f=subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','90',str(p),str(VERIFY/f'{idx}_first')],capture_output=True,text=True)
+              l=subprocess.run(['pdftoppm','-f',str(pc),'-l',str(pc),'-singlefile','-png','-r','90',str(p),str(VERIFY/f'{idx}_last')],capture_output=True,text=True)
+              if f.returncode or l.returncode: raise RuntimeError(f'render failed {p.name}')
+              records.append({'filename':p.name,'broker':m['broker'],'title':m['title'],'publish_date':m['date'],'pages':pc,'rating':m['rating'],'analysts':m['analysts'],'source_url':m['source'],'source_type':m['source_type'],'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+
+          lines=['三维化学（002469.SZ，历史简称三维工程）券商深度报告合集','整理日期：2026-10-14','','本包收录2份完整长篇公司研究。国信证券报告为原始PDF；天风证券报告按照公开在线阅读器页面顺序重建，页面内容未改动。','','文件清单：']
+          for i,r in enumerate(records,1): lines += [f'{i}. {r["filename"]}',f'   机构：{r["broker"]}',f'   标题：{r["title"]}',f'   日期：{r["publish_date"]}；页数：{r["pages"]}；评级：{r["rating"]}',f'   来源类型：{r["source_type"]}',f'   来源：{r["source_url"]}',f'   SHA-256：{r["sha256"]}','']
+          lines.append('完整性核验：已检查页数、PDF结构、首末页渲染、页面尺寸与非空白性、SHA-256及ZIP CRC。')
+          (PACKAGE/'00_文件清单与范围说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (PACKAGE/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (PACKAGE/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records),encoding='utf-8')
+          cz=ART/'三维化学_002469.SZ_券商深度报告_2份.zip'
+          with zipfile.ZipFile(cz,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for p in sorted(PACKAGE.iterdir()): z.write(p,arcname=f'{PACKAGE.name}/{p.name}')
+          with zipfile.ZipFile(cz) as z:
+              bad=z.testzip(); count=sum(n.lower().endswith('.pdf') for n in z.namelist())
+              if bad or count!=2: raise RuntimeError(f'ZIP invalid {bad} {count}')
+          ez=ART/'Sanwei_Chemical_002469_Broker_Deep_Research_2_Reports.zip'; shutil.copy2(cz,ez)
+          print('RECORDS',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+          print('FINAL',cz,cz.stat().st_size,hashlib.sha256(cz.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanwei-book118-reports-v2-artifact
+          path: artifact_out/*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
