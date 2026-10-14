@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from io import BytesIO
 from pathlib import Path
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image
 
 OUT = Path("debon_sanwei_probe")
 OUT.mkdir(exist_ok=True)
@@ -15,36 +17,79 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
 }
-URLS = [
-    "https://www.sgpjbg.com/labels/jingxihuagongxingyegaikuang.html",
-    "https://www.sgpjbg.com/labels/jingxihuagongxingyefazhanqushiyuce.html",
-]
-needle = "三维化学-公司研究报告-精细化工稳发展"
-results = []
-for url in URLS:
-    rec = {"url": url}
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=(20, 120), allow_redirects=True)
-        rec.update({"status": r.status_code, "bytes": len(r.content), "final_url": r.url})
-        print("PAGE", rec)
-        text = r.content.decode(r.encoding or "utf-8", errors="replace")
-        (OUT / ("label_" + str(len(results)) + ".html")).write_text(text, encoding="utf-8")
-        soup = BeautifulSoup(text, "html.parser")
-        matches = []
-        for tag in soup.find_all("a"):
-            label = tag.get_text(" ", strip=True)
-            href = tag.get("href") or ""
-            if "三维化学" in label or "精细化工稳发展" in label or "230620" in label:
-                full = urljoin(r.url, href)
-                item = {"label": label, "href": full}
-                matches.append(item)
-                print("MATCH", item)
-        for m in re.finditer(r"三维化学.{0,300}", text, flags=re.S):
-            snippet = re.sub(r"\s+", " ", m.group(0))[:1000]
-            print("CONTEXT", snippet)
-        rec["matches"] = matches
-    except Exception as exc:
-        rec["error"] = f"{type(exc).__name__}: {exc}"
-        print("ERROR", rec)
-    results.append(rec)
+REPORT_URL = "https://www.sgpjbg.com/baogao/130314.html"
+results: dict[str, object] = {"report_url": REPORT_URL}
+
+r = requests.get(REPORT_URL, headers=HEADERS, timeout=(20, 120), allow_redirects=True)
+r.raise_for_status()
+text = r.content.decode(r.encoding or "utf-8", errors="replace")
+(OUT / "report_130314.html").write_text(text, encoding="utf-8")
+soup = BeautifulSoup(text, "html.parser")n
+print("STATUS", r.status_code, "BYTES", len(r.content), "FINAL", r.url)
+print("TITLE", soup.title.get_text(" ", strip=True) if soup.title else "")
+
+bases: list[str] = []
+dp = soup.find(id="dp")
+if dp and dp.get("value"):
+    bases.append(str(dp.get("value")))
+    print("DP", dp.get("value"))
+for tag in soup.find_all(True):
+    for value in tag.attrs.values():
+        vals = value if isinstance(value, list) else [value]
+        for val in vals:
+            s = str(val)
+            if "file.sgpjbg.com/fileroot2/2023-6/21/" in s:
+                m = re.search(r"https?://[^\"'<>\s]+", s)
+                if m:
+                    candidate = m.group(0)
+                    candidate = re.sub(r"(?:\d+\.(?:gif|png|jpg|jpeg|webp))?.*$", "", candidate, flags=re.I)
+                    bases.append(candidate)
+                    print("ATTR_BASE", candidate)
+for m in re.finditer(r"https?://file\.sgpjbg\.com/fileroot2/2023-6/21/[^\"'<>\s]+", text, flags=re.I):
+    candidate = m.group(0)
+    candidate = re.sub(r"(?:\d+\.(?:gif|png|jpg|jpeg|webp))?.*$", "", candidate, flags=re.I)
+    bases.append(candidate)
+    print("TEXT_BASE", candidate)
+
+bases = list(dict.fromkeys(x.rstrip("/") for x in bases if x))
+print("BASES", bases)
+results["bases"] = bases
+
+all_tests = []
+for base in bases:
+    base_rec = {"base": base, "pages": []}
+    consecutive = 0
+    for page in range(1, 36):
+        ok = False
+        attempts = []
+        for ext in ("gif", "png", "jpg", "webp"):
+            url = f"{base}{page}.{ext}"
+            try:
+                resp = requests.get(url, headers={**HEADERS, "Referer": REPORT_URL}, timeout=(15, 60), allow_redirects=True)
+                rec = {"url": url, "status": resp.status_code, "bytes": len(resp.content), "content_type": resp.headers.get("content-type")}
+                attempts.append(rec)
+                if resp.status_code != 200 or len(resp.content) < 10000:
+                    continue
+                image = Image.open(BytesIO(resp.content))
+                image.load()
+                w, h = image.size
+                if w < 500 or h < 500:
+                    continue
+                sha = hashlib.sha256(resp.content).hexdigest()
+                page_rec = {"page": page, "url": resp.url, "bytes": len(resp.content), "format": image.format, "width": w, "height": h, "sha256": sha}
+                base_rec["pages"].append(page_rec)
+                print("OK", page_rec)
+                consecutive += 1
+                ok = True
+                break
+            except Exception as exc:
+                attempts.append({"url": url, "error": f"{type(exc).__name__}: {exc}"})
+        if not ok:
+            print("MISS", page, attempts)
+            base_rec["first_missing_page"] = page
+            break
+    base_rec["consecutive_pages"] = consecutive
+    print("SEQUENCE", base, consecutive)
+    all_tests.append(base_rec)
+results["tests"] = all_tests
 (OUT / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
