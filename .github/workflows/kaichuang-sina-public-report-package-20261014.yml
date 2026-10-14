@@ -1,0 +1,276 @@
+name: Package public Kaichuang International brokerage report pages
+
+on:
+  push:
+    paths:
+      - '.github/workflows/kaichuang-sina-public-report-package-20261014.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Install PDF tools and Chinese fonts
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests beautifulsoup4 lxml weasyprint pypdf
+
+      - name: Fetch, render, validate, and package three reports
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html as html_lib
+          import json
+          import re
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup, Tag
+          from pypdf import PdfReader
+          from weasyprint import HTML
+
+          IDS = ['519227929981','461956648318','430756307540','419673534621','416325881525']
+          TARGET_PHRASES = [
+              '近看政策扶持',
+              '金枪鱼捕捞量增长带动盈利持续上升',
+              '主业萧条依旧',
+              '金枪鱼价格低迷',
+              '收到农业部便函',
+          ]
+          PACKAGE = '开创国际_600097_券商研究报告公开网页归档版_3份'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(exist_ok=True)
+          RAW = OUT / '网页存档'
+          RAW.mkdir(exist_ok=True)
+
+          s = requests.Session(); s.trust_env = False
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':'https://finance.sina.com.cn/',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def decode_response(content: bytes) -> tuple[str, str]:
+              for enc in ('gb18030','gbk','utf-8'):
+                  try:
+                      return content.decode(enc), enc
+                  except UnicodeDecodeError:
+                      pass
+              return content.decode('utf-8','replace'), 'utf-8-replace'
+
+          def clean_text(text: str) -> str:
+              text = html_lib.unescape(text)
+              text = text.replace('\u3000',' ').replace('\xa0',' ')
+              text = re.sub(r'[ \t\r\f\v]+',' ',text)
+              text = re.sub(r'\n{3,}','\n\n',text)
+              return text.strip()
+
+          def title_from(soup: BeautifulSoup) -> str:
+              selectors = ['h1','#report_title','.report_title','.title','.main-title','h2']
+              for sel in selectors:
+                  node = soup.select_one(sel)
+                  if node:
+                      t = clean_text(node.get_text(' ', strip=True))
+                      if '开创国际' in t or any(p in t for p in TARGET_PHRASES):
+                          return t
+              if soup.title:
+                  return clean_text(soup.title.get_text(' ', strip=True)).replace('_新浪财经_新浪网','')
+              return ''
+
+          def extract_meta(full_text: str) -> dict:
+              meta = {}
+              patterns = {
+                  'category': r'类别[：:]\s*([^\s]+)',
+                  'broker': r'机构[：:]\s*([^\n]+?)(?=\s+研究员[：:]|\s+日期[：:]|$)',
+                  'researcher': r'研究员[：:]\s*([^\n]+?)(?=\s+日期[：:]|$)',
+                  'date': r'日期[：:]\s*(\d{4}-\d{2}-\d{2})',
+              }
+              one_line = re.sub(r'\s+',' ',full_text)
+              for key, pat in patterns.items():
+                  m = re.search(pat, one_line)
+                  meta[key] = clean_text(m.group(1)) if m else ''
+              return meta
+
+          def content_root(soup: BeautifulSoup, title: str) -> Tag:
+              candidates = []
+              for sel in ['#content','.content','.report_content','.report-content','.blk_container','.main-content','#main']:
+                  for node in soup.select(sel):
+                      txt = clean_text(node.get_text('\n', strip=True))
+                      if len(txt) >= 600:
+                          candidates.append((len(txt), node))
+              # Prefer a moderate-size container, not the whole navigation-heavy page.
+              if candidates:
+                  candidates.sort(key=lambda x: (x[0] > 50000, x[0]))
+                  return candidates[0][1]
+              # Find a parent around the title with enough report text.
+              for node in soup.find_all(['h1','h2','div','td']):
+                  t = clean_text(node.get_text(' ', strip=True))
+                  if title and (title[:16] in t or any(p in t for p in TARGET_PHRASES)):
+                      parent = node
+                      for _ in range(6):
+                          if parent.parent is None: break
+                          parent = parent.parent
+                          txt = clean_text(parent.get_text('\n', strip=True))
+                          if 800 <= len(txt) <= 50000:
+                              return parent
+              return soup.body or soup
+
+          def extract_paragraphs(root: Tag, title: str) -> list[str]:
+              for bad in root.select('script,style,noscript,form,iframe,nav,header,footer'):
+                  bad.decompose()
+              parts=[]
+              for node in root.find_all(['p','div','td','li','h2','h3'], recursive=True):
+                  # Avoid containers that only duplicate all child text.
+                  if node.find(['p','div','td','li','h2','h3'], recursive=False):
+                      continue
+                  text=clean_text(node.get_text(' ', strip=True))
+                  if not text or len(text)<8: continue
+                  if text == title or text in ('新浪财经','返回首页','打印','关闭','分享到'):
+                      continue
+                  if any(x in text for x in ('新浪首页','财经首页','股票首页','意见反馈','免责声明：以上内容仅供参考')) and len(text)<200:
+                      continue
+                  parts.append(text)
+              # Deduplicate while keeping order.
+              seen=set(); out=[]
+              for p in parts:
+                  key=re.sub(r'\s+','',p)
+                  if key in seen: continue
+                  seen.add(key); out.append(p)
+              # If extraction fragmented badly, fall back to line-separated root text.
+              joined='\n'.join(out)
+              if len(joined)<700:
+                  out=[clean_text(x) for x in root.get_text('\n',strip=True).splitlines() if len(clean_text(x))>=8]
+              return out
+
+          rows=[]
+          for rid in IDS:
+              url=f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml'
+              r=s.get(url,timeout=90,allow_redirects=True)
+              print('FETCH',rid,r.status_code,len(r.content),r.url,flush=True)
+              r.raise_for_status()
+              text,enc=decode_response(r.content)
+              soup=BeautifulSoup(text,'lxml')
+              title=title_from(soup)
+              full=clean_text(soup.get_text('\n',strip=True))
+              meta=extract_meta(full)
+              root=content_root(soup,title)
+              paragraphs=extract_paragraphs(root,title)
+              body='\n'.join(paragraphs)
+              print('PARSED',rid,json.dumps({'title':title,'meta':meta,'body_chars':len(body)},ensure_ascii=False),flush=True)
+              if '开创国际' not in title and '600097' not in full:
+                  continue
+              if len(body)<650:
+                  continue
+              raw_file=RAW/f'{rid}.html'
+              raw_file.write_text(text,encoding='utf-8')
+              score=0
+              for i,p in enumerate(TARGET_PHRASES):
+                  if p in title or p in body[:2500]: score=max(score,100-i*10)
+              if '深度' in title: score+=40
+              if meta.get('broker'): score+=10
+              rows.append({'rid':rid,'url':url,'final_url':r.url,'encoding':enc,'title':title,'meta':meta,'paragraphs':paragraphs,'score':score,'raw_file':raw_file.name})
+
+          rows.sort(key=lambda x:(x['score'],x['meta'].get('date','')),reverse=True)
+          # Diversity: retain the strongest three distinct titles.
+          chosen=[]; title_keys=set()
+          for row in rows:
+              key=re.sub(r'\W+','',row['title'])
+              if key in title_keys: continue
+              title_keys.add(key); chosen.append(row)
+              if len(chosen)==3: break
+          if len(chosen)<3:
+              raise RuntimeError(f'Only {len(chosen)} usable public report pages found: {[r["title"] for r in rows]}')
+
+          def safe(v: str) -> str:
+              v=re.sub(r'[\\/:*?"<>|]+','_',v).strip()
+              v=re.sub(r'\s+','',v)
+              return v[:70]
+
+          records=[]
+          for i,row in enumerate(chosen,1):
+              meta=row['meta']; broker=meta.get('broker') or '券商机构'; date=meta.get('date') or '日期未标明'
+              title=row['title']
+              # Strip site suffixes and leading company labels for filenames.
+              title_clean=re.sub(r'_?新浪财经.*$','',title)
+              filename=f'{i:02d}_{safe(broker)}_{date}_{safe(title_clean)}_公开网页归档版.pdf'
+              pdf_path=OUT/filename
+              para_html='\n'.join(f'<p>{html_lib.escape(p)}</p>' for p in row['paragraphs'])
+              doc=f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+              @page {{ size: A4; margin: 18mm 17mm 18mm 17mm; @bottom-center {{ content: counter(page); font-size: 9pt; color: #666; }} }}
+              body {{ font-family: "Noto Sans CJK SC", "Noto Sans CJK", sans-serif; font-size: 10.5pt; line-height: 1.7; color:#111; }}
+              h1 {{ font-size: 18pt; line-height:1.35; margin:0 0 10pt; }}
+              .meta {{ border-top:1px solid #555; border-bottom:1px solid #aaa; padding:7pt 0; margin-bottom:11pt; font-size:9.5pt; }}
+              .notice {{ background:#f3f3f3; padding:8pt 10pt; margin:0 0 12pt; font-size:9pt; color:#444; }}
+              p {{ margin:0 0 7pt; text-align:justify; }}
+              .source {{ margin-top:16pt; padding-top:8pt; border-top:1px solid #aaa; font-size:8.5pt; color:#555; word-break:break-all; }}
+              </style></head><body>
+              <h1>{html_lib.escape(title_clean)}</h1>
+              <div class="meta">机构：{html_lib.escape(broker)}　研究员：{html_lib.escape(meta.get('researcher') or '公开页面未列明')}　日期：{html_lib.escape(date)}　类别：{html_lib.escape(meta.get('category') or '公司研究')}</div>
+              <div class="notice">说明：本文件为新浪财经公开研究报告页面的打印归档版，用于保存公开可见正文；并非券商原始版式 PDF，图表和分页可能与原报告不同。</div>
+              {para_html}
+              <div class="source">公开页面：{html_lib.escape(row['final_url'])}<br>抓取日期：2026-10-14　新浪报告编号：{row['rid']}</div>
+              </body></html>'''
+              HTML(string=doc,base_url=str(Path.cwd())).write_pdf(str(pdf_path))
+              reader=PdfReader(str(pdf_path),strict=False); pages=len(reader.pages)
+              if pages<2: raise RuntimeError(f'PDF too short: {filename}, pages={pages}')
+              sample=''.join((reader.pages[j].extract_text() or '') for j in range(min(5,pages)))
+              compact=re.sub(r'\s+','',sample)
+              if '开创国际' not in compact and '600097' not in compact:
+                  raise RuntimeError(f'identity check failed: {filename}')
+              q=subprocess.run(['qpdf','--warning-exit-0','--check',str(pdf_path)],capture_output=True,text=True)
+              if q.returncode!=0: raise RuntimeError(q.stderr[-1500:])
+              root=OUT/(pdf_path.stem+'_render')
+              rr=subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','110',str(pdf_path),str(root)],capture_output=True,text=True)
+              png=Path(str(root)+'.png')
+              if rr.returncode!=0 or not png.exists() or png.stat().st_size<8000:
+                  raise RuntimeError(f'render failed: {filename}')
+              render_bytes=png.stat().st_size; png.unlink()
+              raw=pdf_path.read_bytes(); digest=hashlib.sha256(raw).hexdigest()
+              rec={
+                  'filename':filename,'company':'上海开创国际海洋资源股份有限公司','stock_code':'600097.SH',
+                  'broker':broker,'researcher':meta.get('researcher'),'date':date,'title':title_clean,
+                  'source_url':row['final_url'],'sina_report_id':row['rid'],'archive_type':'公开网页打印归档版（非券商原始排版PDF）',
+                  'pages':pages,'bytes':len(raw),'sha256':digest,'first_page_render_bytes':render_bytes,
+              }
+              records.append(rec); print('VALIDATED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          lines=['开创国际（600097.SH）券商研究报告公开网页归档版','整理日期：2026-10-14','',
+                 '本包收录3份新浪财经公开研究报告页面的PDF打印归档版。','这些文件保存公开可见正文，但不是券商原始排版PDF，图表与分页可能不完整。','']
+          for i,r in enumerate(records,1):
+              lines += [f"{i}. {r['broker']}，{r['date']}，{r['pages']}页",f"   标题：{r['title']}",
+                        f"   研究员：{r['researcher'] or '公开页面未列明'}",f"   文件：{r['filename']}",
+                        f"   来源：{r['source_url']}",f"   SHA-256：{r['sha256']}",'']
+          (OUT/'00_报告清单与版本说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          z=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(z,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as a:
+              for p in sorted(OUT.rglob('*')):
+                  if p.is_file(): a.write(p,arcname=f'{PACKAGE}/{p.relative_to(OUT)}')
+          with zipfile.ZipFile(z) as a:
+              bad=a.testzip(); pdfs=[n for n in a.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs)!=3: raise RuntimeError(f'ZIP validation failed bad={bad} pdfs={len(pdfs)}')
+          print('FINAL_ZIP',z.name,z.stat().st_size,'SHA256',hashlib.sha256(z.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload completed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaichuang-international-600097-public-brokerage-reports-20261014
+          path: 开创国际_600097_券商研究报告公开网页归档版_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
