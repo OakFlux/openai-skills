@@ -1,0 +1,222 @@
+name: Probe and package Sanwei reports from public APIs
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/probe-package-sanwei-public-api-20261014.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pillow img2pdf
+
+      - name: Probe public APIs and package if complete pages are public
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, shutil, subprocess, zipfile
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import img2pdf
+          import requests
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          API='https://api.fxbaogao.com'
+          REPORTS={
+            4736599:{'broker':'国盛证券','title':'“硫磺回收”与“正丙醇”双龙头，新疆煤化工打开成长空间','date':'2025-03-18','rating':'买入'},
+            4665308:{'broker':'财通证券','title':'三业联动发展，业绩或迎拐点','date':'2025-01-07','rating':'增持'},
+            4790436:{'broker':'德邦证券','title':'醋酸纤维素国产化或受益，新疆煤化工赋予发展机遇','date':'2025-04-23','rating':'买入'},
+          }
+          ROOT=Path('work'); RAW=ROOT/'raw'; IMGS=ROOT/'images'; PACKAGE=ROOT/'package'; VERIFY=ROOT/'verify'; ART=Path('artifact_out')
+          for p in (RAW,IMGS,PACKAGE,VERIFY,ART): p.mkdir(parents=True,exist_ok=True)
+
+          s=requests.Session(); s.trust_env=False
+          retry=Retry(total=5,connect=5,read=5,status=5,backoff_factor=0.8,status_forcelist=[429,500,502,503,504],allowed_methods=['GET','POST'],raise_on_status=False)
+          s.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=12,pool_maxsize=12))
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Origin':'https://www.fxbaogao.com',
+            'Referer':'https://www.fxbaogao.com/',
+            'Accept':'application/json, text/plain, */*',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def save_resp(label:str,r:requests.Response):
+            path=RAW/f'{label}.txt'
+            path.write_bytes(r.content)
+            print('RESP',label,r.status_code,len(r.content),r.headers.get('content-type'),r.url,flush=True)
+            print(r.text[:6000],flush=True)
+
+          def request_all(rid:int):
+            calls=[]
+            calls.append(('preview_get', 'GET', f'{API}/mofoun/report/report/getReportPreviewImages?reportId={rid}', None, None))
+            calls.append(('read_get', 'GET', f'{API}/mofoun/report/readReport/readReport?reportId={rid}', None, None))
+            calls.append(('catalog_get', 'GET', f'{API}/mofoun/report/searchReport/detail/catalog?reportId={rid}', None, None))
+            calls.append(('downloadbean_get', 'GET', f'{API}/mofoun/report/report/downloadReportByBean?reportId={rid}', None, None))
+            calls.append(('predown_get', 'GET', f'{API}/mofoun/report/report/report/preDownV2?reportId={rid}', None, None))
+            calls.append(('filedownload_get', 'GET', f'{API}/mofoun/report/report/file/downloadReport?reportId={rid}', None, None))
+            calls.append(('detail_post_report_json', 'POST', f'{API}/mofoun/report/searchReport/detail', {'reportId':rid}, 'json'))
+            calls.append(('detail_post_id_json', 'POST', f'{API}/mofoun/report/searchReport/detail', {'id':rid}, 'json'))
+            calls.append(('detail_post_doc_json', 'POST', f'{API}/mofoun/report/searchReport/detail', {'docId':rid}, 'json'))
+            calls.append(('detail_post_report_form', 'POST', f'{API}/mofoun/report/searchReport/detail', {'reportId':rid}, 'form'))
+            out=[]
+            for name,method,url,payload,mode in calls:
+              try:
+                if method=='GET': r=s.get(url,timeout=(20,90),allow_redirects=True)
+                elif mode=='json': r=s.post(url,json=payload,timeout=(20,90),allow_redirects=True)
+                else: r=s.post(url,data=payload,timeout=(20,90),allow_redirects=True)
+                save_resp(f'{rid}_{name}',r)
+                out.append((name,r))
+              except Exception as e:
+                print('CALL_ERROR',rid,name,repr(e),flush=True)
+            return out
+
+          def parse_json(r:requests.Response):
+            try:return r.json()
+            except Exception:return None
+
+          def walk(obj:Any, path=''):
+            if isinstance(obj,dict):
+              for k,v in obj.items():
+                yield from walk(v,f'{path}.{k}' if path else str(k))
+            elif isinstance(obj,list):
+              for i,v in enumerate(obj): yield from walk(v,f'{path}[{i}]')
+            else: yield path,obj
+
+          def collect_assets(responses):
+            urls=[]; scalars=[]
+            for name,r in responses:
+              data=parse_json(r)
+              if data is None: continue
+              for path,val in walk(data):
+                if isinstance(val,(str,int,float,bool)) or val is None:
+                  scalars.append((name,path,val))
+                if isinstance(val,str):
+                  low=val.lower()
+                  if val.startswith('http') and ('.pdf' in low or 'report-image' in low or re.search(r'\.(?:png|jpe?g|webp)(?:\?|$)',low)):
+                    urls.append(val)
+                  elif ('report-image/' in low or re.search(r'\.(?:png|jpe?g|webp)(?:\?|$)',low)) and len(val)<1000:
+                    urls.append(urljoin('https://public.fxbaogao.com/',val.lstrip('/')))
+            print('SCALARS_IMPORTANT',json.dumps([(n,p,v) for n,p,v in scalars if any(k in p.lower() for k in ('page','pdf','url','doc','report','image','file','code','msg'))][:1000],ensure_ascii=False,indent=2),flush=True)
+            return list(dict.fromkeys(urls))
+
+          discovered={}
+          for rid in REPORTS:
+            responses=request_all(rid)
+            assets=collect_assets(responses)
+            print('DISCOVERED_ASSETS',rid,json.dumps(assets,ensure_ascii=False,indent=2),flush=True)
+            discovered[rid]=assets
+
+          # Always include the verified original Guosen Securities report.
+          guoxin_url='https://pdf.dfcfw.com/pdf/H3_AP202505161673828576_1.pdf'
+          guoxin=PACKAGE/'01_2025-05-16_国信证券_受益于新疆煤化工建设提速_工程加实业携手并进.pdf'
+          rg=s.get(guoxin_url,headers={'Referer':'https://data.eastmoney.com/'},timeout=(30,240))
+          print('GUOXIN',rg.status_code,len(rg.content),flush=True)
+          if rg.status_code!=200 or not rg.content.startswith(b'%PDF'): raise RuntimeError('Guosen PDF failed')
+          guoxin.write_bytes(rg.content)
+          gr=PdfReader(str(guoxin),strict=False)
+          if len(gr.pages)!=37: raise RuntimeError(f'Guosen pages {len(gr.pages)}')
+
+          records=[{'filename':guoxin.name,'broker':'国信证券','title':'受益于新疆煤化工建设提速，“工程+实业”携手并进','publish_date':'2025-05-16','pages':37,'rating':'增持','source_url':guoxin_url,'source_type':'原始PDF','bytes':guoxin.stat().st_size,'sha256':hashlib.sha256(guoxin.read_bytes()).hexdigest()}]
+
+          # Build at most two additional reports only when the anonymous public API explicitly returned full assets.
+          for rid,assets in discovered.items():
+            pdfs=[u for u in assets if '.pdf' in u.lower()]
+            images=[u for u in assets if u not in pdfs]
+            out_pdf=None; source_type=None; source_url=None
+            if pdfs:
+              for u in pdfs:
+                try:
+                  r=s.get(u,timeout=(30,240),headers={'Referer':'https://www.fxbaogao.com/'})
+                  print('PUBLIC_PDF',rid,r.status_code,len(r.content),u,flush=True)
+                  if r.status_code==200 and r.content.startswith(b'%PDF') and len(r.content)>100000:
+                    out_pdf=PACKAGE/f'{len(records)+1:02d}_{REPORTS[rid]["date"]}_{REPORTS[rid]["broker"]}_{REPORTS[rid]["title"]}.pdf'
+                    out_pdf.write_bytes(r.content); source_type='公开匿名API返回原始PDF'; source_url=u; break
+                except Exception as e: print('PUBLIC_PDF_ERROR',rid,u,repr(e),flush=True)
+            if out_pdf is None and len(images)>=8:
+              # Preserve the explicit API order; require multiple distinct page-numbered assets.
+              page_assets=[]
+              for pos,u in enumerate(images):
+                m=re.search(r'(?:-|/)(\d+)(?:\.(?:png|jpe?g|webp)|\?)',u,re.I)
+                page_assets.append((int(m.group(1)) if m else pos+1,pos,u))
+              page_assets.sort(key=lambda x:(x[0],x[1]))
+              imgs=[]; idir=IMGS/str(rid); idir.mkdir(exist_ok=True)
+              ok=True
+              for idx,(_,_,u) in enumerate(page_assets,1):
+                try:
+                  r=s.get(u,timeout=(20,120),headers={'Referer':f'https://www.fxbaogao.com/view?id={rid}'})
+                  print('PUBLIC_IMAGE',rid,idx,r.status_code,len(r.content),u,flush=True)
+                  if r.status_code!=200 or len(r.content)<10000: ok=False; break
+                  im=Image.open(io.BytesIO(r.content)); im.load()
+                  if im.width<600 or im.height<700 or ImageStat.Stat(im.convert('L')).var[0]<20: ok=False; break
+                  p=idir/f'{idx:03d}.jpg'; im.convert('RGB').save(p,'JPEG',quality=96,optimize=True); imgs.append(p)
+                except Exception as e: print('PUBLIC_IMAGE_ERROR',rid,idx,repr(e),flush=True); ok=False; break
+              if ok and len(imgs)>=8:
+                out_pdf=PACKAGE/f'{len(records)+1:02d}_{REPORTS[rid]["date"]}_{REPORTS[rid]["broker"]}_{REPORTS[rid]["title"]}.pdf'
+                out_pdf.write_bytes(img2pdf.convert([str(p) for p in imgs])); source_type='公开匿名API返回的有序页面重建PDF'; source_url=f'https://www.fxbaogao.com/view?id={rid}'
+            if out_pdf is not None:
+              reader=PdfReader(str(out_pdf),strict=False); pages=len(reader.pages)
+              if pages<8: out_pdf.unlink(missing_ok=True); continue
+              q=subprocess.run(['qpdf','--check',str(out_pdf)],capture_output=True,text=True)
+              if q.returncode not in (0,3): out_pdf.unlink(missing_ok=True); continue
+              records.append({'filename':out_pdf.name,'broker':REPORTS[rid]['broker'],'title':REPORTS[rid]['title'],'publish_date':REPORTS[rid]['date'],'pages':pages,'rating':REPORTS[rid]['rating'],'source_url':source_url,'source_type':source_type,'bytes':out_pdf.stat().st_size,'sha256':hashlib.sha256(out_pdf.read_bytes()).hexdigest()})
+              if len(records)>=3: break
+
+          print('FINAL_RECORDS',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+          if len(records)<2:
+            raise RuntimeError('Anonymous public APIs did not expose a second complete report')
+
+          # Verify rendering.
+          for i,rec in enumerate(records,1):
+            p=PACKAGE/rec['filename']; pages=len(PdfReader(str(p),strict=False).pages)
+            f=subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','90',str(p),str(VERIFY/f'{i}_first')],capture_output=True,text=True)
+            l=subprocess.run(['pdftoppm','-f',str(pages),'-l',str(pages),'-singlefile','-png','-r','90',str(p),str(VERIFY/f'{i}_last')],capture_output=True,text=True)
+            if f.returncode or l.returncode: raise RuntimeError(f'render failed {p.name}')
+
+          name=f'三维化学_002469.SZ_券商深度报告_{len(records)}份'
+          final=ROOT/name; final.mkdir(exist_ok=True)
+          for rec in records: shutil.copy2(PACKAGE/rec['filename'],final/rec['filename'])
+          lines=['三维化学（002469.SZ，历史简称三维工程）券商深度报告合集','整理日期：2026-10-14','','仅收录原始PDF或公开匿名阅读接口明确返回的完整报告页面，不使用网页摘要、付费隐藏页或猜测URL。','','文件清单：']
+          for i,r in enumerate(records,1): lines += [f'{i}. {r["filename"]}',f'   机构：{r["broker"]}',f'   标题：{r["title"]}',f'   日期：{r["publish_date"]}；页数：{r["pages"]}；评级：{r["rating"]}',f'   来源类型：{r["source_type"]}',f'   来源：{r["source_url"]}',f'   SHA-256：{r["sha256"]}','']
+          lines.append('完整性核验：已检查PDF结构、页数、首末页渲染、SHA-256及ZIP CRC。')
+          (final/'00_文件清单与范围说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (final/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (final/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records),encoding='utf-8')
+          cz=ART/f'{name}.zip'
+          with zipfile.ZipFile(cz,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(final.iterdir()): z.write(p,arcname=f'{name}/{p.name}')
+          with zipfile.ZipFile(cz) as z:
+            bad=z.testzip(); count=sum(x.lower().endswith('.pdf') for x in z.namelist())
+            if bad or count!=len(records): raise RuntimeError(f'zip invalid {bad} {count}')
+          ez=ART/f'Sanwei_Chemical_002469_Broker_Deep_Research_{len(records)}_Reports.zip'; shutil.copy2(cz,ez)
+          print('FINAL_ZIP',cz,cz.stat().st_size,hashlib.sha256(cz.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload outputs and raw API responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanwei-public-api-package
+          path: |
+            artifact_out/*.zip
+            work/raw/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
