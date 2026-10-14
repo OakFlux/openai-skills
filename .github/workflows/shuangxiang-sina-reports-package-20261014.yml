@@ -1,0 +1,242 @@
+name: Package public Shuangxiang brokerage research reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shuangxiang-sina-reports-package-20261014.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Install PDF tools and Chinese fonts
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests beautifulsoup4 lxml weasyprint pypdf
+
+      - name: Discover, render, validate, and package reports
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, html as html_lib, json, re, subprocess, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup, Tag
+          from pypdf import PdfReader
+          from weasyprint import HTML
+
+          PACKAGE='双象股份_002395_券商研究报告公开网页归档版_3份'
+          OUT=Path(PACKAGE); OUT.mkdir(exist_ok=True)
+          RAW=OUT/'网页存档'; RAW.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':'https://finance.sina.com.cn/','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          def decode(content:bytes)->str:
+              for enc in ('gb18030','gbk','utf-8'):
+                  try:return content.decode(enc)
+                  except UnicodeDecodeError: pass
+              return content.decode('utf-8','replace')
+
+          def clean(text:str)->str:
+              text=html_lib.unescape(text).replace('\u3000',' ').replace('\xa0',' ')
+              text=re.sub(r'[ \t\r\f\v]+',' ',text)
+              text=re.sub(r'\n{3,}','\n\n',text)
+              return text.strip()
+
+          search_base='https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml'
+          searches=[
+              {'t1':'2','symbol':'002395'},
+              {'t1':'2','symbol':'sz002395'},
+              {'t1':'2','symbol':'双象股份'},
+              {'t1':'5','title':'双象股份'},
+              {'t1':'5','symbol':'双象股份'},
+          ]
+          detail_urls={
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/lastest/rptid/629760863215/index.phtml'
+          }
+          search_records=[]
+          for i,params in enumerate(searches,1):
+              try:
+                  r=s.get(search_base,params=params,timeout=90,allow_redirects=True)
+                  print('SEARCH',i,r.status_code,len(r.content),r.url,flush=True)
+                  text=decode(r.content); (RAW/f'search_{i}.html').write_text(text,encoding='utf-8')
+                  soup=BeautifulSoup(text,'lxml')
+                  for a in soup.find_all('a',href=True):
+                      href=urljoin(r.url,a['href']); label=clean(a.get_text(' ',strip=True))
+                      if 'vReport_Show' in href and 'rptid/' in href:
+                          detail_urls.add(href)
+                          search_records.append({'label':label,'url':href,'search':i})
+                  # Follow up to five pagination links preserving the same search.
+                  pages=[]
+                  for a in soup.find_all('a',href=True):
+                      href=urljoin(r.url,a['href'])
+                      if 'vReport_List/kind/search' in href and href not in pages and ('page' in href.lower() or 'p=' in href.lower()):
+                          pages.append(href)
+                  for j,href in enumerate(pages[:5],1):
+                      rr=s.get(href,timeout=90); tt=decode(rr.content); (RAW/f'search_{i}_page_{j}.html').write_text(tt,encoding='utf-8')
+                      ss=BeautifulSoup(tt,'lxml')
+                      for a in ss.find_all('a',href=True):
+                          u=urljoin(rr.url,a['href']); label=clean(a.get_text(' ',strip=True))
+                          if 'vReport_Show' in u and 'rptid/' in u:
+                              detail_urls.add(u); search_records.append({'label':label,'url':u,'search':f'{i}.{j}'})
+              except Exception as e:
+                  print('SEARCH_ERROR',i,repr(e),flush=True)
+
+          print('DETAIL_URLS',len(detail_urls),flush=True)
+          rows=[]
+          for idx,url in enumerate(sorted(detail_urls)):
+              if idx>=150: break
+              try:
+                  r=s.get(url,timeout=90,allow_redirects=True)
+                  if r.status_code!=200: continue
+                  text=decode(r.content); soup=BeautifulSoup(text,'lxml')
+                  full=clean(soup.get_text('\n',strip=True))
+                  title=''
+                  for sel in ['h1','#report_title','.report_title','.title','.main-title','h2']:
+                      node=soup.select_one(sel)
+                      if node:
+                          t=clean(node.get_text(' ',strip=True))
+                          if '双象股份' in t or '002395' in t: title=t; break
+                  if not title and soup.title: title=clean(soup.title.get_text(' ',strip=True)).replace('__新浪财经_新浪网','')
+                  if '双象股份' not in title and '002395' not in title and '双象股份' not in full[:1000]:
+                      continue
+                  one=re.sub(r'\s+',' ',full)
+                  def grab(pat):
+                      m=re.search(pat,one); return clean(m.group(1)) if m else ''
+                  meta={
+                    'category':grab(r'类别[：:]\s*([^\s]+)'),
+                    'broker':grab(r'机构[：:]\s*([^\n]+?)(?=\s+研究员[：:]|\s+日期[：:]|$)'),
+                    'researcher':grab(r'研究员[：:]\s*([^\n]+?)(?=\s+日期[：:]|$)'),
+                    'date':grab(r'日期[：:]\s*(\d{4}-\d{2}-\d{2})'),
+                  }
+                  candidates=[]
+                  for sel in ['#content','.content','.report_content','.report-content','.blk_container','.main-content','#main']:
+                      for node in soup.select(sel):
+                          txt=clean(node.get_text('\n',strip=True))
+                          if 350<=len(txt)<=50000: candidates.append((len(txt),node))
+                  root=min(candidates,key=lambda x:x[0])[1] if candidates else (soup.body or soup)
+                  for bad in root.select('script,style,noscript,form,iframe,nav,header,footer'): bad.decompose()
+                  parts=[]
+                  for node in root.find_all(['p','div','td','li','h2','h3'],recursive=True):
+                      if node.find(['p','div','td','li','h2','h3'],recursive=False): continue
+                      t=clean(node.get_text(' ',strip=True))
+                      if len(t)<8 or t==title or t in {'新浪财经','返回首页','打印','关闭','分享到'}: continue
+                      if any(x in t for x in ('新浪首页','财经首页','股票首页','意见反馈')) and len(t)<200: continue
+                      parts.append(t)
+                  dedup=[]; seen=set()
+                  for p in parts:
+                      k=re.sub(r'\s+','',p)
+                      if k in seen: continue
+                      seen.add(k); dedup.append(p)
+                  body='\n'.join(dedup)
+                  if len(body)<350:
+                      dedup=[clean(x) for x in root.get_text('\n',strip=True).splitlines() if len(clean(x))>=8]
+                      body='\n'.join(dedup)
+                  if len(body)<300: continue
+                  rid=(re.search(r'rptid/(\d+)',r.url) or re.search(r'rptid/(\d+)',url))
+                  rid=rid.group(1) if rid else str(idx)
+                  raw=RAW/f'{rid}.html'; raw.write_text(text,encoding='utf-8')
+                  score=0
+                  low=title.lower()
+                  if '深度' in title: score+=200
+                  if any(k in title for k in ('首次覆盖','公司研究','首次评级','推荐')): score+=80
+                  if '立足原料优势' in title: score+=150
+                  score+=min(len(body)//20,80)
+                  if meta['broker']: score+=20
+                  rows.append({'rid':rid,'url':r.url,'title':title,'meta':meta,'paragraphs':dedup,'body_chars':len(body),'score':score})
+                  print('CANDIDATE',json.dumps({'rid':rid,'title':title,'meta':meta,'body_chars':len(body),'score':score},ensure_ascii=False),flush=True)
+              except Exception as e:
+                  print('DETAIL_ERROR',url,repr(e),flush=True)
+
+          rows.sort(key=lambda x:(x['score'],x['meta'].get('date','')),reverse=True)
+          chosen=[]; keys=set(); brokers=set()
+          for row in rows:
+              key=re.sub(r'\W+','',row['title'])
+              if not key or key in keys: continue
+              # Prefer some institutional diversity when alternatives exist.
+              broker=row['meta'].get('broker','')
+              if len(chosen)>=1 and broker and broker in brokers and any(r['meta'].get('broker') not in brokers for r in rows if re.sub(r'\W+','',r['title']) not in keys):
+                  continue
+              chosen.append(row); keys.add(key); brokers.add(broker)
+              if len(chosen)==3: break
+          if len(chosen)<2:
+              raise RuntimeError(f'Only {len(chosen)} usable reports found. Candidates: '+json.dumps([r['title'] for r in rows],ensure_ascii=False))
+          chosen=chosen[:3]
+
+          def safe(v):
+              v=re.sub(r'[\\/:*?"<>|]+','_',v).strip(); v=re.sub(r'\s+','',v); return v[:72]
+
+          records=[]; hashes=set()
+          for i,row in enumerate(chosen,1):
+              meta=row['meta']; broker=meta.get('broker') or '券商机构'; date=meta.get('date') or '日期未标明'
+              filename=f'{i:02d}_{safe(broker)}_{date}_{safe(row["title"])}_公开网页归档版.pdf'
+              pdf=OUT/filename
+              paras='\n'.join(f'<p>{html_lib.escape(p)}</p>' for p in row['paragraphs'])
+              doc=f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+              @page {{ size:A4; margin:17mm 16mm 18mm; @bottom-center {{ content:counter(page); font-size:9pt; color:#666; }} }}
+              body {{ font-family:"Noto Sans CJK SC","Noto Sans CJK",sans-serif; font-size:10.3pt; line-height:1.65; color:#111; }}
+              h1 {{ font-size:17pt; line-height:1.35; margin:0 0 9pt; }}
+              .meta {{ border-top:1px solid #555; border-bottom:1px solid #aaa; padding:7pt 0; margin-bottom:10pt; font-size:9.3pt; }}
+              .notice {{ background:#f1f1f1; padding:8pt 10pt; margin-bottom:11pt; font-size:8.8pt; color:#444; }}
+              p {{ margin:0 0 6pt; text-align:justify; }}
+              .source {{ margin-top:14pt; padding-top:7pt; border-top:1px solid #aaa; font-size:8.2pt; color:#555; word-break:break-all; }}
+              </style></head><body>
+              <h1>{html_lib.escape(row['title'])}</h1>
+              <div class="meta">机构：{html_lib.escape(broker)}　研究员：{html_lib.escape(meta.get('researcher') or '公开页面未列明')}　日期：{html_lib.escape(date)}　类别：{html_lib.escape(meta.get('category') or '公司研究')}</div>
+              <div class="notice">版本说明：本文件依据新浪财经公开研究报告页面的可见正文制作，为网页打印归档版，并非券商原始排版PDF；原报告中的图表、页码及部分内容可能未在公开页面展示。</div>
+              {paras}
+              <div class="source">公开页面：{html_lib.escape(row['url'])}<br>抓取日期：2026-10-14　新浪报告编号：{row['rid']}</div>
+              </body></html>'''
+              HTML(string=doc,base_url=str(Path.cwd())).write_pdf(str(pdf))
+              reader=PdfReader(str(pdf),strict=False); pages=len(reader.pages)
+              if pages<1: raise RuntimeError('Empty PDF '+filename)
+              sample=''.join((reader.pages[j].extract_text() or '') for j in range(min(3,pages)))
+              compact=re.sub(r'\s+','',sample)
+              if '双象股份' not in compact and '002395' not in compact: raise RuntimeError('Identity check failed '+filename)
+              q=subprocess.run(['qpdf','--warning-exit-0','--check',str(pdf)],capture_output=True,text=True)
+              if q.returncode!=0: raise RuntimeError(q.stderr[-1000:])
+              rr=OUT/(pdf.stem+'_render'); p=subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','120',str(pdf),str(rr)],capture_output=True,text=True)
+              png=Path(str(rr)+'.png')
+              if p.returncode!=0 or not png.exists() or png.stat().st_size<8000: raise RuntimeError('Render failed '+filename)
+              render_size=png.stat().st_size; png.unlink()
+              data=pdf.read_bytes(); digest=hashlib.sha256(data).hexdigest()
+              if digest in hashes: raise RuntimeError('Duplicate PDF '+filename)
+              hashes.add(digest)
+              rec={'filename':filename,'company':'无锡双象超纤材料股份有限公司','stock_code':'002395.SZ','broker':broker,'researcher':meta.get('researcher'),'date':date,'title':row['title'],'source_url':row['url'],'sina_report_id':row['rid'],'archive_type':'公开网页打印归档版（非券商原始排版PDF）','visible_text_chars':row['body_chars'],'pages':pages,'bytes':len(data),'sha256':digest,'first_page_render_bytes':render_size}
+              records.append(rec); print('VALIDATED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          readme=['双象股份（002395.SZ）券商研究报告公开网页归档版','整理日期：2026-10-14','',f'本包收录{len(records)}份新浪财经公开研究报告页面的PDF打印归档版。','原始券商PDF未在当前公开渠道直接提供；这些文件保存公开页面可见正文，不等同于券商原始版式，图表、分页及部分正文可能不完整。','', '文件清单：']
+          for i,r in enumerate(records,1):
+              readme += [f"{i}. {r['broker']}，{r['date']}，{r['pages']}页",f"   标题：{r['title']}",f"   研究员：{r['researcher'] or '公开页面未列明'}",f"   文件：{r['filename']}",f"   公开来源：{r['source_url']}",f"   SHA-256：{r['sha256']}",'']
+          (OUT/'00_报告清单与版本说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'discovery_candidates.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+          z=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(z,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as a:
+              for p in sorted(OUT.rglob('*')):
+                  if p.is_file(): a.write(p,arcname=f'{PACKAGE}/{p.relative_to(OUT)}')
+          with zipfile.ZipFile(z) as a:
+              bad=a.testzip(); pdfs=[n for n in a.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs)!=len(records): raise RuntimeError(f'ZIP validation failed bad={bad} pdfs={len(pdfs)} records={len(records)}')
+          print('FINAL_ZIP',z.name,z.stat().st_size,'SHA256',hashlib.sha256(z.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload completed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shuangxiang-002395-public-brokerage-reports-20261014
+          path: 双象股份_002395_券商研究报告公开网页归档版_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
