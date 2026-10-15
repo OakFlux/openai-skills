@@ -1,0 +1,259 @@
+name: Package Tibet Pharmaceutical brokerage reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package-tibet-pharma-brokerage-reports-20261015.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests
+
+      - name: Download validate and package reports
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+
+          PACKAGE = '西藏药业_600211_券商深度及重点研究报告精选_3份'
+          ROOT = Path(PACKAGE)
+          PDF_DIR = ROOT / 'PDF文件'
+          VERIFY_DIR = ROOT / '验证记录'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          VERIFY_DIR.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'info_code': 'AP201908151344254483',
+                  'broker': '新时代证券',
+                  'date': '2019-08-15',
+                  'title': '西藏药业深度报告：新活素进入医保后持续高增长超预期，2019年迎来显著业绩拐点',
+                  'researcher': '崔文亮',
+                  'rating': '买入',
+                  'report_type': '公司深度报告',
+                  'expected_pages': 17,
+              },
+              {
+                  'info_code': 'AP201704240527609543',
+                  'broker': '国金证券',
+                  'date': '2017-04-24',
+                  'title': '新股东新气象，新模式新可能',
+                  'researcher': '李敬雷',
+                  'rating': 'PDF原文为准',
+                  'report_type': '公司深度研究报告',
+                  'expected_pages': 15,
+              },
+              {
+                  'info_code': 'AP202302221583569164',
+                  'broker': '华金证券',
+                  'date': '2023-02-23',
+                  'title': '新活素持续放量推动业绩高增长',
+                  'researcher': '周平',
+                  'rating': '买入',
+                  'report_type': '较长公司研究报告',
+                  'expected_pages': 8,
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def safe_name(text: str) -> str:
+              text = re.sub(r'[\\/:*?"<>|]+', '_', text)
+              text = re.sub(r'\s+', '', text).strip('._ ')
+              return text[:90]
+
+          def download_report(report: dict, destination: Path):
+              info_code = report['info_code']
+              public_page = f'https://data.eastmoney.com/report/info/{info_code}.html'
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{info_code}_1.pdf',
+              ]
+              attempts = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={
+                                  'User-Agent': session.headers['User-Agent'],
+                                  'Referer': public_page,
+                                  'Accept': 'application/pdf,*/*;q=0.8',
+                              },
+                              timeout=240,
+                              allow_redirects=True,
+                          )
+                          meta = {
+                              'requested_url': url,
+                              'final_url': response.url,
+                              'status': response.status_code,
+                              'content_type': response.headers.get('content-type'),
+                              'bytes': len(response.content),
+                              'attempt': attempt,
+                          }
+                          attempts.append(meta)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF') and len(response.content) > 100_000:
+                              destination.write_bytes(response.content)
+                              return public_page, response.url, attempts
+                      except Exception as exc:
+                          attempts.append({'requested_url': url, 'attempt': attempt, 'error': repr(exc)})
+                      time.sleep(attempt)
+              raise RuntimeError('Download failed: ' + json.dumps({'report': report, 'attempts': attempts}, ensure_ascii=False))
+
+          records = []
+          hashes = set()
+          for index, report in enumerate(reports, start=1):
+              filename = f'{index:02d}_{report["broker"]}_{report["date"]}_{safe_name(report["title"])}.pdf'
+              pdf_path = PDF_DIR / filename
+              public_page, source_url, attempts = download_report(report, pdf_path)
+              data = pdf_path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError('Duplicate PDF content: ' + filename)
+              hashes.add(digest)
+
+              qpdf = subprocess.run(['qpdf', '--warning-exit-0', '--check', str(pdf_path)], capture_output=True, text=True)
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f'qpdf failed for {filename}: {qpdf.stderr[-2000:]}')
+
+              info = subprocess.run(['pdfinfo', str(pdf_path)], capture_output=True, text=True)
+              if info.returncode != 0:
+                  raise RuntimeError(f'pdfinfo failed for {filename}: {info.stderr[-1500:]}')
+              page_match = re.search(r'^Pages:\s+(\d+)', info.stdout, re.M)
+              if not page_match:
+                  raise RuntimeError('Page count unavailable for ' + filename)
+              pages = int(page_match.group(1))
+              if pages != report['expected_pages']:
+                  raise RuntimeError(f'Page count mismatch for {filename}: {pages} != {report["expected_pages"]}')
+
+              text_path = VERIFY_DIR / (report['info_code'] + '_前10页.txt')
+              text_run = subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(10, pages)), '-layout', str(pdf_path), str(text_path)],
+                  capture_output=True,
+                  text=True,
+              )
+              if text_run.returncode != 0:
+                  raise RuntimeError(f'pdftotext failed for {filename}: {text_run.stderr[-1500:]}')
+              extracted = text_path.read_text(encoding='utf-8', errors='replace')
+              compact = re.sub(r'\s+', '', extracted)
+              if '西藏药业' not in compact and '600211' not in compact and '西藏诺迪康药业' not in compact:
+                  raise RuntimeError('Company identity check failed for ' + filename)
+              broker_key = report['broker'].replace('证券', '')
+              if broker_key not in compact and report['broker'] not in compact:
+                  raise RuntimeError('Broker identity check failed for ' + filename)
+              title_tokens = [token for token in re.split(r'[：，、“”\s]+', report['title']) if len(token) >= 4]
+              if not any(re.sub(r'\s+', '', token) in compact for token in title_tokens[:12]):
+                  raise RuntimeError('Title identity check failed for ' + filename)
+
+              render_prefix = VERIFY_DIR / (report['info_code'] + '_首页')
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120', str(pdf_path), str(render_prefix)],
+                  capture_output=True,
+                  text=True,
+              )
+              render_file = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not render_file.exists() or render_file.stat().st_size < 8_000:
+                  raise RuntimeError('First-page render failed for ' + filename)
+              render_bytes = render_file.stat().st_size
+              render_file.unlink()
+
+              record = {
+                  **report,
+                  'filename': f'PDF文件/{filename}',
+                  'public_report_page': public_page,
+                  'source_pdf_url': source_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_bytes,
+                  'download_attempts': attempts,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '西藏药业（600211.SH）券商深度及重点研究报告精选3份',
+              '整理日期：2026-10-15',
+              '',
+              '本包收录3份公开渠道可直接获取的券商原始排版完整PDF。',
+              '其中前两份为15页以上的公司深度报告；第三份为8页、时间较新的较长公司研究报告，用于补充近期经营逻辑。',
+              '未使用网页打印版、预览图片或3-5页常规点评报告补足数量。',
+              '',
+              '文件清单：',
+          ]
+          for idx, record in enumerate(records, start=1):
+              readme += [
+                  f'{idx}. {record["broker"]}，{record["date"]}，{record["pages"]}页',
+                  f'   标题：{record["title"]}',
+                  f'   分析师：{record["researcher"]}',
+                  f'   评级：{record["rating"]}',
+                  f'   类型：{record["report_type"]}',
+                  f'   文件：{record["filename"]}',
+                  f'   公开研报页面：{record["public_report_page"]}',
+                  f'   PDF来源：{record["source_pdf_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ]
+
+          (ROOT / '00_报告清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{record["sha256"]}  {record["filename"]}\n' for record in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{PACKAGE}/{path.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={len(pdfs)}')
+
+          print('FINAL_PACKAGE', json.dumps({
+              'filename': zip_path.name,
+              'bytes': zip_path.stat().st_size,
+              'sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'pdf_count': 3,
+              'reports': [{key: record[key] for key in ('broker', 'date', 'title', 'pages', 'info_code')} for record in records],
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload completed ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: tibet-pharma-600211-brokerage-reports-20261015
+          path: 西藏药业_600211_券商深度及重点研究报告精选_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
