@@ -1,0 +1,479 @@
+name: Package Haian Group 001233 broker reports 20261015
+
+on:
+  push:
+    paths:
+      - '.triggers/haian-001233-broker-reports-package-20261015.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4 lxml
+
+      - name: Discover download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CODE = '001233'
+          COMPANY = '海安集团'
+          FULL_COMPANY = '海安橡胶集团股份公司'
+          TODAY = dt.date(2026, 10, 15)
+          ROOT = Path('haian_broker_work')
+          DOWNLOADS = ROOT / 'downloads'
+          FINAL = ROOT / 'final'
+          RENDERS = ROOT / 'renders'
+          ART = Path('artifact_out')
+          for p in (DOWNLOADS, FINAL, RENDERS, ART):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/json,text/plain,text/html,application/pdf,*/*',
+              'Referer': 'https://data.eastmoney.com/report/',
+          })
+
+          def clean(v: object) -> str:
+              return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', html.unescape(str(v or '')))).strip()
+
+          def safe(v: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', v).strip(' ._')[:125]
+
+          raw_candidates: list[dict] = []
+
+          # Eastmoney company research APIs.
+          for endpoint, method in [
+              ('https://reportapi.eastmoney.com/report/list', 'GET'),
+              ('https://reportapi.eastmoney.com/report/list2', 'POST'),
+          ]:
+              for page in range(1, 12):
+                  try:
+                      if method == 'GET':
+                          params = {
+                              'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                              'rating': '*', 'ratingChange': '*',
+                              'beginTime': '2025-01-01', 'endTime': TODAY.isoformat(),
+                              'pageNo': str(page), 'fields': '', 'qType': '0',
+                              'orgCode': '', 'code': CODE, 'rcode': '',
+                              'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                          }
+                          r = session.get(endpoint, params=params, timeout=(20, 120))
+                      else:
+                          body = {
+                              'pageSize': 100, 'pageNo': page, 'p': page,
+                              'pageNum': page, 'pageNumber': page,
+                              'beginTime': '2025-01-01', 'endTime': TODAY.isoformat(),
+                              'code': CODE, 'industryCode': '*', 'rating': None,
+                              'ratingChange': None, 'orgCode': None, 'rcode': '',
+                          }
+                          r = session.post(endpoint, json=body, timeout=(20, 120), headers={'Content-Type': 'application/json'})
+                      print('EM_API', endpoint, page, r.status_code, len(r.content), flush=True)
+                      if r.status_code != 200:
+                          break
+                      rows = r.json().get('data') or []
+                      for row in rows:
+                          blob = json.dumps(row, ensure_ascii=False)
+                          if CODE in blob or COMPANY in blob or FULL_COMPANY in blob:
+                              item = dict(row)
+                              item['_source'] = 'eastmoney'
+                              raw_candidates.append(item)
+                      if len(rows) < 100:
+                          break
+                  except Exception as exc:
+                      print('EM_ERR', endpoint, page, repr(exc), flush=True)
+                      break
+
+          # Fxbaogao public anonymous metadata search, useful for newer/historical coverage.
+          fx_endpoint = 'https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          fx_bodies = []
+          for page in range(1, 10):
+              fx_bodies.append({'stockCodes': [CODE], 'pageNum': page, 'pageSize': 100, 'order': 1})
+          for query in [COMPANY, f'{COMPANY} 首次覆盖', f'{COMPANY} 深度', f'{COMPANY} 新股覆盖', f'{COMPANY} 巨胎']:
+              fx_bodies.append({'keywords': query, 'pageNum': 1, 'pageSize': 100, 'order': 1})
+          for i, body in enumerate(fx_bodies, 1):
+              try:
+                  r = session.post(
+                      fx_endpoint, json=body, timeout=(20, 120),
+                      headers={'Content-Type': 'application/json', 'Origin': 'https://www.fxbaogao.com', 'Referer': 'https://www.fxbaogao.com/'},
+                  )
+                  print('FX_API', i, r.status_code, len(r.content), json.dumps(body, ensure_ascii=False), flush=True)
+                  if r.status_code != 200:
+                      continue
+                  rows = ((r.json().get('data') or {}).get('dataList') or [])
+                  for row in rows:
+                      blob = json.dumps(row, ensure_ascii=False)
+                      if CODE in blob or COMPANY in blob or FULL_COMPANY in blob:
+                          item = dict(row)
+                          item['_source'] = 'fxbaogao'
+                          raw_candidates.append(item)
+              except Exception as exc:
+                  print('FX_ERR', i, repr(exc), flush=True)
+
+          # Public nxny index may expose additional metadata/detail IDs.
+          try:
+              r = session.get(f'https://www.nxny.com/stock/stock_{CODE}/', timeout=(20, 90), headers={'Referer': 'https://www.nxny.com/'})
+              print('NXNY_INDEX', r.status_code, len(r.content), flush=True)
+              if r.status_code == 200:
+                  text = r.content.decode('gb18030', errors='replace')
+                  soup = BeautifulSoup(text, 'lxml')
+                  for a in soup.find_all('a', href=True):
+                      href = urllib.parse.urljoin(r.url, a['href'])
+                      label = clean(a.get_text(' ', strip=True))
+                      m = re.search(r'/report/view_(\d+)\.html', href)
+                      if m and (CODE in label or COMPANY in label):
+                          raw_candidates.append({'_source': 'nxny', 'report_id': m.group(1), 'title': label, 'detail_url': href})
+          except Exception as exc:
+              print('NXNY_ERR', repr(exc), flush=True)
+
+          # Normalize and de-duplicate metadata.
+          normalized: list[dict] = []
+          seen_meta = set()
+          for row in raw_candidates:
+              source = row.get('_source')
+              title = clean(row.get('title') or row.get('reportTitle') or row.get('name') or '')
+              broker = clean(row.get('orgSName') or row.get('orgName') or row.get('publishOrgName') or '')
+              date = clean(row.get('publishDate') or row.get('pubTimeStr') or row.get('publishTime') or row.get('date') or '')
+              date_match = re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}', date)
+              date = date_match.group(0).replace('/', '-') if date_match else ''
+              pages_raw = row.get('attachPages') or row.get('pageNum') or row.get('pages') or 0
+              try:
+                  pages = int(pages_raw)
+              except Exception:
+                  pages = 0
+              info_code = str(row.get('infoCode') or '').strip()
+              doc_id = str(row.get('docId') or row.get('reportId') or row.get('id') or '').strip()
+              pdf_path = str(row.get('pdfPath') or '').strip().lstrip('/')
+              is_not_broker = bool(row.get('isNotBroker'))
+              doc_type = row.get('docType')
+              report_type = row.get('reportType')
+              is_deep = bool(row.get('isDeep'))
+              detail_url = str(row.get('detail_url') or '')
+
+              blob = json.dumps(row, ensure_ascii=False)
+              if not title or (CODE not in blob and COMPANY not in blob and FULL_COMPANY not in blob):
+                  continue
+              if is_not_broker or doc_type in (4, 5) or report_type in (14, 16):
+                  continue
+              if any(term in title for term in ['年度报告', '季度报告', '半年度报告', '机构调研', '调研纪要', '招股说明书']):
+                  continue
+              if broker in ('财报', '发现报告', '未知机构'):
+                  continue
+
+              key = (title, broker, date, info_code, doc_id, pdf_path)
+              if key in seen_meta:
+                  continue
+              seen_meta.add(key)
+              normalized.append({
+                  'source': source,
+                  'title': title,
+                  'broker': broker,
+                  'date': date,
+                  'pages_meta': pages,
+                  'info_code': info_code,
+                  'doc_id': doc_id,
+                  'pdf_path': pdf_path,
+                  'is_deep': is_deep,
+                  'detail_url': detail_url,
+                  'raw': row,
+              })
+
+          # Manually inject the well-known Huajin new-stock report if the APIs omit it.
+          known = {
+              'source': 'known',
+              'title': '新股覆盖研究：海安集团',
+              'broker': '华金证券',
+              'date': '2025-11-07',
+              'pages_meta': 11,
+              'info_code': '',
+              'doc_id': '',
+              'pdf_path': '',
+              'is_deep': True,
+              'detail_url': '',
+              'raw': {},
+          }
+          if not any('华金证券' == x['broker'] and '新股覆盖' in x['title'] for x in normalized):
+              normalized.append(known)
+
+          print('NORMALIZED_COUNT', len(normalized), flush=True)
+          for item in normalized:
+              print('META', json.dumps({k:v for k,v in item.items() if k != 'raw'}, ensure_ascii=False), flush=True)
+          (ROOT / 'all_metadata.json').write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def candidate_urls(item: dict) -> list[str]:
+              urls: list[str] = []
+              info = item['info_code']
+              if info:
+                  urls += [
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_01.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{info}_01.pdf',
+                  ]
+              path = item['pdf_path']
+              if path:
+                  urls += [
+                      'https://dr.fxbaogao.com/' + path,
+                      'https://public.fxbaogao.com/' + path,
+                      'https://report.fxbaogao.com/' + path,
+                      'https://oss-buy.hufangde.com/' + path,
+                  ]
+              if item['detail_url']:
+                  # The detail page may redirect to or expose a direct PDF.
+                  urls.append(item['detail_url'])
+              return list(dict.fromkeys(urls))
+
+          def score_meta(item: dict) -> int:
+              title = item['title']
+              pages = item['pages_meta']
+              score = 0
+              if item['is_deep']:
+                  score += 80
+              if '首次覆盖' in title:
+                  score += 90
+              if '深度' in title:
+                  score += 85
+              if '新股覆盖' in title or '新股研究' in title:
+                  score += 70
+              if '公司研究' in title or '巨胎龙头' in title or '进口替代' in title:
+                  score += 25
+              if pages >= 30:
+                  score += 45
+              elif pages >= 20:
+                  score += 35
+              elif pages >= 15:
+                  score += 25
+              elif pages >= 10:
+                  score += 18
+              elif pages >= 5:
+                  score += 6
+              if any(term in title for term in ['点评', '季报', '年报', '中报']):
+                  score -= 25
+              try:
+                  year = int(item['date'][:4])
+                  score += max(0, min(12, year - 2024))
+              except Exception:
+                  pass
+              return score
+
+          normalized.sort(key=lambda x: (score_meta(x), x['pages_meta'], x['date']), reverse=True)
+
+          valid: list[dict] = []
+          seen_hashes = set()
+          for idx, item in enumerate(normalized, 1):
+              urls = candidate_urls(item)
+              if not urls:
+                  continue
+              target = DOWNLOADS / f'candidate_{idx:03d}.pdf'
+              source_url = None
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          headers = {'Accept': 'application/pdf,*/*'}
+                          if 'fxbaogao' in url or 'hufangde' in url:
+                              headers['Referer'] = 'https://www.fxbaogao.com/'
+                          elif 'nxny' in url:
+                              headers['Referer'] = 'https://www.nxny.com/'
+                          else:
+                              headers['Referer'] = 'https://data.eastmoney.com/report/'
+                          r = session.get(url, timeout=(20, 180), allow_redirects=True, headers=headers)
+                          print('PDF_TRY', idx, attempt, r.status_code, len(r.content), url, 'FINAL', r.url, flush=True)
+                          if r.status_code == 200 and len(r.content) > 90_000 and r.content.startswith(b'%PDF-'):
+                              target.write_bytes(r.content)
+                              source_url = url
+                              break
+                          # Inspect nxny HTML for a direct link.
+                          if r.status_code == 200 and 'nxny.com/report/view_' in url and not r.content.startswith(b'%PDF-'):
+                              text = r.content.decode('gb18030', errors='replace')
+                              links = re.findall(r'https?://[^\s"\'<>]+', text)
+                              for link in links:
+                                  link = link.replace('\\/','/').rstrip(');,]}')
+                                  if '.pdf' in link.lower() or 'download' in link.lower():
+                                      urls.append(link)
+                          time.sleep(attempt)
+                      except Exception as exc:
+                          print('PDF_ERR', idx, url, repr(exc), flush=True)
+                          time.sleep(attempt)
+                  if source_url:
+                      break
+              if not source_url:
+                  target.unlink(missing_ok=True)
+                  continue
+
+              try:
+                  qpdf = subprocess.run(['qpdf', '--check', str(target)], capture_output=True, text=True)
+                  if qpdf.returncode not in (0, 3):
+                      raise RuntimeError(qpdf.stderr[-1000:])
+                  reader = PdfReader(str(target), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 3:
+                      raise RuntimeError(f'Only {pages} pages')
+                  text_parts = []
+                  indices = list(range(min(12, pages))) + list(range(max(0, pages - 2), pages))
+                  for pi in dict.fromkeys(indices):
+                      try:
+                          text_parts.append(reader.pages[pi].extract_text() or '')
+                      except Exception:
+                          pass
+                  sample = '\n'.join(text_parts)
+                  if COMPANY not in sample and FULL_COMPANY not in sample and CODE not in sample:
+                      raise RuntimeError('company identity absent')
+                  if not any(term in sample for term in ['证券研究报告', '公司研究', '研究报告', '投资评级', '新股研究']):
+                      raise RuntimeError('research-report identity absent')
+
+                  render_prefix = RENDERS / f'render_{idx:03d}'
+                  render = subprocess.run(
+                      ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(target), str(render_prefix)],
+                      capture_output=True, text=True,
+                  )
+                  rendered = Path(str(render_prefix) + '.png')
+                  if render.returncode != 0 or not rendered.exists() or rendered.stat().st_size < 8_000:
+                      raise RuntimeError('first-page render failed')
+
+                  data = target.read_bytes()
+                  sha = hashlib.sha256(data).hexdigest()
+                  if sha in seen_hashes:
+                      raise RuntimeError('duplicate PDF')
+                  seen_hashes.add(sha)
+                  rec = {
+                      **{k:v for k,v in item.items() if k != 'raw'},
+                      'pages': pages,
+                      'bytes': len(data),
+                      'sha256': sha,
+                      'source_url': source_url,
+                      'file': str(target),
+                      'score': score_meta(item) + min(pages, 40),
+                  }
+                  valid.append(rec)
+                  print('VALID', json.dumps({k:rec[k] for k in ('broker','title','date','pages','score','source_url')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('REJECT', item['title'], repr(exc), flush=True)
+                  target.unlink(missing_ok=True)
+
+          if len(valid) < 2:
+              raise RuntimeError(f'Only {len(valid)} valid public broker reports found')
+
+          valid.sort(key=lambda x: (x['score'], x['pages'], x['date']), reverse=True)
+          selected: list[dict] = []
+          used_brokers = set()
+          for rec in valid:
+              if rec['broker'] and rec['broker'] not in used_brokers:
+                  selected.append(rec)
+                  used_brokers.add(rec['broker'])
+              if len(selected) == 3:
+                  break
+          if len(selected) < min(3, len(valid)):
+              for rec in valid:
+                  if rec not in selected:
+                      selected.append(rec)
+                  if len(selected) == min(3, len(valid)):
+                      break
+
+          manifest = []
+          for number, rec in enumerate(selected, 1):
+              broker = rec['broker'] or '未知券商'
+              date = rec['date'] or '日期未知'
+              filename = f'{number:02d}_{safe(date)}_{safe(broker)}_{safe(rec["title"])}.pdf'
+              source_path = Path(rec['file'])
+              dest = FINAL / filename
+              dest.write_bytes(source_path.read_bytes())
+              classification = '公司研究报告'
+              if '首次覆盖' in rec['title']:
+                  classification = '首次覆盖深度报告'
+              elif '深度' in rec['title'] or rec['is_deep']:
+                  classification = '公司深度报告'
+              elif '新股覆盖' in rec['title'] or '新股研究' in rec['title']:
+                  classification = '新股覆盖研究'
+              manifest.append({
+                  'filename': filename,
+                  'broker': broker,
+                  'title': rec['title'],
+                  'date': date,
+                  'classification': classification,
+                  'pages': rec['pages'],
+                  'bytes': rec['bytes'],
+                  'sha256': rec['sha256'],
+                  'source_url': rec['source_url'],
+              })
+
+          readme = [
+              '海安集团（001233.SZ）券商深度及公司研究报告精选',
+              f'整理日期：{TODAY.isoformat()}',
+              '',
+              f'本压缩包收录{len(manifest)}份公开、完整且可直接核验的券商研究PDF。',
+              '筛选时优先选择首次覆盖、深度、新股覆盖及页数较长的公司研究，并尽量分散券商来源。',
+              '未使用网页摘要、预览页或残缺文件替代完整报告。',
+              '',
+              '文件清单：',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme += [
+                  f'{i}. {item["filename"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   类型：{item["classification"]}',
+                  f'   标题：{item["title"]}',
+                  f'   日期：{item["date"]}；页数：{item["pages"]}；大小：{item["bytes"]} bytes',
+                  f'   公开PDF：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ]
+          readme.append('完整性检查：已检查PDF文件头、公司名称/证券代码、研究报告属性、实际页数、qpdf结构、首页渲染、重复文件及ZIP CRC。')
+
+          (FINAL / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest), encoding='utf-8')
+
+          zip_name = f'海安集团_001233_券商深度及公司研究报告_{len(manifest)}份.zip'
+          zip_path = ART / zip_name
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for p in sorted(FINAL.iterdir()):
+                  archive.write(p, arcname=p.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_count = sum(1 for name in archive.namelist() if name.lower().endswith('.pdf'))
+              if pdf_count != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(manifest)}')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('SELECTED_FINAL', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: haian-001233-broker-reports
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
