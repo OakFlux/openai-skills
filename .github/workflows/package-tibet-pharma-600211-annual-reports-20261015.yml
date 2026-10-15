@@ -59,6 +59,9 @@ jobs:
               text = text.replace('&nbsp;', ' ').replace('：', ':')
               return re.sub(r'[\s:：()（）]+', '', text)
 
+          def clean_title(text: str) -> str:
+              return re.sub(r'<[^>]+>', '', str(text or '')).strip()
+
           def date_from_cninfo(item: dict[str, Any]) -> str:
               path = str(item.get('adjunctUrl') or '')
               match = re.search(r'finalpage/(\d{4}-\d{2}-\d{2})/', path)
@@ -69,14 +72,9 @@ jobs:
                   return datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
               return ''
 
-          # Query CNINFO with several issuer-id conventions and use the first one that returns records.
+          # CNINFO metadata.
           cninfo_api = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
-          stock_variants = [
-              '600211,gssh0600211',
-              '600211,gssse0600211',
-              '600211,sse600211',
-              '600211',
-          ]
+          stock_variants = ['600211,gssh0600211', '600211,gssse0600211', '600211,sse600211', '600211']
           cninfo_announcements: list[dict[str, Any]] = []
           successful_stock = None
           for stock_value in stock_variants:
@@ -84,21 +82,11 @@ jobs:
               seen = set()
               total = None
               try:
-                  for page in range(1, 30):
+                  for page in range(1, 35):
                       form = {
-                          'pageNum': str(page),
-                          'pageSize': '30',
-                          'column': 'sse',
-                          'tabName': 'fulltext',
-                          'plate': 'sh',
-                          'stock': stock_value,
-                          'searchkey': '',
-                          'secid': '',
-                          'category': '',
-                          'trade': '',
-                          'seDate': '2020-01-01~2026-10-15',
-                          'sortName': '',
-                          'sortType': '',
+                          'pageNum': str(page), 'pageSize': '30', 'column': 'sse', 'tabName': 'fulltext',
+                          'plate': 'sh', 'stock': stock_value, 'searchkey': '', 'secid': '', 'category': '',
+                          'trade': '', 'seDate': '2020-01-01~2026-10-15', 'sortName': '', 'sortType': '',
                           'isHLtitle': 'true',
                       }
                       response = session.post(
@@ -130,18 +118,15 @@ jobs:
                       break
               except Exception as exc:
                   print('CNINFO_VARIANT_FAILED', stock_value, repr(exc), flush=True)
-
-          if not cninfo_announcements:
-              raise RuntimeError('CNINFO returned no announcements for any issuer-id variant')
           (VERIFY_DIR / 'CNINFO_公告元数据.json').write_text(json.dumps({
               'stock_variant': successful_stock,
               'announcements': cninfo_announcements,
           }, ensure_ascii=False, indent=2), encoding='utf-8')
 
-          # Eastmoney public announcement metadata is retained as an independent fallback and cross-check.
+          # Eastmoney metadata. This index is used to backfill years not returned by CNINFO pagination.
           eastmoney_api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
           eastmoney_announcements: list[dict[str, Any]] = []
-          for page in range(1, 15):
+          for page in range(1, 20):
               response = session.get(
                   eastmoney_api,
                   params={'sr': '-1', 'page_size': '100', 'page_index': str(page), 'ann_type': 'A', 'client_source': 'web', 'stock_list': CODE},
@@ -154,14 +139,32 @@ jobs:
                   break
               eastmoney_announcements.extend(rows)
               dates = [str(row.get('notice_date') or '') for row in rows]
-              if dates and min(dates) < '2020-01-01':
+              if dates and min(dates) < '2019-01-01':
                   break
           (VERIFY_DIR / '东方财富公告镜像元数据.json').write_text(json.dumps(eastmoney_announcements, ensure_ascii=False, indent=2), encoding='utf-8')
 
+          def source_record_from_cninfo(item: dict[str, Any]) -> dict[str, Any]:
+              return {
+                  'source': 'cninfo',
+                  'title': clean_title(item.get('announcementTitle')),
+                  'date': date_from_cninfo(item),
+                  'cninfo': item,
+                  'eastmoney': None,
+              }
+
+          def source_record_from_eastmoney(item: dict[str, Any]) -> dict[str, Any]:
+              return {
+                  'source': 'eastmoney',
+                  'title': clean_title(item.get('title')),
+                  'date': str(item.get('notice_date') or '')[:10],
+                  'cninfo': None,
+                  'eastmoney': item,
+              }
+
           annual_by_year: dict[int, dict[str, Any]] = {}
-          for item in cninfo_announcements:
-              title = compact(item.get('announcementTitle'))
-              if '摘要' in title or '英文' in title:
+          for record in [source_record_from_cninfo(item) for item in cninfo_announcements] + [source_record_from_eastmoney(item) for item in eastmoney_announcements]:
+              title = compact(record['title'])
+              if '摘要' in title or '正文' in title or '英文' in title:
                   continue
               match = re.search(r'(20\d{2})年年度报告(?:修订版)?$', title)
               if not match:
@@ -170,50 +173,64 @@ jobs:
               if not 2020 <= year <= 2025:
                   continue
               old = annual_by_year.get(year)
-              if old is None or date_from_cninfo(item) > date_from_cninfo(old):
-                  annual_by_year[year] = item
+              preference = 1 if record['source'] == 'cninfo' else 0
+              old_preference = 1 if old and old['source'] == 'cninfo' else 0
+              if old is None or (record['date'], preference) > (old['date'], old_preference):
+                  annual_by_year[year] = record
 
           annual_years = sorted(annual_by_year)
           if annual_years != [2020, 2021, 2022, 2023, 2024, 2025]:
-              raise RuntimeError(f'Annual-report coverage mismatch from CNINFO: {annual_years}')
+              found_titles = [record['title'] for record in annual_by_year.values()]
+              raise RuntimeError(f'Annual-report coverage mismatch: years={annual_years}, titles={found_titles}')
 
           quarter_candidates: list[dict[str, Any]] = []
-          for item in cninfo_announcements:
-              title = compact(item.get('announcementTitle'))
+          for record in [source_record_from_cninfo(item) for item in cninfo_announcements] + [source_record_from_eastmoney(item) for item in eastmoney_announcements]:
+              title = compact(record['title'])
               if '摘要' in title or '正文' in title or '英文' in title:
                   continue
               if re.search(r'20\d{2}年第(?:一|三)季度报告$', title):
-                  quarter_candidates.append(item)
+                  quarter_candidates.append(record)
           if not quarter_candidates:
-              raise RuntimeError('No formal quarterly report found in CNINFO metadata')
-          latest_quarter = max(quarter_candidates, key=lambda item: (date_from_cninfo(item), compact(item.get('announcementTitle'))))
-          latest_quarter_title = re.sub(r'<[^>]+>', '', str(latest_quarter.get('announcementTitle') or '')).strip()
+              raise RuntimeError('No formal quarterly report found')
+          latest_quarter = max(quarter_candidates, key=lambda record: (record['date'], 1 if record['source'] == 'cninfo' else 0, compact(record['title'])))
+          latest_quarter_title = latest_quarter['title']
           quarter_year_match = re.search(r'(20\d{2})年', latest_quarter_title)
           quarter_year = int(quarter_year_match.group(1)) if quarter_year_match else 2026
           quarter_label = '第三季度报告' if '第三季度' in latest_quarter_title else '第一季度报告'
 
           selections: list[dict[str, Any]] = []
           for index, year in enumerate(annual_years, start=1):
-              item = annual_by_year[year]
-              title = re.sub(r'<[^>]+>', '', str(item.get('announcementTitle') or '')).strip()
-              selections.append({
+              record = dict(annual_by_year[year])
+              record.update({
                   'kind': '年度报告',
                   'year': year,
-                  'title': title,
-                  'date': date_from_cninfo(item),
-                  'cninfo': item,
                   'filename': f'{index:02d}_西藏药业_{year}年年度报告.pdf',
               })
-          selections.append({
+              selections.append(record)
+          quarter_record = dict(latest_quarter)
+          quarter_record.update({
               'kind': '最新季报',
               'year': quarter_year,
-              'title': latest_quarter_title,
-              'date': date_from_cninfo(latest_quarter),
-              'cninfo': latest_quarter,
               'filename': f'07_西藏药业_{quarter_year}年{quarter_label}_最新季报.pdf',
           })
+          selections.append(quarter_record)
+
+          def match_cninfo(selection: dict[str, Any]) -> dict[str, Any] | None:
+              if selection.get('cninfo'):
+                  return selection['cninfo']
+              target = compact(selection['title'])
+              candidates = []
+              for item in cninfo_announcements:
+                  title = compact(item.get('announcementTitle'))
+                  if title == target or title.endswith(target) or target.endswith(title):
+                      candidates.append(item)
+              if candidates:
+                  return max(candidates, key=lambda item: date_from_cninfo(item))
+              return None
 
           def match_eastmoney(selection: dict[str, Any]) -> dict[str, Any] | None:
+              if selection.get('eastmoney'):
+                  return selection['eastmoney']
               target = compact(selection['title'])
               candidates = []
               for item in eastmoney_announcements:
@@ -237,11 +254,11 @@ jobs:
               return max(candidates, key=lambda item: str(item.get('notice_date') or '')) if candidates else None
 
           def download_pdf(selection: dict[str, Any], destination: Path) -> tuple[str, str, list[dict[str, Any]]]:
-              cninfo_item = selection['cninfo']
+              cninfo_item = match_cninfo(selection)
               eastmoney_item = match_eastmoney(selection)
               candidates: list[tuple[str, str]] = []
-              adjunct_url = str(cninfo_item.get('adjunctUrl') or '')
-              if adjunct_url:
+              if cninfo_item and cninfo_item.get('adjunctUrl'):
+                  adjunct_url = str(cninfo_item['adjunctUrl'])
                   candidates.extend([
                       ('巨潮资讯官方静态披露文件', 'https://static.cninfo.com.cn/' + adjunct_url.lstrip('/')),
                       ('巨潮资讯官方静态披露文件HTTP', 'http://static.cninfo.com.cn/' + adjunct_url.lstrip('/')),
@@ -252,6 +269,8 @@ jobs:
                       ('东方财富公告PDF镜像H2', f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf'),
                       ('东方财富公告PDF镜像H3', f'https://pdf.dfcfw.com/pdf/H3_{art_code}_1.pdf'),
                   ])
+              if not candidates:
+                  raise RuntimeError(f'No download candidate for {selection["title"]}')
 
               attempts: list[dict[str, Any]] = []
               for source_name, url in candidates:
@@ -299,7 +318,6 @@ jobs:
               qpdf = subprocess.run(['qpdf', '--warning-exit-0', '--check', str(path)], capture_output=True, text=True)
               if qpdf.returncode != 0:
                   raise RuntimeError(f'qpdf failed for {path.name}: {qpdf.stderr[-2000:]}')
-
               info = subprocess.run(['pdfinfo', str(path)], capture_output=True, text=True)
               if info.returncode != 0:
                   raise RuntimeError(f'pdfinfo failed for {path.name}: {info.stderr[-1500:]}')
@@ -341,18 +359,24 @@ jobs:
               render_bytes = render_file.stat().st_size
               render_file.unlink()
 
-              eastmoney_match = match_eastmoney(selection)
-              cninfo_item = selection['cninfo']
-              cninfo_url = 'https://static.cninfo.com.cn/' + str(cninfo_item.get('adjunctUrl') or '').lstrip('/')
+              cninfo_item = match_cninfo(selection)
+              eastmoney_item = match_eastmoney(selection)
+              official_url = None
+              if cninfo_item and cninfo_item.get('adjunctUrl'):
+                  official_url = 'https://static.cninfo.com.cn/' + str(cninfo_item['adjunctUrl']).lstrip('/')
+              elif eastmoney_item and eastmoney_item.get('art_code'):
+                  official_url = f'https://data.eastmoney.com/notices/detail/{CODE}/{eastmoney_item["art_code"]}.html'
+
               record = {
                   'filename': f'PDF文件/{path.name}',
                   'document_type': selection['kind'],
                   'title': selection['title'],
                   'report_year': selection['year'],
                   'disclosure_date': selection['date'],
-                  'official_cninfo_url': cninfo_url,
-                  'cninfo_announcement_id': cninfo_item.get('announcementId'),
-                  'eastmoney_art_code': eastmoney_match.get('art_code') if eastmoney_match else None,
+                  'metadata_source': selection['source'],
+                  'official_or_public_source_url': official_url,
+                  'cninfo_announcement_id': cninfo_item.get('announcementId') if cninfo_item else None,
+                  'eastmoney_art_code': eastmoney_item.get('art_code') if eastmoney_item else None,
                   'download_source': source_name,
                   'download_url': source_url,
                   'pages': pages,
@@ -373,7 +397,7 @@ jobs:
               f'2. 截至整理日已披露的最新正式季度报告：{latest_quarter_title}，共1份。',
               '',
               '说明：年度报告仅收录全文，不以摘要替代；最新季报按第一季度报告或第三季度报告口径确定，半年度报告不作为季报替代。',
-              '文件选择、披露日期和原始PDF以巨潮资讯公开披露记录为准，并使用东方财富公告镜像进行交叉核验和下载回退。',
+              '文件通过巨潮资讯及东方财富公开公告索引交叉核对，优先下载巨潮资讯官方静态PDF，缺失年份使用东方财富公告PDF镜像。',
               '',
               '文件清单：',
           ]
@@ -384,7 +408,7 @@ jobs:
                   f'   披露日期：{record["disclosure_date"]}',
                   f'   页数：{record["pages"]}',
                   f'   下载来源：{record["download_source"]}',
-                  f'   巨潮资讯地址：{record["official_cninfo_url"]}',
+                  f'   公告来源：{record["official_or_public_source_url"]}',
                   f'   SHA-256：{record["sha256"]}',
                   '',
               ]
