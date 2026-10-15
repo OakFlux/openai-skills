@@ -1,4 +1,4 @@
-name: Probe public Fxbaogao viewers with browser network capture 20261015
+name: Probe Yongtai Eastmoney broker PDFs with browser session 20261015
 
 on:
   push:
@@ -14,113 +14,149 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Install Playwright
+      - name: Install tools
         run: |
-          python -m pip install --quiet playwright
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl wget qpdf poppler-utils
+          python -m pip install --quiet playwright pypdf requests
           python -m playwright install --with-deps chromium
 
-      - name: Capture viewer network traffic
+      - name: Try browser and HTTP download variants
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/probe.py <<'PY'
+          cat > /tmp/eastmoney_probe.py <<'PY'
           from __future__ import annotations
           import asyncio
+          import hashlib
           import json
+          import os
+          import subprocess
+          import time
           from pathlib import Path
-          from urllib.parse import urlparse
+          from typing import Any
+          from urllib.parse import quote
           from playwright.async_api import async_playwright
+          from pypdf import PdfReader
 
-          TARGETS = [
-              ('guolian_3393203', 'https://www.fxbaogao.com/view?id=3393203'),
-              ('guosheng_2745967', 'https://www.fxbaogao.com/view?id=2745967'),
-              ('zhongtai_2714314', 'https://www.fxbaogao.com/view?id=2714314'),
+          REPORTS = [
+              {'key':'guolian_20220929','ap':'AP202209291578773236','title':'构建产业链一体化，打造业绩新曲线'},
+              {'key':'haitong_20230523','ap':'AP202305231587068941','title':'以含氟技术为核心，持续深耕锂电材料及医药板块'},
+              {'key':'guosheng_20210712','ap':'AP202107121503339193','title':'从含氟精细化学品出发，抢攻锂电池电解液材料制高点'},
+              {'key':'zhongtai_20210615','ap':'AP202106151498032996','title':'氟化工龙头，六氟、VC高弹性品种'},
           ]
+          OUT = Path('eastmoney_probe_output'); OUT.mkdir(exist_ok=True)
+          logs=[]
+
+          def is_pdf(data: bytes) -> bool:
+              return len(data)>100000 and data[:5]==b'%PDF-'
 
           async def main():
-              results=[]
               async with async_playwright() as p:
-                  browser=await p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
+                  browser=await p.chromium.launch(headless=True,args=['--disable-blink-features=AutomationControlled'])
                   context=await browser.new_context(
                       viewport={'width':1440,'height':1000},
                       user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
                       locale='zh-CN',
                   )
-                  for label,url in TARGETS:
-                      page=await context.new_page()
-                      responses=[]
-                      requests=[]
-                      console=[]
-                      page.on('console', lambda msg, c=console: c.append({'type':msg.type,'text':msg.text}))
-                      def on_request(req):
-                          u=req.url
-                          if any(k in u.lower() for k in ['pdf','report','document','preview','image','api','file','readreport']):
-                              requests.append({'url':u,'method':req.method,'resource_type':req.resource_type,'post_data':req.post_data})
-                      async def on_response(resp):
-                          u=resp.url
+                  page=await context.new_page()
+                  for rep in REPORTS:
+                      ap=rep['ap']; key=rep['key']; rec={**rep,'page_visits':[],'attempts':[],'successes':[]}
+                      detail_urls=[
+                          f'https://data.eastmoney.com/report/zw_stock.jshtml?infocode={ap}',
+                          f'https://data.eastmoney.com/report/info/{ap}.html',
+                          f'https://data.eastmoney.com/report/',
+                      ]
+                      for u in detail_urls:
                           try:
-                              ct=(await resp.all_headers()).get('content-type','')
-                          except Exception:
-                              ct=''
-                          if any(k in u.lower() for k in ['pdf','report','document','preview','image','api','file','readreport']) or any(k in ct.lower() for k in ['pdf','json','image']):
-                              rec={'url':u,'status':resp.status,'content_type':ct,'resource_type':resp.request.resource_type}
+                              resp=await page.goto(u,wait_until='domcontentloaded',timeout=60000)
+                              await page.wait_for_timeout(3000)
+                              rec['page_visits'].append({'url':u,'final_url':page.url,'status':resp.status if resp else None,'title':await page.title(),'body':(await page.locator('body').inner_text())[:3000]})
+                          except Exception as exc:
+                              rec['page_visits'].append({'url':u,'error':repr(exc)})
+                      cookies=await context.cookies()
+                      rec['cookies']=[{'name':c['name'],'domain':c['domain'],'path':c['path']} for c in cookies]
+
+                      base_urls=[]
+                      for prefix in ['H3','H2','H1','H4']:
+                          base_urls.extend([
+                              f'https://pdf.dfcfw.com/pdf/{prefix}_{ap}_1.pdf',
+                              f'http://pdf.dfcfw.com/pdf/{prefix}_{ap}_1.pdf',
+                          ])
+                      variants=[]
+                      now=str(int(time.time()*1000))
+                      for u in base_urls:
+                          variants.extend([u,u+'?v='+now,u+'?download=1',u+'?'+now])
+
+                      for idx,u in enumerate(variants):
+                          headers_list=[
+                              {'Referer':f'https://data.eastmoney.com/report/zw_stock.jshtml?infocode={ap}','Accept':'application/pdf,*/*;q=0.8','Accept-Encoding':'identity'},
+                              {'Referer':'https://data.eastmoney.com/report/','Accept':'*/*','Range':'bytes=0-'},
+                              {'Referer':'https://data.eastmoney.com/','Accept':'application/pdf','Sec-Fetch-Dest':'document','Sec-Fetch-Mode':'navigate','Sec-Fetch-Site':'same-site'},
+                          ]
+                          for hidx,headers in enumerate(headers_list):
                               try:
-                                  headers=await resp.all_headers()
-                                  rec['content_length']=headers.get('content-length')
-                                  rec['content_disposition']=headers.get('content-disposition')
-                              except Exception:
-                                  pass
-                              responses.append(rec)
-                      page.on('request',on_request)
-                      page.on('response',on_response)
-                      error=None
-                      try:
-                          await page.goto(url,wait_until='domcontentloaded',timeout=120000)
-                          await page.wait_for_timeout(20000)
-                          await page.screenshot(path=f'{label}.png',full_page=True)
-                          html=await page.content()
-                          Path(f'{label}.html').write_text(html,encoding='utf-8')
-                          frames=[]
-                          for f in page.frames:
-                              frames.append({'name':f.name,'url':f.url})
-                          dom=await page.evaluate('''() => ({
-                            title: document.title,
-                            url: location.href,
-                            bodyText: document.body ? document.body.innerText.slice(0,20000) : '',
-                            iframes: Array.from(document.querySelectorAll('iframe')).map(x=>({src:x.src,id:x.id,name:x.name})),
-                            images: Array.from(document.images).map(x=>x.src).filter(Boolean).slice(0,1000),
-                            anchors: Array.from(document.querySelectorAll('a')).map(x=>({text:(x.innerText||'').trim(),href:x.href})).filter(x=>x.href).slice(0,1000),
-                            localStorage: Object.fromEntries(Object.keys(localStorage).map(k=>[k,localStorage.getItem(k)])),
-                            sessionStorage: Object.fromEntries(Object.keys(sessionStorage).map(k=>[k,sessionStorage.getItem(k)]))
-                          })''')
-                          cookies=await context.cookies()
-                      except Exception as exc:
-                          error=repr(exc); frames=[]; dom={}; cookies=[]
-                      rec={'label':label,'input_url':url,'error':error,'frames':frames,'dom':dom,'cookies':cookies,'requests':requests,'responses':responses,'console':console}
-                      results.append(rec)
-                      print('\nTARGET',label,'ERROR',error)
-                      print('FRAMES',json.dumps(frames,ensure_ascii=False,indent=2))
-                      print('DOM',json.dumps(dom,ensure_ascii=False,indent=2)[:50000])
-                      print('REQUESTS',json.dumps(requests,ensure_ascii=False,indent=2)[:100000])
-                      print('RESPONSES',json.dumps(responses,ensure_ascii=False,indent=2)[:100000])
-                      await page.close()
+                                  response=await context.request.get(u,headers=headers,timeout=90000,fail_on_status_code=False)
+                                  data=await response.body()
+                                  meta={'method':'playwright_request','url':u,'headers_variant':hidx,'status':response.status,'bytes':len(data),'content_type':response.headers.get('content-type'),'content_length':response.headers.get('content-length'),'sha256':hashlib.sha256(data).hexdigest() if data else None}
+                                  rec['attempts'].append(meta)
+                                  if is_pdf(data):
+                                      path=OUT/f'{key}_pw_{idx}_{hidx}.pdf';path.write_bytes(data)
+                                      meta['saved']=str(path);rec['successes'].append(meta)
+                                      break
+                              except Exception as exc:
+                                  rec['attempts'].append({'method':'playwright_request','url':u,'headers_variant':hidx,'error':repr(exc)})
+                          if rec['successes']:
+                              break
+
+                      # curl variants can occasionally work when the Python/browser API returns an empty body.
+                      if not rec['successes']:
+                          cookie_header='; '.join(f"{c['name']}={c['value']}" for c in cookies if 'eastmoney' in c['domain'] or 'dfcfw' in c['domain'])
+                          for idx,u in enumerate(variants[:16]):
+                              path=OUT/f'{key}_curl_{idx}.bin'
+                              cmd=['curl','--http1.1','--location','--fail','--silent','--show-error','--max-time','120','--retry','2','--retry-delay','1','-A','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36','-e',f'https://data.eastmoney.com/report/zw_stock.jshtml?infocode={ap}','-H','Accept: application/pdf,*/*;q=0.8','-H','Accept-Encoding: identity','-H','Range: bytes=0-','-o',str(path),u]
+                              if cookie_header:
+                                  cmd[1:1]=['-b',cookie_header]
+                              cp=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                              data=path.read_bytes() if path.exists() else b''
+                              meta={'method':'curl','url':u,'returncode':cp.returncode,'bytes':len(data),'stderr':cp.stderr[-1000:],'sha256':hashlib.sha256(data).hexdigest() if data else None}
+                              rec['attempts'].append(meta)
+                              if is_pdf(data):
+                                  final=OUT/f'{key}_curl.pdf';path.rename(final);meta['saved']=str(final);rec['successes'].append(meta);break
+                              path.unlink(missing_ok=True)
+
+                      logs.append(rec)
+                      print('\nREPORT',key,'SUCCESSES',len(rec['successes']))
+                      print(json.dumps(rec,ensure_ascii=False,indent=2)[:80000])
                   await browser.close()
-              Path('fxbaogao_browser_probe.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+
+              # Validate any successful PDF and create compact inventory.
+              inventory=[]
+              for pdf in sorted(OUT.glob('*.pdf')):
+                  try:
+                      reader=PdfReader(str(pdf),strict=False);pages=len(reader.pages)
+                      q=subprocess.run(['qpdf','--warning-exit-0','--check',str(pdf)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+                      inventory.append({'file':str(pdf),'bytes':pdf.stat().st_size,'pages':pages,'sha256':hashlib.sha256(pdf.read_bytes()).hexdigest(),'qpdf_returncode':q.returncode,'qpdf_output':q.stdout[-2000:]})
+                  except Exception as exc:
+                      inventory.append({'file':str(pdf),'error':repr(exc)})
+              Path('eastmoney_probe.json').write_text(json.dumps({'reports':logs,'inventory':inventory},ensure_ascii=False,indent=2),encoding='utf-8')
+              print('INVENTORY',json.dumps(inventory,ensure_ascii=False,indent=2))
+
           asyncio.run(main())
           PY
           cd /tmp
-          python probe.py
-          cp fxbaogao_browser_probe.json "$GITHUB_WORKSPACE/"
-          cp *.html *.png "$GITHUB_WORKSPACE/" || true
+          python eastmoney_probe.py
+          cp eastmoney_probe.json "$GITHUB_WORKSPACE/"
+          mkdir -p "$GITHUB_WORKSPACE/eastmoney_probe_output"
+          cp -f eastmoney_probe_output/* "$GITHUB_WORKSPACE/eastmoney_probe_output/" 2>/dev/null || true
 
-      - name: Upload browser probe
+      - name: Upload probe output
         uses: actions/upload-artifact@v4
         with:
-          name: fxbaogao-browser-probe
+          name: yongtai-eastmoney-pdf-probe
           path: |
-            fxbaogao_browser_probe.json
-            *.html
-            *.png
+            eastmoney_probe.json
+            eastmoney_probe_output/*
           retention-days: 7
           compression-level: 0
           if-no-files-found: error
