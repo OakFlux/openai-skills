@@ -1,0 +1,205 @@
+name: Build DeZhan Health financial-report package
+
+on:
+  push:
+    branches: [tmp-dezhan-reports-20261015]
+    paths: ['.github/workflows/tmp-dezhan-000813-reports-20261015.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip
+
+      - name: Discover, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='德展健康_000813_2020-2025年报及最新季报'
+          mkdir -p "$PACKAGE"
+
+          python3 - <<'PY'
+          import html
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          ANNUAL = 'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/000813/page_type/ndbg.phtml'
+          Q1 = 'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_BulletinYi/stockid/000813/page_type/yjdbg.phtml'
+          outdir = Path('德展健康_000813_2020-2025年报及最新季报')
+
+          def fetch(url, referer=None):
+              headers = {
+                  'User-Agent': UA,
+                  'Accept': 'text/html,application/xhtml+xml,application/pdf,*/*;q=0.8',
+              }
+              if referer:
+                  headers['Referer'] = referer
+              last = None
+              for attempt in range(5):
+                  try:
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=180) as r:
+                          return r.read(), r.geturl(), dict(r.headers)
+                  except Exception as e:
+                      last = e
+                      time.sleep(2 + attempt)
+              raise RuntimeError(f'Failed to fetch {url}: {last}')
+
+          def decode_page(raw):
+              for enc in ('utf-8', 'gb18030', 'gbk'):
+                  try:
+                      return raw.decode(enc)
+                  except UnicodeDecodeError:
+                      pass
+              return raw.decode('utf-8', errors='replace')
+
+          def anchors(page_url):
+              raw, final_url, _ = fetch(page_url)
+              text = decode_page(raw)
+              result = []
+              for m in re.finditer(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', text, re.I | re.S):
+                  href = html.unescape(m.group(1).strip())
+                  label = re.sub(r'<[^>]+>', '', m.group(2))
+                  label = html.unescape(re.sub(r'\s+', '', label))
+                  result.append((label, urllib.parse.urljoin(final_url, href)))
+              return result
+
+          annual_links = anchors(ANNUAL)
+          q1_links = anchors(Q1)
+
+          records = []
+          for idx, year in enumerate(range(2020, 2026), start=1):
+              needle = f'德展健康：{year}年年度报告'
+              matches = [(label, url) for label, url in annual_links if label == needle]
+              if not matches:
+                  matches = [(label, url) for label, url in annual_links if needle in label and '摘要' not in label]
+              if not matches:
+                  raise SystemExit(f'Could not find annual-report detail link: {needle}')
+              records.append({
+                  'order': idx,
+                  'title': f'{year}年年度报告',
+                  'period': f'{year}年度',
+                  'detail_url': matches[0][1],
+                  'filename': f'{idx:02d}_德展健康_{year}年年度报告.pdf',
+              })
+
+          needle = '德展健康：2026年一季度报告'
+          matches = [(label, url) for label, url in q1_links if label == needle]
+          if not matches:
+              matches = [(label, url) for label, url in q1_links if '德展健康：2026年' in label and '一季度报告' in label]
+          if not matches:
+              raise SystemExit('Could not find 2026 Q1 report detail link')
+          records.append({
+              'order': 7,
+              'title': '2026年第一季度报告（最新季报）',
+              'period': '2026年第一季度',
+              'detail_url': matches[0][1],
+              'filename': '07_德展健康_2026年第一季度报告_最新季报.pdf',
+          })
+
+          for rec in records:
+              detail_anchors = anchors(rec['detail_url'])
+              downloads = [(label, url) for label, url in detail_anchors if '下载公告' in label]
+              if not downloads:
+                  raise SystemExit(f"Could not find PDF link on {rec['detail_url']}")
+              pdf_url = downloads[0][1].replace('%3A', ':').replace('%3a', ':')
+              raw, final_url, headers = fetch(pdf_url, rec['detail_url'])
+              if not raw.startswith(b'%PDF-'):
+                  raise SystemExit(f'Not a PDF: {pdf_url}; prefix={raw[:40]!r}')
+              if len(raw) < 100_000:
+                  raise SystemExit(f'PDF too small: {pdf_url}; bytes={len(raw)}')
+              path = outdir / rec['filename']
+              path.write_bytes(raw)
+              rec['pdf_url'] = final_url
+              rec['bytes'] = len(raw)
+              print(f"Saved {path} ({len(raw)} bytes) from {final_url}")
+
+          import json
+          (outdir / '_download_metadata.json').write_text(
+              json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          PY
+
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            qpdf --check "$pdf" >/dev/null
+            pages=$(pdfinfo "$pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages"
+            test "$pages" -ge 3
+            pdftotext -f 1 -l 5 "$pdf" "$pdf.txt"
+            grep -q '德展大健康股份有限公司' "$pdf.txt"
+            rm -f "$pdf.txt"
+            echo "Validated: $(basename "$pdf") ($pages pages, $(stat -c%s "$pdf") bytes)"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, subprocess
+
+          folder = Path('德展健康_000813_2020-2025年报及最新季报')
+          meta = json.loads((folder / '_download_metadata.json').read_text(encoding='utf-8'))
+          pdfs = sorted(folder.glob('*.pdf'))
+          if len(pdfs) != 7:
+              raise SystemExit(f'Expected 7 PDFs, found {len(pdfs)}')
+
+          by_name = {x['filename']: x for x in meta}
+          lines = [
+              '德展大健康股份有限公司（德展健康，000813）',
+              '2020—2025年年度报告及最新季报',
+              '整理日期：2026-10-15',
+              '',
+              '收录说明：',
+              '1. 收录2020—2025年度报告全文，共6份。',
+              '2. 截至2026-10-15，公司2026年第三季度报告预约于2026-10-30披露，故最新已披露季度报告为2026年第一季度报告。',
+              '3. PDF来源于新浪财经公告附件镜像，报告正文所载指定披露平台为巨潮资讯网。',
+              '',
+              '文件清单：',
+          ]
+          sums = []
+          total_pages = 0
+          for p in pdfs:
+              item = by_name[p.name]
+              data = p.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              info = subprocess.check_output(['pdfinfo', str(p)], text=True, errors='replace')
+              pages = int(next(x.split(':',1)[1].strip() for x in info.splitlines() if x.startswith('Pages:')))
+              total_pages += pages
+              lines += [
+                  f"- {p.name}",
+                  f"  报告期：{item['period']}；页数：{pages}；大小：{len(data)}字节",
+                  f"  PDF来源：{item['pdf_url']}",
+                  f"  SHA-256：{sha}",
+              ]
+              sums.append(f'{sha}  {p.name}')
+          lines += ['', f'合计页数：{total_pages}页。', '全部PDF均已通过文件头、qpdf结构、页数及首页正文公司名称检查。']
+          (folder / '00_文件清单与说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (folder / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          (folder / '_download_metadata.json').unlink()
+          print('\n'.join(lines))
+          PY
+
+          zip -q -r -6 "$PACKAGE.zip" "$PACKAGE"
+          unzip -t "$PACKAGE.zip" >/dev/null
+          test "$(unzip -Z1 "$PACKAGE.zip" | grep -c '\.pdf$')" -eq 7
+          sha256sum "$PACKAGE.zip"
+          du -h "$PACKAGE.zip"
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeZhan-Health-000813-2020-2025-annual-and-latest-quarter
+          path: 德展健康_000813_2020-2025年报及最新季报.zip
+          retention-days: 2
+          compression-level: 0
+          if-no-files-found: error
