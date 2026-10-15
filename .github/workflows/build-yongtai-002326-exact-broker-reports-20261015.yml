@@ -1,0 +1,306 @@
+name: Build targeted Yongtai Technology broker report package
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/yongtai-002326-broker-reports-20261015.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4 lxml pillow reportlab
+
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY = '永太科技'
+          FULL_COMPANY = '浙江永太科技股份有限公司'
+          CODE = '002326'
+          ROOT = Path('work')
+          OUT = ROOT / 'package'
+          TMP = ROOT / 'tmp'
+          ART = Path('artifact_out')
+          for p in (OUT, TMP, ART):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept': 'application/pdf,text/html,application/json,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www.fxbaogao.com/',
+          })
+
+          reports = [
+              {
+                  'date': '2022-09-29',
+                  'broker': '国联证券',
+                  'title': '构建产业链一体化，打造业绩新曲线',
+                  'classification': '公司深度研究/首次覆盖',
+                  'doc_id': '3393203',
+                  'pdf_path': 'report/2022/09/29/3393203.pdf',
+                  'detail_urls': [
+                      'https://www.fxbaogao.com/detail/3393203',
+                      'https://www.sdyanbao.com/detail/296135',
+                  ],
+                  'minimum_pages': 15,
+                  'priority': 100,
+              },
+              {
+                  'date': '2025-09-11',
+                  'broker': '山西证券',
+                  'title': '锂电“打针复原”黑科技落地，与复旦核心团队成立合资公司',
+                  'classification': '首次覆盖公司研究',
+                  'info_code': 'AP202509111741748142',
+                  'minimum_pages': 4,
+                  'priority': 90,
+              },
+              {
+                  'date': '2021-10-17',
+                  'broker': '中泰证券',
+                  'title': '21年三季报点评：业绩符合预期，新工艺助力成本优势加强',
+                  'classification': '公司研究报告',
+                  'doc_id': '2870690',
+                  'pdf_path': 'report/2021/10/17/2870690.pdf',
+                  'detail_urls': ['https://www.fxbaogao.com/detail/2870690'],
+                  'minimum_pages': 3,
+                  'priority': 80,
+              },
+              {
+                  'date': '2023-08-31',
+                  'broker': '国联证券',
+                  'title': '上半年业绩承压，一体化布局持续深入',
+                  'classification': '公司点评研究',
+                  'doc_id': '3880235',
+                  'pdf_path': 'report/2023/08/31/3880235.pdf',
+                  'detail_urls': ['https://www.fxbaogao.com/detail/3880235'],
+                  'minimum_pages': 3,
+                  'priority': 70,
+              },
+          ]
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:120]
+
+          def candidate_urls(report: dict) -> list[str]:
+              urls: list[str] = []
+              info_code = report.get('info_code')
+              if info_code:
+                  urls.extend([
+                      f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{info_code}_01.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{info_code}_01.pdf',
+                  ])
+              path = report.get('pdf_path')
+              if path:
+                  date_path = '/'.join(path.split('/')[1:4])
+                  filename = path.rsplit('/', 1)[-1]
+                  doc_id = report.get('doc_id')
+                  urls.extend([
+                      f'https://dr.fxbaogao.com/{path}',
+                      f'https://public.fxbaogao.com/{path}',
+                      f'https://report.fxbaogao.com/{path}',
+                      f'https://static.fxbaogao.com/{path}',
+                      f'https://oss-buy.hufangde.com/{path}',
+                      f'https://public.fxbaogao.com/report-cn/{date_path}/{filename}',
+                      f'https://dr.fxbaogao.com/report-cn/{date_path}/{filename}',
+                      f'https://oss-buy.hufangde.com/report-cn/{date_path}/{filename}',
+                      f'https://public.fxbaogao.com/report/{date_path}/{doc_id}.pdf',
+                      f'https://dr.fxbaogao.com/report/{date_path}/{doc_id}.pdf',
+                  ])
+              return list(dict.fromkeys(urls))
+
+          def discover_from_detail(report: dict) -> list[str]:
+              found: list[str] = []
+              for detail_url in report.get('detail_urls', []):
+                  try:
+                      response = session.get(detail_url, timeout=(15, 60), allow_redirects=True)
+                      print('DETAIL', response.status_code, len(response.content), response.url, flush=True)
+                      if response.status_code != 200 or len(response.content) < 500:
+                          continue
+                      text = response.text
+                      (TMP / f'detail_{report.get("doc_id","x")}_{len(found)}.html').write_text(text, encoding='utf-8', errors='replace')
+                      for match in re.finditer(r'https?://[^\s"\'<>]+', text):
+                          url = match.group(0).replace('\\/', '/').rstrip(');,]}')
+                          if '.pdf' in url.lower() or '/report/' in url.lower() or 'download' in url.lower():
+                              found.append(url)
+                      soup = BeautifulSoup(text, 'lxml')
+                      for tag in soup.find_all(True):
+                          for attr in ('href', 'src', 'data-url', 'data-src'):
+                              value = tag.get(attr)
+                              if not value:
+                                  continue
+                              url = urllib.parse.urljoin(response.url, str(value))
+                              if '.pdf' in url.lower() or '/report/' in url.lower() or 'download' in url.lower():
+                                  found.append(url)
+                  except Exception as exc:
+                      print('DETAIL_ERR', detail_url, repr(exc), flush=True)
+              return list(dict.fromkeys(found))
+
+          def download(report: dict, target: Path) -> str:
+              urls = candidate_urls(report) + discover_from_detail(report)
+              errors: list[str] = []
+              print('CANDIDATE_URLS', report['title'], json.dumps(urls, ensure_ascii=False), flush=True)
+              for url in urls:
+                  if len(url) > 1200 or '${' in url:
+                      continue
+                  for attempt in range(1, 3):
+                      try:
+                          response = session.get(url, timeout=(20, 180), allow_redirects=True)
+                          print('GET', report['broker'], attempt, response.status_code, len(response.content), response.headers.get('content-type'), url, 'FINAL', response.url, flush=True)
+                          if response.status_code == 200 and len(response.content) > 80_000 and response.content.startswith(b'%PDF-'):
+                              target.write_bytes(response.content)
+                              return url
+                          errors.append(f'{url}: HTTP {response.status_code}, {len(response.content)} bytes, {response.headers.get("content-type")}')
+                      except Exception as exc:
+                          errors.append(f'{url}: {exc!r}')
+                      time.sleep(0.5)
+              raise RuntimeError(' | '.join(errors[-30:]))
+
+          valid: list[dict] = []
+          hashes: set[str] = set()
+          for report in reports:
+              path = TMP / f'{report.get("doc_id") or report.get("info_code")}.pdf'
+              try:
+                  source_url = download(report, path)
+                  qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+                  if qpdf.returncode not in (0, 3):
+                      raise RuntimeError('qpdf failed: ' + qpdf.stderr[-800:])
+                  reader = PdfReader(str(path), strict=False)
+                  pages = len(reader.pages)
+                  if pages < int(report['minimum_pages']):
+                      raise RuntimeError(f'page count {pages} below minimum {report["minimum_pages"]}')
+                  parts: list[str] = []
+                  for index in range(min(12, pages)):
+                      try:
+                          parts.append(reader.pages[index].extract_text() or '')
+                      except Exception:
+                          pass
+                  sample = '\n'.join(parts)
+                  identity_ok = COMPANY in sample or FULL_COMPANY in sample or CODE in sample
+                  research_ok = any(term in sample for term in ['证券研究报告', '公司研究', '深度研究', '首次覆盖', '投资评级', '研究报告', '公司点评'])
+                  if not identity_ok or not research_ok:
+                      raise RuntimeError(f'identity/research check failed: {identity_ok}/{research_ok}')
+                  data = path.read_bytes()
+                  sha = hashlib.sha256(data).hexdigest()
+                  if sha in hashes:
+                      raise RuntimeError('duplicate PDF')
+                  hashes.add(sha)
+                  rec = {**report, 'pages': pages, 'bytes': len(data), 'sha256': sha, 'source_url': source_url, 'path': str(path)}
+                  valid.append(rec)
+                  print('VALID', json.dumps(rec, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('REJECT', report['broker'], report['title'], repr(exc), flush=True)
+                  path.unlink(missing_ok=True)
+
+          valid.sort(key=lambda x: (x['priority'], x['pages']), reverse=True)
+          selected: list[dict] = []
+          used_brokers: set[str] = set()
+          for report in valid:
+              if report['broker'] in used_brokers and len(valid) >= 3:
+                  continue
+              selected.append(report)
+              used_brokers.add(report['broker'])
+              if len(selected) == 3:
+                  break
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} complete company research PDFs could be downloaded')
+
+          manifest: list[dict] = []
+          for index, report in enumerate(selected, 1):
+              filename = f'{index:02d}_{report["date"]}_{safe(report["broker"])}_{safe(report["title"])}.pdf'
+              destination = OUT / filename
+              destination.write_bytes(Path(report['path']).read_bytes())
+              render_prefix = TMP / f'cover_{index:02d}'
+              render = subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(destination), str(render_prefix)], capture_output=True, text=True)
+              rendered = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not rendered.exists() or rendered.stat().st_size < 7000:
+                  raise RuntimeError(f'cover render failed for {filename}')
+              manifest.append({
+                  'filename': filename,
+                  'date': report['date'],
+                  'broker': report['broker'],
+                  'title': report['title'],
+                  'classification': report['classification'],
+                  'pages': report['pages'],
+                  'bytes': report['bytes'],
+                  'sha256': report['sha256'],
+                  'source_url': report['source_url'],
+              })
+
+          readme = [
+              '浙江永太科技股份有限公司（永太科技，002326.SZ）券商深度及公司研究报告合集',
+              '整理日期：2026-10-15',
+              '',
+              f'本包收录{len(manifest)}份公开可直接下载并完成核验的完整券商研究PDF。',
+              '优先保留国联证券公司深度研究/首次覆盖报告，并用不同券商的后续公司研究补充业务与技术进展。',
+              '未使用网页摘要、预览页、机构调研纪要或不完整拼接文件替代券商原文。',
+              '',
+              '文件清单：',
+          ]
+          for number, item in enumerate(manifest, 1):
+              readme += [
+                  f'{number}. {item["filename"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   类型：{item["classification"]}',
+                  f'   标题：{item["title"]}',
+                  f'   日期：{item["date"]}；页数：{item["pages"]}；大小：{item["bytes"]} bytes',
+                  f'   来源：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ]
+          readme.append('完整性检查：已检查PDF文件头、公司名称或证券代码、券商研究属性、实际页数、qpdf结构、首页渲染、重复文件及ZIP CRC。')
+          (OUT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest), encoding='utf-8')
+
+          zip_path = ART / f'永太科技_002326_券商深度及公司研究报告_{len(manifest)}份.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              count = sum(name.lower().endswith('.pdf') for name in archive.namelist())
+              if bad or count != len(manifest):
+                  raise RuntimeError(f'ZIP invalid: {bad}, {count}')
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: yongtai-targeted-broker-report-package
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
