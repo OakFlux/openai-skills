@@ -1,0 +1,396 @@
+name: Package Haian Group 001233 filings 20261015
+
+on:
+  push:
+    paths:
+      - '.triggers/haian-001233-financial-reports-package-20261015.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover, download, validate, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '001233'
+          COMPANY = '海安集团'
+          FULL_COMPANY = '海安橡胶集团股份公司'
+          TODAY = dt.date(2026, 10, 15)
+          ROOT = Path('haian_work')
+          OUT = ROOT / 'package'
+          RENDERS = ROOT / 'renders'
+          ART = Path('artifact_out')
+          for p in (OUT, RENDERS, ART):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/json,text/plain,application/pdf,*/*',
+              'Referer': f'https://data.eastmoney.com/notices/stock/{CODE}.html',
+          })
+
+          def clean(value: object) -> str:
+              return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', html.unescape(str(value or '')))).strip()
+
+          def safe(value: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', value).strip(' ._')[:145]
+
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          announcements: list[dict] = []
+          seen: set[str] = set()
+          for page in range(1, 31):
+              params = {
+                  'sr': '-1', 'page_size': '100', 'page_index': str(page),
+                  'ann_type': 'A', 'client_source': 'web', 'stock_list': CODE,
+              }
+              last_error = None
+              for attempt in range(1, 6):
+                  try:
+                      response = session.get(api, params=params, timeout=(20, 120))
+                      print('ANN_HTTP', page, attempt, response.status_code, len(response.content), response.url, flush=True)
+                      if response.status_code == 200:
+                          payload = response.json()
+                          break
+                      last_error = RuntimeError(f'HTTP {response.status_code}: {response.text[:300]}')
+                  except Exception as exc:
+                      last_error = exc
+                  time.sleep(attempt)
+              else:
+                  raise RuntimeError(f'Announcement API failed: {last_error!r}')
+
+              data = payload.get('data') or {}
+              rows = data.get('list') or []
+              total = int(data.get('total_hits') or data.get('total') or 0)
+              print('ANN_PAGE', page, 'rows', len(rows), 'total', total, flush=True)
+              for row in rows:
+                  blob = json.dumps(row, ensure_ascii=False)
+                  if CODE not in blob and COMPANY not in blob and FULL_COMPANY not in blob:
+                      continue
+                  key = str(row.get('art_code') or row.get('artCode') or row.get('id') or blob)
+                  if key not in seen:
+                      seen.add(key)
+                      announcements.append(row)
+              if not rows or len(rows) < 100 or (total and page * 100 >= total):
+                  break
+              time.sleep(0.2)
+
+          (ROOT / 'announcement_metadata.json').write_text(
+              json.dumps(announcements, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          print('ANNOUNCEMENT_COUNT', len(announcements), flush=True)
+
+          def normalize(row: dict) -> dict:
+              title = clean(row.get('title') or row.get('title_ch') or row.get('announcementTitle') or '')
+              art_code = str(row.get('art_code') or row.get('artCode') or row.get('announcementId') or '').strip()
+              raw_date = clean(row.get('notice_date') or row.get('display_time') or row.get('noticeDate') or '')
+              match = re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}', raw_date)
+              date = match.group(0).replace('/', '-') if match else ''
+              timestamp = 0
+              if date:
+                  try:
+                      timestamp = int(dt.datetime.strptime(date, '%Y-%m-%d').replace(tzinfo=dt.timezone.utc).timestamp())
+                  except Exception:
+                      pass
+              candidate_urls: list[str] = []
+              for field in ('attach_url', 'attachUrl', 'pdf_url', 'pdfUrl', 'url', 'download_url', 'downloadUrl'):
+                  url = row.get(field)
+                  if isinstance(url, str) and url.startswith('http'):
+                      candidate_urls.append(url)
+              if art_code:
+                  candidate_urls += [
+                      f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{art_code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{art_code}_01.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{art_code}_01.pdf',
+                  ]
+              return {
+                  'title': title,
+                  'art_code': art_code,
+                  'announcement_date': date,
+                  'announcement_time': timestamp,
+                  'candidate_urls': list(dict.fromkeys(candidate_urls)),
+                  'raw': row,
+              }
+
+          records = [normalize(row) for row in announcements]
+          for record in records:
+              if any(term in record['title'] for term in ['年度报告', '季度报告', '半年度报告', '招股说明书']):
+                  print('DISCLOSURE', json.dumps({k:v for k,v in record.items() if k != 'raw'}, ensure_ascii=False), flush=True)
+
+          annual_candidates: list[dict] = []
+          annual_pattern = re.compile(r'(20\d{2})年年度报告(?:[（(][^）)]+[）)])?$')
+          for record in records:
+              title = record['title']
+              if any(term in title for term in ['摘要', '英文', '取消', '审计报告', '提示性公告', '问询函']):
+                  continue
+              m = annual_pattern.search(title)
+              if m:
+                  item = dict(record)
+                  item['report_year'] = int(m.group(1))
+                  annual_candidates.append(item)
+          if not annual_candidates:
+              raise RuntimeError('No full annual report found')
+
+          annual_selected: list[dict] = []
+          for year in sorted({item['report_year'] for item in annual_candidates}):
+              group = [item for item in annual_candidates if item['report_year'] == year]
+              group.sort(key=lambda item: (
+                  2 if any(term in item['title'] for term in ['更正后', '更新后', '修订版', '修订稿']) else 0,
+                  item['announcement_time'],
+              ), reverse=True)
+              annual_selected.append(group[0])
+
+          prospectus_candidates: list[dict] = []
+          for record in records:
+              title = record['title']
+              if (
+                  '首次公开发行股票' in title
+                  and '招股说明书' in title
+                  and not any(term in title for term in ['摘要', '意向书', '申报稿', '上会稿', '注册稿', '提示性公告', '确认意见', '回复'])
+              ):
+                  prospectus_candidates.append(dict(record))
+          if not prospectus_candidates:
+              for record in records:
+                  title = record['title']
+                  if '招股说明书' in title and not any(term in title for term in ['摘要', '意向书', '申报稿', '上会稿', '注册稿', '确认意见', '回复']):
+                      prospectus_candidates.append(dict(record))
+          if not prospectus_candidates:
+              raise RuntimeError('No final prospectus found')
+          prospectus_candidates.sort(key=lambda item: item['announcement_time'], reverse=True)
+          prospectus_selected = prospectus_candidates[0]
+          # Public final-offering PDF fallback published with the 2025-11-20 prospectus.
+          prospectus_selected['candidate_urls'].append(
+              'http://pdffile.qianlong.com.cn:21380/NoticeFile/SZ/Stock/2025-11-20/8caeffe5-9b89-4717-ad95-6a4e571da7cc.pdf'
+          )
+
+          quarter_candidates: list[dict] = []
+          quarter_pattern = re.compile(r'(20\d{2})年(一|第一|三|第三)季度报告(?:[（(][^）)]+[）)])?$')
+          for record in records:
+              title = record['title']
+              if any(term in title for term in ['摘要', '英文', '更正公告', '提示性公告', '取消']):
+                  continue
+              m = quarter_pattern.search(title)
+              if m:
+                  item = dict(record)
+                  item['report_year'] = int(m.group(1))
+                  item['quarter'] = 3 if m.group(2).startswith('三') else 1
+                  quarter_candidates.append(item)
+          if not quarter_candidates:
+              raise RuntimeError('No quarterly report found')
+          quarter_candidates.sort(key=lambda item: (item['report_year'], item['quarter'], item['announcement_time']), reverse=True)
+          quarter_selected = quarter_candidates[0]
+
+          half_candidates: list[dict] = []
+          half_pattern = re.compile(r'(20\d{2})年半年度报告(?:[（(][^）)]+[）)])?$')
+          for record in records:
+              title = record['title']
+              if any(term in title for term in ['摘要', '英文', '提示性公告', '取消']):
+                  continue
+              m = half_pattern.search(title)
+              if m:
+                  item = dict(record)
+                  item['report_year'] = int(m.group(1))
+                  half_candidates.append(item)
+          half_selected = None
+          if half_candidates:
+              half_candidates.sort(key=lambda item: (item['report_year'], item['announcement_time']), reverse=True)
+              half_selected = half_candidates[0]
+
+          selected: list[dict] = []
+          for record in annual_selected:
+              selected.append({**record, 'document_type': '年度报告', 'period': str(record['report_year'])})
+          selected.append({**prospectus_selected, 'document_type': '招股说明书', 'period': 'IPO'})
+          selected.append({**quarter_selected, 'document_type': '最新季报', 'period': f"{quarter_selected['report_year']}Q{quarter_selected['quarter']}"})
+          if half_selected and half_selected['announcement_time'] > quarter_selected['announcement_time']:
+              selected.append({**half_selected, 'document_type': '半年度报告（补充）', 'period': f"{half_selected['report_year']}H1"})
+
+          print('SELECTED', json.dumps([{k:v for k,v in item.items() if k != 'raw'} for item in selected], ensure_ascii=False, indent=2), flush=True)
+
+          def download_pdf(record: dict, target: Path) -> str:
+              errors: list[str] = []
+              for url in record['candidate_urls']:
+                  for attempt in range(1, 5):
+                      try:
+                          response = session.get(url, timeout=(20, 300), allow_redirects=True, headers={
+                              'Referer': 'https://data.eastmoney.com/', 'Accept': 'application/pdf,*/*'
+                          })
+                          print('PDF_TRY', record['title'], attempt, response.status_code, len(response.content), url, 'FINAL', response.url, flush=True)
+                          if response.status_code == 200 and len(response.content) >= 50_000 and response.content.startswith(b'%PDF-'):
+                              target.write_bytes(response.content)
+                              return url
+                          errors.append(f'{url}: HTTP {response.status_code}, {len(response.content)} bytes')
+                      except Exception as exc:
+                          errors.append(f'{url}: {exc!r}')
+                      time.sleep(attempt)
+              raise RuntimeError(f'Could not download {record["title"]}: ' + ' | '.join(errors[-20:]))
+
+          manifest: list[dict] = []
+          seen_hashes: set[str] = set()
+          for index, record in enumerate(selected, 1):
+              if record['document_type'] == '年度报告':
+                  filename = f"{record['period']}年_海安集团_年度报告.pdf"
+              elif record['document_type'] == '招股说明书':
+                  filename = '2025年_海安集团_首次公开发行股票并在主板上市招股说明书.pdf'
+              elif record['document_type'] == '最新季报':
+                  filename = f"{record['period']}_海安集团_最新季报.pdf"
+              else:
+                  filename = f"{record['period']}_海安集团_半年度报告_补充.pdf"
+              filename = safe(filename)
+              path = OUT / filename
+              source_url = download_pdf(record, path)
+
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              print('QPDF', filename, check.returncode, check.stdout[-800:], check.stderr[-800:], flush=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf validation failed for {filename}: {check.stderr[-800:]}')
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'Unexpected page count for {filename}: {pages}')
+              text_parts: list[str] = []
+              indices = list(range(min(12, pages))) + list(range(max(0, pages - 2), pages))
+              for page_index in dict.fromkeys(indices):
+                  try:
+                      text_parts.append(reader.pages[page_index].extract_text() or '')
+                  except Exception:
+                      pass
+              sample = '\n'.join(text_parts)
+              identity_ok = COMPANY in sample or FULL_COMPANY in sample or CODE in sample
+              if not identity_ok:
+                  raise RuntimeError(f'Company identity validation failed for {filename}')
+              if record['document_type'] == '年度报告' and ('年度报告' not in sample or record['period'] not in sample):
+                  raise RuntimeError(f'Annual report validation failed for {filename}')
+              if record['document_type'] == '招股说明书' and '招股说明书' not in sample:
+                  raise RuntimeError(f'Prospectus validation failed for {filename}')
+              if record['document_type'] == '最新季报' and '季度报告' not in sample:
+                  raise RuntimeError(f'Quarterly report validation failed for {filename}')
+              if record['document_type'].startswith('半年度') and '半年度报告' not in sample:
+                  raise RuntimeError(f'Half-year report validation failed for {filename}')
+
+              render_prefix = RENDERS / f'page_{index:02d}'
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(path), str(render_prefix)],
+                  capture_output=True, text=True,
+              )
+              rendered = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not rendered.exists() or rendered.stat().st_size < 8_000:
+                  raise RuntimeError(f'First-page render failed for {filename}: {render.stderr[-800:]}')
+
+              data = path.read_bytes()
+              sha256 = hashlib.sha256(data).hexdigest()
+              if sha256 in seen_hashes:
+                  raise RuntimeError(f'Duplicate report detected: {filename}')
+              seen_hashes.add(sha256)
+              item = {
+                  'document_type': record['document_type'],
+                  'period': record['period'],
+                  'title': record['title'],
+                  'announcement_date': record['announcement_date'],
+                  'art_code': record['art_code'],
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha256,
+                  'source_url': source_url,
+              }
+              manifest.append(item)
+              print('VERIFIED', json.dumps(item, ensure_ascii=False), flush=True)
+
+          annual_years = [item['period'] for item in manifest if item['document_type'] == '年度报告']
+          latest_quarter = next(item for item in manifest if item['document_type'] == '最新季报')
+          prospectus = next(item for item in manifest if item['document_type'] == '招股说明书')
+          half = next((item for item in manifest if item['document_type'].startswith('半年度')), None)
+          readme = [
+              '海安橡胶集团股份公司（海安集团，001233.SZ）全部上市后年度报告、招股说明书及最新季报',
+              f'整理日期：{TODAY.isoformat()}',
+              '',
+              f'年度报告：{", ".join(annual_years)}年度，共{len(annual_years)}份。',
+              f'招股说明书：{prospectus["title"]}。',
+              f'最新季报：{latest_quarter["title"]}（{latest_quarter["period"]}）。',
+          ]
+          if half:
+              readme.append(f'补充更新：{half["title"]}（{half["period"]}），用于反映季报之后的最新半年度经营情况。')
+          readme += [
+              '',
+              '说明：',
+              '1. 公司于2025年11月25日上市，上市后已披露的完整年度报告目前仅有2025年度报告。',
+              '2. 年报仅保留完整正文，排除摘要、审计报告单行文件、英文版及提示性公告。',
+              '3. 招股说明书采用正式发行版，排除申报稿、上会稿、注册稿、意向书和摘要。',
+              '4. 截至整理日尚未披露2026年第三季度报告，因此最新正式季报为2026年第一季度报告。',
+              '5. 已检查PDF文件头、公司名称/证券代码、报告类型、实际页数、qpdf结构、首页渲染、重复文件及ZIP CRC。',
+              '',
+              '文件清单：',
+          ]
+          for number, item in enumerate(manifest, 1):
+              readme += [
+                  f'{number}. {item["filename"]}',
+                  f'   类型：{item["document_type"]}；报告期：{item["period"]}',
+                  f'   标题：{item["title"]}',
+                  f'   公告日期：{item["announcement_date"]}；页数：{item["pages"]}；大小：{item["bytes"]} bytes',
+                  f'   来源：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ]
+
+          (OUT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in manifest), encoding='utf-8'
+          )
+
+          zip_name = f'海安集团_001233_全部年报_招股说明书及最新季报_截至{TODAY.isoformat()}.zip'
+          zip_path = ART / zip_name
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_count = sum(1 for name in archive.namelist() if name.lower().endswith('.pdf'))
+              if pdf_count != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(manifest)}')
+          zip_hash = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, zip_hash, flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: haian-001233-financial-reports
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
