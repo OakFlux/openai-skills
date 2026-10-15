@@ -1,0 +1,227 @@
+name: Build Zhongnan Media reports package v2 20261016
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongnan-media-601098-package-v2-20261016.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          from typing import Any
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '601098'
+          SHORT = '中南传媒'
+          FULL = '中南出版传媒集团股份有限公司'
+          PACKAGE = '中南传媒_601098_2020-2025年报及最新季报'
+          ROOT = Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREV = ROOT / '首页预览'
+          PREV.mkdir(exist_ok=True)
+
+          specs = [
+              (['2020年年度报告','2020年年报'], '2020', '01_中南传媒_2020年年度报告.pdf', 80, '年度报告'),
+              (['2021年年度报告','2021年年报'], '2021', '02_中南传媒_2021年年度报告.pdf', 80, '年度报告'),
+              (['2022年年度报告','2022年年报'], '2022', '03_中南传媒_2022年年度报告.pdf', 80, '年度报告'),
+              (['2023年年度报告','2023年年报'], '2023', '04_中南传媒_2023年年度报告.pdf', 80, '年度报告'),
+              (['2024年年度报告','2024年年报'], '2024', '05_中南传媒_2024年年度报告.pdf', 80, '年度报告'),
+              (['2025年年度报告','2025年年报'], '2025', '06_中南传媒_2025年年度报告.pdf', 80, '年度报告'),
+          ]
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/notices/stock/{CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+          })
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          windows = [
+              ('2021-01-01','2021-06-30'),('2022-01-01','2022-06-30'),
+              ('2023-01-01','2023-06-30'),('2024-01-01','2024-06-30'),
+              ('2025-01-01','2025-06-30'),('2026-01-01','2026-10-16'),
+          ]
+          rows: list[dict[str, Any]] = []
+          query_log = []
+          for begin, end in windows:
+              for page in range(1, 16):
+                  params = {
+                      'sr':'-1','page_size':'100','page_index':str(page),'ann_type':'A',
+                      'client_source':'web','stock_list':CODE,'f_node':'0','s_node':'0',
+                      'begin_time':begin,'end_time':end,
+                  }
+                  data = None
+                  last = None
+                  for attempt in range(8):
+                      try:
+                          r = s.get(api, params=params, timeout=(20,120))
+                          last = {'status':r.status_code,'text':r.text[:200]}
+                          if r.status_code == 200:
+                              data = r.json(); break
+                      except Exception as exc:
+                          last = {'error':repr(exc)}
+                      time.sleep(attempt + 1)
+                  if data is None:
+                      raise RuntimeError(f'API failed {begin} {end} page {page}: {last}')
+                  batch = ((data.get('data') or {}).get('list') or [])
+                  query_log.append({'begin':begin,'end':end,'page':page,'count':len(batch)})
+                  if not batch: break
+                  rows.extend(batch)
+                  time.sleep(0.08)
+          dedup = {}
+          for r in rows:
+              art = str(r.get('art_code') or r.get('artCode') or '')
+              if art: dedup[art] = r
+          rows = list(dedup.values())
+
+          def compact(x: str) -> str:
+              return re.sub(r'\s+', '', x or '')
+          def art(r: dict[str, Any]) -> str:
+              return str(r.get('art_code') or r.get('artCode') or '')
+          def date(r: dict[str, Any]) -> str:
+              return str(r.get('display_time') or '')
+
+          exclusions = [
+              '摘要','英文版','取消','问询','回复','审计报告','董事会','监事会','更正公告',
+              '提示性公告','社会责任报告','环境、社会及管治报告','可持续发展报告',
+              '独立董事述职报告','内部控制评价报告','财务决算报告','年度报告说明会',
+              '年度报告网上说明会','募集资金','会计师事务所','财务报表及相关附注',
+          ]
+          def pick(variants: list[str], label: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+              found = []
+              for r in rows:
+                  title = compact(str(r.get('title') or ''))
+                  hit = next((v for v in variants if compact(v) in title), None)
+                  if not hit or any(compact(x) in title for x in exclusions):
+                      continue
+                  score = 50
+                  key = compact(hit)
+                  if title.endswith(key): score += 35
+                  if title == key: score += 20
+                  if title.startswith(SHORT) or title.startswith(FULL) or f'{CODE}:' in title: score += 15
+                  if any(x in title for x in ['更正后','修订版','更新后','修订稿']): score += 100
+                  found.append((score, date(r), r, hit))
+              found.sort(key=lambda x:(x[0],x[1]), reverse=True)
+              if not found:
+                  titles = sorted(str(r.get('title') or '') for r in rows)
+                  raise RuntimeError(f'Missing {label}; variants={variants}; titles={titles}')
+              log = [{'score':a,'date':b,'title':c.get('title'),'art_code':art(c),'variant':d} for a,b,c,d in found[:10]]
+              return found[0][2], log
+
+          selected = []
+          candidate_log = {}
+          for variants, period, filename, min_pages, doc_type in specs:
+              row, log = pick(variants, period)
+              candidate_log[period] = log
+              selected.append({'row':row,'period':period,'filename':filename,'min_pages':min_pages,'doc_type':doc_type})
+
+          quarter_options = [
+              (['2026年第三季度报告','2026年三季度报告'], '2026Q3'),
+              (['2026年第一季度报告','2026年一季度报告'], '2026Q1'),
+              (['2025年第三季度报告','2025年三季度报告'], '2025Q3'),
+              (['2025年第一季度报告','2025年一季度报告'], '2025Q1'),
+          ]
+          qrow = None; qperiod = None; qlog = []
+          for variants, period in quarter_options:
+              try:
+                  qrow, qlog = pick(variants, period); qperiod = period; break
+              except RuntimeError:
+                  continue
+          if qrow is None or qperiod is None:
+              raise RuntimeError('No quarterly report found')
+          candidate_log['latest_quarter'] = qlog
+          selected.append({'row':qrow,'period':qperiod,'filename':f'07_中南传媒_{qperiod}_最新季报.pdf','min_pages':4,'doc_type':'最新季报'})
+
+          def download_pdf(art_code: str, referer: str):
+              urls = [f'https://pdf.dfcfw.com/pdf/H{x}_{art_code}_1.pdf' for x in (2,3,1,4)]
+              last = None
+              for url in urls:
+                  for attempt in range(5):
+                      try:
+                          r = s.get(url, headers={'User-Agent':s.headers['User-Agent'],'Referer':referer,'Accept':'application/pdf,*/*;q=0.8'}, timeout=(30,420), allow_redirects=True)
+                          last = {'url':url,'status':r.status_code,'bytes':len(r.content),'content_type':r.headers.get('content-type','')}
+                          if r.status_code == 200 and r.content[:5] == b'%PDF-' and len(r.content) > 30000:
+                              return r.content, url, last
+                      except Exception as exc:
+                          last = {'url':url,'error':repr(exc)}
+                      time.sleep(attempt + 1)
+              raise RuntimeError(f'Download failed {art_code}: {last}')
+
+          manifest = []
+          for item in selected:
+              r = item.pop('row')
+              code = art(r)
+              detail = f'https://data.eastmoney.com/notices/detail/{CODE}/{code}.html'
+              data, pdf_url, meta = download_pdf(code, detail)
+              dest = ROOT / item['filename']
+              dest.write_bytes(data)
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f'Too few pages: {dest.name} {pages}')
+              text = ''
+              for p in reader.pages[:min(20,pages)]:
+                  try: text += '\n' + (p.extract_text() or '')
+                  except Exception: pass
+              if not any(x in text for x in ['中南传媒','中南出版传媒','601098']):
+                  raise RuntimeError(f'Identity check failed: {dest.name}')
+              subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = PREV / dest.stem
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(dest),str(prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix)+'.png')
+              if not preview.exists() or preview.stat().st_size < 5000:
+                  raise RuntimeError(f'Preview failed: {dest.name}')
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({**item,'announcement_title':r.get('title'),'announcement_date':r.get('display_time'),'art_code':code,'announcement_page':detail,'pdf_url':pdf_url,'pages':pages,'bytes':len(data),'sha256':sha,'download_meta':meta,'preview':str(Path('首页预览')/preview.name)})
+
+          lines = [f'{FULL}（{CODE}.SH）2020—2025年年度报告及最新季度报告资料包','整理日期：2026-10-16','']
+          for i,m in enumerate(manifest,1):
+              lines += [f"{i}. {m['filename']}",f"   公告标题：{m['announcement_title']}",f"   公告日期：{m['announcement_date']}；页数：{m['pages']}；字节数：{m['bytes']}",f"   公告页面：{m['announcement_page']}",f"   SHA-256：{m['sha256']}",'']
+          lines += ['核验：PDF文件头、公司名称/证券代码、报告期间、页数、qpdf结构、首页渲染、ZIP CRC。']
+          (ROOT/'README_文件清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps({'company':FULL,'stock_code':CODE,'prepared_on':'2026-10-16','latest_quarter':qperiod,'files':manifest,'candidates':candidate_log,'queries':query_log},ensure_ascii=False,indent=2),encoding='utf-8')
+          with (ROOT/'manifest.csv').open('w',newline='',encoding='utf-8-sig') as f:
+              w=csv.writer(f); w.writerow(['文件名','类型','期间','公告标题','公告日期','页数','字节数','SHA-256','公告页面','PDF地址'])
+              for m in manifest: w.writerow([m['filename'],m['doc_type'],m['period'],m['announcement_title'],m['announcement_date'],m['pages'],m['bytes'],m['sha256'],m['announcement_page'],m['pdf_url']])
+          (ROOT/'SHA256SUMS.txt').write_text('\n'.join(f"{m['sha256']}  {m['filename']}" for m in manifest)+'\n',encoding='utf-8')
+
+          out = Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file(): z.write(p,arcname=str(p))
+          with zipfile.ZipFile(out) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError(f'ZIP CRC failed: {bad}')
+          print(json.dumps({'package':str(out),'zip_bytes':out.stat().st_size,'pdf_count':len(manifest),'latest_quarter':qperiod,'files':[{'name':m['filename'],'pages':m['pages'],'bytes':m['bytes'],'sha256':m['sha256']} for m in manifest]},ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongnan-media-601098-reports-v2-20261016
+          path: 中南传媒_601098_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
