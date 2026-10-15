@@ -1,0 +1,326 @@
+name: Build HATU 600864 broker report package
+
+on:
+  pull_request:
+    paths:
+      - 'tasks/hatu-600864-broker-reports-20261015.trigger'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover, download, validate, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '600864'
+          COMPANY = '哈投股份'
+          FULL_COMPANY = '哈尔滨哈投投资股份有限公司'
+          TODAY = '2026-10-15'
+          ROOT = Path('hatu_broker_work')
+          DOWNLOADS = ROOT / 'downloads'
+          OUT = ROOT / 'package'
+          RENDERS = ROOT / 'renders'
+          ART = Path('artifact_out')
+          for p in (DOWNLOADS, OUT, RENDERS, ART):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept': 'application/json,application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:125]
+
+          # Eastmoney broker-report metadata.
+          all_rows: list[dict] = []
+          seen_info: set[str] = set()
+          for page in range(1, 12):
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2008-01-01', 'endTime': TODAY,
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': CODE, 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+              last_error = None
+              for attempt in range(1, 5):
+                  try:
+                      response = session.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=(20, 120))
+                      print('EASTMONEY', page, attempt, response.status_code, len(response.content), response.url, flush=True)
+                      if response.status_code == 200:
+                          batch = response.json().get('data') or []
+                          break
+                      last_error = RuntimeError(f'HTTP {response.status_code}: {response.text[:300]}')
+                  except Exception as exc:
+                      last_error = exc
+                  time.sleep(attempt)
+              else:
+                  raise RuntimeError(f'Eastmoney report API failed: {last_error!r}')
+              for row in batch:
+                  info_code = str(row.get('infoCode') or '')
+                  blob = json.dumps(row, ensure_ascii=False)
+                  if not info_code or info_code in seen_info:
+                      continue
+                  if CODE not in blob and COMPANY not in blob:
+                      continue
+                  seen_info.add(info_code)
+                  all_rows.append(row)
+              if len(batch) < 100:
+                  break
+
+          print('EASTMONEY_COUNT', len(all_rows), flush=True)
+          for row in all_rows:
+              print('EM_ROW', json.dumps({k: row.get(k) for k in ('infoCode','title','orgSName','publishDate','attachPages','emRatingName')}, ensure_ascii=False), flush=True)
+
+          # Public report index as a supplementary metadata source.
+          fx_rows: list[dict] = []
+          try:
+              fx_session = requests.Session()
+              fx_session.trust_env = False
+              fx_session.headers.update({
+                  'User-Agent': 'Mozilla/5.0',
+                  'Origin': 'https://www.fxbaogao.com',
+                  'Referer': 'https://www.fxbaogao.com/',
+                  'Content-Type': 'application/json',
+              })
+              endpoint = 'https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+              for body in [
+                  {'stockCodes': [CODE], 'pageNum': 1, 'pageSize': 100, 'order': 1},
+                  {'keywords': COMPANY, 'pageNum': 1, 'pageSize': 100, 'order': 1},
+              ]:
+                  rr = fx_session.post(endpoint, json=body, timeout=(20, 90))
+                  print('FX', rr.status_code, len(rr.content), json.dumps(body, ensure_ascii=False), rr.text[:200], flush=True)
+                  if rr.status_code == 200:
+                      fx_rows.extend(((rr.json().get('data') or {}).get('dataList') or []))
+          except Exception as exc:
+              print('FX_ERROR', repr(exc), flush=True)
+          fx_unique = {}
+          for row in fx_rows:
+              did = str(row.get('docId') or '')
+              blob = json.dumps(row, ensure_ascii=False)
+              if did and (CODE in blob or COMPANY in blob):
+                  fx_unique[did] = row
+          print('FX_COUNT', len(fx_unique), flush=True)
+          for row in fx_unique.values():
+              print('FX_ROW', json.dumps(row, ensure_ascii=False), flush=True)
+
+          # Download every directly available Eastmoney PDF and validate it.
+          def download_pdf(info_code: str, target: Path) -> str:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_01.pdf',
+              ]
+              errors = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(url, timeout=(20, 240), allow_redirects=True)
+                          print('PDF', info_code, attempt, response.status_code, len(response.content), url, flush=True)
+                          if response.status_code == 200 and len(response.content) > 80_000 and response.content.startswith(b'%PDF-'):
+                              target.write_bytes(response.content)
+                              return url
+                          errors.append(f'{url}: HTTP {response.status_code}, {len(response.content)} bytes')
+                      except Exception as exc:
+                          errors.append(f'{url}: {exc!r}')
+                      time.sleep(attempt)
+              raise RuntimeError(' | '.join(errors[-12:]))
+
+          deep_terms = ['深度', '首次覆盖', '公司深度', '热电与证券双轮驱动', '价值分析', '投资价值', '双轮驱动', '证券业务具备弹性']
+          shallow_terms = ['点评', '简评', '季报', '年报', '中报', '半年报', '业绩快报', '事件点评', '公告点评']
+
+          def score_meta(row: dict, pages: int) -> int:
+              title = str(row.get('title') or '')
+              date = str(row.get('publishDate') or '')
+              year = int(date[:4]) if re.match(r'20\d{2}', date) else 0
+              score = pages * 4 + max(0, min(16, year - 2010))
+              if '深度' in title:
+                  score += 100
+              if '首次覆盖' in title:
+                  score += 90
+              score += sum(20 for term in deep_terms if term in title)
+              score -= sum(18 for term in shallow_terms if term in title)
+              return score
+
+          valid: list[dict] = []
+          hashes: set[str] = set()
+          for row in all_rows:
+              info_code = str(row.get('infoCode') or '')
+              title = str(row.get('title') or '').strip()
+              broker = str(row.get('orgSName') or row.get('orgName') or '未知券商').strip()
+              publish_date = str(row.get('publishDate') or '')[:10]
+              path = DOWNLOADS / f'{info_code}.pdf'
+              try:
+                  source_url = download_pdf(info_code, path)
+                  qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+                  if qpdf.returncode not in (0, 3):
+                      raise RuntimeError('qpdf validation failed: ' + qpdf.stderr[-1000:])
+                  reader = PdfReader(str(path), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 3:
+                      raise RuntimeError(f'too short: {pages} pages')
+                  parts: list[str] = []
+                  indices = list(range(min(12, pages))) + list(range(max(0, pages - 2), pages))
+                  for idx in dict.fromkeys(indices):
+                      try:
+                          parts.append(reader.pages[idx].extract_text() or '')
+                      except Exception:
+                          pass
+                  sample = '\n'.join(parts)
+                  identity_ok = COMPANY in sample or FULL_COMPANY in sample or CODE in sample
+                  research_ok = any(term in sample for term in ['证券研究报告', '公司研究', '深度研究', '首次覆盖', '投资评级', '研究报告', '公司点评'])
+                  if not identity_ok or not research_ok:
+                      raise RuntimeError(f'identity/research validation failed: {identity_ok}/{research_ok}')
+                  data = path.read_bytes()
+                  sha256 = hashlib.sha256(data).hexdigest()
+                  if sha256 in hashes:
+                      raise RuntimeError('duplicate PDF')
+                  hashes.add(sha256)
+                  record = {
+                      'info_code': info_code,
+                      'title': title,
+                      'broker': broker,
+                      'publish_date': publish_date,
+                      'pages': pages,
+                      'bytes': len(data),
+                      'sha256': sha256,
+                      'source_url': source_url,
+                      'path': str(path),
+                      'score': score_meta(row, pages),
+                  }
+                  valid.append(record)
+                  print('VALID', json.dumps(record, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('REJECT', info_code, broker, title, repr(exc), flush=True)
+                  path.unlink(missing_ok=True)
+
+          if len(valid) < 2:
+              raise RuntimeError(f'Only {len(valid)} complete company research PDFs found')
+
+          valid.sort(key=lambda item: (item['score'], item['pages'], item['publish_date']), reverse=True)
+          selected: list[dict] = []
+          used_brokers: set[str] = set()
+          for item in valid:
+              if item['broker'] in used_brokers and len(valid) >= 3:
+                  continue
+              selected.append(item)
+              used_brokers.add(item['broker'])
+              if len(selected) == 3:
+                  break
+          if len(selected) < 3:
+              for item in valid:
+                  if item not in selected:
+                      selected.append(item)
+                  if len(selected) == 3:
+                      break
+          selected = selected[:3]
+
+          manifest: list[dict] = []
+          for index, item in enumerate(selected, 1):
+              filename = f'{index:02d}_{item["publish_date"]}_{safe(item["broker"])}_{safe(item["title"])}.pdf'
+              destination = OUT / filename
+              destination.write_bytes(Path(item['path']).read_bytes())
+              render_prefix = RENDERS / f'cover_{index:02d}'
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(destination), str(render_prefix)],
+                  capture_output=True,
+                  text=True,
+              )
+              rendered = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not rendered.exists() or rendered.stat().st_size < 7000:
+                  raise RuntimeError(f'cover render failed for {filename}: {render.stderr[-800:]}')
+              manifest.append({
+                  'filename': filename,
+                  'broker': item['broker'],
+                  'title': item['title'],
+                  'publish_date': item['publish_date'],
+                  'pages': item['pages'],
+                  'bytes': item['bytes'],
+                  'sha256': item['sha256'],
+                  'source_url': item['source_url'],
+                  'info_code': item['info_code'],
+              })
+
+          readme = [
+              '哈尔滨哈投投资股份有限公司（哈投股份，600864.SH）券商深度及公司研究报告合集',
+              f'整理日期：{TODAY}',
+              '',
+              f'本压缩包收录{len(manifest)}份公开可直接下载并完成核验的完整券商研究PDF。',
+              '筛选时优先选择公司深度、首次覆盖、热电与证券双主业分析及较长篇幅报告；如公开渠道长篇深度报告不足，则以完整公司研究报告补充。',
+              '未使用网页摘要、新闻转载、预览页或拼接文件替代完整PDF。',
+              '',
+              '文件清单：',
+          ]
+          for number, item in enumerate(manifest, 1):
+              readme += [
+                  f'{number}. {item["filename"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   标题：{item["title"]}',
+                  f'   日期：{item["publish_date"]}；页数：{item["pages"]}；大小：{item["bytes"]} bytes',
+                  f'   公开PDF：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ]
+          readme.append('完整性检查：已检查PDF文件头、公司名称或证券代码、券商研究属性、实际页数、qpdf结构、首页渲染、重复文件及ZIP CRC。')
+
+          (OUT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in manifest), encoding='utf-8'
+          )
+
+          zip_path = ART / f'哈投股份_600864_券商深度及公司研究报告_{len(manifest)}份.zip'
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdf_count = sum(name.lower().endswith('.pdf') for name in archive.namelist())
+              if bad or pdf_count != len(manifest):
+                  raise RuntimeError(f'ZIP validation failed: {bad}, {pdf_count}')
+
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hatu-600864-broker-reports
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
