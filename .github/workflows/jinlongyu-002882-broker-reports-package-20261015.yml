@@ -1,0 +1,211 @@
+name: Package Jinlongyu 002882 broker reports 20261015
+
+on:
+  push:
+    paths:
+      - '.triggers/jinlongyu-002882-broker-reports-package-20261015.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          REPORTS = [
+              {
+                  'date': '2017-06-04',
+                  'broker': '华鑫证券',
+                  'title': '新股询价报告：金龙羽',
+                  'classification': '新股询价公司研究报告',
+                  'info_code': 'AP201706040624478853',
+                  'expected_pages': 3,
+              },
+              {
+                  'date': '2017-06-02',
+                  'broker': '东莞证券',
+                  'title': '新股网下申购询价建议报告（金龙羽）',
+                  'classification': '新股网下申购询价研究报告',
+                  'info_code': 'AP201706020618757250',
+                  'expected_pages': 2,
+              },
+          ]
+
+          ROOT = Path('jinlongyu_broker_package')
+          RENDERS = Path('render_checks')
+          ART = Path('artifact_out')
+          for directory in (ROOT, RENDERS, ART):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept': 'application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:125]
+
+          def download(report: dict, target: Path) -> str:
+              code = report['info_code']
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_01.pdf',
+              ]
+              errors = []
+              for url in urls:
+                  for attempt in range(1, 5):
+                      try:
+                          response = session.get(url, timeout=(20, 180), allow_redirects=True)
+                          print('DOWNLOAD', report['title'], attempt, response.status_code, len(response.content), url, 'FINAL', response.url, flush=True)
+                          if response.status_code == 200 and len(response.content) > 50_000 and response.content.startswith(b'%PDF-'):
+                              target.write_bytes(response.content)
+                              return url
+                          errors.append(f'{url}: HTTP {response.status_code}, {len(response.content)} bytes')
+                      except Exception as exc:
+                          errors.append(f'{url}: {exc!r}')
+                      time.sleep(attempt)
+              raise RuntimeError('Download failed: ' + ' | '.join(errors[-16:]))
+
+          manifest = []
+          seen_hashes = set()
+          for index, report in enumerate(REPORTS, 1):
+              filename = f'{index:02d}_{report["date"]}_{report["broker"]}_{safe(report["title"])}.pdf'
+              path = ROOT / filename
+              source_url = download(report, path)
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              print('QPDF', filename, qpdf.returncode, qpdf.stdout[-800:], qpdf.stderr[-800:], flush=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf validation failed for {filename}: {qpdf.stderr[-800:]}')
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'Unexpected page count for {filename}: {pages}')
+              if abs(pages - report['expected_pages']) > 1:
+                  raise RuntimeError(f'Page-count mismatch for {filename}: {pages} vs expected {report["expected_pages"]}')
+
+              parts = []
+              for page_index in range(min(5, pages)):
+                  try:
+                      parts.append(reader.pages[page_index].extract_text() or '')
+                  except Exception:
+                      pass
+              sample = '\n'.join(parts)
+              if '金龙羽' not in sample and '002882' not in sample:
+                  raise RuntimeError(f'Company identity validation failed for {filename}')
+              if not any(term in sample for term in ('询价', '新股', '证券研究报告', '申购')):
+                  raise RuntimeError(f'Research-report validation failed for {filename}')
+
+              render_prefix = RENDERS / f'cover_{index:02d}'
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '100', str(path), str(render_prefix)],
+                  capture_output=True,
+                  text=True,
+              )
+              rendered = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not rendered.exists() or rendered.stat().st_size < 8_000:
+                  raise RuntimeError(f'First-page render failed for {filename}: {render.stderr[-800:]}')
+
+              data = path.read_bytes()
+              sha256 = hashlib.sha256(data).hexdigest()
+              if sha256 in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {filename}')
+              seen_hashes.add(sha256)
+
+              item = {
+                  **report,
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha256,
+                  'source_url': source_url,
+              }
+              manifest.append(item)
+              print('VERIFIED', json.dumps(item, ensure_ascii=False), flush=True)
+
+          readme = [
+              '金龙羽集团股份有限公司（金龙羽，002882.SZ）券商公司研究报告合集',
+              '整理日期：2026-10-15',
+              '',
+              '本压缩包收录2份公开渠道能够直接下载、内容完整并完成结构核验的公司专项券商报告。',
+              '两份均为公司上市前的新股询价/申购研究，属于公司专项研究，但篇幅较短，不应误称为长篇公司深度报告。',
+              '公开匿名渠道未检索到可直接下载的金龙羽长篇首次覆盖或公司深度PDF，因此未使用网页摘要、行业文章、预览页或拼接文件凑数。',
+              '',
+              '文件清单：',
+          ]
+          for number, item in enumerate(manifest, 1):
+              readme.extend([
+                  f'{number}. {item["filename"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   类型：{item["classification"]}',
+                  f'   标题：{item["title"]}',
+                  f'   日期：{item["date"]}；页数：{item["pages"]}；大小：{item["bytes"]} bytes',
+                  f'   公开PDF：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ])
+          readme.append('完整性检查：已检查PDF文件头、公司名称或证券代码、研究报告属性、实际页数、qpdf结构、首页渲染、重复文件及ZIP CRC。')
+
+          (ROOT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in manifest),
+              encoding='utf-8',
+          )
+
+          zip_path = ART / '金龙羽_002882_券商公司研究报告_2份_公开完整版.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdf_count = sum(1 for name in archive.namelist() if name.lower().endswith('.pdf'))
+              if bad or pdf_count != 2:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdf_count={pdf_count}')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, zip_sha, flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinlongyu-002882-broker-reports
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
