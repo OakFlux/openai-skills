@@ -1,0 +1,446 @@
+name: Build Shanghai Yizhong 688091 broker deep reports 20261015
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shanghai-yizhong-688091-broker-deep-reports-20261015.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Query download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          TODAY = '2026-10-15'
+          CODE = '688091'
+          COMPANY = '上海谊众'
+          FULL_COMPANY = '上海谊众药业股份有限公司'
+          PACKAGE = '上海谊众_688091_券商深度研究资料_3份_公司专属优先'
+          WORK = Path('shanghai_yizhong_broker_work')
+          DOWNLOADS = WORK / 'downloads'
+          FINAL = WORK / 'final' / PACKAGE
+          ART = Path('artifact_out')
+          VERIFY = Path('verification_renders')
+          for directory in (DOWNLOADS, FINAL, ART, VERIFY):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+          report_api = 'https://reportapi.eastmoney.com/report/list'
+
+          def safe(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip(' ._')[:105]
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def qcheck(path: Path) -> None:
+              result = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if result.returncode not in (0, 3):
+                  raise RuntimeError(result.stderr[-1000:])
+
+          def query_reports(code: str, begin: str = '2010-01-01') -> list[dict[str, Any]]:
+              rows: list[dict[str, Any]] = []
+              seen: set[str] = set()
+              for qtype in ['0', '1', '2']:
+                  for page in range(1, 8):
+                      params = {
+                          'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                          'rating': '*', 'ratingChange': '*',
+                          'beginTime': begin, 'endTime': TODAY,
+                          'pageNo': str(page), 'fields': '', 'qType': qtype,
+                          'orgCode': '', 'code': code, 'rcode': '',
+                          'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                      }
+                      response = session.get(report_api, params=params, timeout=(25, 180))
+                      print('REPORT_API', code, qtype, page, response.status_code, len(response.content), flush=True)
+                      response.raise_for_status()
+                      batch = response.json().get('data') or []
+                      for row in batch:
+                          info = str(row.get('infoCode') or '')
+                          if str(row.get('stockCode') or '') == code and info and info not in seen:
+                              seen.add(info)
+                              rows.append(row)
+                      if len(batch) < 100:
+                          break
+                      time.sleep(0.4)
+              return rows
+
+          def info_code(row: dict[str, Any]) -> str:
+              return str(row.get('infoCode') or '').strip()
+
+          def title(row: dict[str, Any]) -> str:
+              return str(row.get('title') or '').strip()
+
+          def broker(row: dict[str, Any]) -> str:
+              return str(row.get('orgSName') or row.get('orgName') or '未知券商').strip()
+
+          def publish_date(row: dict[str, Any]) -> str:
+              return str(row.get('publishDate') or '')[:10]
+
+          def pages_meta(row: dict[str, Any]) -> int:
+              try:
+                  return int(row.get('attachPages') or 0)
+              except Exception:
+                  return 0
+
+          short_terms = [
+              '季报点评', '一季报点评', '三季报点评', '年报点评', '中报点评', '半年报点评',
+              '事件点评', '公司事件点评', '业绩预告', '业绩快报', '公告点评', '简评', '快评',
+              '信息更新', '点评报告', '跟踪报告',
+          ]
+          deep_terms = [
+              '首次覆盖', '深度报告', '公司深度', '深度研究', '重新覆盖', '新股覆盖',
+              '紫杉醇胶束', '紫杉醇聚合物胶束', '肿瘤', '抗癌', '创新药', '非小细胞肺癌',
+              '核心产品', '商业化', '放量', '市场空间', '临床', '研发管线', '成长空间',
+          ]
+
+          def score_row(row: dict[str, Any], strict: bool = True) -> int:
+              report_title = title(row)
+              pages = pages_meta(row)
+              date = publish_date(row)
+              if not report_title or not info_code(row):
+                  return -100000
+              if strict and any(term in report_title for term in short_terms):
+                  return -100000
+              if strict and pages < 12:
+                  return -100000
+              if not strict and pages < 7:
+                  return -100000
+              score = pages * 4
+              if any(term in report_title for term in deep_terms):
+                  score += 280
+              if '首次覆盖' in report_title:
+                  score += 160
+              if date >= '2025-01-01':
+                  score += 100
+              elif date >= '2023-01-01':
+                  score += 65
+              elif date >= '2021-01-01':
+                  score += 40
+              if pages >= 30:
+                  score += 100
+              elif pages >= 20:
+                  score += 65
+              elif pages >= 15:
+                  score += 35
+              return score
+
+          def pdf_urls(code: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_01.pdf',
+              ]
+
+          def download(code: str, target: Path) -> str:
+              last = ''
+              for attempt in range(1, 5):
+                  for url in pdf_urls(code):
+                      try:
+                          response = session.get(url, timeout=(30, 420), allow_redirects=True, headers={
+                              'User-Agent': session.headers['User-Agent'],
+                              'Referer': 'https://data.eastmoney.com/',
+                              'Accept': 'application/pdf,*/*',
+                          })
+                          print('PDF', code, attempt, response.status_code, len(response.content), url, flush=True)
+                          if response.status_code == 200 and len(response.content) > 100_000 and response.content.startswith(b'%PDF-'):
+                              target.write_bytes(response.content)
+                              return str(response.url)
+                          last = f'{response.status_code}/{len(response.content)}'
+                      except Exception as exc:
+                          last = repr(exc)
+                  time.sleep(attempt)
+              raise RuntimeError(f'No complete PDF for {code}: {last}')
+
+          def extract_text(path: Path, max_pages: int = 55) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              indexes = list(range(min(max_pages, pages)))
+              if pages > max_pages + 5:
+                  indexes.extend(range(max(0, pages - 5), pages))
+              parts: list[str] = []
+              for index in dict.fromkeys(indexes):
+                  try:
+                      parts.append(reader.pages[index].extract_text() or '')
+                  except Exception:
+                      pass
+              return pages, '\n'.join(parts)
+
+          def validate_company_report(row: dict[str, Any], aliases: list[str], stock_code: str, stock_name: str, peer: bool, relation: str = '') -> dict[str, Any]:
+              code = info_code(row)
+              temp = DOWNLOADS / f'{code}.pdf'
+              source_url = download(code, temp)
+              pages, text = extract_text(temp)
+              if pages < 7:
+                  raise RuntimeError(f'too short: {pages}')
+              identity_blob = text + '\n' + title(row) + '\n' + stock_name + '\n' + stock_code
+              if not any(alias in identity_blob for alias in aliases):
+                  raise RuntimeError('company identity not verified')
+              if not any(mark in text for mark in ['证券研究报告', '公司研究', '首次覆盖', '深度报告', '投资评级', '研究报告', '公司报告']):
+                  raise RuntimeError('broker research identity not verified')
+              qcheck(temp)
+              raw = temp.read_bytes()
+              report_title = title(row)
+              is_long = pages >= 12 and not any(term in report_title for term in short_terms)
+              return {
+                  'stock_code': stock_code,
+                  'stock_name': stock_name,
+                  'broker': broker(row),
+                  'publish_date': publish_date(row),
+                  'title': report_title,
+                  'info_code': code,
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'source_url': source_url,
+                  'is_long_report': is_long,
+                  'peer_report': peer,
+                  'relation_to_shanghai_yizhong': relation,
+                  'pdf_path': str(temp),
+              }
+
+          direct_rows = query_reports(CODE)
+          print('DIRECT_ROW_COUNT', len(direct_rows), flush=True)
+          print('DIRECT_METADATA', json.dumps(direct_rows, ensure_ascii=False, indent=2), flush=True)
+
+          direct_candidates = sorted(
+              [(score_row(row, True), row) for row in direct_rows if score_row(row, True) > -100000],
+              key=lambda item: item[0], reverse=True,
+          )
+          loose_direct = sorted(
+              [(score_row(row, False), row) for row in direct_rows if score_row(row, False) > -100000],
+              key=lambda item: item[0], reverse=True,
+          )
+
+          selected: list[dict[str, Any]] = []
+          seen_hashes: set[str] = set()
+          seen_brokers: set[str] = set()
+          rejected: list[dict[str, str]] = []
+          direct_aliases = [CODE, COMPANY, FULL_COMPANY, '上海谊众药业', '谊众药业', 'YIZHONG']
+
+          # Prefer three long company-specific reports from different brokers.
+          for distinct_only in [True, False]:
+              for score, row in direct_candidates:
+                  if len(selected) >= 3:
+                      break
+                  if any(item['info_code'] == info_code(row) for item in selected):
+                      continue
+                  if distinct_only and broker(row) in seen_brokers:
+                      continue
+                  try:
+                      record = validate_company_report(row, direct_aliases, CODE, COMPANY, False)
+                      if not record['is_long_report']:
+                          raise RuntimeError('not a long report')
+                      if record['sha256'] in seen_hashes:
+                          raise RuntimeError('duplicate PDF')
+                      selected.append(record)
+                      seen_hashes.add(record['sha256'])
+                      seen_brokers.add(record['broker'])
+                      print('DIRECT_VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+                  except Exception as exc:
+                      rejected.append({'info_code': info_code(row), 'title': title(row), 'error': repr(exc)})
+                      print('DIRECT_REJECT', info_code(row), title(row), repr(exc), flush=True)
+                      (DOWNLOADS / f'{info_code(row)}.pdf').unlink(missing_ok=True)
+              if len(selected) >= 3:
+                  break
+
+          # If fewer than two direct long reports are available, allow one complete 7+ page company report.
+          if len(selected) < 2:
+              for score, row in loose_direct:
+                  if len(selected) >= 2:
+                      break
+                  if any(item['info_code'] == info_code(row) for item in selected):
+                      continue
+                  try:
+                      record = validate_company_report(row, direct_aliases, CODE, COMPANY, False)
+                      if record['sha256'] in seen_hashes:
+                          raise RuntimeError('duplicate PDF')
+                      selected.append(record)
+                      seen_hashes.add(record['sha256'])
+                      seen_brokers.add(record['broker'])
+                      print('DIRECT_FALLBACK_VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+                  except Exception as exc:
+                      rejected.append({'info_code': info_code(row), 'title': title(row), 'error': repr(exc)})
+                      print('DIRECT_FALLBACK_REJECT', info_code(row), title(row), repr(exc), flush=True)
+                      (DOWNLOADS / f'{info_code(row)}.pdf').unlink(missing_ok=True)
+
+          # Fill to three only when company-specific reports are insufficient.
+          peer_specs = [
+              {'code': '600276', 'name': '恒瑞医药', 'aliases': ['600276', '恒瑞医药', '江苏恒瑞医药股份有限公司'], 'weight': 220,
+               'relation': '国内抗肿瘤创新药龙头，可用于比较肿瘤药商业化、临床管线、市场准入和销售体系。'},
+              {'code': '002422', 'name': '科伦药业', 'aliases': ['002422', '科伦药业', '四川科伦药业股份有限公司'], 'weight': 205,
+               'relation': '肿瘤药与复杂制剂布局较丰富，可用于比较制剂平台、临床研发和商业化能力。'},
+              {'code': '688506', 'name': '百利天恒', 'aliases': ['688506', '百利天恒', '四川百利天恒药业股份有限公司'], 'weight': 195,
+               'relation': '创新肿瘤药企业，可用于比较临床价值、管线估值、商业化节奏与市场空间。'},
+              {'code': '688180', 'name': '君实生物', 'aliases': ['688180', '君实生物', '上海君实生物医药科技股份有限公司'], 'weight': 175,
+               'relation': '肿瘤免疫治疗与创新药平台，可用于比较研发投入、临床推进和商业化路径。'},
+          ]
+
+          peer_metadata: dict[str, list[dict[str, Any]]] = {}
+          peer_candidates: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+          for spec in peer_specs:
+              rows = query_reports(spec['code'], '2020-01-01')
+              peer_metadata[spec['code']] = rows
+              for row in rows:
+                  pages = pages_meta(row)
+                  report_title = title(row)
+                  if not report_title or not info_code(row) or pages < 18:
+                      continue
+                  if any(term in report_title for term in short_terms):
+                      continue
+                  score = spec['weight'] + pages * 3
+                  if any(term in report_title for term in deep_terms):
+                      score += 180
+                  if publish_date(row) >= '2024-01-01':
+                      score += 60
+                  peer_candidates.append((score, row, spec))
+          peer_candidates.sort(key=lambda item: item[0], reverse=True)
+
+          used_peer_companies: set[str] = set()
+          for score, row, spec in peer_candidates:
+              if len(selected) >= 3:
+                  break
+              if spec['name'] in used_peer_companies:
+                  continue
+              try:
+                  record = validate_company_report(row, spec['aliases'], spec['code'], spec['name'], True, spec['relation'])
+                  if not record['is_long_report'] or record['pages'] < 18:
+                      raise RuntimeError('peer report not long enough')
+                  if record['sha256'] in seen_hashes:
+                      raise RuntimeError('duplicate PDF')
+                  selected.append(record)
+                  seen_hashes.add(record['sha256'])
+                  used_peer_companies.add(spec['name'])
+                  print('PEER_VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  rejected.append({'info_code': info_code(row), 'title': title(row), 'error': repr(exc)})
+                  print('PEER_REJECT', spec['name'], info_code(row), title(row), repr(exc), flush=True)
+                  (DOWNLOADS / f'{info_code(row)}.pdf').unlink(missing_ok=True)
+
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} complete reports validated; rejected={rejected}')
+          selected = selected[:3]
+
+          manifest: list[dict[str, Any]] = []
+          for index, record in enumerate(selected, 1):
+              tag = '公司深度' if not record['peer_report'] else '同业深度'
+              filename = f"{index:02d}_{tag}_{safe(record['publish_date'])}_{safe(record['broker'])}_{safe(record['stock_name'])}_{safe(record['title'])}.pdf"
+              shutil.copy2(record['pdf_path'], FINAL / filename)
+              clean = {key: value for key, value in record.items() if key != 'pdf_path'}
+              clean['filename'] = filename
+              manifest.append(clean)
+
+          direct_count = sum(1 for item in manifest if not item['peer_report'])
+          peer_count = sum(1 for item in manifest if item['peer_report'])
+          long_count = sum(1 for item in manifest if item['is_long_report'])
+          readme = [
+              '上海谊众（688091.SH；上海谊众药业股份有限公司）券商深度研究资料包',
+              f'整理日期：{TODAY}',
+              '',
+              f'收录数量：{len(manifest)}份；公司专属报告{direct_count}份；同业深度报告{peer_count}份；长篇报告{long_count}份。',
+              '筛选原则：优先公司专属首次覆盖、公司深度，以及围绕紫杉醇聚合物胶束、肿瘤药商业化和研发管线的完整PDF。',
+              '若公司专属长篇报告不足3份，才补充业务高度相关的抗肿瘤创新药同业深度；同业报告不代表券商对上海谊众本身的评级、目标价或盈利预测。',
+              '已剔除网页摘要、缺页预览、媒体文章及无法完成全文核验的文件。',
+              '',
+              '文件清单：',
+          ]
+          for index, item in enumerate(manifest, 1):
+              readme += [
+                  f'{index}. {item["filename"]}',
+                  f'   公司：{item["stock_name"]}；券商：{item["broker"]}；日期：{item["publish_date"]}；页数：{item["pages"]}',
+                  f'   标题：{item["title"]}',
+                  f'   类型：{"上海谊众公司专属报告" if not item["peer_report"] else "相关同业深度报告"}',
+              ]
+              if item.get('relation_to_shanghai_yizhong'):
+                  readme.append(f'   与上海谊众的可比性：{item["relation_to_shanghai_yizhong"]}')
+              readme += [
+                  f'   来源：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ]
+          if rejected:
+              readme += ['部分未纳入候选及原因：'] + [f'- {item["title"]}：{item["error"]}' for item in rejected[:20]] + ['']
+          readme.append('完整性核验：已检查研究主体、券商研究属性、实际页数、PDF结构、重复文件及SHA-256；每份PDF首页已渲染，最终ZIP已通过CRC测试。')
+
+          (FINAL / '00_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / '上海谊众原始研报检索元数据.json').write_text(json.dumps(direct_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / '同业研报检索元数据.json').write_text(json.dumps(peer_metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in manifest), encoding='utf-8')
+
+          for index, item in enumerate(manifest, 1):
+              source = FINAL / item['filename']
+              prefix = VERIFY / f'{index:02d}'
+              result = subprocess.run([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120', str(source), str(prefix)
+              ], capture_output=True, text=True)
+              if result.returncode != 0:
+                  raise RuntimeError(f'Render failed for {source.name}: {result.stderr[-800:]}')
+
+          zip_path = ART / f'{PACKAGE}.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(FINAL.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              if len(pdfs) != len(manifest):
+                  raise RuntimeError(f'PDF count mismatch: {len(pdfs)} vs {len(manifest)}')
+
+          zip_sha = sha256(zip_path)
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(manifest), 'SHA256', zip_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-yizhong-688091-broker-deep-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload verification renders
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-yizhong-688091-broker-deep-renders
+          path: verification_renders/*.png
+          retention-days: 30
+          compression-level: 0
