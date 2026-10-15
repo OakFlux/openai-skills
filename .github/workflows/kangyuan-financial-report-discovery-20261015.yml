@@ -1,0 +1,129 @@
+name: Discover Kangyuan Pharmaceutical filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/kangyuan-financial-report-discovery-20261015.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Query SSE and CNINFO disclosure APIs
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import json, re, time, traceback
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT=Path('kangyuan_discovery'); OUT.mkdir(exist_ok=True)
+          CODE='600557'; NAME='康缘药业'
+          s=requests.Session(); s.trust_env=False
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          def clean_title(text):
+              text=re.sub(r'<[^>]+>','',str(text or ''))
+              text=text.replace('&nbsp;',' ').replace('：',':')
+              return re.sub(r'\s+','',text)
+
+          # 1) SSE official metadata.
+          sse_url='https://query.sse.com.cn/security/stock/queryCompanyBulletin.do'
+          params={
+              'isPagination':'true','productId':CODE,'keyWord':'',
+              'securityType':'0101,120100,020100,020200,120200','reportType':'ALL',
+              'beginDate':'2020-01-01','endDate':'2026-10-15','pageHelp.pageSize':'200',
+              'pageHelp.pageNo':'1','pageHelp.beginPage':'1','pageHelp.endPage':'5','pageHelp.cacheSize':'1',
+              'reportType2':'DQBG',
+          }
+          headers={'User-Agent':ua,'Referer':f'https://www.sse.com.cn/assortment/stock/list/info/announcement/index.shtml?productId={CODE}'}
+          r=s.get(sse_url,params=params,headers=headers,timeout=90); r.raise_for_status()
+          data=r.json(); rows=data.get('result') or data.get('data') or data.get('pageHelp',{}).get('data') or []
+          if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or []
+          OUT.joinpath('sse_periodic.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SSE_ROWS',len(rows),flush=True)
+          for row in rows:
+              title=str(row.get('TITLE') or '')
+              if any(k in title for k in ('年度报告','第一季度报告','第三季度报告','半年度报告')):
+                  print('SSE_TARGET',json.dumps(row,ensure_ascii=False),flush=True)
+
+          # 2) CNINFO top search for orgId.
+          top_url='https://www.cninfo.com.cn/new/information/topSearch/query'
+          for kw in (CODE,NAME):
+              try:
+                  rr=s.get(top_url,params={'keyWord':kw,'maxNum':'20'},headers={'User-Agent':ua,'Referer':'https://www.cninfo.com.cn/'},timeout=60)
+                  print('TOPSEARCH',kw,rr.status_code,len(rr.content),rr.url,flush=True)
+                  OUT.joinpath(f'topsearch_{kw}.json').write_bytes(rr.content)
+                  try:
+                      payload=rr.json(); print('TOPSEARCH_JSON',kw,json.dumps(payload,ensure_ascii=False),flush=True)
+                  except Exception: print('TOPSEARCH_TEXT',kw,rr.text[:2000],flush=True)
+              except Exception as exc: print('TOPSEARCH_ERROR',kw,repr(exc),flush=True)
+
+          # 3) CNINFO historical announcement API with several stock/org variants.
+          api='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          stock_variants=[CODE,f'{CODE},gssh0600557',f'{CODE},gssse0600557',f'{CODE},sse600557']
+          all_ann=[]
+          for stock in stock_variants:
+              for page in range(1,8):
+                  form={
+                      'pageNum':str(page),'pageSize':'100','column':'sse','tabName':'fulltext','plate':'sh',
+                      'stock':stock,'searchkey':'','secid':'','category':'','trade':'',
+                      'seDate':'2020-01-01~2026-10-15','sortName':'','sortType':'','isHLtitle':'true',
+                  }
+                  try:
+                      rr=s.post(api,data=form,headers={'User-Agent':ua,'Referer':'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search','X-Requested-With':'XMLHttpRequest'},timeout=90)
+                      print('CNINFO',stock,page,rr.status_code,len(rr.content),rr.url,flush=True)
+                      OUT.joinpath(f'cninfo_{re.sub(r"[^A-Za-z0-9]+","_",stock)}_{page}.body').write_bytes(rr.content)
+                      payload=rr.json(); anns=payload.get('announcements') or []
+                      print('CNINFO_COUNT',stock,page,len(anns),'TOTAL',payload.get('totalAnnouncement'),flush=True)
+                      if not anns: break
+                      for ann in anns:
+                          title=clean_title(ann.get('announcementTitle'))
+                          if CODE in str(ann) or NAME in title or '江苏康缘药业' in title:
+                              key=(ann.get('announcementId'),ann.get('adjunctUrl'))
+                              if key not in {(x.get('announcementId'),x.get('adjunctUrl')) for x in all_ann}:
+                                  all_ann.append(ann)
+                                  if any(k in title for k in ('年度报告','第一季度报告','第三季度报告','半年度报告')):
+                                      print('CNINFO_TARGET',json.dumps(ann,ensure_ascii=False),flush=True)
+                      if len(anns)<100: break
+                  except Exception as exc:
+                      print('CNINFO_ERROR',stock,page,repr(exc),flush=True)
+                      break
+          OUT.joinpath('cninfo_all_matches.json').write_text(json.dumps(all_ann,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # 4) Eastmoney announcement API as an independent mirror/index.
+          em_url='https://np-anotice-stock.eastmoney.com/api/security/ann'
+          em_rows=[]
+          for page in range(1,15):
+              try:
+                  rr=s.get(em_url,params={'sr':'-1','page_size':'100','page_index':str(page),'ann_type':'A','client_source':'web','stock_list':CODE},headers={'User-Agent':ua,'Referer':f'https://data.eastmoney.com/notices/stock/{CODE}.html'},timeout=90)
+                  print('EAST',page,rr.status_code,len(rr.content),rr.url,flush=True)
+                  payload=rr.json(); anns=(payload.get('data') or {}).get('list') or []
+                  if not anns: break
+                  em_rows.extend(anns)
+                  for ann in anns:
+                      title=str(ann.get('title') or '')
+                      if any(k in title for k in ('年度报告','第一季度报告','第三季度报告','半年度报告')):
+                          print('EAST_TARGET',json.dumps(ann,ensure_ascii=False),flush=True)
+                  dates=[str(x.get('notice_date') or '') for x in anns]
+                  if dates and min(dates)<'2020-01-01': break
+              except Exception as exc:
+                  print('EAST_ERROR',page,repr(exc),flush=True); break
+          OUT.joinpath('eastmoney_announcements.json').write_text(json.dumps(em_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: kangyuan-financial-report-discovery-20261015
+          path: kangyuan_discovery
+          retention-days: 7
+          compression-level: 6
