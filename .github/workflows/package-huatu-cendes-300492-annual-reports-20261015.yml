@@ -56,13 +56,6 @@ jobs:
               'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
           })
 
-          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
-          stock_variants = [
-              ('szse', 'sz', '300492,szse300492'),
-              ('szse', 'sz', '300492,szse0300492'),
-              ('szse', 'sz', '300492'),
-          ]
-
           def strip_html(text: Any) -> str:
               return re.sub(r'<[^>]+>', '', str(text or '')).replace('&nbsp;', ' ').strip()
 
@@ -70,186 +63,137 @@ jobs:
               value = strip_html(text).replace('：', ':')
               return re.sub(r'[\s:：()（）【】\[\]<>《》]+', '', value)
 
-          def disclosure_date(item: dict[str, Any]) -> str:
-              path = str(item.get('adjunctUrl') or '')
-              match = re.search(r'finalpage/(\d{4}-\d{2}-\d{2})/', path)
-              if match:
-                  return match.group(1)
-              timestamp = int(item.get('announcementTime') or 0)
-              if timestamp:
-                  return time.strftime('%Y-%m-%d', time.localtime(timestamp / 1000))
-              return ''
+          def notice_date(item: dict[str, Any]) -> str:
+              return str(item.get('notice_date') or item.get('display_time') or '')[:10]
 
-          def query_cninfo(searchkey: str, date_range: str) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
-              best_rows: list[dict[str, Any]] = []
-              best_meta = None
-              errors = []
-              for column, plate, stock in stock_variants:
-                  rows: list[dict[str, Any]] = []
-                  seen = set()
-                  try:
-                      for page in range(1, 12):
-                          form = {
-                              'pageNum': str(page),
-                              'pageSize': '30',
-                              'column': column,
-                              'tabName': 'fulltext',
-                              'plate': plate,
-                              'stock': stock,
-                              'searchkey': searchkey,
-                              'secid': '',
-                              'category': '',
-                              'trade': '',
-                              'seDate': date_range,
-                              'sortName': '',
-                              'sortType': '',
-                              'isHLtitle': 'true',
-                          }
-                          response = session.post(
-                              endpoint,
-                              data=form,
-                              headers={
-                                  'User-Agent': UA,
-                                  'Referer': 'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search',
-                                  'X-Requested-With': 'XMLHttpRequest',
-                              },
-                              timeout=90,
-                          )
-                          response.raise_for_status()
-                          payload = response.json()
-                          batch = payload.get('announcements') or []
-                          if not batch:
-                              break
-                          for item in batch:
-                              key = (item.get('announcementId'), item.get('adjunctUrl'))
-                              if key not in seen:
-                                  seen.add(key)
-                                  rows.append(item)
-                          total = int(payload.get('totalAnnouncement') or 0)
-                          if total and page * 30 >= total:
-                              break
-                      meta = {'column': column, 'plate': plate, 'stock': stock}
-                      print('QUERY', searchkey, date_range, json.dumps(meta, ensure_ascii=False), 'ROWS', len(rows), flush=True)
-                      for item in rows:
-                          print('ROW', strip_html(item.get('announcementTitle')), item.get('adjunctUrl'), flush=True)
-                      if len(rows) > len(best_rows):
-                          best_rows = rows
-                          best_meta = meta
-                      if rows:
-                          return rows, meta
-                  except Exception as exc:
-                      errors.append({'column': column, 'plate': plate, 'stock': stock, 'error': repr(exc)})
-              print('QUERY_ERRORS', searchkey, date_range, json.dumps(errors, ensure_ascii=False), flush=True)
-              return best_rows, best_meta
+          # Fetch the complete public announcement index for the company.
+          announcement_api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          announcements: list[dict[str, Any]] = []
+          seen = set()
+          page_snapshots = []
+          for page in range(1, 30):
+              response = session.get(
+                  announcement_api,
+                  params={
+                      'sr': '-1',
+                      'page_size': '100',
+                      'page_index': str(page),
+                      'ann_type': 'A',
+                      'client_source': 'web',
+                      'stock_list': CODE,
+                  },
+                  headers={
+                      'User-Agent': UA,
+                      'Referer': f'https://data.eastmoney.com/notices/stock/{CODE}.html',
+                  },
+                  timeout=90,
+              )
+              response.raise_for_status()
+              payload = response.json()
+              rows = (payload.get('data') or {}).get('list') or []
+              page_snapshots.append({'page': page, 'count': len(rows), 'rows': rows})
+              print('ANNOUNCEMENT_PAGE', page, 'ROWS', len(rows), flush=True)
+              if not rows:
+                  break
+              for item in rows:
+                  key = str(item.get('art_code') or item.get('announcement_id') or '')
+                  if key and key not in seen:
+                      seen.add(key)
+                      announcements.append(item)
+              dates = [notice_date(item) for item in rows if notice_date(item)]
+              if dates and min(dates) < '2019-01-01':
+                  break
 
-          queries = []
-          selections: list[dict[str, Any]] = []
+          if not announcements:
+              raise RuntimeError('No public announcement metadata returned for 300492')
+
+          (VERIFY_DIR / '东方财富公告索引快照.json').write_text(
+              json.dumps({'pages': page_snapshots, 'announcements': announcements}, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
 
           annual_exclusions = (
               '摘要', '英文', '独立意见', '问询', '回复', '监管', '说明', '社会责任',
               '环境报告', '内部控制', '审计报告', '鉴证报告', '专项报告', '更正公告',
+              '董事会', '监事会', '审议', '提示性公告',
           )
 
-          for index, report_year in enumerate(range(2020, 2026), start=1):
-              phrase = f'{report_year}年年度报告'
-              disclosure_year = report_year + 1
-              date_ranges = [
-                  f'{disclosure_year}-01-01~{disclosure_year}-12-31',
-                  f'{report_year}-01-01~{min(2026, disclosure_year + 1)}-12-31',
-                  '2020-01-01~2026-10-15',
-              ]
-              candidates: list[dict[str, Any]] = []
-              for date_range in date_ranges:
-                  rows, meta = query_cninfo(phrase, date_range)
-                  queries.append({
-                      'searchkey': phrase,
-                      'date_range': date_range,
-                      'query_meta': meta,
-                      'count': len(rows),
-                      'rows': rows,
-                  })
-                  for item in rows:
-                      title = compact(item.get('announcementTitle'))
-                      if phrase not in title:
-                          continue
-                      if any(term in title for term in annual_exclusions):
-                          continue
-                      # Accept the direct report, a “全文” version, or a later revised/updated full report.
-                      if not any(marker in title for marker in (phrase, phrase + '全文')):
-                          continue
-                      candidates.append(item)
-                  if candidates:
-                      break
-              if not candidates:
-                  raise RuntimeError(f'No full annual report candidate found for {report_year}')
+          annual_by_year: dict[int, dict[str, Any]] = {}
+          for item in announcements:
+              title = compact(item.get('title'))
+              if any(term in title for term in annual_exclusions):
+                  continue
+              match = re.search(r'(20\d{2})年年度报告(?:全文)?(?:修订版|更新后|更正后)?$', title)
+              if not match:
+                  continue
+              year = int(match.group(1))
+              if not 2020 <= year <= 2025:
+                  continue
+              old = annual_by_year.get(year)
+              if old is None or (notice_date(item), int(item.get('art_code', '0').replace('AN', '') or 0)) > (
+                  notice_date(old), int(str(old.get('art_code', '0')).replace('AN', '') or 0)
+              ):
+                  annual_by_year[year] = item
 
-              # Prefer the latest disclosure, so a revised/updated full report supersedes the original.
-              chosen = max(
-                  candidates,
-                  key=lambda item: (
-                      disclosure_date(item),
-                      int(item.get('announcementTime') or 0),
-                      -len(compact(item.get('announcementTitle'))),
-                  ),
-              )
-              title = strip_html(chosen.get('announcementTitle'))
-              selections.append({
-                  'kind': '年度报告',
-                  'year': report_year,
-                  'title': title,
-                  'date': disclosure_date(chosen),
-                  'row': chosen,
-                  'filename': f'{index:02d}_华图山鼎_{report_year}年年度报告.pdf',
-              })
+          annual_years = sorted(annual_by_year)
+          if annual_years != [2020, 2021, 2022, 2023, 2024, 2025]:
+              candidates = [
+                  {'title': strip_html(item.get('title')), 'date': notice_date(item), 'art_code': item.get('art_code')}
+                  for item in announcements
+                  if '年度报告' in compact(item.get('title')) and '摘要' not in compact(item.get('title'))
+              ]
+              raise RuntimeError(f'Annual-report coverage mismatch: {annual_years}; candidates={json.dumps(candidates, ensure_ascii=False)}')
 
           quarter_candidates: list[dict[str, Any]] = []
-          for phrase in ('2026年第三季度报告', '2026年第一季度报告'):
-              rows, meta = query_cninfo(phrase, '2026-01-01~2026-10-15')
-              queries.append({
-                  'searchkey': phrase,
-                  'date_range': '2026-01-01~2026-10-15',
-                  'query_meta': meta,
-                  'count': len(rows),
-                  'rows': rows,
-              })
-              for item in rows:
-                  title = compact(item.get('announcementTitle'))
-                  if phrase not in title:
-                      continue
-                  if any(term in title for term in ('摘要', '英文', '问询', '回复', '说明')):
-                      continue
+          for item in announcements:
+              title = compact(item.get('title'))
+              if any(term in title for term in ('摘要', '英文', '问询', '回复', '说明')):
+                  continue
+              if re.search(r'2026年第(?:一|三)季度报告(?:全文)?$', title):
                   quarter_candidates.append(item)
 
           if not quarter_candidates:
-              raise RuntimeError('No formal 2026 quarterly report candidate found')
+              raise RuntimeError('No formal 2026 quarterly report found in the announcement index')
 
-          latest_quarter = max(
-              quarter_candidates,
-              key=lambda item: (disclosure_date(item), int(item.get('announcementTime') or 0)),
-          )
-          latest_quarter_title = strip_html(latest_quarter.get('announcementTitle'))
+          latest_quarter = max(quarter_candidates, key=lambda item: (notice_date(item), str(item.get('art_code') or '')))
+          latest_quarter_title = strip_html(latest_quarter.get('title'))
           quarter_label = '第三季度报告' if '第三季度' in latest_quarter_title else '第一季度报告'
+
+          selections: list[dict[str, Any]] = []
+          for index, year in enumerate(annual_years, start=1):
+              item = annual_by_year[year]
+              selections.append({
+                  'kind': '年度报告',
+                  'year': year,
+                  'title': strip_html(item.get('title')),
+                  'date': notice_date(item),
+                  'row': item,
+                  'filename': f'{index:02d}_华图山鼎_{year}年年度报告.pdf',
+              })
           selections.append({
               'kind': '最新季报',
               'year': 2026,
               'title': latest_quarter_title,
-              'date': disclosure_date(latest_quarter),
+              'date': notice_date(latest_quarter),
               'row': latest_quarter,
               'filename': f'07_华图山鼎_2026年{quarter_label}_最新季报.pdf',
           })
 
-          (VERIFY_DIR / 'CNINFO_查询与选中文件.json').write_text(
-              json.dumps({'queries': queries, 'selections': selections}, ensure_ascii=False, indent=2),
+          (VERIFY_DIR / '选中文件元数据.json').write_text(
+              json.dumps(selections, ensure_ascii=False, indent=2),
               encoding='utf-8',
           )
 
           def download_pdf(item: dict[str, Any], destination: Path) -> tuple[str, list[dict[str, Any]]]:
-              adjunct = str(item.get('adjunctUrl') or '')
-              if not adjunct:
-                  raise RuntimeError('Selected CNINFO item has no adjunctUrl')
+              art_code = str(item.get('art_code') or '')
+              if not art_code:
+                  raise RuntimeError('Selected announcement has no art_code')
+              public_page = f'https://data.eastmoney.com/notices/detail/{CODE}/{art_code}.html'
               urls = [
-                  'https://static.cninfo.com.cn/' + adjunct.lstrip('/'),
-                  'http://static.cninfo.com.cn/' + adjunct.lstrip('/'),
+                  f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{art_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{art_code}_1.pdf',
               ]
               attempts = []
               for url in urls:
@@ -259,7 +203,7 @@ jobs:
                               url,
                               headers={
                                   'User-Agent': UA,
-                                  'Referer': 'https://www.cninfo.com.cn/',
+                                  'Referer': public_page,
                                   'Accept': 'application/pdf,*/*;q=0.8',
                               },
                               timeout=240,
@@ -280,7 +224,7 @@ jobs:
                       except Exception as exc:
                           attempts.append({'requested_url': url, 'attempt': attempt, 'error': repr(exc)})
                       time.sleep(attempt)
-              raise RuntimeError('PDF download failed: ' + json.dumps(attempts, ensure_ascii=False))
+              raise RuntimeError('PDF download failed: ' + json.dumps({'art_code': art_code, 'attempts': attempts}, ensure_ascii=False))
 
           records = []
           hashes = set()
@@ -295,11 +239,7 @@ jobs:
                   raise RuntimeError('Duplicate PDF content: ' + path.name)
               hashes.add(digest)
 
-              qpdf = subprocess.run(
-                  ['qpdf', '--warning-exit-0', '--check', str(path)],
-                  capture_output=True,
-                  text=True,
-              )
+              qpdf = subprocess.run(['qpdf', '--warning-exit-0', '--check', str(path)], capture_output=True, text=True)
               if qpdf.returncode != 0:
                   raise RuntimeError(f'qpdf failed for {path.name}: {qpdf.stderr[-2000:]}')
 
@@ -343,15 +283,15 @@ jobs:
               render_bytes = render_file.stat().st_size
               render_file.unlink()
 
-              official_url = 'https://static.cninfo.com.cn/' + str(selection['row'].get('adjunctUrl') or '').lstrip('/')
+              art_code = str(selection['row'].get('art_code') or '')
               record = {
                   'filename': 'PDF文件/' + path.name,
                   'document_type': selection['kind'],
                   'title': selection['title'],
                   'report_year': selection['year'],
                   'disclosure_date': selection['date'],
-                  'cninfo_announcement_id': selection['row'].get('announcementId'),
-                  'official_pdf_url': official_url,
+                  'eastmoney_art_code': art_code,
+                  'public_announcement_page': f'https://data.eastmoney.com/notices/detail/{CODE}/{art_code}.html',
                   'download_url': source_url,
                   'pages': pages,
                   'bytes': len(data),
@@ -371,7 +311,7 @@ jobs:
               f'2. 截至整理日已披露的最新正式季度报告：{latest_quarter_title}，共1份。',
               '',
               '年度报告均为报告全文，不以摘要替代；最新季报按第一季度报告或第三季度报告口径确定，半年度报告不作为季报替代。',
-              '全部PDF来自巨潮资讯公开披露静态文件，并完成PDF结构、页数、公司与年份身份及首页渲染检查。',
+              '文件通过公开公告索引筛选并下载公告PDF镜像，已完成PDF结构、页数、公司与年份身份及首页渲染检查。',
               '',
               '文件清单：',
           ]
@@ -381,7 +321,8 @@ jobs:
                   f'   文件：{record["filename"]}',
                   f'   披露日期：{record["disclosure_date"]}',
                   f'   页数：{record["pages"]}',
-                  f'   官方PDF：{record["official_pdf_url"]}',
+                  f'   公告页面：{record["public_announcement_page"]}',
+                  f'   PDF来源：{record["download_url"]}',
                   f'   SHA-256：{record["sha256"]}',
                   '',
               ]
