@@ -1,0 +1,100 @@
+name: Build Jinlongyu broker report package
+
+on:
+  pull_request:
+    paths:
+      - '.triggers/jinlongyu-broker-pr-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          reports=[
+            {'date':'2017-06-04','broker':'华鑫证券','title':'新股询价报告：金龙羽','type':'新股询价公司研究报告','code':'AP201706040624478853','expected':3},
+            {'date':'2017-06-02','broker':'东莞证券','title':'新股网下申购询价建议报告（金龙羽）','type':'新股网下申购询价研究报告','code':'AP201706020618757250','expected':2},
+          ]
+          out=Path('pkg'); renders=Path('renders'); artifacts=Path('artifact_out')
+          for d in (out,renders,artifacts): d.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/','Accept':'application/pdf,*/*'})
+          def safe(x): return re.sub(r'[\\/:*?"<>|]+','_',x).strip(' ._')[:120]
+          manifest=[]; hashes=set()
+          for i,rpt in enumerate(reports,1):
+            fn=f'{i:02d}_{rpt["date"]}_{rpt["broker"]}_{safe(rpt["title"])}.pdf'; p=out/fn
+            urls=[f'https://pdf.dfcfw.com/pdf/H3_{rpt["code"]}_1.pdf',f'https://pdf.dfcfw.com/pdf/H2_{rpt["code"]}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{rpt["code"]}_01.pdf',f'https://pdf.dfcfw.com/pdf/H2_{rpt["code"]}_01.pdf']
+            used=None; errs=[]
+            for u in urls:
+              for a in range(1,4):
+                try:
+                  resp=s.get(u,timeout=(20,180),allow_redirects=True)
+                  print('GET',i,a,resp.status_code,len(resp.content),u,flush=True)
+                  if resp.status_code==200 and resp.content.startswith(b'%PDF-') and len(resp.content)>50000:
+                    p.write_bytes(resp.content); used=u; break
+                  errs.append(f'{u}:{resp.status_code}:{len(resp.content)}')
+                except Exception as e: errs.append(f'{u}:{e!r}')
+                time.sleep(a)
+              if used: break
+            if not used: raise RuntimeError('download failed '+' | '.join(errs[-12:]))
+            q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+            if q.returncode not in (0,3): raise RuntimeError(q.stderr[-800:])
+            reader=PdfReader(str(p),strict=False); pages=len(reader.pages)
+            if pages<2 or abs(pages-rpt['expected'])>1: raise RuntimeError(f'bad pages {pages}')
+            txt='\n'.join((reader.pages[j].extract_text() or '') for j in range(min(5,pages)))
+            if '金龙羽' not in txt and '002882' not in txt: raise RuntimeError('wrong company')
+            if not any(k in txt for k in ('询价','新股','申购','证券研究报告')): raise RuntimeError('not research')
+            pre=renders/f'cover{i}'
+            rr=subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','100',str(p),str(pre)],capture_output=True,text=True)
+            png=Path(str(pre)+'.png')
+            if rr.returncode or not png.exists() or png.stat().st_size<8000: raise RuntimeError('render failed')
+            data=p.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+            if sha in hashes: raise RuntimeError('duplicate')
+            hashes.add(sha)
+            item={'filename':fn,'date':rpt['date'],'broker':rpt['broker'],'title':rpt['title'],'classification':rpt['type'],'pages':pages,'bytes':len(data),'sha256':sha,'source_url':used}
+            manifest.append(item); print('VERIFIED',json.dumps(item,ensure_ascii=False),flush=True)
+          readme=['金龙羽集团股份有限公司（金龙羽，002882.SZ）券商公司研究报告合集','整理日期：2026-10-15','',
+          '本包收录2份公开可直接下载并完成结构核验的公司专项券商报告。两份均为上市前的新股询价/申购研究，篇幅较短，不属于长篇公司深度报告。',
+          '公开匿名渠道未检索到可直接下载的金龙羽长篇首次覆盖或公司深度PDF，未使用网页摘要、行业文章、预览页或拼接文件凑数。','','文件清单：']
+          for n,x in enumerate(manifest,1):
+            readme += [f'{n}. {x["filename"]}',f'   券商：{x["broker"]}',f'   类型：{x["classification"]}',f'   标题：{x["title"]}',f'   日期：{x["date"]}；页数：{x["pages"]}',f'   来源：{x["source_url"]}',f'   SHA-256：{x["sha256"]}','']
+          readme.append('已检查PDF文件头、公司身份、报告属性、页数、qpdf结构、首页渲染、重复文件及ZIP CRC。')
+          (out/'00_文件清单与来源说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest),encoding='utf-8')
+          zpath=artifacts/'金龙羽_002882_券商公司研究报告_2份_公开完整版.zip'
+          with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(out.iterdir()): z.write(p,arcname=p.name)
+          with zipfile.ZipFile(zpath) as z:
+            bad=z.testzip(); count=sum(n.lower().endswith('.pdf') for n in z.namelist())
+            if bad or count!=2: raise RuntimeError(f'zip invalid {bad} {count}')
+          print('FINAL_ZIP',zpath.name,zpath.stat().st_size,hashlib.sha256(zpath.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinlongyu-broker-report-package
+          path: artifact_out/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
