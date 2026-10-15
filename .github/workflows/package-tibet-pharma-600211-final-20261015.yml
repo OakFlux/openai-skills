@@ -1,0 +1,342 @@
+name: Create final Tibet Pharmaceutical report package
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package-tibet-pharma-600211-final-20261015.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Install validation tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests
+
+      - name: Query targeted filings, download, validate, and package
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+
+          AS_OF = '2026-10-15'
+          CODE = '600211'
+          PACKAGE = '西藏药业_600211_2020-2025年报及最新季报'
+          ROOT = Path(PACKAGE)
+          PDF_DIR = ROOT / 'PDF文件'
+          VERIFY_DIR = ROOT / '验证记录'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          VERIFY_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
+          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          stock_variants = ['600211,gssh0600211', '600211,gssse0600211', '600211,sse600211']
+
+          def clean(text: str) -> str:
+              text = re.sub(r'<[^>]+>', '', str(text or ''))
+              text = text.replace('&nbsp;', ' ').replace('：', ':')
+              return re.sub(r'\s+', '', text)
+
+          def disclosure_date(item: dict[str, Any]) -> str:
+              path = str(item.get('adjunctUrl') or '')
+              match = re.search(r'finalpage/(\d{4}-\d{2}-\d{2})/', path)
+              return match.group(1) if match else ''
+
+          def query(searchkey: str, date_range: str) -> tuple[list[dict[str, Any]], str | None]:
+              errors = []
+              for stock in stock_variants:
+                  collected = []
+                  seen = set()
+                  try:
+                      for page in range(1, 8):
+                          form = {
+                              'pageNum': str(page),
+                              'pageSize': '30',
+                              'column': 'sse',
+                              'tabName': 'fulltext',
+                              'plate': 'sh',
+                              'stock': stock,
+                              'searchkey': searchkey,
+                              'secid': '',
+                              'category': '',
+                              'trade': '',
+                              'seDate': date_range,
+                              'sortName': '',
+                              'sortType': '',
+                              'isHLtitle': 'true',
+                          }
+                          response = session.post(
+                              endpoint,
+                              data=form,
+                              headers={
+                                  'User-Agent': UA,
+                                  'Referer': 'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search',
+                                  'X-Requested-With': 'XMLHttpRequest',
+                              },
+                              timeout=90,
+                          )
+                          response.raise_for_status()
+                          payload = response.json()
+                          rows = payload.get('announcements') or []
+                          if not rows:
+                              break
+                          for row in rows:
+                              key = (row.get('announcementId'), row.get('adjunctUrl'))
+                              if key not in seen:
+                                  seen.add(key)
+                                  collected.append(row)
+                          total = int(payload.get('totalAnnouncement') or 0)
+                          if total and page * 30 >= total:
+                              break
+                      if collected:
+                          print('QUERY_RESULT', searchkey, date_range, stock, len(collected), flush=True)
+                          return collected, stock
+                  except Exception as exc:
+                      errors.append({'stock': stock, 'error': repr(exc)})
+              print('QUERY_EMPTY', searchkey, date_range, json.dumps(errors, ensure_ascii=False), flush=True)
+              return [], None
+
+          selections = []
+          query_log = []
+          used_stock_variants = set()
+
+          for index, report_year in enumerate(range(2020, 2026), start=1):
+              disclosure_year = report_year + 1
+              searchkey = f'{report_year}年年度报告'
+              date_ranges = [
+                  f'{disclosure_year}-01-01~{disclosure_year}-12-31',
+                  f'{report_year}-01-01~{min(2026, disclosure_year + 1)}-12-31',
+                  '2020-01-01~2026-10-15',
+              ]
+              candidates = []
+              for date_range in date_ranges:
+                  rows, stock_variant = query(searchkey, date_range)
+                  query_log.append({'searchkey': searchkey, 'date_range': date_range, 'stock_variant': stock_variant, 'count': len(rows), 'rows': rows})
+                  if stock_variant:
+                      used_stock_variants.add(stock_variant)
+                  for row in rows:
+                      title = clean(row.get('announcementTitle'))
+                      if '摘要' in title or '英文' in title or '社会责任' in title or '环境' in title:
+                          continue
+                      if re.search(rf'{report_year}年年度报告(?:修订版)?$', title):
+                          candidates.append(row)
+                  if candidates:
+                      break
+              if not candidates:
+                  raise RuntimeError(f'Could not find full {report_year} annual report')
+              chosen = max(candidates, key=lambda item: (disclosure_date(item), int(item.get('announcementTime') or 0)))
+              title = re.sub(r'<[^>]+>', '', str(chosen.get('announcementTitle') or '')).strip()
+              selections.append({
+                  'kind': '年度报告',
+                  'year': report_year,
+                  'title': title,
+                  'date': disclosure_date(chosen),
+                  'cninfo': chosen,
+                  'filename': f'{index:02d}_西藏药业_{report_year}年年度报告.pdf',
+              })
+
+          quarter_candidates = []
+          for phrase in ('2026年第三季度报告', '2026年第一季度报告'):
+              rows, stock_variant = query(phrase, '2026-01-01~2026-10-15')
+              query_log.append({'searchkey': phrase, 'date_range': '2026-01-01~2026-10-15', 'stock_variant': stock_variant, 'count': len(rows), 'rows': rows})
+              if stock_variant:
+                  used_stock_variants.add(stock_variant)
+              for row in rows:
+                  title = clean(row.get('announcementTitle'))
+                  if '摘要' in title or '正文' in title or '英文' in title:
+                      continue
+                  if title.endswith(phrase):
+                      quarter_candidates.append(row)
+          if not quarter_candidates:
+              raise RuntimeError('Could not find a 2026 formal quarterly report')
+          latest_quarter = max(quarter_candidates, key=lambda item: (disclosure_date(item), int(item.get('announcementTime') or 0)))
+          latest_title = re.sub(r'<[^>]+>', '', str(latest_quarter.get('announcementTitle') or '')).strip()
+          quarter_label = '第三季度报告' if '第三季度' in latest_title else '第一季度报告'
+          selections.append({
+              'kind': '最新季报',
+              'year': 2026,
+              'title': latest_title,
+              'date': disclosure_date(latest_quarter),
+              'cninfo': latest_quarter,
+              'filename': f'07_西藏药业_2026年{quarter_label}_最新季报.pdf',
+          })
+
+          (VERIFY_DIR / 'CNINFO_查询与元数据.json').write_text(json.dumps({
+              'used_stock_variants': sorted(used_stock_variants),
+              'queries': query_log,
+              'selections': selections,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def download(item: dict[str, Any], destination: Path) -> tuple[str, list[dict[str, Any]]]:
+              adjunct = str(item.get('adjunctUrl') or '')
+              if not adjunct:
+                  raise RuntimeError('Missing adjunctUrl: ' + json.dumps(item, ensure_ascii=False))
+              urls = [
+                  'https://static.cninfo.com.cn/' + adjunct.lstrip('/'),
+                  'http://static.cninfo.com.cn/' + adjunct.lstrip('/'),
+              ]
+              attempts = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={'User-Agent': UA, 'Referer': 'https://www.cninfo.com.cn/', 'Accept': 'application/pdf,*/*;q=0.8'},
+                              timeout=240,
+                              allow_redirects=True,
+                          )
+                          meta = {
+                              'requested_url': url,
+                              'final_url': response.url,
+                              'status': response.status_code,
+                              'content_type': response.headers.get('content-type'),
+                              'bytes': len(response.content),
+                              'attempt': attempt,
+                          }
+                          attempts.append(meta)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF') and len(response.content) > 50_000:
+                              destination.write_bytes(response.content)
+                              return response.url, attempts
+                      except Exception as exc:
+                          attempts.append({'requested_url': url, 'attempt': attempt, 'error': repr(exc)})
+                      time.sleep(attempt)
+              raise RuntimeError('Download failed: ' + json.dumps(attempts, ensure_ascii=False))
+
+          records = []
+          hashes = set()
+          for selection in selections:
+              path = PDF_DIR / selection['filename']
+              source_url, attempts = download(selection['cninfo'], path)
+              data = path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError('Duplicate PDF content: ' + path.name)
+              hashes.add(digest)
+
+              qpdf = subprocess.run(['qpdf', '--warning-exit-0', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode != 0:
+                  raise RuntimeError('qpdf failed: ' + path.name + '\n' + qpdf.stderr[-2000:])
+              info = subprocess.run(['pdfinfo', str(path)], capture_output=True, text=True)
+              if info.returncode != 0:
+                  raise RuntimeError('pdfinfo failed: ' + path.name)
+              page_match = re.search(r'^Pages:\s+(\d+)', info.stdout, re.M)
+              if not page_match:
+                  raise RuntimeError('Page count unavailable: ' + path.name)
+              pages = int(page_match.group(1))
+
+              text_file = VERIFY_DIR / (path.stem + '_前12页.txt')
+              text_run = subprocess.run(['pdftotext', '-f', '1', '-l', str(min(12, pages)), '-layout', str(path), str(text_file)], capture_output=True, text=True)
+              if text_run.returncode != 0:
+                  raise RuntimeError('pdftotext failed: ' + path.name)
+              text = clean(text_file.read_text(encoding='utf-8', errors='replace'))
+              if not any(term in text for term in ('西藏药业', '西藏诺迪康药业', CODE)):
+                  raise RuntimeError('Company identity check failed: ' + path.name)
+              if str(selection['year']) not in text:
+                  raise RuntimeError('Year identity check failed: ' + path.name)
+              if selection['kind'] == '年度报告' and '年度报告' not in text:
+                  raise RuntimeError('Annual report check failed: ' + path.name)
+              if selection['kind'] == '最新季报' and '季度报告' not in text:
+                  raise RuntimeError('Quarterly report check failed: ' + path.name)
+
+              render_prefix = VERIFY_DIR / (path.stem + '_首页')
+              render = subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120', str(path), str(render_prefix)], capture_output=True, text=True)
+              png = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not png.exists() or png.stat().st_size < 8_000:
+                  raise RuntimeError('First-page render failed: ' + path.name)
+              render_bytes = png.stat().st_size
+              png.unlink()
+
+              cninfo_url = 'https://static.cninfo.com.cn/' + str(selection['cninfo'].get('adjunctUrl') or '').lstrip('/')
+              record = {
+                  'filename': 'PDF文件/' + path.name,
+                  'document_type': selection['kind'],
+                  'title': selection['title'],
+                  'report_year': selection['year'],
+                  'disclosure_date': selection['date'],
+                  'cninfo_announcement_id': selection['cninfo'].get('announcementId'),
+                  'official_pdf_url': cninfo_url,
+                  'download_url': source_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_bytes,
+                  'download_attempts': attempts,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '西藏药业（600211.SH）2020-2025年年度报告及最新季度报告',
+              f'整理日期：{AS_OF}',
+              '',
+              '本压缩包共收录7份完整PDF：2020-2025年年度报告全文6份，以及截至整理日最新正式季度报告1份。',
+              f'最新季报：{latest_title}。',
+              '年度报告只收录全文，不以摘要替代；半年度报告不按季度报告计入。全部PDF来自巨潮资讯公开披露静态文件。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme += [
+                  f'{index}. {record["title"]}',
+                  f'   文件：{record["filename"]}',
+                  f'   披露日期：{record["disclosure_date"]}',
+                  f'   页数：{record["pages"]}',
+                  f'   官方PDF：{record["official_pdf_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ]
+          (ROOT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{record["sha256"]}  {record["filename"]}\n' for record in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for file in sorted(ROOT.rglob('*')):
+                  if file.is_file():
+                      archive.write(file, arcname=f'{PACKAGE}/{file.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad or len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={len(pdfs)}')
+
+          print('FINAL_PACKAGE', json.dumps({
+              'filename': zip_path.name,
+              'bytes': zip_path.stat().st_size,
+              'sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'pdf_count': 7,
+              'latest_quarter': latest_title,
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: tibet-pharma-600211-final-reports-20261015
+          path: 西藏药业_600211_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
