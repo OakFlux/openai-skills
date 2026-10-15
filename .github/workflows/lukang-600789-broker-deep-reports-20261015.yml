@@ -1,0 +1,409 @@
+name: Build LuKang 600789 broker deep reports 20261015
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lukang-600789-broker-deep-reports-20261015.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = '600789'
+          COMPANY = '鲁抗医药'
+          COMPANY_FULL = '山东鲁抗医药股份有限公司'
+          AS_OF = '2026-10-15'
+          TARGET_COUNT = 3
+          PACKAGE_BASE = f'{COMPANY}_{STOCK_CODE}_券商深度报告_完整版'
+          WORK = Path('work')
+          WORK.mkdir(exist_ok=True)
+          CACHE = WORK / 'candidate_pdfs'
+          CACHE.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+              'Referer': f'https://data.eastmoney.com/report/{STOCK_CODE}.html',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/json,text/plain,*/*',
+          })
+
+          def compact(s: Any) -> str:
+              return re.sub(r'\s+', '', str(s or ''))
+
+          def field(row: dict[str, Any], *names: str, default: Any = '') -> Any:
+              for name in names:
+                  if name in row and row[name] not in (None, ''):
+                      return row[name]
+              return default
+
+          def to_int(x: Any, default: int = 0) -> int:
+              try:
+                  return int(float(str(x).replace(',', '').strip()))
+              except Exception:
+                  return default
+
+          def parse_date(x: Any) -> str:
+              s = str(x or '')[:10]
+              return s if re.fullmatch(r'\d{4}-\d{2}-\d{2}', s) else '未知日期'
+
+          def request_json(url: str, params: dict[str, str]) -> dict[str, Any]:
+              last: Any = None
+              for attempt in range(8):
+                  try:
+                      r = session.get(url, params=params, timeout=(25, 120))
+                      last = {'status': r.status_code, 'text': r.text[:300]}
+                      if r.status_code != 200:
+                          time.sleep(1 + attempt)
+                          continue
+                      text = r.text.strip().lstrip('\ufeff')
+                      try:
+                          return r.json()
+                      except Exception:
+                          m = re.search(r'^[^(]*\((.*)\)\s*;?$', text, re.S)
+                          if m:
+                              return json.loads(m.group(1))
+                          return json.loads(text)
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'研报列表接口失败: {last}')
+
+          api = 'https://reportapi.eastmoney.com/report/list'
+          all_rows: list[dict[str, Any]] = []
+          page_logs: list[dict[str, Any]] = []
+          for page in range(1, 11):
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2017-01-01', 'endTime': AS_OF,
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': STOCK_CODE, 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  '_': str(int(time.time() * 1000)),
+              }
+              payload = request_json(api, params)
+              rows = payload.get('data') or []
+              if isinstance(rows, dict):
+                  rows = rows.get('list') or rows.get('data') or []
+              if not isinstance(rows, list):
+                  rows = []
+              page_logs.append({'page': page, 'count': len(rows), 'hits': payload.get('hits')})
+              all_rows.extend(x for x in rows if isinstance(x, dict))
+              if len(rows) < 100:
+                  break
+              time.sleep(0.3)
+
+          if not all_rows:
+              raise RuntimeError('东方财富研报接口未返回鲁抗医药研报记录')
+
+          positive = {
+              '深度': 1200, '首次覆盖': 1100, '公司深度': 1000,
+              '投资价值分析': 900, '价值重估': 850, '首次给予': 700,
+              '系列报告': 600, '专题报告': 550, '研究报告': 350,
+              '成长': 120, '龙头': 120, '转型': 100, '布局': 80,
+          }
+          negative = {
+              '点评': -650, '季报': -450, '年报': -350, '中报': -350,
+              '事件': -350, '快报': -400, '公告': -500, '跟踪': -180,
+              '更新报告': -160, '业绩预告': -500, '简评': -500,
+          }
+
+          normalized: list[dict[str, Any]] = []
+          seen_codes: set[str] = set()
+          for row in all_rows:
+              info = str(field(row, 'infoCode', 'info_code', 'reportId', 'report_id')).strip()
+              title = str(field(row, 'title', 'reportTitle')).strip()
+              if not info or not title or info in seen_codes:
+                  continue
+              seen_codes.add(info)
+              pages_hint = to_int(field(row, 'attachPages', 'attach_pages', 'pageCount', 'pages'))
+              date = parse_date(field(row, 'publishDate', 'pubDate', 'pub_date'))
+              broker = str(field(row, 'orgSName', 'orgName', 'org_name', default='未知券商')).strip()
+              analysts = str(field(row, 'researcher', 'researchers', 'author', default='')).strip()
+              rating = str(field(row, 'emRatingName', 'ratingName', 'rating', default='')).strip()
+              title_c = compact(title)
+              score = pages_hint * 18
+              for k, v in positive.items():
+                  if k in title_c:
+                      score += v
+              for k, v in negative.items():
+                  if k in title_c:
+                      score += v
+              try:
+                  age_days = (dt.date.fromisoformat(AS_OF) - dt.date.fromisoformat(date)).days
+                  score += max(0, 500 - age_days // 5)
+              except Exception:
+                  pass
+              normalized.append({
+                  'info_code': info, 'title': title, 'date': date,
+                  'broker': broker, 'analysts': analysts, 'rating': rating,
+                  'pages_hint': pages_hint, 'score': score,
+                  'raw': row,
+              })
+
+          normalized.sort(key=lambda x: (x['score'], x['pages_hint'], x['date']), reverse=True)
+          (WORK / 'all_report_metadata.json').write_text(
+              json.dumps(normalized, ensure_ascii=False, indent=2, default=str), encoding='utf-8'
+          )
+
+          def download_pdf(info_code: str) -> tuple[bytes, str, dict[str, Any]]:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{info_code}_1.pdf',
+              ]
+              last: dict[str, Any] = {}
+              for url in urls:
+                  for attempt in range(5):
+                      try:
+                          r = session.get(url, timeout=(30, 300), allow_redirects=True, headers={
+                              'User-Agent': session.headers['User-Agent'],
+                              'Referer': f'https://data.eastmoney.com/report/info/{info_code}.html',
+                              'Accept': 'application/pdf,*/*;q=0.8',
+                          })
+                          last = {
+                              'url': url, 'status': r.status_code, 'bytes': len(r.content),
+                              'content_type': r.headers.get('content-type', ''), 'final_url': r.url,
+                          }
+                          if r.status_code == 200 and r.content[:5] == b'%PDF-' and len(r.content) > 80_000:
+                              return r.content, url, last
+                      except Exception as exc:
+                          last = {'url': url, 'error': repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f'PDF下载失败 {info_code}: {last}')
+
+          def pdf_text(path: Path, pages: int) -> str:
+              text_parts: list[str] = []
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  for p in reader.pages[:min(16, pages)]:
+                      try:
+                          text_parts.append(p.extract_text() or '')
+                      except Exception:
+                          pass
+              except Exception:
+                  pass
+              text = '\n'.join(text_parts)
+              if len(compact(text)) < 120:
+                  txt_path = path.with_suffix('.txt')
+                  subprocess.run(
+                      ['pdftotext', '-f', '1', '-l', str(min(16, pages)), str(path), str(txt_path)],
+                      check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  )
+                  if txt_path.exists():
+                      text += '\n' + txt_path.read_text(encoding='utf-8', errors='ignore')
+              return text
+
+          attempts: list[dict[str, Any]] = []
+          valid: list[dict[str, Any]] = []
+          candidate_limit = min(40, len(normalized))
+          for meta in normalized[:candidate_limit]:
+              if len(valid) >= 8:
+                  break
+              item = {k: v for k, v in meta.items() if k != 'raw'}
+              try:
+                  data, pdf_url, dlmeta = download_pdf(meta['info_code'])
+                  tmp = CACHE / f"{meta['info_code']}.pdf"
+                  tmp.write_bytes(data)
+                  reader = PdfReader(str(tmp), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 7:
+                      raise RuntimeError(f'页数过少: {pages}')
+                  text = pdf_text(tmp, pages)
+                  text_c = compact(text)
+                  identity_terms = [x for x in [COMPANY, COMPANY_FULL, STOCK_CODE] if compact(x) in text_c]
+                  if not identity_terms:
+                      raise RuntimeError('PDF正文未检出公司名称或证券代码')
+                  subprocess.run(
+                      ['qpdf', '--warning-exit-0', '--check', str(tmp)],
+                      check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  )
+                  depth_bonus = 0
+                  title_c = compact(meta['title'])
+                  if any(k in title_c for k in ['深度', '首次覆盖', '公司深度', '投资价值分析', '价值重估']):
+                      depth_bonus += 1000
+                  if pages >= 25:
+                      depth_bonus += 700
+                  elif pages >= 18:
+                      depth_bonus += 450
+                  elif pages >= 12:
+                      depth_bonus += 220
+                  if any(k in title_c for k in ['点评', '季报', '年报', '中报', '事件', '快报']):
+                      depth_bonus -= 450
+                  final_score = meta['score'] + pages * 30 + depth_bonus
+                  valid.append({
+                      **item, 'actual_pages': pages, 'bytes': len(data),
+                      'sha256': hashlib.sha256(data).hexdigest(),
+                      'pdf_url': pdf_url, 'download_meta': dlmeta,
+                      'identity_terms': identity_terms, 'final_score': final_score,
+                      'temp_path': str(tmp),
+                  })
+                  attempts.append({'status': 'accepted_candidate', **valid[-1]})
+              except Exception as exc:
+                  attempts.append({'status': 'rejected', **item, 'reason': repr(exc)})
+
+          if len(valid) < 2:
+              raise RuntimeError(f'仅找到{len(valid)}份通过核验的完整券商报告，少于最低2份')
+
+          valid.sort(key=lambda x: (x['final_score'], x['actual_pages'], x['date']), reverse=True)
+
+          selected: list[dict[str, Any]] = []
+          used_brokers: set[str] = set()
+          used_titles: set[str] = set()
+          # 第一轮优先不同券商的长篇深度报告
+          for item in valid:
+              title_key = re.sub(r'[^\u4e00-\u9fffA-Za-z0-9]', '', item['title'])
+              if title_key in used_titles or item['broker'] in used_brokers:
+                  continue
+              if item['actual_pages'] < 10:
+                  continue
+              selected.append(item)
+              used_titles.add(title_key)
+              used_brokers.add(item['broker'])
+              if len(selected) >= TARGET_COUNT:
+                  break
+          # 第二轮补足2-3份，仍要求完整报告
+          if len(selected) < TARGET_COUNT:
+              for item in valid:
+                  title_key = re.sub(r'[^\u4e00-\u9fffA-Za-z0-9]', '', item['title'])
+                  if title_key in used_titles or item in selected:
+                      continue
+                  selected.append(item)
+                  used_titles.add(title_key)
+                  if len(selected) >= TARGET_COUNT:
+                      break
+
+          selected = selected[:TARGET_COUNT]
+          if len(selected) < 2:
+              raise RuntimeError('最终筛选不足2份')
+
+          package = f'{PACKAGE_BASE}_{len(selected)}份_截至20261015'
+          root = Path(package)
+          root.mkdir(exist_ok=True)
+          previews = root / '首页预览'
+          previews.mkdir(exist_ok=True)
+
+          def safe_name(s: str, limit: int = 52) -> str:
+              s = re.sub(r'[\\/:*?"<>|\r\n]+', '_', s).strip(' ._')
+              return s[:limit].rstrip(' ._') or '未命名报告'
+
+          manifest: list[dict[str, Any]] = []
+          for idx, item in enumerate(selected, 1):
+              title_short = safe_name(item['title'])
+              broker_short = safe_name(item['broker'], 18)
+              date = item['date'].replace('-', '')
+              filename = f'{idx:02d}_{broker_short}_{date}_{title_short}_完整版.pdf'
+              src = Path(item['temp_path'])
+              dest = root / filename
+              dest.write_bytes(src.read_bytes())
+              prefix = previews / dest.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(dest), str(prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 8_000:
+                  raise RuntimeError(f'首页预览生成失败: {filename}')
+              out = {k: v for k, v in item.items() if k not in ['temp_path', 'raw']}
+              out.update({
+                  'filename': filename,
+                  'source_report_page': f"https://data.eastmoney.com/report/info/{item['info_code']}.html",
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'document_nature': '券商原始完整PDF',
+                  'validation': ['PDF header', 'issuer identity', 'actual page count', 'qpdf structure', 'first-page render'],
+              })
+              manifest.append(out)
+
+          readme = [
+              f'{COMPANY_FULL}（{STOCK_CODE}.SH）券商深度报告完整版资料包',
+              f'整理日期：{AS_OF}',
+              '',
+              f'本包收录{len(manifest)}份公开可直接取得的券商原始完整PDF。',
+              '筛选规则：优先公司深度、首次覆盖和投资价值分析；优先较长篇幅与不同券商；剔除页数过少、公司身份不符或PDF结构异常的文件。',
+              '',
+          ]
+          for i, x in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {x['broker']}：《{x['title']}》",
+                  f"   日期：{x['date']}；分析师：{x['analysts'] or '未标注'}；评级：{x['rating'] or '未标注'}",
+                  f"   完整页数：{x['actual_pages']}页；文件：{x['filename']}",
+                  f"   来源页面：{x['source_report_page']}",
+                  f"   SHA-256：{x['sha256']}",
+                  '',
+              ]
+          readme += [
+              '报告内容和版权归原券商及作者所有，仅供研究参考，不构成投资建议。',
+              '核验项目：PDF文件头、公司名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+
+          (root / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+          (root / '筛选与下载日志.json').write_text(
+              json.dumps({'api_pages': page_logs, 'records': len(all_rows), 'attempts': attempts}, ensure_ascii=False, indent=2, default=str),
+              encoding='utf-8',
+          )
+          (root / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest), encoding='utf-8'
+          )
+
+          zpath = Path(package + '.zip')
+          with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{package}/{p.relative_to(root)}')
+          with zipfile.ZipFile(zpath) as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs) != len(manifest):
+                  raise RuntimeError(f'ZIP核验失败: bad={bad}, pdfs={len(pdfs)}, expected={len(manifest)}')
+
+          alias = Path('lukang_600789_broker_deep_reports.zip')
+          alias.write_bytes(zpath.read_bytes())
+          print('FINAL_ZIP', zpath, zpath.stat().st_size, 'SHA256', hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print('SELECTED_REPORTS', json.dumps(manifest, ensure_ascii=False, indent=2, default=str))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: lukang-600789-broker-deep-reports-final-20261015
+          path: |
+            鲁抗医药_600789_券商深度报告_完整版_*份_截至20261015.zip
+            lukang_600789_broker_deep_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
