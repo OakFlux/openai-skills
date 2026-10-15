@@ -1,0 +1,318 @@
+name: Package Loongson official reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package-loongson-official-reports-20261015.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover official filings, download, validate, and package
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          AS_OF = '2026-10-15'
+          COMPANY = '龙芯中科'
+          CODE = '688047'
+          PACKAGE = f'{COMPANY}_{CODE}_所有年报_招股说明书_最新季报_{AS_OF.replace("-", "")}'
+          ROOT = Path(PACKAGE)
+          DOCS = ROOT / 'PDF文件'
+          VERIFY = ROOT / '验证记录'
+          DOCS.mkdir(parents=True, exist_ok=True)
+          VERIFY.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': f'https://www.sse.com.cn/assortment/stock/list/info/announcement/index.shtml?productId={CODE}',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://query.sse.com.cn/security/stock/queryCompanyBulletin.do'
+          base_params = {
+              'isPagination': 'true',
+              'productId': CODE,
+              'keyWord': '',
+              'securityType': '0101,120100,020100,020200,120200',
+              'reportType': 'ALL',
+              'beginDate': '2020-01-01',
+              'endDate': AS_OF,
+              'pageHelp.pageSize': '200',
+              'pageHelp.pageNo': '1',
+              'pageHelp.beginPage': '1',
+              'pageHelp.endPage': '5',
+              'pageHelp.cacheSize': '1',
+          }
+
+          def api_rows(params: dict[str, str]) -> list[dict[str, Any]]:
+              last_error = None
+              for attempt in range(1, 4):
+                  try:
+                      response = session.get(api, params=params, timeout=90)
+                      response.raise_for_status()
+                      data = response.json()
+                      rows = data.get('result') or data.get('data') or data.get('pageHelp', {}).get('data') or []
+                      if isinstance(rows, dict):
+                          rows = rows.get('data') or rows.get('list') or []
+                      if not isinstance(rows, list):
+                          raise RuntimeError(f'Unexpected SSE API payload: {type(rows)}')
+                      return [row for row in rows if isinstance(row, dict)]
+                  except Exception as exc:
+                      last_error = exc
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'SSE API failed after retries: {last_error!r}')
+
+          periodic_params = dict(base_params)
+          periodic_params['reportType2'] = 'DQBG'
+          periodic = api_rows(periodic_params)
+
+          prospectus_params = dict(base_params)
+          prospectus_params.pop('reportType', None)
+          prospectus_params['keyWord'] = '招股说明书'
+          prospectus_rows = api_rows(prospectus_params)
+
+          (VERIFY / 'SSE_定期报告API快照.json').write_text(json.dumps(periodic, ensure_ascii=False, indent=2), encoding='utf-8')
+          (VERIFY / 'SSE_招股说明书API快照.json').write_text(json.dumps(prospectus_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Select every full annual report disclosed since listing. If an amended/revised version exists,
+          # keep the latest disclosure for that report year.
+          annual_by_year: dict[int, dict[str, Any]] = {}
+          for row in periodic:
+              title = str(row.get('TITLE') or '')
+              bulletin_type = str(row.get('BULLETIN_TYPE') or '')
+              match = re.fullmatch(r'龙芯中科(20\d{2})年年度报告(?:（.*?）|\(.*?\))?', title)
+              if not match or bulletin_type != '年报' or '摘要' in title:
+                  continue
+              year = int(match.group(1))
+              old = annual_by_year.get(year)
+              if old is None or str(row.get('SSEDATE') or '') > str(old.get('SSEDATE') or ''):
+                  annual_by_year[year] = row
+
+          annual_years = sorted(annual_by_year)
+          if not annual_years:
+              raise RuntimeError('No full annual reports found in the official SSE API.')
+          expected_years = list(range(annual_years[0], annual_years[-1] + 1))
+          if annual_years != expected_years:
+              raise RuntimeError(f'Annual-report years are not continuous: found {annual_years}, expected {expected_years}')
+          if annual_years[0] != 2022 or annual_years[-1] < 2025:
+              raise RuntimeError(f'Unexpected annual-report coverage: {annual_years}')
+
+          # Latest formal quarterly report means Q1 or Q3, not a half-year report.
+          quarter_candidates = []
+          for row in periodic:
+              title = str(row.get('TITLE') or '')
+              bulletin_type = str(row.get('BULLETIN_TYPE') or '')
+              if bulletin_type in {'第一季度季报', '第三季度季报'} and re.fullmatch(r'龙芯中科20\d{2}年第[一三]季度报告', title):
+                  quarter_candidates.append(row)
+          if not quarter_candidates:
+              raise RuntimeError('No quarterly report found in the official SSE API.')
+          latest_quarter = max(quarter_candidates, key=lambda r: (str(r.get('SSEDATE') or ''), str(r.get('TITLE') or '')))
+
+          # Final IPO prospectus, excluding later refinancing documents and summaries.
+          ipo_candidates = []
+          for row in prospectus_rows:
+              title = str(row.get('TITLE') or '')
+              if title == '龙芯中科首次公开发行股票并在科创板上市招股说明书':
+                  ipo_candidates.append(row)
+          if not ipo_candidates:
+              raise RuntimeError('Final IPO prospectus not found in the official SSE API.')
+          prospectus = max(ipo_candidates, key=lambda r: str(r.get('SSEDATE') or ''))
+
+          selections: list[dict[str, Any]] = []
+          selections.append({'kind': '招股说明书', 'order': 1, 'row': prospectus, 'filename': '01_龙芯中科_首次公开发行股票并在科创板上市招股说明书.pdf'})
+          for index, year in enumerate(annual_years, start=2):
+              selections.append({'kind': '年度报告', 'order': index, 'row': annual_by_year[year], 'filename': f'{index:02d}_龙芯中科_{year}年年度报告.pdf'})
+          q_index = len(selections) + 1
+          q_title = str(latest_quarter.get('TITLE') or '')
+          selections.append({'kind': '最新季报', 'order': q_index, 'row': latest_quarter, 'filename': f'{q_index:02d}_{q_title}.pdf'})
+
+          def download_pdf(relative_url: str, destination: Path) -> tuple[str, dict[str, Any]]:
+              if not relative_url.startswith('/'):
+                  relative_url = '/' + relative_url
+              candidates = [
+                  'https://static.sse.com.cn' + relative_url,
+                  'https://www.sse.com.cn' + relative_url,
+              ]
+              errors = []
+              for url in candidates:
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(url, timeout=180, allow_redirects=True)
+                          content = response.content
+                          meta = {
+                              'requested_url': url,
+                              'final_url': response.url,
+                              'status': response.status_code,
+                              'content_type': response.headers.get('content-type'),
+                              'bytes': len(content),
+                              'attempt': attempt,
+                          }
+                          if response.status_code == 200 and content.startswith(b'%PDF') and len(content) > 50_000:
+                              destination.write_bytes(content)
+                              return response.url, meta
+                          errors.append(meta)
+                      except Exception as exc:
+                          errors.append({'requested_url': url, 'attempt': attempt, 'error': repr(exc)})
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f'Failed to download official PDF {relative_url}: {errors}')
+
+          records: list[dict[str, Any]] = []
+          seen_hashes: set[str] = set()
+
+          for item in selections:
+              row = item['row']
+              title = str(row.get('TITLE') or '')
+              relative_url = str(row.get('URL') or '')
+              disclosed = str(row.get('SSEDATE') or '')
+              destination = DOCS / item['filename']
+              source_url, download_meta = download_pdf(relative_url, destination)
+
+              data = destination.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {destination.name}')
+              seen_hashes.add(digest)
+
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages < 1:
+                  raise RuntimeError(f'No pages in {destination.name}')
+
+              sample_pages = min(pages, 8)
+              sample_text = '\n'.join((reader.pages[i].extract_text() or '') for i in range(sample_pages))
+              compact = re.sub(r'\s+', '', sample_text)
+              if '龙芯中科' not in compact and '688047' not in compact:
+                  raise RuntimeError(f'Company identity check failed for {destination.name}')
+
+              if item['kind'] == '年度报告':
+                  report_year = re.search(r'(20\d{2})年年度报告', title)
+                  if not report_year or report_year.group(1) not in compact:
+                      raise RuntimeError(f'Annual-report year check failed for {destination.name}')
+              elif item['kind'] == '招股说明书' and '招股说明书' not in compact:
+                  raise RuntimeError(f'Prospectus title check failed for {destination.name}')
+              elif item['kind'] == '最新季报' and ('季度报告' not in compact and '第一季度' not in compact and '第三季度' not in compact):
+                  raise RuntimeError(f'Quarterly-report title check failed for {destination.name}')
+
+              qpdf = subprocess.run(['qpdf', '--warning-exit-0', '--check', str(destination)], capture_output=True, text=True)
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f'qpdf validation failed for {destination.name}: {qpdf.stderr[-2000:]}')
+
+              render_prefix = VERIFY / (destination.stem + '_首页')
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120', str(destination), str(render_prefix)],
+                  capture_output=True,
+                  text=True,
+              )
+              render_file = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not render_file.exists() or render_file.stat().st_size < 8_000:
+                  raise RuntimeError(f'First-page rendering failed for {destination.name}: {render.stderr[-1000:]}')
+
+              record = {
+                  'filename': f'PDF文件/{destination.name}',
+                  'document_type': item['kind'],
+                  'title': title,
+                  'report_year': re.search(r'(20\d{2})年', title).group(1) if re.search(r'(20\d{2})年', title) else None,
+                  'disclosure_date': disclosed,
+                  'official_source_url': source_url,
+                  'official_relative_url': relative_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_file.stat().st_size,
+                  'download': download_meta,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          latest_title = str(latest_quarter.get('TITLE') or '')
+          readme_lines = [
+              '龙芯中科（688047.SH）年报、招股说明书及最新季报',
+              f'整理日期：{AS_OF}',
+              '',
+              '收录范围：',
+              f'1. 公司上市后已披露的全部完整年度报告：{annual_years[0]}-{annual_years[-1]}年，共{len(annual_years)}份。',
+              '2. 首次公开发行股票并在科创板上市的最终招股说明书，共1份。',
+              f'3. 截至{AS_OF}上交所已披露的最新正式季度报告：{latest_title}，共1份。',
+              '',
+              '说明：年度报告仅收录全文，不收录年度报告摘要；“最新季报”按第一季度报告或第三季度报告口径确定，不以半年度报告替代。全部PDF均来自上海证券交易所正式披露链接。',
+              '',
+              '文件清单：',
+          ]
+          for idx, record in enumerate(records, start=1):
+              readme_lines.extend([
+                  f'{idx}. {record["title"]}',
+                  f'   文件：{record["filename"]}',
+                  f'   披露日期：{record["disclosure_date"]}',
+                  f'   页数：{record["pages"]}',
+                  f'   官方来源：{record["official_source_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+
+          (ROOT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{PACKAGE}/{path.relative_to(ROOT)}')
+
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              pdf_entries = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad is not None:
+                  raise RuntimeError(f'ZIP CRC validation failed at {bad}')
+              if len(pdf_entries) != len(records):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_entries)} != {len(records)}')
+
+          final_hash = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_PACKAGE', json.dumps({
+              'filename': zip_path.name,
+              'bytes': zip_path.stat().st_size,
+              'sha256': final_hash,
+              'pdf_count': len(records),
+              'annual_years': annual_years,
+              'latest_quarter': latest_title,
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload completed ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongson-688047-official-reports-20261015
+          path: 龙芯中科_688047_所有年报_招股说明书_最新季报_20261015.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
