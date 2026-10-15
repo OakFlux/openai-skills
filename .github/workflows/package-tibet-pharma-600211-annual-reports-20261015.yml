@@ -1,0 +1,454 @@
+name: Package Tibet Pharmaceutical annual reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package-tibet-pharma-600211-annual-reports-20261015.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Install validation tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests
+
+      - name: Discover download validate and package reports
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+
+          AS_OF = '2026-10-15'
+          CODE = '600211'
+          COMPANY = '西藏药业'
+          PACKAGE = '西藏药业_600211_2020-2025年报及最新季报'
+          ROOT = Path(PACKAGE)
+          PDF_DIR = ROOT / 'PDF文件'
+          VERIFY_DIR = ROOT / '验证记录'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          VERIFY_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          def compact(text: str) -> str:
+              text = re.sub(r'<[^>]+>', '', str(text or ''))
+              text = text.replace('&nbsp;', ' ').replace('：', ':')
+              return re.sub(r'[\s:：()（）]+', '', text)
+
+          # Shanghai Stock Exchange metadata is the source of truth for selection.
+          sse_api = 'https://query.sse.com.cn/security/stock/queryCompanyBulletin.do'
+          sse_params = {
+              'isPagination': 'true',
+              'productId': CODE,
+              'keyWord': '',
+              'securityType': '0101,120100,020100,020200,120200',
+              'reportType': 'ALL',
+              'beginDate': '2020-01-01',
+              'endDate': AS_OF,
+              'pageHelp.pageSize': '200',
+              'pageHelp.pageNo': '1',
+              'pageHelp.beginPage': '1',
+              'pageHelp.endPage': '5',
+              'pageHelp.cacheSize': '1',
+              'reportType2': 'DQBG',
+          }
+          sse_response = session.get(
+              sse_api,
+              params=sse_params,
+              headers={
+                  'User-Agent': UA,
+                  'Referer': f'https://www.sse.com.cn/assortment/stock/list/info/announcement/index.shtml?productId={CODE}',
+              },
+              timeout=90,
+          )
+          sse_response.raise_for_status()
+          sse_payload = sse_response.json()
+          sse_rows = sse_payload.get('result') or sse_payload.get('data') or sse_payload.get('pageHelp', {}).get('data') or []
+          if isinstance(sse_rows, dict):
+              sse_rows = sse_rows.get('data') or sse_rows.get('list') or []
+          if not isinstance(sse_rows, list):
+              raise RuntimeError('Unexpected SSE response structure')
+          (VERIFY_DIR / 'SSE_定期报告官方元数据.json').write_text(json.dumps(sse_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          annual_by_year: dict[int, dict[str, Any]] = {}
+          for row in sse_rows:
+              title = str(row.get('TITLE') or '').strip()
+              if str(row.get('BULLETIN_TYPE') or '') != '年报' or '摘要' in title:
+                  continue
+              match = re.search(r'(20\d{2})年年度报告(?:（.*?）|\(.*?\))?$', title)
+              if not match:
+                  continue
+              year = int(match.group(1))
+              if 2020 <= year <= 2025:
+                  old = annual_by_year.get(year)
+                  if old is None or str(row.get('SSEDATE') or '') > str(old.get('SSEDATE') or ''):
+                      annual_by_year[year] = row
+
+          annual_years = sorted(annual_by_year)
+          if annual_years != [2020, 2021, 2022, 2023, 2024, 2025]:
+              raise RuntimeError(f'Annual-report coverage mismatch: {annual_years}')
+
+          quarterly_rows = []
+          for row in sse_rows:
+              title = str(row.get('TITLE') or '').strip()
+              bulletin_type = str(row.get('BULLETIN_TYPE') or '')
+              if bulletin_type not in {'第一季度季报', '第三季度季报'}:
+                  continue
+              if '正文' in title or '摘要' in title:
+                  continue
+              if re.search(r'20\d{2}年第[一三]季度报告$', title):
+                  quarterly_rows.append(row)
+          if not quarterly_rows:
+              raise RuntimeError('No formal quarterly report found')
+          latest_quarter = max(quarterly_rows, key=lambda row: (str(row.get('SSEDATE') or ''), str(row.get('TITLE') or '')))
+          latest_quarter_title = str(latest_quarter.get('TITLE') or '').strip()
+
+          selections: list[dict[str, Any]] = []
+          for index, year in enumerate(annual_years, start=1):
+              row = annual_by_year[year]
+              selections.append({
+                  'kind': '年度报告',
+                  'year': year,
+                  'title': str(row.get('TITLE') or '').strip(),
+                  'date': str(row.get('SSEDATE') or ''),
+                  'sse_relative_url': str(row.get('URL') or ''),
+                  'filename': f'{index:02d}_西藏药业_{year}年年度报告.pdf',
+              })
+          quarter_year_match = re.search(r'(20\d{2})年', latest_quarter_title)
+          quarter_year = int(quarter_year_match.group(1)) if quarter_year_match else 2026
+          quarter_label = '第三季度报告' if '第三季度' in latest_quarter_title else '第一季度报告'
+          selections.append({
+              'kind': '最新季报',
+              'year': quarter_year,
+              'title': latest_quarter_title,
+              'date': str(latest_quarter.get('SSEDATE') or ''),
+              'sse_relative_url': str(latest_quarter.get('URL') or ''),
+              'filename': f'07_西藏药业_{quarter_year}年{quarter_label}_最新季报.pdf',
+          })
+
+          # CNINFO index. Shanghai issuers conventionally use gssh06 + six-digit ticker.
+          cninfo_api = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          cninfo_announcements: list[dict[str, Any]] = []
+          seen_ann = set()
+          total = None
+          for page in range(1, 25):
+              form = {
+                  'pageNum': str(page),
+                  'pageSize': '30',
+                  'column': 'sse',
+                  'tabName': 'fulltext',
+                  'plate': 'sh',
+                  'stock': '600211,gssh0600211',
+                  'searchkey': '',
+                  'secid': '',
+                  'category': '',
+                  'trade': '',
+                  'seDate': '2020-01-01~2026-10-15',
+                  'sortName': '',
+                  'sortType': '',
+                  'isHLtitle': 'true',
+              }
+              response = session.post(
+                  cninfo_api,
+                  data=form,
+                  headers={
+                      'User-Agent': UA,
+                      'Referer': 'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search',
+                      'X-Requested-With': 'XMLHttpRequest',
+                  },
+                  timeout=90,
+              )
+              response.raise_for_status()
+              payload = response.json()
+              announcements = payload.get('announcements') or []
+              total = int(payload.get('totalAnnouncement') or total or 0)
+              if not announcements:
+                  break
+              for announcement in announcements:
+                  key = (announcement.get('announcementId'), announcement.get('adjunctUrl'))
+                  if key not in seen_ann:
+                      seen_ann.add(key)
+                      cninfo_announcements.append(announcement)
+              if total and page * 30 >= total:
+                  break
+          (VERIFY_DIR / 'CNINFO_公告元数据.json').write_text(json.dumps(cninfo_announcements, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Eastmoney public announcement metadata as fallback.
+          eastmoney_api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          eastmoney_announcements: list[dict[str, Any]] = []
+          for page in range(1, 12):
+              response = session.get(
+                  eastmoney_api,
+                  params={'sr': '-1', 'page_size': '100', 'page_index': str(page), 'ann_type': 'A', 'client_source': 'web', 'stock_list': CODE},
+                  headers={'User-Agent': UA, 'Referer': f'https://data.eastmoney.com/notices/stock/{CODE}.html'},
+                  timeout=90,
+              )
+              response.raise_for_status()
+              rows = (response.json().get('data') or {}).get('list') or []
+              if not rows:
+                  break
+              eastmoney_announcements.extend(rows)
+              dates = [str(row.get('notice_date') or '') for row in rows]
+              if dates and min(dates) < '2020-01-01':
+                  break
+          (VERIFY_DIR / '东方财富公告镜像元数据.json').write_text(json.dumps(eastmoney_announcements, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def match_cninfo(selection: dict[str, Any]) -> dict[str, Any] | None:
+              target = compact(selection['title'])
+              exact = []
+              for announcement in cninfo_announcements:
+                  title = compact(announcement.get('announcementTitle'))
+                  if title == target:
+                      exact.append(announcement)
+              if exact:
+                  return max(exact, key=lambda item: int(item.get('announcementTime') or 0))
+              year = selection['year']
+              candidates = []
+              for announcement in cninfo_announcements:
+                  title = compact(announcement.get('announcementTitle'))
+                  if f'{year}年' not in title or '摘要' in title or '正文' in title:
+                      continue
+                  if selection['kind'] == '年度报告' and title.endswith(f'{year}年年度报告'):
+                      candidates.append(announcement)
+                  elif selection['kind'] == '最新季报':
+                      if '第三季度报告' in selection['title'] and '第三季度报告' in title:
+                          candidates.append(announcement)
+                      elif '第一季度报告' in selection['title'] and '第一季度报告' in title:
+                          candidates.append(announcement)
+              return max(candidates, key=lambda item: int(item.get('announcementTime') or 0)) if candidates else None
+
+          def match_eastmoney(selection: dict[str, Any]) -> dict[str, Any] | None:
+              target = compact(selection['title'])
+              candidates = []
+              for announcement in eastmoney_announcements:
+                  title = compact(announcement.get('title'))
+                  if title.endswith(target) or target.endswith(title):
+                      candidates.append(announcement)
+              if candidates:
+                  return max(candidates, key=lambda item: str(item.get('notice_date') or ''))
+              year = selection['year']
+              for announcement in eastmoney_announcements:
+                  title = compact(announcement.get('title'))
+                  if f'{year}年' not in title or '摘要' in title or '正文' in title:
+                      continue
+                  if selection['kind'] == '年度报告' and title.endswith(f'{year}年年度报告'):
+                      candidates.append(announcement)
+                  elif selection['kind'] == '最新季报':
+                      if '第三季度报告' in selection['title'] and '第三季度报告' in title:
+                          candidates.append(announcement)
+                      elif '第一季度报告' in selection['title'] and '第一季度报告' in title:
+                          candidates.append(announcement)
+              return max(candidates, key=lambda item: str(item.get('notice_date') or '')) if candidates else None
+
+          def download_pdf(selection: dict[str, Any], destination: Path) -> tuple[str, str, list[dict[str, Any]]]:
+              cninfo = match_cninfo(selection)
+              eastmoney = match_eastmoney(selection)
+              candidates: list[tuple[str, str]] = []
+              if cninfo and cninfo.get('adjunctUrl'):
+                  candidates.append(('巨潮资讯官方静态披露文件', 'https://static.cninfo.com.cn/' + str(cninfo['adjunctUrl']).lstrip('/')))
+              sse_path = selection['sse_relative_url']
+              candidates.extend([
+                  ('上海证券交易所官方静态文件', 'https://static.sse.com.cn' + sse_path),
+                  ('上海证券交易所官方网站', 'https://www.sse.com.cn' + sse_path),
+              ])
+              if eastmoney and eastmoney.get('art_code'):
+                  art_code = str(eastmoney['art_code'])
+                  candidates.extend([
+                      ('东方财富公告PDF镜像H2', f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf'),
+                      ('东方财富公告PDF镜像H3', f'https://pdf.dfcfw.com/pdf/H3_{art_code}_1.pdf'),
+                  ])
+
+              attempts: list[dict[str, Any]] = []
+              for source_name, url in candidates:
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={
+                                  'User-Agent': UA,
+                                  'Referer': 'https://www.cninfo.com.cn/' if 'cninfo' in url else f'https://www.sse.com.cn/assortment/stock/list/info/announcement/index.shtml?productId={CODE}',
+                                  'Accept': 'application/pdf,*/*;q=0.8',
+                              },
+                              timeout=240,
+                              allow_redirects=True,
+                          )
+                          meta = {
+                              'source_name': source_name,
+                              'requested_url': url,
+                              'final_url': response.url,
+                              'status': response.status_code,
+                              'content_type': response.headers.get('content-type'),
+                              'bytes': len(response.content),
+                              'attempt': attempt,
+                          }
+                          attempts.append(meta)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF') and len(response.content) > 50_000:
+                              destination.write_bytes(response.content)
+                              return source_name, response.url, attempts
+                      except Exception as exc:
+                          attempts.append({'source_name': source_name, 'requested_url': url, 'attempt': attempt, 'error': repr(exc)})
+                      time.sleep(attempt)
+              raise RuntimeError('Download failed: ' + json.dumps({'title': selection['title'], 'attempts': attempts}, ensure_ascii=False))
+
+          records: list[dict[str, Any]] = []
+          hashes: set[str] = set()
+          for selection in selections:
+              path = PDF_DIR / selection['filename']
+              source_name, source_url, attempts = download_pdf(selection, path)
+              data = path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'Duplicate PDF content: {path.name}')
+              hashes.add(digest)
+
+              qpdf = subprocess.run(['qpdf', '--warning-exit-0', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f'qpdf failed for {path.name}: {qpdf.stderr[-2000:]}')
+
+              info = subprocess.run(['pdfinfo', str(path)], capture_output=True, text=True)
+              if info.returncode != 0:
+                  raise RuntimeError(f'pdfinfo failed for {path.name}: {info.stderr[-1500:]}')
+              match = re.search(r'^Pages:\s+(\d+)', info.stdout, re.M)
+              if not match:
+                  raise RuntimeError(f'Page count unavailable for {path.name}')
+              pages = int(match.group(1))
+              if pages < 1:
+                  raise RuntimeError(f'No pages in {path.name}')
+
+              text_path = VERIFY_DIR / (path.stem + '_前12页.txt')
+              text_run = subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(12, pages)), '-layout', str(path), str(text_path)],
+                  capture_output=True,
+                  text=True,
+              )
+              if text_run.returncode != 0:
+                  raise RuntimeError(f'pdftotext failed for {path.name}: {text_run.stderr[-1500:]}')
+              extracted = text_path.read_text(encoding='utf-8', errors='replace')
+              extracted_compact = compact(extracted)
+              if not any(key in extracted_compact for key in ('西藏药业', '西藏诺迪康药业', CODE)):
+                  raise RuntimeError(f'Company identity check failed for {path.name}')
+              year_text = str(selection['year'])
+              if year_text not in extracted_compact:
+                  raise RuntimeError(f'Year identity check failed for {path.name}')
+              if selection['kind'] == '年度报告' and '年度报告' not in extracted_compact:
+                  raise RuntimeError(f'Annual-report identity check failed for {path.name}')
+              if selection['kind'] == '最新季报' and '季度报告' not in extracted_compact:
+                  raise RuntimeError(f'Quarterly-report identity check failed for {path.name}')
+
+              render_prefix = VERIFY_DIR / (path.stem + '_首页')
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120', str(path), str(render_prefix)],
+                  capture_output=True,
+                  text=True,
+              )
+              render_file = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not render_file.exists() or render_file.stat().st_size < 8_000:
+                  raise RuntimeError(f'First-page render failed for {path.name}: {render.stderr[-1000:]}')
+              render_bytes = render_file.stat().st_size
+              render_file.unlink()
+
+              cninfo_match = match_cninfo(selection)
+              eastmoney_match = match_eastmoney(selection)
+              record = {
+                  'filename': f'PDF文件/{path.name}',
+                  'document_type': selection['kind'],
+                  'title': selection['title'],
+                  'report_year': selection['year'],
+                  'disclosure_date': selection['date'],
+                  'official_sse_url': 'https://www.sse.com.cn' + selection['sse_relative_url'],
+                  'cninfo_announcement_id': cninfo_match.get('announcementId') if cninfo_match else None,
+                  'eastmoney_art_code': eastmoney_match.get('art_code') if eastmoney_match else None,
+                  'download_source': source_name,
+                  'download_url': source_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'first_page_render_bytes': render_bytes,
+                  'download_attempts': attempts,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          readme = [
+              '西藏药业（600211.SH）2020-2025年年度报告及最新季度报告',
+              f'整理日期：{AS_OF}',
+              '',
+              '本压缩包共收录7份完整PDF：',
+              '1. 2020-2025年年度报告全文，共6份；',
+              f'2. 截至整理日已披露的最新正式季度报告：{latest_quarter_title}，共1份。',
+              '',
+              '说明：年度报告仅收录全文，不以摘要替代；最新季报按第一季度报告或第三季度报告口径确定，半年度报告不作为季报替代。',
+              '文件选择与披露日期以上海证券交易所官方定期报告目录为准，PDF优先从巨潮资讯官方静态披露文件获取，并设置上交所及东方财富公告镜像作为下载回退来源。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, start=1):
+              readme += [
+                  f'{index}. {record["title"]}',
+                  f'   文件：{record["filename"]}',
+                  f'   披露日期：{record["disclosure_date"]}',
+                  f'   页数：{record["pages"]}',
+                  f'   下载来源：{record["download_source"]}',
+                  f'   下载地址：{record["download_url"]}',
+                  f'   上交所官方地址：{record["official_sse_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ]
+
+          (ROOT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{record["sha256"]}  {record["filename"]}\n' for record in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for file in sorted(ROOT.rglob('*')):
+                  if file.is_file():
+                      archive.write(file, arcname=f'{PACKAGE}/{file.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad is not None or len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={len(pdfs)}')
+
+          print('FINAL_PACKAGE', json.dumps({
+              'filename': zip_path.name,
+              'bytes': zip_path.stat().st_size,
+              'sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'pdf_count': 7,
+              'annual_years': annual_years,
+              'latest_quarter': latest_quarter_title,
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload completed ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: tibet-pharma-600211-annual-reports-20261015
+          path: 西藏药业_600211_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
