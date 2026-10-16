@@ -1,0 +1,172 @@
+name: Fetch Adisseo 600299 deep report 20250930
+
+on:
+  push:
+    paths:
+      - '.github/workflows/adisseo-600299-deep-report-20250930.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover and download exact deep report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time
+          from pathlib import Path
+          from typing import Any
+          import requests
+          from pypdf import PdfReader
+
+          out=Path('adisseo_deep_report'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/stock.jshtml?stockCode=600299',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def parse(text:str)->Any:
+              text=text.strip()
+              try: return json.loads(text)
+              except Exception: pass
+              m=re.search(r'^[^(]*\((.*)\)\s*;?$',text,re.S)
+              if m:
+                  try: return json.loads(m.group(1))
+                  except Exception: pass
+              return None
+
+          def rows_from(payload:Any)->list[dict[str,Any]]:
+              if isinstance(payload,list): return [x for x in payload if isinstance(x,dict)]
+              if not isinstance(payload,dict): return []
+              rows=[]; stack=[payload]; visited=set()
+              while stack:
+                  cur=stack.pop()
+                  if id(cur) in visited: continue
+                  visited.add(id(cur))
+                  for val in cur.values():
+                      if isinstance(val,dict): stack.append(val)
+                      elif isinstance(val,list):
+                          ds=[x for x in val if isinstance(x,dict)]
+                          if ds and any(any(k in x for k in ['infoCode','title','stockCode','orgSName','publishDate']) for x in ds): rows.extend(ds)
+                          else: stack.extend(ds)
+              return rows
+
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          all_rows=[]; logs=[]; seen=set()
+          for qtype in ['0','1','2']:
+              for page in range(1,4):
+                  params={
+                      'pageSize':'100','pageNo':str(page),'p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                      'qType':qtype,'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+                      'fields':'','orgCode':'','author':'','stockCode':'600299','rcode':'',
+                      'beginTime':'2025-09-01','endTime':'2025-10-31',
+                  }
+                  payload=None; last=None
+                  for attempt in range(5):
+                      try:
+                          r=s.get(endpoint,params=params,timeout=(20,120),headers={'User-Agent':s.headers['User-Agent'],'Referer':s.headers['Referer'],'Accept':'application/json,text/plain,*/*'})
+                          last={'qType':qtype,'page':page,'status':r.status_code,'bytes':len(r.content),'url':r.url,'prefix':r.text[:200]}
+                          if r.status_code==200:
+                              payload=parse(r.text)
+                              if payload is not None: break
+                      except Exception as exc: last={'qType':qtype,'page':page,'error':repr(exc)}
+                      time.sleep(1+attempt)
+                  logs.append(last)
+                  if payload is None: break
+                  rows=rows_from(payload)
+                  if not rows: break
+                  added=0
+                  for row in rows:
+                      code=str(row.get('infoCode') or row.get('info_code') or row.get('reportCode') or row.get('rcode') or '')
+                      key=code or json.dumps(row,ensure_ascii=False,sort_keys=True)
+                      if key in seen: continue
+                      seen.add(key); all_rows.append(row); added+=1
+                  if len(rows)<100 or added==0: break
+
+          def get(row,*keys):
+              for k in keys:
+                  if row.get(k): return str(row[k])
+              return ''
+          scored=[]
+          for row in all_rows:
+              title=get(row,'title','reportTitle','reportName')
+              ct=re.sub(r'\s+','',title)
+              broker=get(row,'orgSName','orgName','organization')
+              code=get(row,'infoCode','info_code','reportCode','rcode')
+              score=0
+              if '全球蛋氨酸行业龙头' in ct: score+=100
+              if '特种产品蓬勃发展' in ct: score+=100
+              if '东吴' in broker: score+=30
+              if ('安迪苏' in str(row) or '600299' in str(row)): score+=20
+              if code and score>=100: scored.append((score,row))
+          scored.sort(key=lambda x:x[0],reverse=True)
+          (out/'all_rows.json').write_text(json.dumps(all_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'request_log.json').write_text(json.dumps(logs,ensure_ascii=False,indent=2),encoding='utf-8')
+          if not scored:
+              raise RuntimeError('Exact deep report not found. Rows: '+json.dumps(all_rows,ensure_ascii=False)[:10000])
+          row=scored[0][1]
+          code=get(row,'infoCode','info_code','reportCode','rcode')
+          title=get(row,'title','reportTitle','reportName')
+          broker=get(row,'orgSName','orgName','organization') or '东吴证券'
+          date=get(row,'publishDate','publish_date','date','reportDate')[:10] or '2025-09-30'
+          authors=get(row,'researcher','author','authors','researcherName')
+
+          attempts=[]; data=None; selected_url=None
+          detail=f'https://data.eastmoney.com/report/info/{code}.html'
+          for prefix in ['H3','H2','H1','H4']:
+              url=f'https://pdf.dfcfw.com/pdf/{prefix}_{code}_1.pdf'
+              for attempt in range(5):
+                  try:
+                      rr=s.get(url,timeout=(30,300),allow_redirects=True,headers={'User-Agent':s.headers['User-Agent'],'Referer':detail,'Accept':'application/pdf,*/*;q=0.8'})
+                      attempts.append({'url':url,'status':rr.status_code,'bytes':len(rr.content),'type':rr.headers.get('content-type',''),'final_url':rr.url})
+                      if rr.status_code==200 and rr.content[:5]==b'%PDF-' and len(rr.content)>200000:
+                          data=rr.content; selected_url=url; break
+                  except Exception as exc: attempts.append({'url':url,'error':repr(exc)})
+                  time.sleep(1+attempt)
+              if data is not None: break
+          if data is None: raise RuntimeError('PDF download failed: '+json.dumps(attempts[-12:],ensure_ascii=False))
+
+          filename='东吴证券_安迪苏_全球蛋氨酸行业龙头特种产品蓬勃发展_2025-09-30.pdf'
+          dest=out/filename; dest.write_bytes(data)
+          reader=PdfReader(str(dest),strict=False); pages=len(reader.pages)
+          if pages<20: raise RuntimeError(f'Expected deep report >=20 pages, got {pages}')
+          text=''
+          for p in reader.pages[:min(15,pages)]:
+              try: text+='\n'+(p.extract_text() or '')
+              except Exception: pass
+          ct=re.sub(r'\s+','',text)
+          hits=[x for x in ['安迪苏','600299','全球蛋氨酸行业龙头','特种产品蓬勃发展','东吴证券'] if re.sub(r'\s+','',x) in ct]
+          if len(ct)>300 and not any(x in hits for x in ['安迪苏','600299']) and len(hits)<2: raise RuntimeError('Text identity check failed')
+          subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          preview=out/'首页预览.png'
+          subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(dest),str(preview.with_suffix(''))],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          if not preview.exists() or preview.stat().st_size<10000: raise RuntimeError('Preview failed')
+          sha=hashlib.sha256(data).hexdigest()
+          manifest={'code':code,'broker':broker,'date':date,'authors':authors,'title':title,'filename':filename,'pages':pages,'bytes':len(data),'sha256':sha,'source_report_page':detail,'pdf_url':selected_url,'text_hits':hits,'text_chars':len(ct),'download_attempts':attempts}
+          (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload exact deep report
+        uses: actions/upload-artifact@v4
+        with:
+          name: adisseo-600299-deep-report-20250930
+          path: adisseo_deep_report
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
