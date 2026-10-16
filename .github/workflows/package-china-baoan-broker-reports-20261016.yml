@@ -12,41 +12,93 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Inspect report API request headers
+      - name: Install browser tools
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Capture anonymous viewer requests
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import re
-          import requests
+          import asyncio
+          import json
+          from playwright.async_api import async_playwright
 
-          url = 'https://www.fxbaogao.com/_fxbg/2610141742/js/app-pages-fxbg-main-js.fd6234d1ab18d90a303e.chunk.js'
-          response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(25, 120))
-          text = response.text
-          print('BUNDLE', response.status_code, len(response.content), flush=True)
+          TARGET = 'https://www.fxbaogao.com/view?id=2892941'
 
-          patterns = [
-              'fetchGet', 'fetchPost', 'NODE_API', 'pageVersion', 'appVersion',
-              'versionCode', 'x-version', 'X-Version', 'version:', 'version=',
-              'headers:', 'Authorization', 'axios', 'XMLHttpRequest', '251105',
-              'dnGetter', 'refreshLocalTime', 'getK', 'localTime', 'timestamp',
-          ]
-          for pattern in patterns:
-              matches = list(re.finditer(re.escape(pattern), text, re.I))
-              print('\nPATTERN', pattern, 'COUNT', len(matches), flush=True)
-              for match in matches[:20]:
-                  start = max(0, match.start() - 1200)
-                  end = min(len(text), match.start() + 2400)
-                  print('SNIP', text[start:end].replace('\n', ' ')[:3600], flush=True)
+          def redact(headers):
+              result = {}
+              for key, value in headers.items():
+                  lower = key.lower()
+                  if lower in {'cookie', 'authorization', 'proxy-authorization'}:
+                      result[key] = '<redacted>'
+                  else:
+                      result[key] = value
+              return result
 
-          for regex in [
-              r'headers\s*[:=]\s*\{[^}]{0,2000}\}',
-              r'fetchGet\s*[:=][^;]{0,3000}',
-              r'function\s+\w+\([^)]*\)\{[^{}]{0,1200}fetch\(',
-              r'[A-Za-z0-9_-]{2,30}Version[A-Za-z0-9_-]{0,20}',
-          ]:
-              found = re.findall(regex, text, re.I)
-              print('\nREGEX', regex, 'COUNT', len(found), flush=True)
-              for item in found[:40]:
-                  print('FOUND', str(item)[:3000], flush=True)
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context(
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+                      locale='zh-CN',
+                      viewport={'width': 1440, 'height': 1000},
+                  )
+                  page = await context.new_page()
+
+                  async def on_request(request):
+                      if 'node.mofoun.com' not in request.url:
+                          return
+                      try:
+                          headers = await request.all_headers()
+                      except Exception:
+                          headers = request.headers
+                      print('REQUEST', json.dumps({
+                          'method': request.method,
+                          'url': request.url,
+                          'headers': redact(headers),
+                          'post_data': request.post_data,
+                      }, ensure_ascii=False), flush=True)
+
+                  async def on_response(response):
+                      if 'node.mofoun.com' not in response.url:
+                          return
+                      try:
+                          headers = await response.all_headers()
+                      except Exception:
+                          headers = response.headers
+                      record = {
+                          'status': response.status,
+                          'url': response.url,
+                          'headers': redact(headers),
+                      }
+                      try:
+                          body = await response.body()
+                          record['bytes'] = len(body)
+                          if body.startswith(b'%PDF'):
+                              record['body_type'] = 'PDF'
+                              record['body_head'] = body[:24].hex()
+                          else:
+                              record['body_type'] = 'text_or_binary'
+                              record['body_head'] = body[:30000].decode('utf-8', errors='replace')
+                      except Exception as exc:
+                          record['body_error'] = repr(exc)
+                      print('RESPONSE', json.dumps(record, ensure_ascii=False), flush=True)
+
+                  page.on('request', on_request)
+                  page.on('response', on_response)
+                  await page.goto(TARGET, wait_until='domcontentloaded', timeout=120000)
+                  await page.wait_for_timeout(18000)
+                  print('PAGE_TITLE', await page.title(), flush=True)
+                  print('PAGE_URL', page.url, flush=True)
+                  print('PAGE_TEXT', (await page.locator('body').inner_text())[:10000], flush=True)
+                  print('COOKIES', json.dumps([
+                      {'name': cookie['name'], 'domain': cookie['domain'], 'path': cookie['path']}
+                      for cookie in await context.cookies()
+                  ], ensure_ascii=False), flush=True)
+                  await browser.close()
+
+          asyncio.run(main())
           PY
