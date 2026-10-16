@@ -1,0 +1,185 @@
+name: Build curated Xinquan 603179 deep reports 20261016
+
+on:
+  push:
+    paths:
+      - '.github/workflows/xinquan-603179-broker-deep-reports-curated-20261016.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package curated reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          stock_code='603179'
+          company='新泉股份'
+          company_full='江苏新泉汽车饰件股份有限公司'
+          package='新泉股份_603179_券商深度报告_3份'
+          root=Path(package); root.mkdir(exist_ok=True)
+          previews=root/'首页预览'; previews.mkdir(exist_ok=True)
+
+          reports=[
+            {
+              'broker':'西南证券','date':'2024-12-29',
+              'title':'汽车内饰件龙头，全球化进程开启',
+              'info_code':'AP202412291641463292','expected_pages':30,
+              'filename':'01_西南证券_新泉股份_汽车内饰件龙头全球化进程开启_2024-12-29.pdf'
+            },
+            {
+              'broker':'开源证券','date':'2024-12-27',
+              'title':'公司深度报告：自主内外饰龙头，产品开拓+全球布局打开成长空间',
+              'info_code':'AP202412271641454138','expected_pages':28,
+              'filename':'02_开源证券_新泉股份_自主内外饰龙头产品开拓全球布局打开成长空间_2024-12-27.pdf'
+            },
+            {
+              'broker':'东吴证券','date':'2024-03-07',
+              'title':'自主内饰龙头的成长复盘及未来展望',
+              'info_code':'AP202403071625932548','expected_pages':23,
+              'filename':'03_东吴证券_新泉股份_自主内饰龙头的成长复盘及未来展望_2024-03-07.pdf'
+            },
+          ]
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+            'Referer':f'https://data.eastmoney.com/report/stock.jshtml?stockCode={stock_code}',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'
+          })
+
+          # Pull metadata once, so analyst/rating fields can be retained in the package.
+          meta={}
+          try:
+            params={
+              'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+              'beginTime':'2017-01-01','endTime':'2026-10-16','pageNo':'1','fields':'','qType':'0',
+              'orgCode':'','author':'','code':stock_code,'rcode':'','p':'1','pageNum':'1','pageNumber':'1'
+            }
+            r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(20,120))
+            if r.status_code==200:
+              payload=r.json(); rows=payload.get('data') or []
+              if isinstance(rows,dict): rows=rows.get('list') or rows.get('data') or []
+              for row in rows:
+                if isinstance(row,dict) and row.get('infoCode'):
+                  meta[str(row['infoCode'])]=row
+          except Exception:
+            pass
+
+          def download(info_code:str, detail:str):
+            attempts=[]
+            for prefix in ['H3','H2','H1','H4']:
+              url=f'https://pdf.dfcfw.com/pdf/{prefix}_{info_code}_1.pdf'
+              for attempt in range(6):
+                try:
+                  rr=s.get(url,timeout=(30,360),allow_redirects=True,headers={
+                    'User-Agent':s.headers['User-Agent'],'Referer':detail,
+                    'Accept':'application/pdf,*/*;q=0.8'
+                  })
+                  attempts.append({'url':url,'status':rr.status_code,'bytes':len(rr.content),'type':rr.headers.get('content-type',''),'final_url':rr.url})
+                  if rr.status_code==200 and rr.content[:5]==b'%PDF-' and len(rr.content)>100000:
+                    return rr.content,url,attempts
+                except Exception as exc:
+                  attempts.append({'url':url,'error':repr(exc)})
+                time.sleep(1+attempt)
+            raise RuntimeError(f'PDF download failed {info_code}: {attempts[-12:]}')
+
+          manifest=[]
+          for item in reports:
+            info=item['info_code']
+            detail=f'https://data.eastmoney.com/report/info/{info}.html'
+            data,pdf_url,attempts=download(info,detail)
+            dest=root/item['filename']; dest.write_bytes(data)
+            reader=PdfReader(str(dest),strict=False); pages=len(reader.pages)
+            if pages < int(item['expected_pages']*0.85):
+              raise RuntimeError(f'too few pages {dest.name}: {pages}')
+            text=''
+            for p in reader.pages[:min(20,pages)]:
+              try: text+='\n'+(p.extract_text() or '')
+              except Exception: pass
+            compact=re.sub(r'\s+','',text)
+            hits=[x for x in [company,company_full,stock_code] if re.sub(r'\s+','',x) in compact]
+            if len(compact)>500 and not hits:
+              raise RuntimeError(f'issuer mismatch {dest.name}')
+            subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            prefix=previews/dest.stem
+            subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(dest),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            preview=Path(str(prefix)+'.png')
+            if not preview.exists() or preview.stat().st_size<10000:
+              raise RuntimeError(f'preview failed {dest.name}')
+            row=meta.get(info,{})
+            sha=hashlib.sha256(data).hexdigest()
+            manifest.append({
+              **item,
+              'actual_pages':pages,'bytes':len(data),'sha256':sha,
+              'analysts':row.get('researcher') or row.get('author'),
+              'rating':row.get('emRatingName') or row.get('sRatingName'),
+              'source_report_page':detail,'pdf_url':pdf_url,
+              'identity_hits':hits,'preview_file':str(Path('首页预览')/preview.name),
+              'download_attempts':attempts,
+              'validation':['PDF header','issuer identity','page count','qpdf structure','first-page render']
+            })
+
+          readme=[
+            '江苏新泉汽车饰件股份有限公司（603179.SH）券商深度报告资料包',
+            '整理日期：2026-10-16','',
+            '本包收录3份公开可直接取得的券商原始完整PDF，均为2024年长篇公司深度报告。',
+            '已排除短篇季报、年报及事件点评。',''
+          ]
+          for i,x in enumerate(manifest,1):
+            readme += [
+              f"{i}. {x['broker']}：《{x['title']}》",
+              f"   日期：{x['date']}；分析师：{x['analysts']}；评级：{x['rating']}",
+              f"   完整页数：{x['actual_pages']}页；文件：{x['filename']}",
+              f"   来源页面：{x['source_report_page']}",
+              f"   SHA-256：{x['sha256']}",'',
+            ]
+          readme += [
+            '报告内容及版权归原券商与作者所有，仅供研究参考，不构成投资建议。',
+            '核验项目：PDF文件头、公司名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。'
+          ]
+          (root/'00_文件清单与说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest),encoding='utf-8')
+
+          zpath=Path(package+'.zip')
+          with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+            for p in sorted(root.rglob('*')):
+              if p.is_file(): z.write(p,arcname=f'{package}/{p.relative_to(root)}')
+          with zipfile.ZipFile(zpath) as z:
+            bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=3:
+              raise RuntimeError(f'zip validation failed bad={bad} pdfs={len(pdfs)}')
+          Path('xinquan_603179_broker_deep_reports.zip').write_bytes(zpath.read_bytes())
+          print('FINAL_ZIP',zpath,zpath.stat().st_size,'SHA256',hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinquan-603179-broker-deep-reports-curated-final
+          path: |
+            新泉股份_603179_券商深度报告_3份.zip
+            xinquan_603179_broker_deep_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
