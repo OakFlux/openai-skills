@@ -1,0 +1,462 @@
+name: Package Keboda 603786 broker deep reports 20261016
+
+on:
+  push:
+    branches:
+      - tmp/keboda-603786-broker-reports-20261016-v1
+    paths:
+      - .github/workflows/keboda-603786-broker-deep-reports-20261016-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "603786"
+          SHORT = "科博达"
+          FULL = "科博达技术股份有限公司"
+          PREPARED = "2026-10-16"
+          PACKAGE = "科博达_603786_券商深度报告_3份"
+          ROOT = Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREVIEW = ROOT / "首页预览"
+          PREVIEW.mkdir(exist_ok=True)
+
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": UA,
+              "Referer": "https://data.eastmoney.com/report/",
+              "Accept": "application/json,text/plain,*/*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          api = "https://reportapi.eastmoney.com/report/list"
+          records: list[dict[str, Any]] = []
+          query_log: list[dict[str, Any]] = []
+          for page in range(1, 12):
+              params = {
+                  "industryCode": "*",
+                  "pageSize": "100",
+                  "industry": "*",
+                  "rating": "*",
+                  "ratingChange": "*",
+                  "beginTime": "2018-01-01",
+                  "endTime": "2030-12-31",
+                  "pageNo": str(page),
+                  "fields": "",
+                  "qType": "0",
+                  "orgCode": "",
+                  "code": CODE,
+                  "rcode": "",
+                  "p": str(page),
+                  "pageNum": str(page),
+                  "pageNumber": str(page),
+              }
+              data = None
+              last: Any = None
+              for attempt in range(8):
+                  try:
+                      response = session.get(api, params=params, timeout=(20, 120))
+                      last = {
+                          "status": response.status_code,
+                          "content_type": response.headers.get("content-type", ""),
+                          "text": response.text[:300],
+                      }
+                      if response.status_code == 200:
+                          data = response.json()
+                          break
+                  except Exception as exc:
+                      last = {"error": repr(exc)}
+                  time.sleep(1 + attempt)
+              if data is None:
+                  raise RuntimeError(f"Eastmoney report API failed on page {page}: {last}")
+              batch = data.get("data") or []
+              if isinstance(batch, dict):
+                  batch = batch.get("list") or batch.get("data") or []
+              if not isinstance(batch, list):
+                  raise RuntimeError(f"Unexpected report API shape: {type(batch)} / {str(data)[:500]}")
+              query_log.append({"page": page, "count": len(batch), "hits": data.get("hits")})
+              records.extend(item for item in batch if isinstance(item, dict))
+              if len(batch) < 100:
+                  break
+              time.sleep(0.2)
+
+          if not records:
+              raise RuntimeError("No broker reports returned for 603786")
+
+          def first(row: dict[str, Any], *keys: str, default: Any = "") -> Any:
+              for key in keys:
+                  value = row.get(key)
+                  if value not in (None, ""):
+                      return value
+              return default
+
+          def as_int(value: Any) -> int:
+              try:
+                  return int(float(str(value).strip()))
+              except Exception:
+                  return 0
+
+          def clean(text: Any) -> str:
+              return re.sub(r"\s+", " ", str(text or "")).strip()
+
+          def date_obj(value: Any) -> datetime:
+              text = str(value or "").strip()
+              for fmt, length in (("%Y-%m-%d", 10), ("%Y/%m/%d", 10), ("%Y%m%d", 8)):
+                  try:
+                      return datetime.strptime(text[:length], fmt)
+                  except Exception:
+                      pass
+              match = re.search(r"(20\d{2})[-/]?(\d{2})[-/]?(\d{2})", text)
+              if match:
+                  return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+              return datetime(1900, 1, 1)
+
+          normalized: list[dict[str, Any]] = []
+          deep_words = [
+              "深度", "首次覆盖", "首次评级", "投资价值", "公司专题",
+              "专题报告", "深度研究", "价值分析", "公司研究报告", "公司研究",
+          ]
+          commentary_words = [
+              "点评", "快报", "跟踪", "季报", "年报", "中报",
+              "业绩预告", "业绩快报", "调研简报",
+          ]
+          for row in records:
+              code = clean(first(row, "stockCode", "stock_code", "code"))
+              if code and CODE not in code:
+                  continue
+              info_code = clean(first(row, "infoCode", "info_code", "reportId", "report_id"))
+              title = clean(first(row, "title", "reportTitle", "report_title"))
+              if not info_code or not title:
+                  continue
+              org = clean(first(row, "orgSName", "orgName", "org_name", "organization")) or "未知券商"
+              author = clean(first(row, "researcher", "researcherName", "author", "authors"))
+              publish = clean(first(row, "publishDate", "publish_date", "pubDate", "pub_date"))
+              pages = as_int(first(row, "attachPages", "attach_pages", "pageCount", "pages"))
+              rating = clean(first(row, "emRatingName", "ratingName", "rating", "rating_name"))
+              dt = date_obj(publish)
+              compact = re.sub(r"\s+", "", title)
+              true_deep = any(word in compact for word in deep_words)
+              commentary = any(word in compact for word in commentary_words)
+              substantive = true_deep or pages >= 15
+              if not substantive:
+                  continue
+              score = pages * 4
+              if true_deep:
+                  score += 200
+              if "首次" in compact:
+                  score += 55
+              if commentary and not true_deep:
+                  score -= 100
+              elif commentary:
+                  score -= 30
+              score += max(0, dt.year - 2019) * 8
+              if dt.year >= 2024:
+                  score += 35
+              normalized.append({
+                  "raw": row,
+                  "info_code": info_code,
+                  "title": title,
+                  "org": org,
+                  "author": author,
+                  "publish": publish,
+                  "date": dt,
+                  "metadata_pages": pages,
+                  "rating": rating,
+                  "true_deep": true_deep,
+                  "commentary": commentary,
+                  "score": score,
+              })
+
+          if not normalized:
+              raise RuntimeError("No substantive broker reports found after metadata filtering")
+
+          ranked = sorted(
+              normalized,
+              key=lambda item: (item["score"], item["metadata_pages"], item["date"]),
+              reverse=True,
+          )
+          recent = sorted(
+              [item for item in normalized if item["date"].year >= 2024 and item["metadata_pages"] >= 10],
+              key=lambda item: (item["true_deep"], item["date"], item["metadata_pages"]),
+              reverse=True,
+          )
+          shortlist: list[dict[str, Any]] = []
+          seen_codes: set[str] = set()
+          if recent:
+              shortlist.append(recent[0])
+              seen_codes.add(recent[0]["info_code"])
+          for item in ranked:
+              if item["info_code"] in seen_codes:
+                  continue
+              shortlist.append(item)
+              seen_codes.add(item["info_code"])
+              if len(shortlist) >= 60:
+                  break
+
+          def safe_name(text: str) -> str:
+              text = re.sub(r"[\\/:*?\"<>|]+", "_", text)
+              text = re.sub(r"\s+", " ", text).strip(" ._")
+              return text[:115]
+
+          def download_pdf(info_code: str) -> tuple[bytes, str, dict[str, Any]]:
+              urls = [
+                  f"https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H1_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H4_{info_code}_1.pdf",
+              ]
+              last: dict[str, Any] = {}
+              for url in urls:
+                  for attempt in range(5):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={
+                                  "User-Agent": UA,
+                                  "Referer": f"https://data.eastmoney.com/report/info/{info_code}.html",
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                              },
+                              timeout=(30, 420),
+                              allow_redirects=True,
+                          )
+                          last = {
+                              "url": url,
+                              "status": response.status_code,
+                              "content_type": response.headers.get("content-type", ""),
+                              "bytes": len(response.content),
+                              "final_url": response.url,
+                          }
+                          if response.status_code == 200 and response.content[:5] == b"%PDF-" and len(response.content) > 50_000:
+                              return response.content, url, last
+                      except Exception as exc:
+                          last = {"url": url, "error": repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"PDF download failed for {info_code}: {last}")
+
+          accepted: list[dict[str, Any]] = []
+          rejected: list[dict[str, Any]] = []
+          used_orgs: set[str] = set()
+
+          def try_candidates(min_pages: int, distinct_org: bool) -> None:
+              for candidate in shortlist:
+                  if len(accepted) >= 3:
+                      return
+                  if any(item["info_code"] == candidate["info_code"] for item in accepted):
+                      continue
+                  if distinct_org and candidate["org"] in used_orgs:
+                      continue
+                  temp = ROOT / ("_candidate_" + candidate["info_code"] + ".pdf")
+                  try:
+                      data, pdf_url, download_meta = download_pdf(candidate["info_code"])
+                      temp.write_bytes(data)
+                      reader = PdfReader(str(temp), strict=False)
+                      actual_pages = len(reader.pages)
+                      text = ""
+                      for page in reader.pages[:min(24, actual_pages)]:
+                          try:
+                              text += "\n" + (page.extract_text() or "")
+                          except Exception:
+                              pass
+                      issuer_ok = (SHORT in text) or (FULL in text) or (CODE in text) or ("科博达技术" in text)
+                      if actual_pages < min_pages or not issuer_ok:
+                          rejected.append({
+                              "info_code": candidate["info_code"],
+                              "title": candidate["title"],
+                              "org": candidate["org"],
+                              "actual_pages": actual_pages,
+                              "reason": f"pages<{min_pages}" if actual_pages < min_pages else "issuer check failed",
+                          })
+                          temp.unlink(missing_ok=True)
+                          continue
+                      subprocess.run(
+                          ["qpdf", "--warning-exit-0", "--check", str(temp)],
+                          check=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                      )
+                      prefix_date = candidate["date"].strftime("%Y%m%d") if candidate["date"].year > 1900 else "未知日期"
+                      final_name = safe_name(
+                          f"{len(accepted)+1:02d}_{prefix_date}_{candidate['org']}_{candidate['title']}.pdf"
+                      )
+                      dest = ROOT / final_name
+                      temp.replace(dest)
+                      preview_prefix = PREVIEW / dest.stem
+                      subprocess.run(
+                          [
+                              "pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "120",
+                              "-singlefile", str(dest), str(preview_prefix),
+                          ],
+                          check=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                      )
+                      preview_file = Path(str(preview_prefix) + ".png")
+                      if not preview_file.exists() or preview_file.stat().st_size < 5_000:
+                          raise RuntimeError(f"Preview render failed: {dest.name}")
+                      sha = hashlib.sha256(data).hexdigest()
+                      accepted.append({
+                          **{key: value for key, value in candidate.items() if key not in ("raw", "date")},
+                          "filename": final_name,
+                          "actual_pages": actual_pages,
+                          "bytes": len(data),
+                          "sha256": sha,
+                          "pdf_url": pdf_url,
+                          "detail_url": f"https://data.eastmoney.com/report/info/{candidate['info_code']}.html",
+                          "download_meta": download_meta,
+                          "preview_file": str(Path("首页预览") / preview_file.name),
+                      })
+                      used_orgs.add(candidate["org"])
+                  except Exception as exc:
+                      rejected.append({
+                          "info_code": candidate["info_code"],
+                          "title": candidate["title"],
+                          "org": candidate["org"],
+                          "reason": repr(exc),
+                      })
+                      temp.unlink(missing_ok=True)
+
+          try_candidates(min_pages=15, distinct_org=True)
+          if len(accepted) < 3:
+              try_candidates(min_pages=12, distinct_org=True)
+          if len(accepted) < 3:
+              try_candidates(min_pages=10, distinct_org=True)
+          if len(accepted) < 3:
+              try_candidates(min_pages=10, distinct_org=False)
+          if len(accepted) < 3:
+              try_candidates(min_pages=7, distinct_org=False)
+
+          if len(accepted) < 2:
+              raise RuntimeError(f"Only {len(accepted)} suitable reports found; rejected={rejected[:30]}")
+
+          readme = [
+              f"科博达（{CODE}.SH）券商深度研究报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              f"本包收录{len(accepted)}份公开可下载的券商公司研究报告。筛选优先考虑深度/首次覆盖特征、实际篇幅、发布时间及券商来源多样性。",
+              "报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。",
+              "",
+          ]
+          for index, item in enumerate(accepted, 1):
+              readme += [
+                  f"{index}. {item['filename']}",
+                  f"   券商：{item['org']}；研究员：{item['author'] or '未标注'}；发布日期：{item['publish'] or '未标注'}",
+                  f"   标题：{item['title']}",
+                  f"   评级：{item['rating'] or '未标注'}；实际页数：{item['actual_pages']}页；文件大小：{item['bytes']}字节",
+                  f"   来源页面：{item['detail_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ]
+          readme += [
+              "核验项目：PDF文件头、科博达/证券代码匹配、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "说明：东方财富研报中心为公开聚合来源；如报告后续被来源方撤回，应以原券商发布规则为准。",
+          ]
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          manifest = {
+              "company": SHORT,
+              "full_company_name": FULL,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "report_count": len(accepted),
+              "selection_method": "public Eastmoney broker-report metadata; prioritize depth, actual length, recency and brokerage diversity",
+              "files": accepted,
+              "rejected_candidates": rejected,
+              "top_metadata_candidates": [
+                  {key: value for key, value in item.items() if key not in ("raw", "date")}
+                  for item in ranked[:50]
+              ],
+              "query_log": query_log,
+          }
+          (ROOT / "manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+              encoding="utf-8",
+          )
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow([
+                  "文件名", "券商", "研究员", "发布日期", "标题", "评级", "页数", "字节数",
+                  "SHA-256", "来源页面", "PDF地址",
+              ])
+              for item in accepted:
+                  writer.writerow([
+                      item["filename"], item["org"], item["author"], item["publish"], item["title"],
+                      item["rating"], item["actual_pages"], item["bytes"], item["sha256"],
+                      item["detail_url"], item["pdf_url"],
+                  ])
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  {item['filename']}" for item in accepted) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path(PACKAGE + ".zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(path))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed: {bad}")
+
+          print(json.dumps({
+              "package": str(zip_path),
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "report_count": len(accepted),
+              "files": [
+                  {
+                      "name": item["filename"],
+                      "broker": item["org"],
+                      "date": item["publish"],
+                      "pages": item["actual_pages"],
+                      "bytes": item["bytes"],
+                      "sha256": item["sha256"],
+                      "title": item["title"],
+                  }
+                  for item in accepted
+              ],
+          }, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: keboda-603786-broker-deep-reports-20261016
+          path: 科博达_603786_券商深度报告_3份.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
