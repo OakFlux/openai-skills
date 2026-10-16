@@ -4,3 +4,4 @@ Inspect individual report attachment links.
 Inspect public report metadata.
 Inspect public report viewer.
 Inspect public viewer JavaScript endpoints.
+Probe public report APIs.
