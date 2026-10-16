@@ -1,0 +1,153 @@
+name: Build People.cn 603000 broker reports direct artifact 20261016
+
+on:
+  push:
+    paths:
+      - '.github/workflows/people-cn-603000-broker-direct-artifact-20261016.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download and validate reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          package = '人民网_603000_券商深度报告_完整版_2份'
+          root = Path(package)
+          root.mkdir(exist_ok=True)
+          previews = Path('_validation_previews')
+          previews.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '东吴证券', 'date': '2020-02-07',
+                  'analysts': '张良卫、郭天瑜', 'rating': '买入',
+                  'title': '原创内容快速发展，公司内容领域优势凸显',
+                  'info_code': 'AP202002071374891444', 'min_pages': 18,
+                  'terms': ['人民网', '原创内容', '内容领域优势'],
+                  'filename': '01_东吴证券_人民网_原创内容快速发展公司内容领域优势凸显_2020-02-07_21页.pdf',
+              },
+              {
+                  'broker': '联讯证券', 'date': '2018-03-20',
+                  'analysts': '陈诤娴', 'rating': '买入',
+                  'title': '中国领先的综合性网络媒体',
+                  'info_code': 'AP201803201106628762', 'min_pages': 12,
+                  'terms': ['人民网', '综合性网络媒体', '中国领先'],
+                  'filename': '02_联讯证券_人民网_中国领先的综合性网络媒体_2018-03-20_15页.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def download_pdf(info_code: str):
+              urls = [f'https://pdf.dfcfw.com/pdf/H{host}_{info_code}_1.pdf' for host in (3, 2, 1, 4)]
+              last = None
+              for url in urls:
+                  for attempt in range(7):
+                      try:
+                          response = session.get(url, timeout=(25, 240), allow_redirects=True, headers={
+                              'User-Agent': session.headers['User-Agent'],
+                              'Referer': 'https://data.eastmoney.com/report/',
+                              'Accept': 'application/pdf,*/*;q=0.8',
+                          })
+                          last = {'url': url, 'status': response.status_code, 'bytes': len(response.content)}
+                          if response.status_code == 200 and response.content[:5] == b'%PDF-' and len(response.content) > 100_000:
+                              return response.content, url
+                      except Exception as exc:
+                          last = {'url': url, 'error': repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f'download failed for {info_code}: {last}')
+
+          manifest = []
+          for index, report in enumerate(reports, 1):
+              data, pdf_url = download_pdf(report['info_code'])
+              destination = root / report['filename']
+              destination.write_bytes(data)
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages < report['min_pages']:
+                  raise RuntimeError(f'page count failed: {destination.name}: {pages}')
+              text = ''
+              for page in reader.pages[:min(15, pages)]:
+                  try:
+                      text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', text)
+              if not any(term in compact for term in ['人民网', '603000', '人民网股份有限公司']):
+                  raise RuntimeError(f'issuer check failed: {destination.name}')
+              matched = [term for term in report['terms'] if term in compact]
+              if not matched:
+                  raise RuntimeError(f'title check failed: {destination.name}')
+              subprocess.run(['qpdf', '--warning-exit-0', '--check', str(destination)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = previews / f'{index:02d}'
+              subprocess.run(['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(destination), str(prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'render failed: {destination.name}')
+              sha256 = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  **report, 'actual_pages': pages, 'bytes': len(data), 'sha256': sha256,
+                  'source_report_page': f'https://data.eastmoney.com/report/info/{report["info_code"]}.html',
+                  'pdf_url': pdf_url, 'matched_terms': matched,
+                  'validation': ['PDF header', 'issuer identity', 'title keywords', 'page count', 'qpdf structure', 'first-page render'],
+              })
+
+          readme = [
+              '人民网股份有限公司（603000.SH）券商深度报告完整版资料包',
+              '整理日期：2026-10-16', '',
+              '公开检索到的6份人民网券商报告中，仅以下2份达到长篇公司深度报告篇幅，因此收录2份，不以3—5页事件或业绩点评凑数。', '',
+          ]
+          for index, item in enumerate(manifest, 1):
+              readme += [
+                  f'{index}. {item["broker"]}：《{item["title"]}》',
+                  f'   日期：{item["date"]}；分析师：{item["analysts"]}；评级：{item["rating"]}',
+                  f'   页数：{item["actual_pages"]}页；文件：{item["filename"]}',
+                  f'   来源页面：{item["source_report_page"]}',
+                  f'   SHA-256：{item["sha256"]}', '',
+              ]
+          readme += [
+              '报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。',
+              '核验项目：PDF文件头、公司名称/证券代码、标题关键词、页数、qpdf结构、首页渲染。',
+          ]
+          (root / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in manifest), encoding='utf-8')
+          print('PACKAGE_DIR', root)
+          print('TOTAL_PAGES', sum(item['actual_pages'] for item in manifest))
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload package as final ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: people-cn-603000-broker-deep-reports-direct
+          path: 人民网_603000_券商深度报告_完整版_2份/
+          retention-days: 30
+          compression-level: 6
+          if-no-files-found: error
