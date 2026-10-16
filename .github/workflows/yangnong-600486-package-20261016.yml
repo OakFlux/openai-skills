@@ -1,0 +1,332 @@
+name: Package Yangnong Chemical 600486 annual and latest quarter 20261016
+
+on:
+  push:
+    paths:
+      - '.github/workflows/yangnong-600486-package-20261016.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download, verify, and package filings
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '600486'
+          NAME = '扬农化工'
+          FULL_NAME = '江苏扬农化工股份有限公司'
+          AS_OF = datetime(2026, 10, 16, 23, 59, 59)
+          YEARS = list(range(2020, 2026))
+
+          out_dir = Path('扬农化工_600486_2020-2025年报及最新季报_截至20261016')
+          reports_dir = out_dir / 'PDF原件'
+          previews_dir = out_dir / '首页预览'
+          reports_dir.mkdir(parents=True, exist_ok=True)
+          previews_dir.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept': 'application/json,text/plain,*/*',
+          })
+
+          def parse_dt(value):
+              if not value:
+                  return datetime.min
+              text = str(value).strip().replace('T', ' ')
+              for fmt in ('%Y-%m-%d %H:%M:%S:%f', '%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                  try:
+                      return datetime.strptime(text, fmt)
+                  except ValueError:
+                      pass
+              m = re.match(r'^(\d{4}-\d{2}-\d{2})', text)
+              return datetime.strptime(m.group(1), '%Y-%m-%d') if m else datetime.min
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def safe_name(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+', '_', text).strip()
+
+          def fetch_announcements():
+              endpoint = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+              collected = []
+              seen = set()
+              for page in range(1, 11):
+                  params = {
+                      'sr': '-1',
+                      'page_size': '100',
+                      'page_index': str(page),
+                      'ann_type': 'A',
+                      'client_source': 'web',
+                      'stock_list': CODE,
+                      'f_node': '0',
+                      's_node': '0',
+                  }
+                  r = session.get(endpoint, params=params, timeout=(20, 90))
+                  r.raise_for_status()
+                  payload = r.json()
+                  data = payload.get('data') or {}
+                  rows = data.get('list') if isinstance(data, dict) else data
+                  rows = rows or []
+                  if not rows:
+                      break
+                  for rec in rows:
+                      art = rec.get('art_code') or rec.get('artCode')
+                      if not art or art in seen:
+                          continue
+                      seen.add(art)
+                      title = str(rec.get('title') or '').strip()
+                      dt = parse_dt(rec.get('notice_date') or rec.get('display_time') or rec.get('noticeDate'))
+                      if dt <= AS_OF:
+                          rec = dict(rec)
+                          rec['_art'] = art
+                          rec['_title'] = title
+                          rec['_date'] = dt
+                          collected.append(rec)
+                  if len(rows) < 100:
+                      break
+              if not collected:
+                  raise RuntimeError('No announcements returned for 600486')
+              return collected
+
+          announcements = fetch_announcements()
+          print('ANNOUNCEMENTS', len(announcements))
+
+          excluded = ('摘要', '英文', '审计报告', '内部控制', '社会责任', 'ESG', '问询', '专项说明', '取消')
+          selected = []
+
+          for year in YEARS:
+              needle = f'{year}年年度报告'
+              cands = [
+                  r for r in announcements
+                  if needle in r['_title'] and not any(word in r['_title'] for word in excluded)
+              ]
+              if not cands:
+                  raise RuntimeError(f'Missing annual report candidate for {year}')
+              def annual_score(r):
+                  title = r['_title']
+                  revised = int(any(x in title for x in ('修订', '更新', '更正版')))
+                  exactish = int(title.endswith('年度报告') or title.endswith('年度报告（修订版）') or title.endswith('年度报告(修订版)'))
+                  return (revised, exactish, r['_date'], r['_art'])
+              chosen = max(cands, key=annual_score)
+              selected.append({
+                  'kind': 'annual',
+                  'year': year,
+                  'period': str(year),
+                  'record': chosen,
+              })
+
+          quarter_candidates = []
+          for r in announcements:
+              title = r['_title']
+              if any(word in title for word in ('摘要', '英文', '问询', '说明公告')):
+                  continue
+              m = re.search(r'(20\d{2})年(?:第)?([一三])季度报告', title)
+              if not m:
+                  continue
+              year = int(m.group(1))
+              quarter = 1 if m.group(2) == '一' else 3
+              quarter_candidates.append((year, quarter, r['_date'], int('正文' not in title), r))
+
+          if not quarter_candidates:
+              raise RuntimeError('No quarterly report candidate found')
+          latest_year, latest_q, _, _, latest_rec = max(quarter_candidates, key=lambda x: (x[0], x[1], x[2], x[3]))
+          selected.append({
+              'kind': 'quarter',
+              'year': latest_year,
+              'quarter': latest_q,
+              'period': f'{latest_year}Q{latest_q}',
+              'record': latest_rec,
+          })
+
+          def normalize_url(url: str) -> str:
+              url = str(url).strip()
+              if url.startswith('//'):
+                  return 'https:' + url
+              if url.startswith('/'):
+                  return urljoin('https://pdf.dfcfw.com/', url)
+              return url
+
+          def candidate_urls(art: str):
+              urls = []
+              detail_api = f'https://np-cnotice-stock.eastmoney.com/api/content/ann?art_code={art}&client_source=web&page_index=1'
+              try:
+                  r = session.get(detail_api, timeout=(20, 90), headers={
+                      'User-Agent': session.headers['User-Agent'],
+                      'Referer': f'https://data.eastmoney.com/notices/detail/{CODE}/{art}.html',
+                  })
+                  if r.ok:
+                      data = r.json().get('data') or {}
+                      for item in data.get('attach_list') or []:
+                          for key in ('attach_url', 'attach_url_web'):
+                              if item.get(key):
+                                  urls.append(normalize_url(item[key]))
+                      for key in ('attach_url_web', 'attach_url'):
+                          if data.get(key):
+                              urls.append(normalize_url(data[key]))
+              except Exception as exc:
+                  print('DETAIL_API_WARNING', art, repr(exc))
+              urls.extend([
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H22_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{art}_1.pdf',
+              ])
+              return list(dict.fromkeys(u for u in urls if u))
+
+          def download_pdf(art: str):
+              errors = []
+              for url in candidate_urls(art):
+                  try:
+                      r = session.get(url, timeout=(20, 150), allow_redirects=True, headers={
+                          'User-Agent': session.headers['User-Agent'],
+                          'Referer': f'https://data.eastmoney.com/notices/detail/{CODE}/{art}.html',
+                      })
+                      content = r.content
+                      if r.status_code == 200 and content.startswith(b'%PDF') and len(content) > 30000:
+                          return content, r.url
+                      errors.append(f'{url}: status={r.status_code}, bytes={len(content)}')
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError(f'Failed to download {art}: ' + ' | '.join(errors[-8:]))
+
+          manifest = []
+          for idx, item in enumerate(selected, 1):
+              rec = item['record']
+              art = rec['_art']
+              title = rec['_title']
+              content, source_url = download_pdf(art)
+              if item['kind'] == 'annual':
+                  filename = safe_name(f"{item['year']}_扬农化工_{item['year']}年年度报告.pdf")
+              else:
+                  filename = safe_name(f"{item['period']}_扬农化工_最新季度报告.pdf")
+              pdf_path = reports_dir / filename
+              pdf_path.write_bytes(content)
+
+              subprocess.run(['qpdf', '--check', str(pdf_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              reader = PdfReader(str(pdf_path))
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'Unexpected page count for {filename}: {pages}')
+
+              text_result = subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', '3', '-layout', str(pdf_path), '-'],
+                  check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace'
+              )
+              first_text = text_result.stdout.replace(' ', '')
+              identity_hits = [x for x in (NAME, FULL_NAME, CODE) if x.replace(' ', '') in first_text]
+              if first_text.strip() and not identity_hits:
+                  raise RuntimeError(f'Issuer identity not found in first pages: {filename}')
+
+              preview_base = previews_dir / f'{idx:02d}_{item["period"]}'
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120', str(pdf_path), str(preview_base)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+              )
+              preview_path = preview_base.with_suffix('.png')
+              if not preview_path.exists() or preview_path.stat().st_size < 1000:
+                  raise RuntimeError(f'Preview render failed for {filename}')
+
+              row = {
+                  'kind': item['kind'],
+                  'period': item['period'],
+                  'title': title,
+                  'announcement_date': rec['_date'].strftime('%Y-%m-%d %H:%M:%S'),
+                  'art_code': art,
+                  'filename': f'PDF原件/{filename}',
+                  'pages': pages,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha256(pdf_path),
+                  'source_url': source_url,
+                  'source_page': f'https://data.eastmoney.com/notices/detail/{CODE}/{art}.html',
+                  'identity_hits': identity_hits,
+                  'validation': ['PDF header', 'qpdf structure', 'page count', 'issuer identity when text extractable', 'first-page render'],
+              }
+              manifest.append(row)
+              print('VERIFIED', json.dumps(row, ensure_ascii=False))
+
+          readme = [
+              '扬农化工（600486）2020—2025年年度报告及最新季度报告',
+              '整理日期：2026-10-16',
+              '',
+              '文件范围：2020—2025年完整年度报告6份；截至整理日期的最新独立季度报告1份。',
+              'PDF均为公开披露原始文件，仅供个人研究与学习。',
+              '',
+          ]
+          for i, row in enumerate(manifest, 1):
+              readme.extend([
+                  f'{i}. {row["period"]}｜{row["title"]}',
+                  f'   公告日期：{row["announcement_date"]}',
+                  f'   页数：{row["pages"]}页',
+                  f'   文件：{row["filename"]}',
+                  f'   来源：{row["source_url"]}',
+                  '',
+              ])
+          (out_dir / '文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out_dir / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out_dir / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{row["sha256"]}  {row["filename"]}' for row in manifest) + '\n',
+              encoding='utf-8'
+          )
+
+          zip_cn = Path('扬农化工_600486_2020-2025年报及最新季报_截至20261016.zip')
+          with zipfile.ZipFile(zip_cn, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(out_dir.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, path.relative_to(out_dir.parent))
+          with zipfile.ZipFile(zip_cn, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+
+          zip_en = Path('yangnong_600486_2020_2025_annual_latest_quarter_20261016.zip')
+          shutil.copy2(zip_cn, zip_en)
+
+          print('SELECTED_LATEST_QUARTER', manifest[-1]['period'], manifest[-1]['title'], manifest[-1]['announcement_date'])
+          print('FINAL_ZIP', zip_cn.name, zip_cn.stat().st_size, 'SHA256', sha256(zip_cn))
+          print('COUNTS', json.dumps({'annual': 6, 'quarter': 1, 'pdfs': len(manifest)}, ensure_ascii=False))
+          PY
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: yangnong-600486-annual-latest-quarter-20261016
+          path: |
+            扬农化工_600486_2020-2025年报及最新季报_截至20261016.zip
+            yangnong_600486_2020_2025_annual_latest_quarter_20261016.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
