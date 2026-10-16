@@ -1,0 +1,326 @@
+name: Build CosMX 688772 filings package 20261016
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cosmx-688772-filings-package-20261016.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover, download, validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = '688772'
+          COMPANY_SHORT = '珠海冠宇'
+          COMPANY_FULL = '珠海冠宇电池股份有限公司'
+          AS_OF = '2026-10-16'
+          PACKAGE = '珠海冠宇_688772_全部年报_招股说明书_最新季报_截至20261016'
+          ROOT = Path(PACKAGE)
+          PDF_DIR = ROOT / 'PDF原文'
+          PREVIEW_DIR = ROOT / '首页预览'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          all_rows: list[dict[str, Any]] = []
+          search_pages: list[dict[str, Any]] = []
+          for page in range(1, 61):
+              params = {
+                  'sr':'-1', 'page_size':'100', 'page_index':str(page),
+                  'ann_type':'A', 'client_source':'web', 'stock_list':STOCK_CODE,
+                  'f_node':'0', 's_node':'0',
+              }
+              data = None
+              last: Any = None
+              for attempt in range(8):
+                  try:
+                      r = session.get(api, params=params, timeout=(20, 120))
+                      last = {'status':r.status_code,'text':r.text[:300]}
+                      if r.status_code == 200:
+                          data = r.json()
+                          break
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              if data is None:
+                  raise RuntimeError(f'Announcement API failed page {page}: {last}')
+              rows = ((data.get('data') or {}).get('list') or [])
+              search_pages.append({'page':page,'count':len(rows)})
+              if not rows:
+                  break
+              all_rows.extend(rows)
+              time.sleep(0.08)
+
+          def compact(text: str) -> str:
+              text = html.unescape(str(text or ''))
+              text = re.sub(r'<[^>]+>', '', text)
+              return re.sub(r'\s+', '', text)
+
+          def art_code(row: dict[str, Any]) -> str:
+              return str(row.get('art_code') or row.get('artCode') or '')
+
+          def date_value(row: dict[str, Any]) -> str:
+              return str(row.get('display_time') or row.get('notice_date') or '')
+
+          bad_common = [
+              '摘要','英文版','取消','问询','回复','审计报告','董事会','监事会',
+              '提示性公告','社会责任报告','环境、社会及管治报告','可持续发展报告',
+              '独立董事述职报告','内部控制评价报告','财务决算报告','说明会',
+              '募集资金','会计师事务所','前期会计差错更正后的财务报表',
+              '财务报表及相关附注','发行保荐书','法律意见书','上市公告书',
+          ]
+
+          def choose_report(variants: list[str], label: str, extra_bad: list[str] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+              extra_bad = extra_bad or []
+              candidates: list[tuple[int, str, dict[str, Any], str]] = []
+              for row in all_rows:
+                  raw = str(row.get('title') or '')
+                  title = compact(raw)
+                  matched = next((key for key in variants if compact(key) in title), None)
+                  if not matched:
+                      continue
+                  if any(compact(x) in title for x in bad_common + extra_bad):
+                      continue
+                  score = 50
+                  key = compact(matched)
+                  if title.endswith(key): score += 35
+                  if title == key: score += 20
+                  if COMPANY_SHORT in title or COMPANY_FULL in title: score += 15
+                  if any(x in title for x in ['更正后','修订版','更新后','修订稿']): score += 100
+                  if any(x in title for x in ['取消版','已取消']): score -= 200
+                  candidates.append((score, date_value(row), row, matched))
+              candidates.sort(key=lambda x:(x[0],x[1]), reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'Missing report: {label} / {variants}')
+              log = [
+                  {'label':label,'matched_variant':matched,'score':score,'date':date,
+                   'title':row.get('title'),'art_code':art_code(row)}
+                  for score,date,row,matched in candidates[:20]
+              ]
+              return candidates[0][2], log
+
+          specs = [
+              {'label':'2021年年度报告','variants':['2021年年度报告'],'filename':'01_珠海冠宇_2021年年度报告.pdf','doc_type':'年度报告','period':'2021','min_pages':80},
+              {'label':'2022年年度报告','variants':['2022年年度报告'],'filename':'02_珠海冠宇_2022年年度报告.pdf','doc_type':'年度报告','period':'2022','min_pages':80},
+              {'label':'2023年年度报告','variants':['2023年年度报告'],'filename':'03_珠海冠宇_2023年年度报告.pdf','doc_type':'年度报告','period':'2023','min_pages':80},
+              {'label':'2024年年度报告','variants':['2024年年度报告'],'filename':'04_珠海冠宇_2024年年度报告.pdf','doc_type':'年度报告','period':'2024','min_pages':80},
+              {'label':'2025年年度报告','variants':['2025年年度报告'],'filename':'05_珠海冠宇_2025年年度报告.pdf','doc_type':'年度报告','period':'2025','min_pages':80},
+              {'label':'正式招股说明书','variants':['首次公开发行股票并在科创板上市招股说明书'],'filename':'06_珠海冠宇_首次公开发行股票并在科创板上市招股说明书_正式版.pdf','doc_type':'招股说明书','period':'2021IPO','min_pages':200,'extra_bad':['申报稿','上会稿','注册稿','招股意向书']},
+              {'label':'2026年第一季度报告','variants':['2026年第一季度报告','2026年一季度报告'],'filename':'07_珠海冠宇_2026年第一季度报告_最新季报.pdf','doc_type':'最新季报','period':'2026Q1','min_pages':6},
+              {'label':'2026年半年度报告','variants':['2026年半年度报告','2026年半年报'],'filename':'08_珠海冠宇_2026年半年度报告_补充.pdf','doc_type':'补充半年度报告','period':'2026H1','min_pages':40},
+          ]
+
+          # Stable public announcement IDs provide a fallback for the newest filings and the final IPO prospectus.
+          known_art = {
+              '2023年年度报告':'AN202404081630056770',
+              '2024年年度报告':'AN202503301649146377',
+              '2025年年度报告':'AN202603301820860513',
+              '正式招股说明书':'AN202110101521785263',
+              '2026年第一季度报告':'AN202604291821751666',
+              '2026年半年度报告':'AN202608251828406107',
+          }
+
+          selected: list[dict[str, Any]] = []
+          candidate_logs: dict[str, Any] = {}
+          for spec in specs:
+              try:
+                  row, log = choose_report(spec['variants'], spec['label'], spec.get('extra_bad'))
+              except RuntimeError:
+                  art = known_art.get(spec['label'])
+                  if not art:
+                      raise
+                  row = {'title':spec['label'],'art_code':art,'display_time':'known-ID fallback'}
+                  log = [{'label':spec['label'],'fallback':True,'art_code':art}]
+              candidate_logs[spec['label']] = log
+              selected.append({**spec,'row':row})
+
+          def fetch_pdf(art: str, referer: str) -> tuple[bytes, dict[str, Any], str]:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{art}_1.pdf',
+              ]
+              last: dict[str, Any] = {}
+              for url in urls:
+                  for attempt in range(6):
+                      try:
+                          rr = session.get(url, timeout=(30, 480), allow_redirects=True, headers={
+                              'User-Agent':session.headers['User-Agent'], 'Referer':referer,
+                              'Accept':'application/pdf,*/*;q=0.8',
+                          })
+                          last = {'url':url,'status':rr.status_code,'final_url':rr.url,
+                                  'content_type':rr.headers.get('content-type',''),'bytes':len(rr.content)}
+                          if rr.status_code == 200 and rr.content[:5] == b'%PDF-' and len(rr.content) > 30_000:
+                              return rr.content, last, url
+                      except Exception as exc:
+                          last = {'url':url,'error':repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f'PDF download failed {art}: {last}')
+
+          manifest: list[dict[str, Any]] = []
+          for original in selected:
+              spec = dict(original)
+              row = spec.pop('row')
+              spec.pop('variants', None)
+              spec.pop('extra_bad', None)
+              art = art_code(row)
+              if not art:
+                  raise RuntimeError(f'No art code for {spec["filename"]}')
+              detail_page = f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{art}.html'
+              data, download_meta, mirror_pdf = fetch_pdf(art, detail_page)
+              dest = PDF_DIR / spec['filename']
+              dest.write_bytes(data)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'Too few pages {dest.name}: {pages} < {spec["min_pages"]}')
+
+              extracted = ''
+              for p in reader.pages[:min(18, pages)]:
+                  try:
+                      extracted += '\n' + (p.extract_text() or '')
+                  except Exception:
+                      pass
+              identity_ok = any(x in extracted for x in ['珠海冠宇','688772','珠海冠宇电池股份有限公司'])
+              if not identity_ok:
+                  raise RuntimeError(f'Issuer identity check failed: {dest.name}')
+
+              subprocess.run(
+                  ['qpdf','--warning-exit-0','--check',str(dest)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              prefix = PREVIEW_DIR / dest.stem
+              subprocess.run([
+                  'pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(dest),str(prefix)
+              ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 8_000:
+                  raise RuntimeError(f'Preview render failed: {dest.name}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  **spec,
+                  'announcement_title':row.get('title'),
+                  'announcement_date':row.get('display_time') or row.get('notice_date'),
+                  'art_code':art,
+                  'announcement_detail_page':detail_page,
+                  'pdf_source_url':mirror_pdf,
+                  'official_sse_disclosure_index':f'https://www.sse.com.cn/assortment/stock/list/info/announcement/index.shtml?productId={STOCK_CODE}',
+                  'actual_pages':pages,
+                  'bytes':len(data),
+                  'sha256':sha,
+                  'identity_text_check':identity_ok,
+                  'download_meta':download_meta,
+                  'preview_file':str(Path('首页预览') / preview.name),
+                  'validation':['PDF header','announcement-title match','issuer identity','minimum page count','qpdf structure','first-page render'],
+              })
+
+          readme = [
+              '珠海冠宇电池股份有限公司（688772.SH）公开披露文件资料包',
+              f'整理基准日：{AS_OF}',
+              '',
+              '收录范围：',
+              '1. 公司上市以来全部完整年度报告：2021年至2025年，共5份。',
+              '2. 首次公开发行股票并在科创板上市招股说明书正式版，共1份。',
+              '3. 截至整理基准日最新独立季度报告：2026年第一季度报告，共1份。',
+              '4. 另附2026年半年度报告1份，用于补充最新阶段性财务信息；半年度报告不计作季报。',
+              '',
+              '筛选规则：排除年度报告摘要、英文版、提示性公告及IPO申报稿/上会稿/注册稿，保留完整正式全文；如存在更正或修订版本，则优先较新的完整版本。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {item['filename']}",
+                  f"   文件类型：{item['doc_type']}；公告标题：{item['announcement_title']}",
+                  f"   公告日期：{item['announcement_date']}；实际页数：{item['actual_pages']}页；大小：{item['bytes']}字节",
+                  f"   公告页面：{item['announcement_detail_page']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          readme += [
+              '核验项目：PDF文件头、发行人名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC和SHA-256。',
+              '包内“首页预览”目录仅用于人工快速复核；PDF原文均位于“PDF原文”目录。',
+          ]
+
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'candidate_selection_log.json').write_text(json.dumps(candidate_logs, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'announcement_search_log.json').write_text(
+              json.dumps({'pages':search_pages,'rows_scanned':len(all_rows)}, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  PDF原文/{item['filename']}\n" for item in manifest), encoding='utf-8'
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{PACKAGE}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in z.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8 or len(manifest) != 8:
+                  raise RuntimeError(f'PDF count mismatch: zip={len(pdfs)}, manifest={len(manifest)}')
+
+          short_path = Path('cosmx_688772_filings_20261016.zip')
+          short_path.write_bytes(zip_path.read_bytes())
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'SHA256', zip_sha)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmx-688772-filings-final-20261016
+          path: |
+            珠海冠宇_688772_全部年报_招股说明书_最新季报_截至20261016.zip
+            cosmx_688772_filings_20261016.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
