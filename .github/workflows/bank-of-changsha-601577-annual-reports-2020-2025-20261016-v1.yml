@@ -1,0 +1,434 @@
+name: Package Bank of Changsha 601577 annual reports 20261016
+
+on:
+  push:
+    branches:
+      - tmp/bank-of-changsha-601577-annual-reports-20261016-v1
+    paths:
+      - .github/workflows/bank-of-changsha-601577-annual-reports-2020-2025-20261016-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "601577"
+          SHORT = "长沙银行"
+          FULL = "长沙银行股份有限公司"
+          PREPARED = "2026-10-16"
+          PACKAGE = "长沙银行_601577_2020-2025年报及最新季报"
+          ROOT = Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREVIEW = ROOT / "首页预览"
+          PREVIEW.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
+              "Referer": f"https://data.eastmoney.com/notices/stock/{CODE}.html",
+              "Accept": "application/json,text/plain,*/*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          api = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+          windows = [
+              ("2021-01-01", "2021-06-30"),
+              ("2022-01-01", "2022-06-30"),
+              ("2023-01-01", "2023-06-30"),
+              ("2024-01-01", "2024-06-30"),
+              ("2025-01-01", "2025-06-30"),
+              ("2026-01-01", PREPARED),
+          ]
+          rows: list[dict[str, Any]] = []
+          query_log: list[dict[str, Any]] = []
+
+          for begin, end in windows:
+              for page in range(1, 18):
+                  params = {
+                      "sr": "-1",
+                      "page_size": "100",
+                      "page_index": str(page),
+                      "ann_type": "A",
+                      "client_source": "web",
+                      "stock_list": CODE,
+                      "f_node": "0",
+                      "s_node": "0",
+                      "begin_time": begin,
+                      "end_time": end,
+                  }
+                  data = None
+                  last: Any = None
+                  for attempt in range(8):
+                      try:
+                          response = session.get(api, params=params, timeout=(20, 120))
+                          last = {
+                              "status": response.status_code,
+                              "content_type": response.headers.get("content-type", ""),
+                              "text": response.text[:300],
+                          }
+                          if response.status_code == 200:
+                              data = response.json()
+                              break
+                      except Exception as exc:
+                          last = {"error": repr(exc)}
+                      time.sleep(1 + attempt)
+                  if data is None:
+                      raise RuntimeError(f"Announcement API failed {begin} to {end}, page {page}: {last}")
+                  batch = ((data.get("data") or {}).get("list") or [])
+                  query_log.append({"begin": begin, "end": end, "page": page, "count": len(batch)})
+                  if not batch:
+                      break
+                  rows.extend(item for item in batch if isinstance(item, dict))
+                  if len(batch) < 100:
+                      break
+                  time.sleep(0.08)
+
+          unique: dict[str, dict[str, Any]] = {}
+          for row in rows:
+              key = str(row.get("art_code") or row.get("artCode") or "")
+              if key:
+                  unique[key] = row
+          rows = list(unique.values())
+
+          def compact(text: Any) -> str:
+              return re.sub(r"\s+", "", str(text or ""))
+
+          def article_code(row: dict[str, Any]) -> str:
+              return str(row.get("art_code") or row.get("artCode") or "")
+
+          def display_time(row: dict[str, Any]) -> str:
+              return str(row.get("display_time") or row.get("displayTime") or "")
+
+          exclusions = [
+              "摘要", "英文版", "取消", "问询", "回复", "审计报告", "董事会", "监事会",
+              "更正公告", "提示性公告", "社会责任报告", "环境、社会及管治报告",
+              "可持续发展报告", "独立董事述职报告", "内部控制评价报告", "财务决算报告",
+              "年度报告说明会", "年度报告网上说明会", "募集资金", "会计师事务所",
+              "前期会计差错更正后的财务报表", "财务报表及相关附注", "资本充足率报告",
+              "第三支柱信息披露报告", "绿色金融报告", "消费者权益保护报告",
+          ]
+
+          def candidates(variants: list[str]) -> list[dict[str, Any]]:
+              found: list[tuple[int, str, dict[str, Any]]] = []
+              for row in rows:
+                  title = compact(row.get("title"))
+                  hit = next((variant for variant in variants if compact(variant) in title), None)
+                  if not hit or any(compact(item) in title for item in exclusions):
+                      continue
+                  key = compact(hit)
+                  score = 50
+                  if title.endswith(key):
+                      score += 40
+                  if title == key:
+                      score += 20
+                  if title.startswith(SHORT) or f"{CODE}:" in title:
+                      score += 15
+                  if any(item in title for item in ["更正后", "修订版", "更新后", "修订稿"]):
+                      score += 100
+                  found.append((score, display_time(row), row))
+              found.sort(key=lambda item: (item[0], item[1]), reverse=True)
+              return [item[2] for item in found]
+
+          def download_pdf(code: str, referer: str) -> tuple[bytes, str, dict[str, Any]]:
+              urls = [
+                  f"https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H1_{code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H4_{code}_1.pdf",
+              ]
+              last: dict[str, Any] = {}
+              for url in urls:
+                  for attempt in range(5):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={
+                                  "User-Agent": session.headers["User-Agent"],
+                                  "Referer": referer,
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                              },
+                              timeout=(30, 420),
+                              allow_redirects=True,
+                          )
+                          last = {
+                              "url": url,
+                              "status": response.status_code,
+                              "content_type": response.headers.get("content-type", ""),
+                              "bytes": len(response.content),
+                              "final_url": response.url,
+                          }
+                          if response.status_code == 200 and response.content[:5] == b"%PDF-" and len(response.content) > 30_000:
+                              return response.content, url, last
+                      except Exception as exc:
+                          last = {"url": url, "error": repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"PDF download failed {code}: {last}")
+
+          specs: list[dict[str, Any]] = []
+          for index, year in enumerate(range(2020, 2026), start=1):
+              specs.append({
+                  "label": f"{year}年年度报告",
+                  "period": str(year),
+                  "filename": f"{index:02d}_长沙银行_{year}年年度报告.pdf",
+                  "doc_type": "年度报告",
+                  "min_pages": 100,
+                  "required_text": [str(year), "年度报告"],
+                  "candidates": candidates([f"{year}年年度报告", f"{year}年年报"]),
+              })
+
+          quarter_options = [
+              (["2026年第三季度报告", "2026年三季度报告"], "2026Q3"),
+              (["2026年第一季度报告", "2026年一季度报告"], "2026Q1"),
+              (["2025年第三季度报告", "2025年三季度报告"], "2025Q3"),
+              (["2025年第一季度报告", "2025年一季度报告"], "2025Q1"),
+          ]
+          qperiod = None
+          qcandidates: list[dict[str, Any]] = []
+          for variants, period in quarter_options:
+              current = candidates(variants)
+              if current:
+                  qperiod = period
+                  qcandidates = current
+                  break
+          if not qperiod:
+              raise RuntimeError("No independent quarterly report found")
+
+          specs.append({
+              "label": f"{qperiod}最新季度报告",
+              "period": qperiod,
+              "filename": f"07_长沙银行_{qperiod}_最新季报.pdf",
+              "doc_type": "最新季报",
+              "min_pages": 4,
+              "required_text": [qperiod[:4], "季度"],
+              "candidates": qcandidates,
+          })
+
+          manifest: list[dict[str, Any]] = []
+          candidate_log: dict[str, Any] = {}
+          identity_tokens = [SHORT, FULL, CODE, "长沙银行股份"]
+
+          for spec in specs:
+              candidate_rows = spec.pop("candidates")
+              candidate_log[spec["label"]] = [
+                  {
+                      "title": row.get("title"),
+                      "display_time": display_time(row),
+                      "art_code": article_code(row),
+                  }
+                  for row in candidate_rows[:20]
+              ]
+              if not candidate_rows:
+                  available = sorted({
+                      str(row.get("title") or "")
+                      for row in rows
+                      if any(word in compact(row.get("title")) for word in ["年度报告", "季度报告", "一季度报告", "三季度报告"])
+                  })
+                  raise RuntimeError(f"Missing {spec['label']}; available={available}")
+
+              accepted = None
+              failures: list[dict[str, Any]] = []
+              for row in candidate_rows[:12]:
+                  code = article_code(row)
+                  if not code:
+                      continue
+                  detail = f"https://data.eastmoney.com/notices/detail/{CODE}/{code}.html"
+                  temp = ROOT / ("_candidate_" + code + ".pdf")
+                  try:
+                      data, pdf_url, download_meta = download_pdf(code, detail)
+                      temp.write_bytes(data)
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < spec["min_pages"]:
+                          raise RuntimeError(f"Too few pages: {pages} < {spec['min_pages']}")
+
+                      text = ""
+                      for page in reader.pages[:min(30, pages)]:
+                          try:
+                              text += "\n" + (page.extract_text() or "")
+                          except Exception:
+                              pass
+                      if not any(token in text for token in identity_tokens):
+                          raise RuntimeError("Issuer identity check failed")
+                      if not all(token in text for token in spec["required_text"]):
+                          title_text = compact(row.get("title"))
+                          if not all(compact(token) in title_text for token in spec["required_text"]):
+                              raise RuntimeError(f"Document-type/period check failed: required={spec['required_text']}")
+
+                      subprocess.run(
+                          ["qpdf", "--warning-exit-0", "--check", str(temp)],
+                          check=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                      )
+                      dest = ROOT / spec["filename"]
+                      temp.replace(dest)
+                      preview_prefix = PREVIEW / dest.stem
+                      subprocess.run(
+                          [
+                              "pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "120",
+                              "-singlefile", str(dest), str(preview_prefix),
+                          ],
+                          check=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                      )
+                      preview_file = Path(str(preview_prefix) + ".png")
+                      if not preview_file.exists() or preview_file.stat().st_size < 5_000:
+                          raise RuntimeError("Preview render failed")
+
+                      sha = hashlib.sha256(data).hexdigest()
+                      accepted = {
+                          **spec,
+                          "announcement_title": row.get("title"),
+                          "announcement_date": display_time(row),
+                          "art_code": code,
+                          "announcement_page": detail,
+                          "pdf_url": pdf_url,
+                          "actual_pages": pages,
+                          "bytes": len(data),
+                          "sha256": sha,
+                          "download_meta": download_meta,
+                          "preview_file": str(Path("首页预览") / preview_file.name),
+                      }
+                      break
+                  except Exception as exc:
+                      failures.append({
+                          "title": row.get("title"),
+                          "art_code": code,
+                          "reason": repr(exc),
+                      })
+                      temp.unlink(missing_ok=True)
+
+              if accepted is None:
+                  raise RuntimeError(f"No valid candidate for {spec['label']}: {failures}")
+              accepted["candidate_failures"] = failures
+              manifest.append(accepted)
+
+          readme = [
+              f"长沙银行（{CODE}.SH）2020—2025年年度报告及最新季度报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              "本包收录2020年至2025年六份完整年度报告，以及截至整理日已披露的最新独立季度报告。",
+              "若同一年度存在更正后、修订版或更新后版本，优先选用较新的完整版本；摘要不作为年度报告原件收录。",
+              "",
+          ]
+          for index, item in enumerate(manifest, 1):
+              readme += [
+                  f"{index}. {item['filename']}",
+                  f"   类型：{item['doc_type']}；期间：{item['period']}",
+                  f"   公告标题：{item['announcement_title']}",
+                  f"   公告日期：{item['announcement_date'] or '来源接口未返回'}；实际页数：{item['actual_pages']}页；文件大小：{item['bytes']}字节",
+                  f"   公告页面：{item['announcement_page']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ]
+          readme += [
+              "来源说明：PDF由公开证券公告镜像下载，并与公司名称、证券代码、报告期间及公告标题逐一匹配。",
+              "核验项目：PDF文件头、公司身份、报告类型/期间、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+          ]
+          (ROOT / "README_文件清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          payload = {
+              "company": SHORT,
+              "full_company_name": FULL,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "annual_report_years": list(range(2020, 2026)),
+              "latest_quarter": qperiod,
+              "files": manifest,
+              "candidate_log": candidate_log,
+              "query_log": query_log,
+          }
+          (ROOT / "manifest.json").write_text(
+              json.dumps(payload, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow([
+                  "文件名", "类型", "期间", "公告标题", "公告日期", "页数", "字节数",
+                  "SHA-256", "公告页面", "PDF地址",
+              ])
+              for item in manifest:
+                  writer.writerow([
+                      item["filename"], item["doc_type"], item["period"], item["announcement_title"],
+                      item["announcement_date"], item["actual_pages"], item["bytes"], item["sha256"],
+                      item["announcement_page"], item["pdf_url"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  {item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path(PACKAGE + ".zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(path))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed: {bad}")
+
+          print(json.dumps({
+              "package": str(zip_path),
+              "zip_bytes": zip_path.stat().st_size,
+              "pdf_count": len(manifest),
+              "latest_quarter": qperiod,
+              "files": [
+                  {
+                      "name": item["filename"],
+                      "type": item["doc_type"],
+                      "period": item["period"],
+                      "pages": item["actual_pages"],
+                      "bytes": item["bytes"],
+                      "sha256": item["sha256"],
+                      "title": item["announcement_title"],
+                      "date": item["announcement_date"],
+                  }
+                  for item in manifest
+              ],
+          }, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: bank-of-changsha-601577-2020-2025-annual-latest-quarter-20261016
+          path: 长沙银行_601577_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
