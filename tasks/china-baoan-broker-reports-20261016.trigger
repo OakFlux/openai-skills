@@ -8,3 +8,4 @@ Probe public report APIs.
 Inspect report API request headers.
 Capture anonymous viewer requests.
 Inspect public report download links.
+Inspect public report page in browser.
