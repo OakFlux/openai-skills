@@ -7,3 +7,4 @@ Inspect public viewer JavaScript endpoints.
 Probe public report APIs.
 Inspect report API request headers.
 Capture anonymous viewer requests.
+Inspect public report download links.
