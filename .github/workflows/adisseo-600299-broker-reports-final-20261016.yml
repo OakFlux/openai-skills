@@ -1,0 +1,421 @@
+name: Build Adisseo 600299 broker research reports 20261016
+
+on:
+  push:
+    paths:
+      - '.github/workflows/adisseo-600299-broker-reports-final-20261016.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE='安迪苏_600299_券商深度报告_3份'
+          ROOT=Path(PACKAGE)
+          ROOT.mkdir(exist_ok=True)
+          PREVIEWS=ROOT/'首页预览'
+          PREVIEWS.mkdir(exist_ok=True)
+
+          session=requests.Session()
+          session.trust_env=False
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/stock.jshtml?stockCode=600299',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def parse_payload(text:str)->Any:
+              text=text.strip()
+              try:
+                  return json.loads(text)
+              except Exception:
+                  pass
+              m=re.search(r'^[^(]*\((.*)\)\s*;?$',text,re.S)
+              if m:
+                  try:
+                      return json.loads(m.group(1))
+                  except Exception:
+                      pass
+              return None
+
+          def extract_rows(payload:Any)->list[dict[str,Any]]:
+              rows=[]
+              if isinstance(payload,list):
+                  return [x for x in payload if isinstance(x,dict)]
+              if not isinstance(payload,dict):
+                  return rows
+              stack=[payload]
+              visited=set()
+              while stack:
+                  cur=stack.pop()
+                  if id(cur) in visited:
+                      continue
+                  visited.add(id(cur))
+                  for val in cur.values():
+                      if isinstance(val,dict):
+                          stack.append(val)
+                      elif isinstance(val,list):
+                          dicts=[x for x in val if isinstance(x,dict)]
+                          if dicts and any(any(k in x for k in ['infoCode','title','stockCode','orgSName','publishDate']) for x in dicts):
+                              rows.extend(dicts)
+                          else:
+                              stack.extend(dicts)
+              return rows
+
+          def compact(s:str)->str:
+              return re.sub(r'\s+','',s or '')
+
+          def report_code(row:dict[str,Any])->str:
+              for key in ['infoCode','info_code','reportCode','rcode']:
+                  v=row.get(key)
+                  if v:
+                      return str(v)
+              return ''
+
+          def row_title(row:dict[str,Any])->str:
+              for key in ['title','reportTitle','reportName']:
+                  v=row.get(key)
+                  if v:
+                      return str(v)
+              return ''
+
+          def row_date(row:dict[str,Any])->str:
+              for key in ['publishDate','publish_date','date','researcherDate','reportDate']:
+                  v=row.get(key)
+                  if v:
+                      return str(v)[:10]
+              return ''
+
+          def row_broker(row:dict[str,Any])->str:
+              for key in ['orgSName','orgName','organization','broker']:
+                  v=row.get(key)
+                  if v:
+                      return str(v)
+              return ''
+
+          def row_authors(row:dict[str,Any])->str:
+              for key in ['researcher','author','authors','researcherName']:
+                  v=row.get(key)
+                  if v:
+                      return str(v)
+              return ''
+
+          api='https://reportapi.eastmoney.com/report/list'
+          discovery_log=[]
+
+          def query_window(begin:str,end:str)->list[dict[str,Any]]:
+              collected=[]; seen=set()
+              for qtype in ['0','1','2']:
+                  for page in range(1,8):
+                      params={
+                          'pageSize':'100','pageNo':str(page),'p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                          'qType':qtype,'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+                          'fields':'','orgCode':'','author':'','stockCode':'600299','rcode':'',
+                          'beginTime':begin,'endTime':end,
+                      }
+                      payload=None; meta=None
+                      for attempt in range(6):
+                          try:
+                              rr=session.get(api,params=params,timeout=(20,120),headers={
+                                  'User-Agent':session.headers['User-Agent'],
+                                  'Referer':session.headers['Referer'],
+                                  'Accept':'application/json,text/plain,*/*',
+                              })
+                              meta={'qType':qtype,'page':page,'begin':begin,'end':end,'status':rr.status_code,'bytes':len(rr.content),'url':rr.url}
+                              if rr.status_code==200:
+                                  payload=parse_payload(rr.text)
+                                  if payload is not None:
+                                      break
+                          except Exception as exc:
+                              meta={'qType':qtype,'page':page,'begin':begin,'end':end,'error':repr(exc)}
+                          time.sleep(1+attempt)
+                      discovery_log.append(meta)
+                      if payload is None:
+                          break
+                      rows=extract_rows(payload)
+                      if not rows:
+                          break
+                      added=0
+                      for row in rows:
+                          code=report_code(row)
+                          key=code or json.dumps(row,ensure_ascii=False,sort_keys=True)
+                          if key in seen:
+                              continue
+                          seen.add(key); collected.append(row); added+=1
+                      if len(rows)<100 or added==0:
+                          break
+                      time.sleep(0.05)
+              return collected
+
+          dynamic_specs=[
+              {
+                  'slot':'long_deep','begin':'2020-01-01','end':'2020-12-31',
+                  'must_any':['蛋氨酸拐点在即','VA高景气周期'],
+                  'broker_hint':'东吴','display_broker':'东吴证券','display_date':'2020-04-16',
+                  'display_title':'蛋氨酸拐点在即，VA高景气周期',
+                  'filename':'01_东吴证券_安迪苏_首次覆盖_蛋氨酸拐点在即VA高景气周期_2020-04-16.pdf',
+                  'min_pages':15,'report_class':'首次覆盖深度报告'
+              },
+              {
+                  'slot':'first_coverage','begin':'2024-01-01','end':'2024-12-31',
+                  'must_any':['蛋氨酸销售增长强劲','运营效率提升显著'],
+                  'broker_hint':'山西','display_broker':'山西证券','display_date':'2024-11-11',
+                  'display_title':'蛋氨酸销售增长强劲，运营效率提升显著',
+                  'filename':'02_山西证券_安迪苏_蛋氨酸销售增长强劲运营效率提升显著_2024-11-11.pdf',
+                  'min_pages':4,'report_class':'首次覆盖公司研究'
+              },
+          ]
+
+          direct_specs=[
+              {
+                  'slot':'recent','code':'AP202609141829351640','display_broker':'太平洋证券','display_date':'2026-09-14',
+                  'display_title':'蛋氨酸、特种产品齐头并进，新产品、新产能蓄势待发',
+                  'filename':'03_太平洋证券_安迪苏_蛋氨酸特种产品齐头并进新产品新产能蓄势待发_2026-09-14.pdf',
+                  'min_pages':3,'report_class':'最新公司研究','terms':['安迪苏','蛋氨酸','特种产品']
+              },
+              {
+                  'slot':'fallback1','code':'AP202604071821050020','display_broker':'东吴证券','display_date':'2026-04-08',
+                  'display_title':'地缘冲突引发蛋氨酸价格快速上涨，公司作为全球蛋氨酸龙头有望受益',
+                  'filename':'03_东吴证券_安迪苏_地缘冲突引发蛋氨酸价格快速上涨_2026-04-08.pdf',
+                  'min_pages':3,'report_class':'公司研究','terms':['安迪苏','蛋氨酸']
+              },
+              {
+                  'slot':'fallback2','code':'AP202501091641841924','display_broker':'太平洋证券','display_date':'2025-01-09',
+                  'display_title':'VA、蛋氨酸景气延续，有望实现量价齐升',
+                  'filename':'03_太平洋证券_安迪苏_VA蛋氨酸景气延续有望实现量价齐升_2025-01-09.pdf',
+                  'min_pages':3,'report_class':'公司研究','terms':['安迪苏','蛋氨酸']
+              },
+              {
+                  'slot':'fallback3','code':'AP202410301640570450','display_broker':'东吴证券','display_date':'2024-10-31',
+                  'display_title':'2024年三季报点评：特种产品业务增速亮眼，蛋氨酸景气度持续改善',
+                  'filename':'03_东吴证券_安迪苏_特种产品业务增速亮眼蛋氨酸景气改善_2024-10-31.pdf',
+                  'min_pages':3,'report_class':'公司研究','terms':['安迪苏','特种产品','蛋氨酸']
+              },
+          ]
+
+          chosen=[]
+          candidate_log={}
+          for spec in dynamic_specs:
+              rows=query_window(spec['begin'],spec['end'])
+              scored=[]
+              for row in rows:
+                  title=row_title(row)
+                  ct=compact(title)
+                  broker=row_broker(row)
+                  hits=[t for t in spec['must_any'] if compact(t) in ct]
+                  score=len(hits)*100
+                  if spec['broker_hint'] and spec['broker_hint'] in broker:
+                      score+=30
+                  if '安迪苏' in str(row) or '600299' in str(row):
+                      score+=20
+                  code=report_code(row)
+                  if code and hits:
+                      scored.append((score,row,hits))
+              scored.sort(key=lambda x:(x[0],row_date(x[1])),reverse=True)
+              candidate_log[spec['slot']]=[
+                  {'score':s,'code':report_code(r),'title':row_title(r),'date':row_date(r),'broker':row_broker(r),'authors':row_authors(r),'hits':h}
+                  for s,r,h in scored[:20]
+              ]
+              if scored:
+                  row=scored[0][1]
+                  chosen.append({
+                      **spec,
+                      'code':report_code(row),
+                      'api_title':row_title(row),
+                      'api_date':row_date(row),
+                      'api_broker':row_broker(row),
+                      'api_authors':row_authors(row),
+                      'terms':['安迪苏','600299']+spec['must_any'],
+                      'source_mode':'Eastmoney report API exact-title discovery',
+                  })
+
+          # Always add the latest directly identified company research report.
+          chosen.append({**direct_specs[0],'api_title':direct_specs[0]['display_title'],'api_date':direct_specs[0]['display_date'],'api_broker':direct_specs[0]['display_broker'],'api_authors':'王海涛','source_mode':'verified Eastmoney report code'})
+
+          def fetch_pdf(code:str)->tuple[bytes,str,list[dict[str,Any]]]:
+              attempts=[]
+              detail=f'https://data.eastmoney.com/report/info/{code}.html'
+              for prefix in ['H3','H2','H1','H4']:
+                  url=f'https://pdf.dfcfw.com/pdf/{prefix}_{code}_1.pdf'
+                  for attempt in range(6):
+                      try:
+                          rr=session.get(url,timeout=(30,300),allow_redirects=True,headers={
+                              'User-Agent':session.headers['User-Agent'],
+                              'Referer':detail,
+                              'Accept':'application/pdf,*/*;q=0.8',
+                          })
+                          meta={'url':url,'status':rr.status_code,'bytes':len(rr.content),'type':rr.headers.get('content-type',''),'final_url':rr.url}
+                          attempts.append(meta)
+                          if rr.status_code==200 and rr.content[:5]==b'%PDF-' and len(rr.content)>40_000:
+                              return rr.content,url,attempts
+                      except Exception as exc:
+                          attempts.append({'url':url,'error':repr(exc)})
+                      time.sleep(1+attempt)
+              raise RuntimeError(f'PDF download failed for {code}: {attempts[-12:]}')
+
+          manifest=[]
+          used_codes=set()
+          selected=[]
+          # Try dynamic selections first, but do not fail the whole package if an old mirror is unavailable.
+          for item in chosen:
+              if len(selected)>=3 or not item.get('code') or item['code'] in used_codes:
+                  continue
+              try:
+                  data,url,attempts=fetch_pdf(item['code'])
+                  selected.append((item,data,url,attempts))
+                  used_codes.add(item['code'])
+              except Exception as exc:
+                  candidate_log.setdefault('download_failures',[]).append({'code':item.get('code'),'title':item.get('display_title'),'error':repr(exc)})
+
+          # Fill any missing slots with independently verified recent reports.
+          for item in direct_specs[1:]:
+              if len(selected)>=3 or item['code'] in used_codes:
+                  continue
+              try:
+                  data,url,attempts=fetch_pdf(item['code'])
+                  selected.append((item,data,url,attempts))
+                  used_codes.add(item['code'])
+              except Exception as exc:
+                  candidate_log.setdefault('download_failures',[]).append({'code':item['code'],'title':item['display_title'],'error':repr(exc)})
+
+          if len(selected)<2:
+              raise RuntimeError(f'Only {len(selected)} reports could be downloaded; need at least 2')
+
+          # Re-number filenames according to final order while keeping informative names.
+          for idx,(item,data,url,attempts) in enumerate(selected,1):
+              base=item['filename']
+              base=re.sub(r'^\d+_',f'{idx:02d}_',base)
+              dest=ROOT/base
+              dest.write_bytes(data)
+              reader=PdfReader(str(dest),strict=False)
+              pages=len(reader.pages)
+              min_pages=int(item.get('min_pages',3))
+              if pages<min_pages:
+                  raise RuntimeError(f'Too few pages: {dest.name}: {pages} < {min_pages}')
+              text=''
+              for page in reader.pages[:min(15,pages)]:
+                  try:
+                      text+='\n'+(page.extract_text() or '')
+                  except Exception:
+                      pass
+              ct=compact(text)
+              issuer_hits=[x for x in ['安迪苏','600299','蓝星安迪苏'] if compact(x) in ct]
+              title_tokens=[]
+              for token in item.get('terms',[]):
+                  if len(compact(token))>=3 and compact(token) in ct:
+                      title_tokens.append(token)
+              # Some broker PDFs use embedded fonts that yield weak text extraction. Exact report-code provenance,
+              # PDF structure and first-page rendering remain mandatory; text checks are recorded rather than guessed.
+              if len(ct)>300 and not issuer_hits and not title_tokens:
+                  raise RuntimeError(f'Issuer/title text check failed: {dest.name}')
+              subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              prefix=PREVIEWS/dest.stem
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(dest),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              preview=Path(str(prefix)+'.png')
+              if not preview.exists() or preview.stat().st_size<10_000:
+                  raise RuntimeError(f'Preview render failed: {dest.name}')
+              sha=hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  'filename':dest.name,
+                  'broker':item.get('api_broker') or item.get('display_broker'),
+                  'date':item.get('api_date') or item.get('display_date'),
+                  'authors':item.get('api_authors',''),
+                  'title':item.get('api_title') or item.get('display_title'),
+                  'report_class':item.get('report_class'),
+                  'info_code':item['code'],
+                  'source_report_page':f"https://data.eastmoney.com/report/info/{item['code']}.html",
+                  'pdf_url':url,
+                  'source_mode':item.get('source_mode'),
+                  'pages':pages,
+                  'bytes':len(data),
+                  'sha256':sha,
+                  'issuer_text_hits':issuer_hits,
+                  'title_text_hits':title_tokens,
+                  'text_extracted_chars':len(ct),
+                  'preview_file':str(Path('首页预览')/preview.name),
+                  'download_attempts':attempts,
+                  'validation':['PDF header','minimum page count','qpdf structure','first-page render','report-code provenance','text identity where extractable'],
+              })
+
+          readme=[
+              '蓝星安迪苏股份有限公司（600299.SH）券商研究报告资料包',
+              '整理日期：2026-10-16',
+              '',
+              f'本包收录{len(manifest)}份可公开取得的券商原始完整PDF。优先选择长篇首次覆盖、首次覆盖公司研究及较新的公司研究报告。',
+              '未使用网页摘要、机构调研纪要或自行重制的PDF替代原报告。',
+              '',
+          ]
+          for i,x in enumerate(manifest,1):
+              readme += [
+                  f"{i}. {x['broker']}：《{x['title']}》",
+                  f"   日期：{x['date']}；作者：{x['authors'] or '原报告内载'}；类别：{x['report_class']}",
+                  f"   完整页数：{x['pages']}页；文件：{x['filename']}",
+                  f"   来源页面：{x['source_report_page']}",
+                  f"   SHA-256：{x['sha256']}",
+                  '',
+              ]
+          readme += [
+              '报告内容及版权归原券商与作者所有，仅供研究参考，不构成投资建议。',
+              '核验项目：PDF文件头、报告编号与来源、最低页数、qpdf结构、首页渲染、可提取文本中的公司/标题关键词、ZIP CRC及SHA-256。',
+          ]
+          (ROOT/'00_文件清单与说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'candidate_selection_log.json').write_text(json.dumps(candidate_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'discovery_request_log.json').write_text(json.dumps(discovery_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest),encoding='utf-8')
+
+          zip_path=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p,arcname=f'{PACKAGE}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip()
+              pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs)!=len(manifest) or len(pdfs)<2:
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={len(pdfs)}, manifest={len(manifest)}')
+          alias=Path('adisseo_broker_reports.zip')
+          alias.write_bytes(zip_path.read_bytes())
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'SHA256',hashlib.sha256(zip_path.read_bytes()).hexdigest())
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: adisseo-600299-broker-reports-final
+          path: |
+            安迪苏_600299_券商深度报告_3份.zip
+            adisseo_broker_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
