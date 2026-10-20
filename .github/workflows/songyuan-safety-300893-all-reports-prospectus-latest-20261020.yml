@@ -1,0 +1,445 @@
+name: Build Songyuan Safety 300893 annual reports prospectus latest package 20261020
+
+on:
+  push:
+    paths:
+      - '.github/workflows/songyuan-safety-300893-all-reports-prospectus-latest-20261020.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          TODAY = '2026-10-20'
+          STOCK_CODE = '300893'
+          COMPANY_CURRENT = '松原安全'
+          COMPANY_OLD = '松原股份'
+          COMPANY_FULL = '浙江松原汽车安全系统股份有限公司'
+          PACKAGE = '松原安全_300893_全部年报_招股说明书_最新季报'
+          ROOT = Path(PACKAGE)
+          PREVIEW_DIR = ROOT / '首页预览'
+          ARTIFACT_DIR = Path('artifact_out')
+          ROOT.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+          ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+          annual_specs = [
+              {'year':'2020','variants':['2020年年度报告','2020年度报告'],'filename':'01_松原安全_2020年年度报告.pdf','min_pages':70},
+              {'year':'2021','variants':['2021年年度报告','2021年度报告'],'filename':'02_松原安全_2021年年度报告.pdf','min_pages':70},
+              {'year':'2022','variants':['2022年年度报告','2022年度报告'],'filename':'03_松原安全_2022年年度报告.pdf','min_pages':70},
+              {'year':'2023','variants':['2023年年度报告','2023年度报告'],'filename':'04_松原安全_2023年年度报告.pdf','min_pages':70},
+              {'year':'2024','variants':['2024年年度报告','2024年度报告'],'filename':'05_松原安全_2024年年度报告.pdf','min_pages':70},
+              {'year':'2025','variants':['2025年年度报告','2025年度报告'],'filename':'06_松原安全_2025年年度报告.pdf','min_pages':70},
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          all_rows: list[dict[str, Any]] = []
+          page_log: list[dict[str, Any]] = []
+          seen: set[str] = set()
+
+          for page in range(1, 81):
+              params = {
+                  'sr':'-1','page_size':'100','page_index':str(page),
+                  'ann_type':'A','client_source':'web','stock_list':STOCK_CODE,
+                  'f_node':'0','s_node':'0',
+              }
+              payload = None
+              last: Any = None
+              for attempt in range(1, 8):
+                  try:
+                      r = session.get(api, params=params, timeout=(20, 120))
+                      last = {'status':r.status_code,'bytes':len(r.content),'head':r.text[:160]}
+                      if r.status_code == 200:
+                          payload = r.json()
+                          break
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(attempt)
+              if payload is None:
+                  raise RuntimeError(f'Announcement API failed page {page}: {last}')
+              rows = ((payload.get('data') or {}).get('list') or [])
+              page_log.append({'page':page,'count':len(rows)})
+              if not rows:
+                  break
+              for row in rows:
+                  code = str(row.get('art_code') or row.get('artCode') or '')
+                  if code and code not in seen:
+                      seen.add(code)
+                      all_rows.append(row)
+              if len(rows) < 100:
+                  break
+              time.sleep(0.08)
+
+          if not all_rows:
+              raise RuntimeError('No announcement metadata returned')
+
+          def compact(value: Any) -> str:
+              return re.sub(r'\s+', '', str(value or '')).replace('&nbsp;', '')
+
+          def title_of(row: dict[str, Any]) -> str:
+              return compact(row.get('title'))
+
+          def art_code(row: dict[str, Any]) -> str:
+              return str(row.get('art_code') or row.get('artCode') or '').strip()
+
+          def date_of(row: dict[str, Any]) -> str:
+              return str(row.get('display_time') or row.get('notice_date') or '')
+
+          annual_excludes = [
+              '摘要','英文版','取消版','已取消','问询函','回复函','审计报告','董事会','监事会',
+              '更正公告','提示性公告','社会责任报告','环境、社会及管治报告','可持续发展报告',
+              '内部控制评价报告','财务决算报告','年度报告说明会','网上说明会','业绩说明会',
+              '募集资金','会计师事务所','财务报表及相关附注','独立董事述职','业绩快报','业绩预告',
+          ]
+
+          def choose_report(variants: list[str], period: str, extra_excludes: list[str] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+              excludes = annual_excludes + (extra_excludes or [])
+              candidates: list[tuple[int, str, dict[str, Any], str]] = []
+              for row in all_rows:
+                  title = title_of(row)
+                  matched = next((v for v in variants if compact(v) in title), None)
+                  if not matched:
+                      continue
+                  if any(compact(x) in title for x in excludes):
+                      continue
+                  score = 100
+                  key = compact(matched)
+                  if title == key: score += 100
+                  if title.endswith(key): score += 70
+                  if title.startswith(STOCK_CODE + ':'): score += 10
+                  if any(name in title for name in [COMPANY_CURRENT, COMPANY_OLD, COMPANY_FULL]): score += 30
+                  if any(x in title for x in ['更正后','修订版','更新后','修订稿']): score += 160
+                  candidates.append((score, date_of(row), row, matched))
+              candidates.sort(key=lambda x:(x[0], x[1]), reverse=True)
+              log = [
+                  {'period':period,'score':score,'date':date,'title':row.get('title'),'art_code':art_code(row),'matched_variant':matched}
+                  for score,date,row,matched in candidates[:30]
+              ]
+              if not candidates:
+                  near = [
+                      {'title':row.get('title'),'date':date_of(row),'art_code':art_code(row)}
+                      for row in all_rows
+                      if period[:4] in title_of(row)
+                  ][:40]
+                  raise RuntimeError(f'Missing report {period}: {variants}; near={json.dumps(near, ensure_ascii=False)}')
+              return candidates[0][2], log
+
+          def choose_prospectus() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+              wanted = ['首次公开发行股票并在创业板上市招股说明书','首次公开发行股票招股说明书','招股说明书']
+              bad = ['招股意向书','摘要','申报稿','注册稿','上会稿','问询','回复','审核中心意见','上市公告书','保荐书','法律意见书','提示性公告']
+              candidates: list[tuple[int,str,dict[str,Any],str]] = []
+              for row in all_rows:
+                  title = title_of(row)
+                  if '招股说明书' not in title:
+                      continue
+                  if any(compact(x) in title for x in bad):
+                      continue
+                  matched = next((v for v in wanted if compact(v) in title), '招股说明书')
+                  score = 100
+                  if '首次公开发行股票并在创业板上市招股说明书' in title: score += 180
+                  if title.endswith('招股说明书'): score += 100
+                  if any(name in title for name in [COMPANY_CURRENT, COMPANY_OLD, COMPANY_FULL]): score += 30
+                  if '正式' in title: score += 30
+                  candidates.append((score,date_of(row),row,matched))
+              candidates.sort(key=lambda x:(x[0],x[1]), reverse=True)
+              log = [
+                  {'period':'IPO','score':score,'date':date,'title':row.get('title'),'art_code':art_code(row),'matched_variant':matched}
+                  for score,date,row,matched in candidates[:30]
+              ]
+              if not candidates:
+                  near = [
+                      {'title':row.get('title'),'date':date_of(row),'art_code':art_code(row)}
+                      for row in all_rows if '招股' in title_of(row)
+                  ][:50]
+                  raise RuntimeError(f'Missing formal prospectus; near={json.dumps(near, ensure_ascii=False)}')
+              return candidates[0][2], log
+
+          selected: list[dict[str, Any]] = []
+          candidate_logs: dict[str, Any] = {}
+
+          for spec in annual_specs:
+              row, log = choose_report(spec['variants'], spec['year'])
+              candidate_logs[f"{spec['year']}年年度报告"] = log
+              selected.append({
+                  'period':spec['year'],'report_label':f"{spec['year']}年年度报告",'doc_type':'年度报告',
+                  'filename':spec['filename'],'min_pages':spec['min_pages'],'row':row,
+              })
+
+          prospectus_row, prospectus_log = choose_prospectus()
+          candidate_logs['招股说明书'] = prospectus_log
+          selected.append({
+              'period':'IPO','report_label':'首次公开发行股票并在创业板上市招股说明书','doc_type':'招股说明书',
+              'filename':'07_松原安全_首次公开发行股票并在创业板上市招股说明书.pdf','min_pages':120,'row':prospectus_row,
+          })
+
+          quarter_preferences = [
+              (['2026年第三季度报告','2026年三季度报告'],'2026Q3','2026年第三季度报告'),
+              (['2026年第一季度报告','2026年一季度报告'],'2026Q1','2026年第一季度报告'),
+              (['2025年第三季度报告','2025年三季度报告'],'2025Q3','2025年第三季度报告'),
+              (['2025年第一季度报告','2025年一季度报告'],'2025Q1','2025年第一季度报告'),
+          ]
+          quarter_row = None
+          quarter_period = None
+          quarter_label = None
+          quarter_logs: list[dict[str,Any]] = []
+          for variants, period, label in quarter_preferences:
+              try:
+                  row, log = choose_report(variants, period, extra_excludes=['正文'])
+                  quarter_logs.extend(log)
+                  quarter_row, quarter_period, quarter_label = row, period, label
+                  break
+              except RuntimeError:
+                  continue
+          if quarter_row is None:
+              raise RuntimeError('No eligible quarterly report found')
+          candidate_logs['最新季报'] = quarter_logs
+          selected.append({
+              'period':quarter_period,'report_label':quarter_label,'doc_type':'最新季报',
+              'filename':f'08_松原安全_{quarter_label}.pdf','min_pages':5,'row':quarter_row,
+          })
+
+          interim_preferences = [
+              (['2026年半年度报告','2026年半年报'],'2026H1','2026年半年度报告'),
+              (['2025年半年度报告','2025年半年报'],'2025H1','2025年半年度报告'),
+          ]
+          interim_row = None
+          interim_period = None
+          interim_label = None
+          interim_logs: list[dict[str,Any]] = []
+          for variants, period, label in interim_preferences:
+              try:
+                  row, log = choose_report(variants, period)
+                  interim_logs.extend(log)
+                  interim_row, interim_period, interim_label = row, period, label
+                  break
+              except RuntimeError:
+                  continue
+          candidate_logs['最新半年度报告'] = interim_logs
+          if interim_row is not None:
+              selected.append({
+                  'period':interim_period,'report_label':interim_label,'doc_type':'半年度报告（补充）',
+                  'filename':f'09_松原安全_{interim_label}_补充.pdf','min_pages':30,'row':interim_row,
+              })
+
+          def pdf_urls(art: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_01.pdf',
+              ]
+
+          def download_pdf(art: str, referer: str) -> tuple[bytes,str,dict[str,Any]]:
+              last: dict[str,Any] = {}
+              for url in pdf_urls(art):
+                  for attempt in range(1,7):
+                      try:
+                          r = session.get(url, timeout=(30,420), allow_redirects=True, headers={
+                              'User-Agent':session.headers['User-Agent'],
+                              'Referer':referer,
+                              'Accept':'application/pdf,*/*;q=0.8',
+                          })
+                          last = {'requested_url':url,'final_url':str(r.url),'status':r.status_code,'bytes':len(r.content),'content_type':r.headers.get('content-type','')}
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 30000:
+                              return r.content, str(r.url), last
+                      except Exception as exc:
+                          last = {'requested_url':url,'error':repr(exc)}
+                      time.sleep(attempt)
+              raise RuntimeError(f'PDF download failed for {art}: {last}')
+
+          manifest: list[dict[str,Any]] = []
+          for index, raw_item in enumerate(selected,1):
+              item = dict(raw_item)
+              row = item.pop('row')
+              art = art_code(row)
+              if not art:
+                  raise RuntimeError(f'Missing art code for {item["filename"]}')
+              detail_page = f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{art}.html'
+              data, source_url, download_meta = download_pdf(art, detail_page)
+              dest = ROOT / item['filename']
+              dest.write_bytes(data)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f'Too few pages: {dest.name} = {pages} < {item["min_pages"]}')
+
+              sample_indices = list(range(min(18,pages)))
+              if pages > 2:
+                  sample_indices += [pages-2,pages-1]
+              texts: list[str] = []
+              for pno in dict.fromkeys(sample_indices):
+                  try:
+                      texts.append(reader.pages[pno].extract_text() or '')
+                  except Exception:
+                      pass
+              extracted = '\n'.join(texts)
+              identity_tokens = [COMPANY_CURRENT,COMPANY_OLD,COMPANY_FULL,STOCK_CODE,'浙江松原汽车安全系统']
+              identity_ok = any(token in extracted for token in identity_tokens)
+              if not identity_ok:
+                  txt = dest.with_suffix('.txt')
+                  subprocess.run(['pdftotext','-f','1','-l',str(min(20,pages)),str(dest),str(txt)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  extracted = txt.read_text(encoding='utf-8',errors='ignore')
+                  txt.unlink(missing_ok=True)
+                  identity_ok = any(token in extracted for token in identity_tokens)
+              if not identity_ok:
+                  raise RuntimeError(f'Issuer identity check failed: {dest.name}')
+
+              if item['doc_type'] == '年度报告':
+                  period_ok = item['period'] in extracted and ('年度报告' in extracted or '年度 报告' in extracted or 'ANNUAL REPORT' in extracted.upper())
+              elif item['doc_type'] == '招股说明书':
+                  period_ok = '招股说明书' in extracted and ('首次公开发行' in extracted or '创业板' in extracted)
+              elif item['doc_type'] == '最新季报':
+                  period_ok = item['period'][:4] in extracted and ('季度报告' in extracted or '第一季度' in extracted or '第三季度' in extracted)
+              else:
+                  period_ok = item['period'][:4] in extracted and ('半年度报告' in extracted or '半年' in extracted)
+              if not period_ok:
+                  raise RuntimeError(f'Report type/period check failed: {dest.name}')
+
+              q = subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+              if q.returncode != 0:
+                  raise RuntimeError(f'qpdf check failed: {dest.name}: {q.stdout[-1200:]}')
+
+              first_prefix = PREVIEW_DIR / f'{index:02d}_{dest.stem}_首页'
+              last_prefix = PREVIEW_DIR / f'{index:02d}_{dest.stem}_末页'
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(dest),str(first_prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              subprocess.run(['pdftoppm','-f',str(pages),'-l',str(pages),'-png','-r','90','-singlefile',str(dest),str(last_prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              first_png = Path(str(first_prefix)+'.png')
+              last_png = Path(str(last_prefix)+'.png')
+              if not first_png.exists() or first_png.stat().st_size < 8000:
+                  raise RuntimeError(f'First page render failed: {dest.name}')
+              if not last_png.exists() or last_png.stat().st_size < 3000:
+                  raise RuntimeError(f'Last page render failed: {dest.name}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  **item,
+                  'stock_code':STOCK_CODE,
+                  'current_stock_name':COMPANY_CURRENT,
+                  'former_stock_name':COMPANY_OLD,
+                  'company_full_name':COMPANY_FULL,
+                  'announcement_title':row.get('title'),
+                  'announcement_date':date_of(row),
+                  'art_code':art,
+                  'announcement_detail_page':detail_page,
+                  'pdf_source_url':source_url,
+                  'official_cninfo_index':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK_CODE}',
+                  'official_szse_profile':f'https://www.szse.cn/market/product/stock/list/index.html?code={STOCK_CODE}',
+                  'actual_pages':pages,
+                  'bytes':len(data),
+                  'sha256':sha,
+                  'identity_check':identity_ok,
+                  'period_type_check':period_ok,
+                  'download_meta':download_meta,
+                  'validation':['PDF header','issuer identity','report type/period','minimum page count','qpdf structure','first-page render','last-page render'],
+              })
+
+          expected_min = 8
+          if len(manifest) < expected_min:
+              raise RuntimeError(f'Expected at least {expected_min} PDFs, got {len(manifest)}')
+          if len({m['sha256'] for m in manifest}) != len(manifest):
+              raise RuntimeError('Duplicate PDF content detected')
+
+          quarter_item = next((m for m in manifest if m['doc_type']=='最新季报'), None)
+          interim_item = next((m for m in manifest if m['doc_type']=='半年度报告（补充）'), None)
+          readme = [
+              f'{COMPANY_FULL}（{STOCK_CODE}.SZ，现简称“{COMPANY_CURRENT}”，曾用简称“{COMPANY_OLD}”）全部年报、招股说明书及最新季报资料包',
+              f'整理日期：{TODAY}',
+              '',
+              '收录口径：',
+              '- 上市后全部完整年度报告：2020年至2025年，共6份。',
+              '- 正式发行版《首次公开发行股票并在创业板上市招股说明书》1份；排除招股意向书、申报稿、注册稿、摘要、问询回复和上市公告书。',
+              f'- 最新独立季度报告：{quarter_item["report_label"] if quarter_item else "未识别"}。',
+              f'- 披露时间更晚的半年度报告：{interim_item["report_label"] if interim_item else "未收录"}，作为补充阶段性报告。',
+              '- 年报均使用报告全文，不以摘要、业绩快报、审计报告或财务报表附件替代。',
+              '',
+              '文件清单：',
+          ]
+          for i,m in enumerate(manifest,1):
+              readme += [
+                  f'{i}. {m["filename"]}',
+                  f'   类型：{m["doc_type"]}；报告期/文件：{m["report_label"]}',
+                  f'   公告标题：{m["announcement_title"]}',
+                  f'   公告日期：{m["announcement_date"]}；实际页数：{m["actual_pages"]}页',
+                  f'   公告页面：{m["announcement_detail_page"]}',
+                  f'   PDF来源：{m["pdf_source_url"]}',
+                  f'   SHA-256：{m["sha256"]}',
+                  '',
+              ]
+          readme += [
+              '核验说明：',
+              '- 每份PDF均检查文件头、公司名称/证券代码、报告期或文件类别、最低页数和qpdf结构。',
+              '- 每份PDF均完成首页与末页渲染验证；预览图随包附带。',
+              '- 已执行重复文件检查及最终ZIP CRC完整性检查。',
+          ]
+          (ROOT/'00_文件清单与来源说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'候选公告筛选记录.json').write_text(json.dumps(candidate_logs,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'公告检索分页记录.json').write_text(json.dumps(page_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f'{m["sha256"]}  {m["filename"]}\n' for m in manifest),encoding='utf-8')
+
+          zip_path = ARTIFACT_DIR / f'{PACKAGE}.zip'
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as zf:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path,arcname=path.relative_to(ROOT).as_posix())
+          with zipfile.ZipFile(zip_path,'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_names = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_names)} != {len(manifest)}')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          print('FINAL_ZIP',zip_path.name,zip_path.stat().st_size,'PDF_COUNT',len(manifest),'SHA256',zip_sha)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: songyuan-safety-300893-all-reports-prospectus-latest-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
