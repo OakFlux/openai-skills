@@ -1,0 +1,334 @@
+name: Build Jingcheng 600860 reports package 20261020 v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jingcheng-600860-reports-20261020-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = '600860'
+          COMPANY_SHORT = '京城股份'
+          COMPANY_FULL = '北京京城机电股份有限公司'
+          FORMER_SHORT = '*ST京城'
+          PACKAGE = '京城股份_600860_2020-2025年报及最新季报'
+          ROOT = Path(PACKAGE)
+          PREVIEW_DIR = ROOT / '首页预览'
+          TMP_DIR = Path('_candidate_pdfs')
+          ROOT.mkdir(exist_ok=True)
+          PREVIEW_DIR.mkdir(exist_ok=True)
+          TMP_DIR.mkdir(exist_ok=True)
+
+          annual_specs = [
+              {'variants':['2020年年度报告'], 'period':'2020', 'filename':'01_京城股份_2020年年度报告.pdf', 'min_pages':80},
+              {'variants':['2021年年度报告'], 'period':'2021', 'filename':'02_京城股份_2021年年度报告.pdf', 'min_pages':80},
+              {'variants':['2022年年度报告'], 'period':'2022', 'filename':'03_京城股份_2022年年度报告.pdf', 'min_pages':80},
+              {'variants':['2023年年度报告'], 'period':'2023', 'filename':'04_京城股份_2023年年度报告.pdf', 'min_pages':80},
+              {'variants':['2024年年度报告'], 'period':'2024', 'filename':'05_京城股份_2024年年度报告.pdf', 'min_pages':80},
+              {'variants':['2025年年度报告'], 'period':'2025', 'filename':'06_京城股份_2025年年度报告.pdf', 'min_pages':80},
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          all_rows: list[dict[str, Any]] = []
+          search_pages: list[dict[str, Any]] = []
+          seen_rows: set[str] = set()
+
+          for page in range(1, 61):
+              params = {
+                  'sr':'-1', 'page_size':'100', 'page_index':str(page),
+                  'ann_type':'A', 'client_source':'web', 'stock_list':STOCK_CODE,
+                  'f_node':'0', 's_node':'0',
+              }
+              data = None
+              last: Any = None
+              for attempt in range(8):
+                  try:
+                      r = session.get(api, params=params, timeout=(20, 120))
+                      last = {'status':r.status_code,'text':r.text[:300],'url':r.url}
+                      if r.status_code == 200:
+                          data = r.json()
+                          break
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              if data is None:
+                  raise RuntimeError(f'Announcement API failed page {page}: {last}')
+              rows = ((data.get('data') or {}).get('list') or [])
+              search_pages.append({'page':page,'count':len(rows)})
+              if not rows:
+                  break
+              for row in rows:
+                  code = str(row.get('art_code') or row.get('artCode') or '')
+                  key = code or json.dumps(row, ensure_ascii=False, sort_keys=True)
+                  if key in seen_rows:
+                      continue
+                  seen_rows.add(key)
+                  all_rows.append(row)
+              time.sleep(0.08)
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', '', text or '')
+
+          def art_code(row: dict[str, Any]) -> str:
+              return str(row.get('art_code') or row.get('artCode') or '')
+
+          def date_value(row: dict[str, Any]) -> str:
+              return str(row.get('display_time') or '')
+
+          bad_common = [
+              '摘要','英文版','取消','问询','回复','审计报告','董事会','监事会',
+              '更正公告','提示性公告','社会责任报告','环境、社会及管治报告',
+              '可持续发展报告','独立董事述职报告','内部控制评价报告','财务决算报告',
+              '年度报告说明会','年度报告网上说明会','募集资金','会计师事务所',
+              '前期会计差错更正后的财务报表','财务报表及相关附注',
+          ]
+
+          def ranked_candidates(variants: list[str], period: str) -> list[dict[str, Any]]:
+              candidates: list[tuple[int, str, dict[str, Any], str]] = []
+              for row in all_rows:
+                  raw = str(row.get('title') or '')
+                  title = compact(raw)
+                  matched = next((key for key in variants if compact(key) in title), None)
+                  if not matched or any(compact(x) in title for x in bad_common):
+                      continue
+                  score = 50
+                  key = compact(matched)
+                  if title.endswith(key): score += 35
+                  if title == key: score += 20
+                  if any(title.startswith(compact(x)) for x in [COMPANY_SHORT, COMPANY_FULL, FORMER_SHORT]): score += 15
+                  if any(x in title for x in ['更正后','修订版','更新后','修订稿']): score += 100
+                  if any(x in title for x in ['取消版','已取消']): score -= 100
+                  candidates.append((score, date_value(row), row, matched))
+              candidates.sort(key=lambda x:(x[0],x[1]), reverse=True)
+              return [
+                  {'row':row, 'score':score, 'date':date, 'matched_variant':matched,
+                   'period':period, 'title':row.get('title'), 'art_code':art_code(row)}
+                  for score,date,row,matched in candidates[:30]
+              ]
+
+          def fetch_pdf(art: str, referer: str) -> tuple[bytes, dict[str, Any], str]:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{art}_1.pdf',
+              ]
+              last: dict[str, Any] = {}
+              for url in urls:
+                  for attempt in range(5):
+                      try:
+                          rr = session.get(url, timeout=(30, 420), allow_redirects=True, headers={
+                              'User-Agent':session.headers['User-Agent'], 'Referer':referer,
+                              'Accept':'application/pdf,*/*;q=0.8',
+                          })
+                          last = {'url':url,'status':rr.status_code,'final_url':rr.url,
+                                  'content_type':rr.headers.get('content-type',''),'bytes':len(rr.content)}
+                          if rr.status_code == 200 and rr.content[:5] == b'%PDF-' and len(rr.content) > 30_000:
+                              return rr.content, last, url
+                      except Exception as exc:
+                          last = {'url':url,'error':repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f'PDF download failed {art}: {last}')
+
+          identity_aliases = [COMPANY_SHORT, COMPANY_FULL, FORMER_SHORT, STOCK_CODE]
+          candidate_logs: dict[str, Any] = {}
+          rejection_log: list[dict[str, Any]] = []
+          manifest: list[dict[str, Any]] = []
+
+          def select_valid_pdf(spec: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+              if not candidates:
+                  raise RuntimeError(f'No announcement candidates for {spec["period"]}')
+              candidate_logs[spec['period']] = [
+                  {k:v for k,v in item.items() if k != 'row'} for item in candidates
+              ]
+              for candidate in candidates:
+                  row = candidate['row']
+                  art = art_code(row)
+                  if not art:
+                      rejection_log.append({'period':spec['period'],'title':row.get('title'),'reason':'missing art code'})
+                      continue
+                  detail_page = f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{art}.html'
+                  try:
+                      data, download_meta, mirror_pdf = fetch_pdf(art, detail_page)
+                  except Exception as exc:
+                      rejection_log.append({'period':spec['period'],'title':row.get('title'),'art_code':art,'reason':repr(exc)})
+                      continue
+
+                  temp = TMP_DIR / f'{spec["period"]}_{art}.pdf'
+                  temp.write_bytes(data)
+                  try:
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                  except Exception as exc:
+                      rejection_log.append({'period':spec['period'],'title':row.get('title'),'art_code':art,'reason':'pdf parse '+repr(exc)})
+                      continue
+                  if pages < spec['min_pages']:
+                      rejection_log.append({'period':spec['period'],'title':row.get('title'),'art_code':art,
+                                            'reason':f'too few pages {pages} < {spec["min_pages"]}'})
+                      continue
+
+                  extracted = ''
+                  for p in reader.pages[:min(15, pages)]:
+                      try:
+                          extracted += '\n' + (p.extract_text() or '')
+                      except Exception:
+                          pass
+                  identity_hits = [x for x in identity_aliases if compact(x) in compact(extracted)]
+                  if not identity_hits:
+                      rejection_log.append({'period':spec['period'],'title':row.get('title'),'art_code':art,
+                                            'reason':'issuer identity not found'})
+                      continue
+                  try:
+                      subprocess.run(['qpdf','--warning-exit-0','--check',str(temp)],
+                                     check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                  except Exception as exc:
+                      rejection_log.append({'period':spec['period'],'title':row.get('title'),'art_code':art,
+                                            'reason':'qpdf '+repr(exc)})
+                      continue
+
+                  dest = ROOT / spec['filename']
+                  dest.write_bytes(data)
+                  prefix = PREVIEW_DIR / dest.stem
+                  subprocess.run([
+                      'pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(dest),str(prefix)
+                  ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                  preview = Path(str(prefix) + '.png')
+                  if not preview.exists() or preview.stat().st_size < 10_000:
+                      raise RuntimeError(f'Preview render failed: {dest.name}')
+
+                  sha = hashlib.sha256(data).hexdigest()
+                  return {
+                      **spec,
+                      'announcement_title':row.get('title'),
+                      'announcement_date':row.get('display_time'),
+                      'art_code':art,
+                      'announcement_detail_page':detail_page,
+                      'mirror_pdf_url':mirror_pdf,
+                      'official_cninfo_index':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK_CODE}',
+                      'official_sse_profile':f'https://www.sse.com.cn/assortment/stock/list/info/company/index.shtml?COMPANY_CODE={STOCK_CODE}',
+                      'actual_pages':pages,
+                      'bytes':len(data),
+                      'sha256':sha,
+                      'identity_hits':identity_hits,
+                      'download_meta':download_meta,
+                      'preview_file':str(Path('首页预览') / preview.name),
+                      'validation':['PDF header','announcement-title match','issuer identity','minimum page count','qpdf structure','first-page render'],
+                  }
+              raise RuntimeError(f'No full valid PDF found for {spec["period"]}; rejections: {json.dumps(rejection_log[-20:], ensure_ascii=False)}')
+
+          for spec in annual_specs:
+              candidates = ranked_candidates(spec['variants'], spec['period'])
+              manifest.append(select_valid_pdf(spec, candidates))
+
+          quarter_options = [
+              (['2026年第三季度报告','2026年三季度报告'], '2026Q3'),
+              (['2026年第一季度报告','2026年一季度报告'], '2026Q1'),
+              (['2025年第三季度报告','2025年三季度报告'], '2025Q3'),
+              (['2025年第一季度报告','2025年一季度报告'], '2025Q1'),
+          ]
+          quarter_item = None
+          quarter_period = None
+          for variants, period in quarter_options:
+              candidates = ranked_candidates(variants, period)
+              if not candidates:
+                  continue
+              spec = {'variants':variants, 'period':period,
+                      'filename':f'07_京城股份_{period}_最新季报.pdf',
+                      'min_pages':5, 'doc_type':'最新季报'}
+              try:
+                  quarter_item = select_valid_pdf(spec, candidates)
+                  quarter_period = period
+                  break
+              except RuntimeError:
+                  continue
+          if quarter_item is None or quarter_period is None:
+              raise RuntimeError('No valid quarterly report found')
+          manifest.append(quarter_item)
+
+          readme = [
+              '北京京城机电股份有限公司（600860.SH）2020-2025年年度报告及最新季度报告资料包',
+              '整理日期：2026-10-20', '',
+              '本包收录2020年至2025年全部完整年度报告，以及截至整理日公开公告中最新的独立季度报告。',
+              '若同一年度存在多份同名或近似公告，先下载并核验页数与正文身份，排除摘要、业绩公告及其他短文件。', '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {item['filename']}",
+                  f"   文件类型：{item['doc_type']}；公告标题：{item['announcement_title']}",
+                  f"   公告日期：{item['announcement_date']}；实际页数：{item['actual_pages']}页",
+                  f"   公告页面：{item['announcement_detail_page']}",
+                  f"   SHA-256：{item['sha256']}", '',
+              ]
+          readme += [
+              '来源说明：PDF由公开公告镜像下载，并与公司代码、公告标题和报告年份逐一匹配；包内保留公告页面及官方信息披露索引。',
+              '核验项目：PDF文件头、公告标题、公司名称/证券代码、实际页数、qpdf结构、首页渲染和SHA-256。',
+          ]
+
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'candidate_selection_log.json').write_text(json.dumps(candidate_logs, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'rejected_candidates_log.json').write_text(json.dumps(rejection_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'announcement_search_log.json').write_text(
+              json.dumps({'pages':search_pages,'rows_scanned':len(all_rows)}, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['filename']}\n" for item in manifest), encoding='utf-8')
+
+          pdfs = sorted(ROOT.glob('*.pdf'))
+          if len(pdfs) != 7:
+              raise RuntimeError(f'PDF count mismatch: {len(pdfs)}')
+          print('PACKAGE_DIRECTORY', ROOT)
+          print('LATEST_QUARTER', quarter_period)
+          print('TOTAL_PAGES', sum(x['actual_pages'] for x in manifest))
+          print('TOTAL_BYTES', sum(x['bytes'] for x in manifest))
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          print('REJECTIONS', json.dumps(rejection_log, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: jingcheng-600860-annual-reports-final-v2
+          path: 京城股份_600860_2020-2025年报及最新季报
+          retention-days: 30
+          compression-level: 6
+          if-no-files-found: error
