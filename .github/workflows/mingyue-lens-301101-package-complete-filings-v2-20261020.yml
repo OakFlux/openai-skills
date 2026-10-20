@@ -1,0 +1,389 @@
+name: Package Mingyue Lens complete filings v2 20261020
+
+on:
+  push:
+    branches:
+      - tmp/mingyue-lens-301101-all-filings-v2-20261020
+    paths:
+      - .github/workflows/mingyue-lens-301101-package-complete-filings-v2-20261020.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package filings
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = '301101'
+          COMPANY_SHORT = '明月镜片'
+          COMPANY_FULL = '明月镜片股份有限公司'
+          AS_OF = '2026-10-20'
+
+          root = Path(f'{COMPANY_SHORT}_{STOCK_CODE}_上市以来全部年报_招股说明书及最新季报_截至20261020')
+          prospectus_dir = root / '00_招股说明书'
+          annual_dir = root / '01_年度报告'
+          quarter_dir = root / '02_最新季度报告'
+          preview_dir = root / '首页预览'
+          for d in (prospectus_dir, annual_dir, quarter_dir, preview_dir):
+              d.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+              'Accept': 'application/json,text/plain,*/*',
+          })
+
+          endpoint = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          rows_all = []
+          for page in range(1, 31):
+              params = {
+                  'sr': '-1',
+                  'page_size': '100',
+                  'page_index': str(page),
+                  'ann_type': 'A',
+                  'client_source': 'web',
+                  'stock_list': STOCK_CODE,
+                  'f_node': '0',
+                  's_node': '0',
+              }
+              r = session.get(endpoint, params=params, timeout=45)
+              print('ANN_PAGE', page, 'STATUS', r.status_code, 'LEN', len(r.content))
+              r.raise_for_status()
+              obj = r.json()
+              rows = (obj.get('data') or {}).get('list') or []
+              print('ANN_ROWS', len(rows))
+              if not rows:
+                  break
+              rows_all.extend(rows)
+              if len(rows) < 100:
+                  break
+              time.sleep(0.2)
+
+          print('ANN_TOTAL', len(rows_all))
+          if not rows_all:
+              raise RuntimeError('Announcement API returned no records')
+
+          def notice_date(rec):
+              raw = rec.get('notice_date') or rec.get('display_time') or rec.get('eiTime') or ''
+              return raw[:10]
+
+          def col_names(rec):
+              return [str(c.get('column_name') or '') for c in (rec.get('columns') or []) if isinstance(c, dict)]
+
+          def clean_title(rec):
+              return str(rec.get('title') or '').strip()
+
+          annual_candidates = {}
+          prospectus_candidates = []
+          quarter_candidates = []
+
+          for rec in rows_all:
+              title = clean_title(rec)
+              cols = col_names(rec)
+              art_code = rec.get('art_code')
+              if not art_code or not title:
+                  continue
+
+              # Complete annual reports only; exclude summaries and unrelated notices.
+              if '年度报告全文' in cols and '摘要' not in title and '更正公告' not in title and '取消' not in title:
+                  m = re.search(r'(20\d{2})年年度报告', title)
+                  if m:
+                      year = int(m.group(1))
+                      annual_candidates.setdefault(year, []).append(rec)
+
+              # Formal IPO prospectus. Exclude application drafts and brief notices.
+              is_prospectus_column = any('首发招股说明书' in x for x in cols)
+              is_prospectus_title = '招股说明书' in title
+              if (is_prospectus_column or is_prospectus_title) and '申报稿' not in title and '摘要' not in title and '提示性公告' not in title:
+                  if '首次公开发行股票' in title or '首次公开发行' in title:
+                      prospectus_candidates.append(rec)
+
+              # Independent Q1/Q3 reports, not semiannual reports or notices.
+              q = None
+              m = re.search(r'(20\d{2})年(?:第)?一季度报告', title)
+              if m:
+                  q = (int(m.group(1)), 1)
+              m3 = re.search(r'(20\d{2})年(?:第)?三季度报告', title)
+              if m3:
+                  q = (int(m3.group(1)), 3)
+              full_quarter_col = any(x in ('一季度报告全文', '三季度报告全文') for x in cols)
+              if q and full_quarter_col and '提示性公告' not in title and '摘要' not in title:
+                  quarter_candidates.append((q, rec))
+
+          print('ANNUAL_YEARS_FOUND', sorted(annual_candidates))
+          print('PROSPECTUS_CANDIDATES', len(prospectus_candidates))
+          print('QUARTER_CANDIDATES', [(q, clean_title(r), notice_date(r)) for q, r in quarter_candidates[:20]])
+
+          # Select the latest complete version for each annual-report year.
+          selected_annual = []
+          for year in sorted(annual_candidates):
+              recs = annual_candidates[year]
+              rec = max(recs, key=lambda x: (notice_date(x), clean_title(x)))
+              selected_annual.append((year, rec))
+
+          required_years = {2021, 2022, 2023, 2024, 2025}
+          found_years = {year for year, _ in selected_annual}
+          missing = sorted(required_years - found_years)
+          if missing:
+              raise RuntimeError(f'Missing required annual-report years: {missing}; found={sorted(found_years)}')
+
+          if not prospectus_candidates:
+              raise RuntimeError('No formal IPO prospectus found')
+          selected_prospectus = max(prospectus_candidates, key=lambda x: (notice_date(x), clean_title(x)))
+
+          if not quarter_candidates:
+              raise RuntimeError('No independent quarterly report found')
+          latest_quarter_key, selected_quarter = max(quarter_candidates, key=lambda x: (x[0][0], x[0][1], notice_date(x[1])))
+
+          docs = []
+          docs.append({
+              'kind': 'prospectus',
+              'period': f'{notice_date(selected_prospectus)[:4]} IPO',
+              'art_code': selected_prospectus['art_code'],
+              'title': clean_title(selected_prospectus),
+              'notice_date': notice_date(selected_prospectus),
+              'filename': f'{notice_date(selected_prospectus)[:4]}_{COMPANY_SHORT}_首次公开发行股票并在创业板上市招股说明书.pdf',
+              'folder': prospectus_dir,
+              'columns': col_names(selected_prospectus),
+          })
+
+          for year, rec in selected_annual:
+              suffix = ''
+              title = clean_title(rec)
+              for marker in ('更正后', '修订后', '更新后', '补充后'):
+                  if marker in title:
+                      suffix = '_' + marker
+                      break
+              docs.append({
+                  'kind': 'annual',
+                  'period': str(year),
+                  'art_code': rec['art_code'],
+                  'title': title,
+                  'notice_date': notice_date(rec),
+                  'filename': f'{year}_{COMPANY_SHORT}_{year}年年度报告{suffix}.pdf',
+                  'folder': annual_dir,
+                  'columns': col_names(rec),
+              })
+
+          q_year, q_num = latest_quarter_key
+          q_label = '一季度' if q_num == 1 else '三季度'
+          docs.append({
+              'kind': 'quarter',
+              'period': f'{q_year}Q{q_num}',
+              'art_code': selected_quarter['art_code'],
+              'title': clean_title(selected_quarter),
+              'notice_date': notice_date(selected_quarter),
+              'filename': f'{q_year}Q{q_num}_{COMPANY_SHORT}_{q_year}年{q_label}报告.pdf',
+              'folder': quarter_dir,
+              'columns': col_names(selected_quarter),
+          })
+
+          print('SELECTED_DOCS')
+          for item in docs:
+              print(json.dumps({k: v for k, v in item.items() if k != 'folder'}, ensure_ascii=False, sort_keys=True))
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download_pdf(item, target):
+              code = item['art_code']
+              candidates = [
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+              ]
+              traces = []
+              for url in candidates:
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, timeout=120, allow_redirects=True)
+                          data = r.content
+                          traces.append({'url': url, 'status': r.status_code, 'bytes': len(data), 'head': repr(data[:20])})
+                          if r.status_code == 200 and data.startswith(b'%PDF') and len(data) > 50000:
+                              target.write_bytes(data)
+                              return url, traces
+                      except Exception as exc:
+                          traces.append({'url': url, 'error': repr(exc)})
+                      time.sleep(attempt)
+              raise RuntimeError(f'Unable to download valid PDF for {item["art_code"]}: {traces}')
+
+          manifest = []
+          for item in docs:
+              target = item['folder'] / item['filename']
+              source_url, traces = download_pdf(item, target)
+
+              q = subprocess.run(
+                  ['qpdf', '--check', str(target)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  errors='replace',
+              )
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {target}: {q.returncode}\n{q.stdout}')
+
+              reader = PdfReader(str(target))
+              pages = len(reader.pages)
+              min_pages = 100 if item['kind'] == 'prospectus' else (20 if item['kind'] == 'annual' else 3)
+              if pages < min_pages:
+                  raise RuntimeError(f'Unexpectedly short {item["kind"]} PDF {target}: {pages} pages')
+
+              txt = target.with_suffix('.txt')
+              subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(15, pages)), str(target), str(txt)],
+                  check=True,
+              )
+              text = txt.read_text(encoding='utf-8', errors='replace')
+              txt.unlink(missing_ok=True)
+
+              identity_hits = [x for x in [COMPANY_SHORT, COMPANY_FULL, STOCK_CODE] if x in text]
+              if not identity_hits:
+                  raise RuntimeError(f'Company identity not found in first pages of {target}')
+              if item['kind'] == 'annual' and item['period'] not in text:
+                  raise RuntimeError(f'Annual report year {item["period"]} not found in first pages of {target}')
+              if item['kind'] == 'prospectus' and '招股说明书' not in text:
+                  raise RuntimeError(f'Prospectus marker not found in first pages of {target}')
+              if item['kind'] == 'quarter':
+                  if str(latest_quarter_key[0]) not in text or not ('季度报告' in text or '一季度' in text or '三季度' in text):
+                      raise RuntimeError(f'Quarter marker not found in first pages of {target}')
+
+              preview_stem = preview_dir / target.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120', str(target), str(preview_stem)],
+                  check=True,
+              )
+              png = preview_stem.with_suffix('.png')
+              if not png.exists() or png.stat().st_size < 10000:
+                  raise RuntimeError(f'First-page render failed for {target}')
+
+              entry = {k: v for k, v in item.items() if k != 'folder'}
+              entry.update({
+                  'source_page': f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{item["art_code"]}.html',
+                  'source_url': source_url,
+                  'pages': pages,
+                  'bytes': target.stat().st_size,
+                  'sha256': sha256(target),
+                  'identity_hits': identity_hits,
+                  'qpdf_status': q.returncode,
+                  'qpdf_output': q.stdout.strip()[:2000],
+                  'download_attempts': traces,
+              })
+              manifest.append(entry)
+              print('VERIFIED', json.dumps(entry, ensure_ascii=False, sort_keys=True))
+
+          annual_periods = [x['period'] for x in manifest if x['kind'] == 'annual']
+          if not all(str(y) in annual_periods for y in range(2021, 2026)):
+              raise RuntimeError(f'Annual coverage incomplete: {annual_periods}')
+          if len([x for x in manifest if x['kind'] == 'prospectus']) != 1:
+              raise RuntimeError('Prospectus count mismatch')
+          if len([x for x in manifest if x['kind'] == 'quarter']) != 1:
+              raise RuntimeError('Quarter count mismatch')
+
+          readme = [
+              f'# {COMPANY_SHORT}（{STOCK_CODE}）上市以来全部年报、招股说明书及最新季度报告',
+              '',
+              f'整理日期：{AS_OF}',
+              '',
+              '## 收录范围',
+              '',
+              f'- 上市以来可检索到的完整年度报告：{annual_periods[0]}—{annual_periods[-1]}年，共{len(annual_periods)}份。',
+              '- 正式首次公开发行股票并在创业板上市招股说明书，共1份；未使用申报稿替代正式发行版。',
+              f'- 截至{AS_OF}可检索到的最新独立季度报告：{latest_quarter_key[0]}年第{latest_quarter_key[1]}季度报告，共1份。',
+              '- 未将年报摘要、半年报、提示性公告或招股说明书申报稿冒充正式文件。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for i, x in enumerate(manifest, 1):
+              readme += [
+                  f'{i}. {x["title"]}',
+                  f'   - 文件：{x["filename"]}',
+                  f'   - 类型：{x["kind"]}',
+                  f'   - 报告期：{x["period"]}',
+                  f'   - 公告日期：{x["notice_date"]}',
+                  f'   - 页数：{x["pages"]}',
+                  f'   - SHA-256：`{x["sha256"]}`',
+                  f'   - 公告页：{x["source_page"]}',
+                  '',
+              ]
+          readme += [
+              '## 校验说明',
+              '',
+              '- 每份PDF均检查文件头、PDF结构、实际页数、公司身份、报告期/文件类型及首页渲染。',
+              '- 压缩包创建后执行CRC完整性测试。',
+          ]
+
+          (root / 'README.md').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{x["sha256"]}  {x["filename"]}' for x in manifest) + '\n',
+              encoding='utf-8',
+          )
+
+          cn_zip = Path('明月镜片_301101_上市以来全部年报_招股说明书及最新季报_截至20261020.zip')
+          en_zip = Path('mingyue_lens_301101_all_annual_reports_prospectus_latest_quarter_20261020.zip')
+          expected_pdf_count = len(manifest)
+
+          for zpath in (cn_zip, en_zip):
+              with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for p in sorted(root.rglob('*')):
+                      if p.is_file():
+                          zf.write(p, p.as_posix())
+              with zipfile.ZipFile(zpath) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+                  pdf_names = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+                  if len(pdf_names) != expected_pdf_count:
+                      raise RuntimeError(f'Unexpected PDF count in ZIP: {len(pdf_names)} expected {expected_pdf_count}')
+              print('FINAL_ZIP', zpath, zpath.stat().st_size, 'SHA256', sha256(zpath))
+
+          print('COUNTS', json.dumps({
+              'prospectus': 1,
+              'annual': len(annual_periods),
+              'quarter': 1,
+              'pdfs': len(manifest),
+              'pages': sum(x['pages'] for x in manifest),
+              'latest_quarter': f'{latest_quarter_key[0]}Q{latest_quarter_key[1]}',
+          }, ensure_ascii=False))
+          PY
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: mingyue-lens-301101-complete-filings-v2-20261020
+          path: |
+            明月镜片_301101_上市以来全部年报_招股说明书及最新季报_截至20261020.zip
+            mingyue_lens_301101_all_annual_reports_prospectus_latest_quarter_20261020.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
