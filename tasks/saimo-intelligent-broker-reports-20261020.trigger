@@ -3,3 +3,4 @@ Probe Sina and other public report sources.
 Probe historical Eastmoney report metadata.
 Probe report platforms and search engines for original PDFs.
 Inspect fxbaogao API routes.
+Inspect report search request schema.
