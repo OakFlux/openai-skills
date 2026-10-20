@@ -1,0 +1,427 @@
+name: Build ST Biaozhun 600302 annual reports package 20261020
+
+on:
+  push:
+    paths:
+      - '.github/workflows/st-biaozhun-600302-annual-reports-2020-2025-latest-20261020.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          TODAY = '2026-10-20'
+          STOCK_CODE = '600302'
+          COMPANY_SHORTS = ['ST标准', '标准股份']
+          COMPANY_FULL = '西安标准工业股份有限公司'
+          PACKAGE = 'ST标准_600302_2020-2025年报及最新季报'
+          WORK = Path('st_biaozhun_work')
+          FINAL = WORK / 'final'
+          VERIFY = WORK / 'verification_renders'
+          ARTIFACT = Path('artifact_out')
+          for directory in (FINAL, VERIFY, ARTIFACT):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          annual_specs = [
+              {'year':'2020','variants':['2020年年度报告','2020年度报告'],'filename':'01_ST标准_2020年年度报告.pdf','min_pages':60},
+              {'year':'2021','variants':['2021年年度报告','2021年度报告'],'filename':'02_ST标准_2021年年度报告.pdf','min_pages':60},
+              {'year':'2022','variants':['2022年年度报告','2022年度报告'],'filename':'03_ST标准_2022年年度报告.pdf','min_pages':60},
+              {'year':'2023','variants':['2023年年度报告','2023年度报告'],'filename':'04_ST标准_2023年年度报告.pdf','min_pages':60},
+              {'year':'2024','variants':['2024年年度报告','2024年度报告'],'filename':'05_ST标准_2024年年度报告.pdf','min_pages':60},
+              {'year':'2025','variants':['2025年年度报告','2025年度报告'],'filename':'06_ST标准_2025年年度报告.pdf','min_pages':60},
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          all_rows: list[dict[str, Any]] = []
+          page_log: list[dict[str, Any]] = []
+          seen: set[str] = set()
+
+          for page in range(1, 61):
+              params = {
+                  'sr':'-1','page_size':'100','page_index':str(page),
+                  'ann_type':'A','client_source':'web','stock_list':STOCK_CODE,
+                  'f_node':'0','s_node':'0',
+              }
+              payload = None
+              last: Any = None
+              for attempt in range(1, 8):
+                  try:
+                      response = session.get(api, params=params, timeout=(20, 120))
+                      last = {'status':response.status_code,'bytes':len(response.content),'head':response.text[:160]}
+                      if response.status_code == 200:
+                          payload = response.json()
+                          break
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(attempt)
+              if payload is None:
+                  raise RuntimeError(f'Announcement API failed on page {page}: {last}')
+              rows = ((payload.get('data') or {}).get('list') or [])
+              page_log.append({'page':page,'count':len(rows)})
+              if not rows:
+                  break
+              new_count = 0
+              for row in rows:
+                  art = str(row.get('art_code') or row.get('artCode') or '')
+                  key = art or json.dumps(row, ensure_ascii=False, sort_keys=True)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  all_rows.append(row)
+                  new_count += 1
+              if len(rows) < 100 or new_count == 0:
+                  break
+              time.sleep(0.1)
+
+          if not all_rows:
+              raise RuntimeError('No announcement metadata returned')
+
+          def compact(value: Any) -> str:
+              return re.sub(r'\s+', '', str(value or '')).replace('&nbsp;', '')
+
+          def row_title(row: dict[str, Any]) -> str:
+              return compact(row.get('title'))
+
+          def art_code(row: dict[str, Any]) -> str:
+              return str(row.get('art_code') or row.get('artCode') or '').strip()
+
+          def row_date(row: dict[str, Any]) -> str:
+              return str(row.get('display_time') or row.get('notice_date') or '')
+
+          excluded_terms = [
+              '摘要','英文版','取消版','已取消','问询函','回复函','审计报告',
+              '董事会','监事会','更正公告','提示性公告','社会责任报告',
+              '环境、社会及管治报告','可持续发展报告','内部控制评价报告',
+              '财务决算报告','年度报告说明会','网上说明会','业绩说明会',
+              '募集资金','会计师事务所','前期会计差错更正后的财务报表',
+              '财务报表及相关附注','关于召开','独立董事述职','业绩预告','业绩快报',
+              '正文',
+          ]
+
+          def choose_report(variants: list[str], period: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+              candidates: list[tuple[int, str, dict[str, Any], str]] = []
+              for row in all_rows:
+                  title = row_title(row)
+                  matched = next((variant for variant in variants if compact(variant) in title), None)
+                  if not matched:
+                      continue
+                  if any(compact(term) in title for term in excluded_terms):
+                      continue
+                  key = compact(matched)
+                  score = 100
+                  if title == key:
+                      score += 80
+                  if title.endswith(key):
+                      score += 60
+                  if any(short in title for short in COMPANY_SHORTS) or COMPANY_FULL in title:
+                      score += 30
+                  if any(term in title for term in ['更正后','修订版','更新后','修订稿']):
+                      score += 120
+                  if '报告全文' in title:
+                      score += 30
+                  candidates.append((score, row_date(row), row, matched))
+              candidates.sort(key=lambda item:(item[0], item[1]), reverse=True)
+              log = [
+                  {
+                      'period':period,'score':score,'date':date,'title':row.get('title'),
+                      'art_code':art_code(row),'matched_variant':matched,
+                  }
+                  for score, date, row, matched in candidates[:20]
+              ]
+              if not candidates:
+                  near = [
+                      {'title':r.get('title'),'date':row_date(r),'art_code':art_code(r)}
+                      for r in all_rows if str(period)[:4] in row_title(r)
+                  ][:30]
+                  raise RuntimeError(f'Missing report for {period}: {variants}; near={json.dumps(near, ensure_ascii=False)}')
+              return candidates[0][2], log
+
+          quarter_preferences = [
+              (['2026年第三季度报告','2026年三季度报告'], '2026Q3', '2026年第三季度报告'),
+              (['2026年第一季度报告','2026年一季度报告'], '2026Q1', '2026年第一季度报告'),
+              (['2025年第三季度报告','2025年三季度报告'], '2025Q3', '2025年第三季度报告'),
+              (['2025年第一季度报告','2025年一季度报告'], '2025Q1', '2025年第一季度报告'),
+          ]
+          interim_preferences = [
+              (['2026年半年度报告','2026年半年报'], '2026H1', '2026年半年度报告'),
+              (['2025年半年度报告','2025年半年报'], '2025H1', '2025年半年度报告'),
+          ]
+
+          selected: list[dict[str, Any]] = []
+          candidate_logs: dict[str, Any] = {}
+
+          for spec in annual_specs:
+              row, candidates = choose_report(spec['variants'], spec['year'])
+              candidate_logs[f"{spec['year']}年年度报告"] = candidates
+              selected.append({
+                  'period':spec['year'],'report_label':f"{spec['year']}年年度报告",
+                  'doc_type':'年度报告','filename':spec['filename'],'min_pages':spec['min_pages'],'row':row,
+              })
+
+          quarter_row = None
+          quarter_period = None
+          quarter_label = None
+          quarter_logs: list[dict[str, Any]] = []
+          for variants, period, label in quarter_preferences:
+              try:
+                  row, candidates = choose_report(variants, period)
+                  quarter_logs.extend(candidates)
+                  quarter_row, quarter_period, quarter_label = row, period, label
+                  break
+              except RuntimeError:
+                  continue
+          if quarter_row is None:
+              raise RuntimeError('No eligible independent quarterly report found')
+          candidate_logs['最新季报'] = quarter_logs
+          selected.append({
+              'period':quarter_period,'report_label':quarter_label,'doc_type':'季度报告',
+              'filename':f'07_ST标准_{quarter_label}.pdf','min_pages':5,'row':quarter_row,
+          })
+
+          interim_row = None
+          interim_period = None
+          interim_label = None
+          interim_logs: list[dict[str, Any]] = []
+          for variants, period, label in interim_preferences:
+              try:
+                  row, candidates = choose_report(variants, period)
+                  interim_logs.extend(candidates)
+                  interim_row, interim_period, interim_label = row, period, label
+                  break
+              except RuntimeError:
+                  continue
+          candidate_logs['最新半年度报告'] = interim_logs
+          if interim_row is not None:
+              selected.append({
+                  'period':interim_period,'report_label':interim_label,'doc_type':'半年度报告（补充）',
+                  'filename':f'08_ST标准_{interim_label}_补充.pdf','min_pages':25,'row':interim_row,
+              })
+
+          def pdf_candidate_urls(art: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_01.pdf',
+              ]
+
+          def download_pdf(art: str, detail_page: str) -> tuple[bytes, str, dict[str, Any]]:
+              last: dict[str, Any] = {}
+              for url in pdf_candidate_urls(art):
+                  for attempt in range(1, 7):
+                      try:
+                          response = session.get(
+                              url, timeout=(30, 420), allow_redirects=True,
+                              headers={
+                                  'User-Agent':session.headers['User-Agent'],'Referer':detail_page,
+                                  'Accept':'application/pdf,*/*;q=0.8',
+                              },
+                          )
+                          last = {
+                              'requested_url':url,'final_url':str(response.url),
+                              'status':response.status_code,'bytes':len(response.content),
+                              'content_type':response.headers.get('content-type',''),
+                          }
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 30_000:
+                              return response.content, str(response.url), last
+                      except Exception as exc:
+                          last = {'requested_url':url,'error':repr(exc)}
+                      time.sleep(attempt)
+              raise RuntimeError(f'PDF download failed for {art}: {last}')
+
+          manifest: list[dict[str, Any]] = []
+          identity_tokens = COMPANY_SHORTS + [COMPANY_FULL, STOCK_CODE, '西安标准工业']
+          for index, raw_item in enumerate(selected, 1):
+              item = dict(raw_item)
+              row = item.pop('row')
+              art = art_code(row)
+              if not art:
+                  raise RuntimeError(f'Missing art code: {item["filename"]}')
+              detail_page = f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{art}.html'
+              pdf_bytes, resolved_url, download_meta = download_pdf(art, detail_page)
+              destination = FINAL / item['filename']
+              destination.write_bytes(pdf_bytes)
+
+              reader = PdfReader(str(destination), strict=False)
+              page_count = len(reader.pages)
+              if page_count < item['min_pages']:
+                  raise RuntimeError(f'Page count too small: {destination.name} = {page_count}')
+
+              sample_indices = list(range(min(18, page_count)))
+              if page_count > 2:
+                  sample_indices.extend([page_count - 2, page_count - 1])
+              extracted_parts: list[str] = []
+              for page_index in dict.fromkeys(sample_indices):
+                  try:
+                      extracted_parts.append(reader.pages[page_index].extract_text() or '')
+                  except Exception:
+                      pass
+              extracted = '\n'.join(extracted_parts)
+              identity_ok = any(token in extracted for token in identity_tokens)
+              if not identity_ok:
+                  txt_path = VERIFY / f'{index:02d}.txt'
+                  subprocess.run(
+                      ['pdftotext','-f','1','-l',str(min(20, page_count)),str(destination),str(txt_path)],
+                      check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  )
+                  extracted += '\n' + txt_path.read_text(encoding='utf-8', errors='ignore')
+                  identity_ok = any(token in extracted for token in identity_tokens)
+              if not identity_ok:
+                  raise RuntimeError(f'Issuer identity check failed: {destination.name}')
+
+              year_token = str(item['period'])[:4]
+              period_ok = year_token in extracted
+              if item['doc_type'] == '年度报告':
+                  period_ok = period_ok and ('年度报告' in extracted or '年度 报告' in extracted or 'Annual Report' in extracted)
+              elif item['doc_type'] == '季度报告':
+                  period_ok = period_ok and ('季度报告' in extracted or '第一季度' in extracted or '第三季度' in extracted or '一季度' in extracted or '三季度' in extracted)
+              else:
+                  period_ok = period_ok and ('半年度报告' in extracted or '半年报' in extracted)
+              if not period_ok:
+                  raise RuntimeError(f'Report-period text check failed: {destination.name}')
+
+              qpdf = subprocess.run(
+                  ['qpdf','--warning-exit-0','--check',str(destination)],
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+              )
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f'qpdf check failed: {destination.name}: {qpdf.stdout[-1200:]}')
+
+              first_prefix = VERIFY / f'{index:02d}_first'
+              last_prefix = VERIFY / f'{index:02d}_last'
+              subprocess.run(
+                  ['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(destination),str(first_prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              subprocess.run(
+                  ['pdftoppm','-f',str(page_count),'-l',str(page_count),'-png','-r','95','-singlefile',str(destination),str(last_prefix)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              first_png = Path(str(first_prefix) + '.png')
+              last_png = Path(str(last_prefix) + '.png')
+              if not first_png.exists() or first_png.stat().st_size < 8_000:
+                  raise RuntimeError(f'First-page render failed: {destination.name}')
+              if not last_png.exists() or last_png.stat().st_size < 3_000:
+                  raise RuntimeError(f'Last-page render failed: {destination.name}')
+
+              sha = hashlib.sha256(pdf_bytes).hexdigest()
+              manifest.append({
+                  **item,
+                  'announcement_title':row.get('title'),'announcement_date':row_date(row),
+                  'art_code':art,'announcement_detail_page':detail_page,'pdf_source_url':resolved_url,
+                  'official_sse_announcements':f'https://www.sse.com.cn/assortment/stock/list/info/announcement/index.shtml?productId={STOCK_CODE}',
+                  'actual_pages':page_count,'bytes':len(pdf_bytes),'sha256':sha,
+                  'identity_text_check':identity_ok,'period_text_check':period_ok,
+                  'download_meta':download_meta,
+                  'validation':['PDF header','issuer identity','report period','minimum page count','qpdf structure','first-page render','last-page render'],
+              })
+              print('VALIDATED', json.dumps(manifest[-1], ensure_ascii=False), flush=True)
+
+          if len(manifest) < 7:
+              raise RuntimeError(f'Expected at least 7 PDF files, got {len(manifest)}')
+          if len({item['sha256'] for item in manifest}) != len(manifest):
+              raise RuntimeError('Duplicate PDF content detected')
+
+          latest_quarter = next(item for item in manifest if item['doc_type'] == '季度报告')
+          readme_lines = [
+              '西安标准工业股份有限公司（600302.SH，现证券简称：ST标准）2020—2025年年度报告及最新季报资料包',
+              f'整理日期：{TODAY}',
+              '',
+              '收录口径：2020年至2025年六份完整年度报告，以及截至整理日可检索到的最新一份独立季度报告。',
+              f'本次识别的最新独立季度报告为：{latest_quarter["report_label"]}。',
+              '如存在披露时间更晚的半年度报告，已作为补充资料一并收入。',
+              '2020—2025年历史报告可能使用原证券简称“标准股份”；2026年5月起公司证券简称变更为“ST标准”。',
+              '已排除年度报告摘要、业绩快报、审计报告、季度报告正文、说明会公告及其他非报告全文。',
+              '同一报告如存在修订版、更正后或更新后版本，优先采用后续完整版本。',
+              '',
+              '文件清单：',
+          ]
+          for index, item in enumerate(manifest, 1):
+              readme_lines.extend([
+                  f'{index}. {item["filename"]}',
+                  f'   类型：{item["doc_type"]}；报告期：{item["report_label"]}',
+                  f'   公告标题：{item["announcement_title"]}',
+                  f'   公告日期：{item["announcement_date"]}；实际页数：{item["actual_pages"]}页',
+                  f'   公告页面：{item["announcement_detail_page"]}',
+                  f'   PDF来源：{item["pdf_source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ])
+          readme_lines.extend([
+              '核验说明：',
+              '- 每份PDF均核对公司名称或证券代码、报告期、文件页数及PDF结构。',
+              '- 每份PDF均完成首页和末页渲染检查，并排除重复文件。',
+              '- 最终ZIP已执行CRC完整性检查。',
+          ])
+          (FINAL / '00_文件清单与来源说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (FINAL / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / '候选公告筛选记录.json').write_text(json.dumps(candidate_logs, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / '公告检索分页记录.json').write_text(json.dumps(page_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (FINAL / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['filename']}\n" for item in manifest), encoding='utf-8'
+          )
+
+          zip_path = ARTIFACT / f'{PACKAGE}.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(FINAL.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad_member = archive.testzip()
+              if bad_member:
+                  raise RuntimeError(f'ZIP CRC failure: {bad_member}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_names)} vs {len(manifest)}')
+
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, 'PDF_COUNT', len(manifest), 'SHA256', zip_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: st-biaozhun-600302-annual-reports-2020-2025-latest-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
