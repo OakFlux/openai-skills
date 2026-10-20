@@ -4,3 +4,4 @@ Probe historical Eastmoney report metadata.
 Probe report platforms and search engines for original PDFs.
 Inspect fxbaogao API routes.
 Inspect report search request schema.
+Query report search pages and APIs.
