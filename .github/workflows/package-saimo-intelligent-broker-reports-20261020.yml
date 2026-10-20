@@ -12,65 +12,221 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Query anonymous report APIs
+      - name: Build verified public research archives
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --quiet requests
+          python -m pip install --quiet requests beautifulsoup4
           python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
           import json
-          import uuid
+          import re
+          import shutil
+          import zipfile
+          from pathlib import Path
+
           import requests
+          from bs4 import BeautifulSoup
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          AS_OF = '2026-10-20'
+          OUT = Path('artifact_out')
+          WORK = Path('saimo_public_research_archives')
+          PACKAGE_NAME = '赛摩智能_300466.SZ_券商研究公开网页存档_3份'
+          PACKAGE = WORK / PACKAGE_NAME
+          OUT.mkdir(parents=True, exist_ok=True)
+          PACKAGE.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'index': 1,
+                  'title': '赛摩电气（300466）：5月28日上市首日定价报告',
+                  'broker': '华泰证券',
+                  'analyst': '赵杨',
+                  'date': '2015-05-27',
+                  'url': 'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/617430098847/index.phtml',
+              },
+              {
+                  'index': 2,
+                  'title': '赛摩电气（300466）新股投资参考：预计公司上市初期压力位35元-40元',
+                  'broker': '金融街证券',
+                  'analyst': '赵砚泽',
+                  'date': '2015-05-19',
+                  'url': 'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/485343912478/index.phtml',
+              },
+              {
+                  'index': 3,
+                  'title': '赛摩电气（300466）：5月19日推荐申购',
+                  'broker': '华泰证券',
+                  'analyst': '赵杨',
+                  'date': '2015-05-18',
+                  'url': 'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/617435354565/index.phtml',
+              },
+          ]
 
           session = requests.Session()
           session.trust_env = False
+          retry = Retry(
+              total=6, connect=6, read=6, status=6,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'], raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry))
           session.headers.update({
-              'User-Agent': 'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/155 Mobile Safari/537.36',
-              'Accept': 'application/json, text/plain, */*',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
               'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-              'Content-Type': 'application/json',
-              'Origin': 'https://m.fxbaogao.com',
-              'Referer': 'https://m.fxbaogao.com/',
-              'USER-ID': '0',
-              'user-Token': '0',
-              'JWT-TOKEN': '',
-              'CLIENT-TYPE': 'XCX',
-              'CLIENT-TYPE-X': 'h5',
-              'CLIENT-ID': str(uuid.uuid4()),
           })
 
-          base = 'https://api.fxbaogao.com'
-          endpoints = [
-              '/mofoun/report/searchReport/searchNoAuth',
-              '/mofoun/report/searchReportData/searchListNoAuth',
-          ]
-          payload_templates = [
-              {'pageNum': 1, 'paragraphSize': 30, 'order': 2, 'nop': -1},
-              {'page': 1, 'limit': 30, 'order': 2, 'nop': -1},
-              {'pageNo': 1, 'pageSize': 30, 'order': 2, 'nop': -1},
-              {'pageNum': 1, 'pageSize': 30, 'sort': 2, 'nop': -1},
-          ]
+          def safe_name(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|]+', '_', value)
+              return value.strip(' ._')[:120]
 
-          for keyword in ('赛摩电气', '赛摩智能', '300466'):
-              for endpoint in endpoints:
-                  for index, template in enumerate(payload_templates, start=1):
-                      payload = dict(template)
-                      payload['keywords'] = keyword
-                      try:
-                          response = session.post(base + endpoint, json=payload, timeout=(20, 90))
-                          print('\nCALL', keyword, endpoint, index, payload, response.status_code, len(response.content), flush=True)
-                          print('BODY', response.text[:60000], flush=True)
-                      except Exception as exc:
-                          print('ERROR', keyword, endpoint, index, repr(exc), flush=True)
+          def extract_report_text(page_html: str, known_title: str) -> list[str]:
+              soup = BeautifulSoup(page_html, 'html.parser')
+              for tag in soup(['script', 'style', 'noscript']):
+                  tag.decompose()
+              raw_lines = [re.sub(r'\s+', ' ', line).strip() for line in soup.get_text('\n').splitlines()]
+              lines = [line for line in raw_lines if line]
 
-          for key in ('赛摩电气', '赛摩智能', '300466'):
-              try:
-                  response = session.get(
-                      base + '/mofoun/report/reportStock/search',
-                      params={'key': key}, timeout=(20, 90),
-                  )
-                  print('\nSTOCK', key, response.status_code, len(response.content), flush=True)
-                  print('BODY', response.text[:30000], flush=True)
-              except Exception as exc:
-                  print('STOCK_ERROR', key, repr(exc), flush=True)
+              start = None
+              for i, line in enumerate(lines):
+                  if line.startswith('日期：') and i + 1 < len(lines):
+                      start = i + 1
+                      break
+              if start is None:
+                  title_hits = [i for i, line in enumerate(lines) if '赛摩电气' in line and ('报告' in line or '申购' in line or '投资参考' in line)]
+                  start = title_hits[-1] + 1 if title_hits else 0
+
+              end = len(lines)
+              stop_markers = ('数据推荐', '客户服务热线', '新浪简介', 'About Sina')
+              for i in range(start, len(lines)):
+                  if any(lines[i].startswith(marker) for marker in stop_markers):
+                      end = i
+                      break
+
+              body = []
+              skip_exact = {
+                  '类别：公司', '类别：公司研究', '研究报告', '公司研究',
+                  '最新滚动', '主力动向', '个股评级', '行业研究',
+                  '投资策略', '宏观研究', '金麒麟研报',
+              }
+              for line in lines[start:end]:
+                  if line in skip_exact:
+                      continue
+                  if line.startswith(('机构：', '研究员：', '日期：')):
+                      continue
+                  if line == known_title or line.replace(' ', '') == known_title.replace(' ', ''):
+                      continue
+                  if len(line) <= 1:
+                      continue
+                  body.append(line)
+
+              compact = ''.join(body)
+              if '赛摩' not in compact or len(compact) < 180:
+                  raise RuntimeError(f'Extracted research text is incomplete: {known_title}; chars={len(compact)}')
+              return body
+
+          manifest = []
+          sha_lines = []
+          for report in reports:
+              response = session.get(report['url'], timeout=(30, 180), allow_redirects=True)
+              response.raise_for_status()
+              response.encoding = 'gb18030'
+              source_html = response.text
+              if '赛摩电气' not in source_html and '赛摩智能' not in source_html:
+                  raise RuntimeError(f'Company identity missing from source page: {report["url"]}')
+
+              paragraphs = extract_report_text(source_html, report['title'])
+              article_html = '\n'.join(f'<p>{html.escape(paragraph)}</p>' for paragraph in paragraphs)
+              archive_html = f'''<!doctype html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>{html.escape(report['title'])}</title>
+            <style>
+              body {{ max-width: 900px; margin: 36px auto; padding: 0 28px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color: #222; line-height: 1.8; }}
+              h1 {{ font-size: 26px; line-height: 1.35; margin-bottom: 14px; }}
+              .meta {{ color: #555; border-bottom: 1px solid #ddd; padding-bottom: 16px; margin-bottom: 22px; }}
+              .notice {{ background: #fff7e6; border: 1px solid #e4bd73; padding: 14px 16px; margin: 18px 0 24px; }}
+              p {{ margin: 0 0 13px; text-align: justify; }}
+              .source {{ margin-top: 28px; padding-top: 16px; border-top: 1px solid #ddd; font-size: 13px; color: #666; word-break: break-all; }}
+            </style>
+          </head>
+          <body>
+            <h1>{html.escape(report['title'])}</h1>
+            <div class="meta">机构：{html.escape(report['broker'])}　分析师：{html.escape(report['analyst'])}　日期：{report['date']}</div>
+            <div class="notice"><strong>存档说明：</strong>本文件为公开券商研究网页的离线文字存档，不是券商发布的原始PDF，也不应被视为长篇深度报告原件。公司当时证券简称为“赛摩电气”，现为“赛摩智能”。</div>
+            <article>{article_html}</article>
+            <div class="source">原始公开页面：{html.escape(report['url'])}<br>存档日期：{AS_OF}</div>
+          </body>
+          </html>'''
+
+              file_name = f'{report["index"]:02d}_{report["date"]}_{safe_name(report["broker"])}_{safe_name(report["title"])}_公开网页存档.html'
+              file_path = PACKAGE / file_name
+              file_path.write_text(archive_html, encoding='utf-8')
+              digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+              sha_lines.append(f'{digest}  {file_name}')
+              manifest.append({
+                  **report,
+                  'file_name': file_name,
+                  'archive_type': 'public_research_webpage_archive',
+                  'original_pdf_available': False,
+                  'paragraph_count': len(paragraphs),
+                  'sha256': digest,
+              })
+
+          readme = f'''# 赛摩智能（300466.SZ）券商研究公开网页存档
+
+整理日期：{AS_OF}
+
+## 重要说明
+
+本资料包收录3份可公开核验的券商公司研究网页离线存档。公开渠道未取得这些报告的原始券商PDF，因此包内文件为清理后的HTML文字存档，不是原始PDF，也不冒充15—30页的长篇深度报告。
+
+三份材料均发布于2015年公司上市阶段，当时证券简称为“赛摩电气”；公司现证券简称为“赛摩智能”。这些材料主要属于上市定价、新股投资参考或申购研究，适合回溯上市初期卖方观点，不代表当前投资意见。
+
+## 文件清单
+
+1. 华泰证券：《赛摩电气（300466）：5月28日上市首日定价报告》，2015-05-27，分析师赵杨。
+2. 金融街证券：《赛摩电气（300466）新股投资参考：预计公司上市初期压力位35元-40元》，2015-05-19，分析师赵砚泽。
+3. 华泰证券：《赛摩电气（300466）：5月19日推荐申购》，2015-05-18，分析师赵杨。
+
+每个HTML文件均注明原始公开页面地址。详细元数据和校验值分别见 `manifest.json` 与 `SHA256SUMS.txt`。
+'''
+          (PACKAGE / 'README.md').write_text(readme, encoding='utf-8')
+          (PACKAGE / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (PACKAGE / 'SHA256SUMS.txt').write_text('\n'.join(sha_lines) + '\n', encoding='utf-8')
+
+          chinese_zip = OUT / f'{PACKAGE_NAME}.zip'
+          with zipfile.ZipFile(chinese_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(PACKAGE.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE_NAME}/{path.name}')
+          with zipfile.ZipFile(chinese_zip, 'r') as archive:
+              bad = archive.testzip()
+              html_count = sum(name.lower().endswith('.html') for name in archive.namelist())
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              if html_count != 3:
+                  raise RuntimeError(f'ZIP contains {html_count} HTML archives, expected 3')
+
+          english_zip = OUT / 'Saimo_Intelligent_300466_Public_Broker_Research_Web_Archives_3.zip'
+          shutil.copy2(chinese_zip, english_zip)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', chinese_zip, chinese_zip.stat().st_size, hashlib.sha256(chinese_zip.read_bytes()).hexdigest(), flush=True)
+          print('BACKUP_ZIP', english_zip, english_zip.stat().st_size, hashlib.sha256(english_zip.read_bytes()).hexdigest(), flush=True)
           PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: saimo-intelligent-public-research-archives
+          path: artifact_out/*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
