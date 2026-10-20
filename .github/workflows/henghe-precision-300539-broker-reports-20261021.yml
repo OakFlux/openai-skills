@@ -1,0 +1,344 @@
+name: Package Henghe Precision 300539 broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/henghe-precision-300539-broker-reports-20261021.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CODE = '300539'
+          COMPANY = '横河精密'
+          FULL_COMPANY = '宁波横河精密工业股份有限公司'
+          CUTOFF = '2026-10-21'
+          CUT = '20261021'
+          API = 'https://reportapi.eastmoney.com/report/list'
+          PDF_URL = 'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+          ROOT_NAME = f'{COMPANY}_{CODE}_券商深度报告_精选3份_截至{CUT}'
+          ROOT = Path('work') / ROOT_NAME
+          REPORTS = ROOT / '券商深度报告'
+          PREVIEWS = ROOT / '首页预览'
+          DIST = Path('dist')
+          for d in (REPORTS, PREVIEWS, DIST):
+              d.mkdir(parents=True, exist_ok=True)
+
+          def make_session() -> requests.Session:
+              s = requests.Session()
+              retry = Retry(
+                  total=6, connect=6, read=6, status=6, backoff_factor=1.0,
+                  status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({'GET'}), raise_on_status=False,
+              )
+              s.mount('https://', HTTPAdapter(max_retries=retry))
+              s.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+                  'Referer': 'https://data.eastmoney.com/report/',
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              })
+              return s
+
+          S = make_session()
+          rows = []
+          for page in range(1, 8):
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2015-01-01', 'endTime': CUTOFF,
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': CODE, 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+              r = S.get(API, params=params, timeout=90)
+              print('LIST', r.status_code, len(r.content), r.url)
+              r.raise_for_status()
+              data = r.json()
+              part = data.get('data') or []
+              rows.extend(part)
+              print('LIST_META', json.dumps({
+                  'hits': data.get('hits'), 'size': data.get('size'),
+                  'page': page, 'rows': len(part), 'acc': len(rows),
+              }, ensure_ascii=False))
+              if not part or len(rows) >= int(data.get('hits') or len(rows)):
+                  break
+              time.sleep(0.5)
+
+          rows = list({str(x.get('infoCode')): x for x in rows if x.get('infoCode')}.values())
+          if not rows:
+              raise RuntimeError('东方财富公开接口未返回横河精密券商研报。')
+
+          for x in rows:
+              print('REPORT', json.dumps({k: x.get(k) for k in (
+                  'publishDate', 'orgSName', 'title', 'infoCode', 'attachPages',
+                  'attachSize', 'emRatingName', 'researcher', 'reportType'
+              )}, ensure_ascii=False))
+
+          def date10(v: object) -> str:
+              return str(v or '')[:10]
+
+          def year_of(v: object) -> int:
+              try:
+                  return int(str(v or '')[:4])
+              except Exception:
+                  return 0
+
+          def score(x: dict) -> float:
+              title = str(x.get('title') or '')
+              pages = int(x.get('attachPages') or 0)
+              year = year_of(x.get('publishDate'))
+              s = pages * 4 + max(0, year - 2015) * 4
+              if any(k in title for k in ('深度报告', '公司深度', '深度研究')):
+                  s += 150
+              if any(k in title for k in ('首次覆盖', '首次披露')):
+                  s += 110
+              if any(k in title for k in ('精密', '注塑', '模具', '汽车', '智能制造', '机器人', '零部件', '成长')):
+                  s += 20
+              if pages >= 30:
+                  s += 80
+              elif pages >= 20:
+                  s += 45
+              elif pages >= 15:
+                  s += 20
+              elif pages >= 10:
+                  s += 8
+              if int(x.get('reportType') or 0) == 2:
+                  s += 20
+              if any(k in title for k in ('点评', '年报', '季报', '中报', '半年报', '业绩快报', '事件点评')):
+                  s -= 120
+              if '转债' in title:
+                  s -= 160
+              return s
+
+          candidates = []
+          for x in rows:
+              title = str(x.get('title') or '')
+              pages = int(x.get('attachPages') or 0)
+              if pages < 8 or '转债' in title:
+                  continue
+              candidates.append((score(x), x))
+          candidates.sort(
+              key=lambda z: (z[0], int(z[1].get('attachPages') or 0), date10(z[1].get('publishDate'))),
+              reverse=True,
+          )
+
+          print('RANKED_CANDIDATES')
+          for sc, x in candidates[:30]:
+              print('RANK', sc, json.dumps({k: x.get(k) for k in (
+                  'publishDate', 'orgSName', 'title', 'infoCode', 'attachPages',
+                  'emRatingName', 'researcher', 'reportType'
+              )}, ensure_ascii=False))
+
+          def safe(v: str) -> str:
+              v = re.sub(r'[\\/:*?"<>|]', '_', v)
+              v = re.sub(r'\s+', '', v)
+              return re.sub(r'_+', '_', v).strip('_. ')
+
+          selected_brokers = set()
+          selected_infos = set()
+          records = []
+          errors = []
+
+          for sc, x in candidates:
+              if len(records) >= 3:
+                  break
+              info = str(x.get('infoCode') or '')
+              broker = str(x.get('orgSName') or x.get('orgName') or '未知券商')
+              if not info or info in selected_infos or broker in selected_brokers:
+                  continue
+              title = str(x.get('title') or '').strip()
+              date = date10(x.get('publishDate'))
+              url = PDF_URL.format(info=info)
+              dest = REPORTS / safe(f'{date}_{broker}_{COMPANY}_{title}.pdf')
+              try:
+                  r = S.get(url, headers={
+                      'Referer': 'https://data.eastmoney.com/',
+                      'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  }, timeout=180)
+                  print('PDF_GET', r.status_code, len(r.content), url, r.headers.get('content-type'))
+                  r.raise_for_status()
+                  if len(r.content) < 50_000 or not r.content.startswith(b'%PDF'):
+                      raise RuntimeError(f'无效PDF: size={len(r.content)} head={r.content[:20]!r}')
+                  dest.write_bytes(r.content)
+
+                  reader = PdfReader(str(dest), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 8:
+                      raise RuntimeError(f'实际页数过少: {pages}')
+                  doc = fitz.open(dest)
+                  if doc.page_count != pages:
+                      raise RuntimeError(f'页数解析不一致: pypdf={pages}, fitz={doc.page_count}')
+                  first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+                  last = doc.load_page(doc.page_count - 1).get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False)
+                  if min(first.width, first.height, last.width, last.height) < 100:
+                      raise RuntimeError('首末页渲染异常')
+                  first.save(PREVIEWS / f'{dest.stem}.png')
+                  probe = ''
+                  for i in range(min(5, doc.page_count)):
+                      try:
+                          probe += doc.load_page(i).get_text('text')
+                      except Exception:
+                          pass
+                  doc.close()
+                  if COMPANY not in probe and CODE not in probe and FULL_COMPANY not in probe:
+                      print('WARNING_TEXT_PROBE', dest.name)
+
+                  rec = {
+                      'broker': broker,
+                      'report_date': date,
+                      'title': title,
+                      'authors': x.get('researcher') or '',
+                      'rating': x.get('emRatingName') or '',
+                      'info_code': info,
+                      'report_type': x.get('reportType'),
+                      'ranking_score': sc,
+                      'source_url': url,
+                      'eastmoney_detail_url': f'https://data.eastmoney.com/report/info/{info}.html',
+                      'relative_path': str(dest.relative_to(ROOT)).replace(os.sep, '/'),
+                      'file_size_bytes': dest.stat().st_size,
+                      'page_count': pages,
+                      'sha256': hashlib.sha256(dest.read_bytes()).hexdigest(),
+                      'pdf_header_valid': True,
+                      'first_page_rendered': True,
+                      'last_page_rendered': True,
+                  }
+                  records.append(rec)
+                  selected_brokers.add(broker)
+                  selected_infos.add(info)
+                  print('VERIFIED', json.dumps(rec, ensure_ascii=False))
+              except Exception as exc:
+                  errors.append({'info_code': info, 'broker': broker, 'title': title, 'error': repr(exc)})
+                  print('CANDIDATE_FAILED', info, broker, title, repr(exc))
+                  if dest.exists():
+                      dest.unlink()
+
+          if len(records) < 2:
+              raise RuntimeError(f'仅成功取得{len(records)}份完整深度报告，少于用户要求的2份。errors={errors}')
+
+          count = len(records)
+          actual_root_name = f'{COMPANY}_{CODE}_券商深度报告_精选{count}份_截至{CUT}'
+          if actual_root_name != ROOT_NAME:
+              new_root = ROOT.parent / actual_root_name
+              if new_root.exists():
+                  shutil.rmtree(new_root)
+              ROOT.rename(new_root)
+              ROOT = new_root
+              REPORTS = ROOT / '券商深度报告'
+              PREVIEWS = ROOT / '首页预览'
+              ROOT_NAME = actual_root_name
+
+          manifest = {
+              'company': COMPANY,
+              'full_company_name': FULL_COMPANY,
+              'stock_code': CODE,
+              'cutoff_date': CUTOFF,
+              'document_count': count,
+              'selection_policy': '优先选择页数较长的首次覆盖、公司深度或主题深度研究；排除短篇普通点评和可转债报告；尽量覆盖不同券商。',
+              'documents': records,
+              'failed_candidates': errors,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['relative_path']}" for r in records) + '\n', encoding='utf-8')
+
+          lines = [
+              f'# {COMPANY}（{CODE}）券商深度报告包', '',
+              f'- 截止日期：{CUTOFF}',
+              f'- 收录数量：{count}份完整PDF。',
+              '- 来源：东方财富公开券商研报PDF接口。',
+              '- 选择原则：优先页数较长的首次覆盖、公司深度或主题深度研究，排除短篇普通点评和可转债报告。',
+              '- 校验：PDF文件头、双解析器页数、首末页渲染、SHA-256、ZIP CRC。',
+              '- 版权归原券商及作者所有，仅供个人研究参考，不构成投资建议。', '',
+              '## 文件清单', '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines += [
+                  f"{i}. `{r['relative_path']}`",
+                  f"   - 券商：{r['broker']}",
+                  f"   - 日期：{r['report_date']}",
+                  f"   - 标题：{r['title']}",
+                  f"   - 作者：{r['authors'] or '未标注'}",
+                  f"   - 评级：{r['rating'] or '未标注'}",
+                  f"   - 页数：{r['page_count']}；大小：{r['file_size_bytes']:,} 字节",
+                  f"   - 来源：{r['source_url']}",
+                  f"   - SHA-256：`{r['sha256']}`",
+              ]
+          (ROOT / 'README.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          final_cn = DIST / f'{ROOT_NAME}.zip'
+          final_en = DIST / f'henghe_precision_300539_broker_deep_reports_{count}_{CUT}.zip'
+          for p in (final_cn, final_en):
+              if p.exists():
+                  p.unlink()
+          with zipfile.ZipFile(final_cn, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, str(p.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(final_cn, final_en)
+
+          for p in (final_cn, final_en):
+              with zipfile.ZipFile(p) as zf:
+                  bad = zf.testzip()
+                  pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+                  if bad or len(pdfs) != count:
+                      raise RuntimeError(f'ZIP校验失败 {p}: bad={bad}, pdfs={len(pdfs)}, expected={count}')
+              print('ZIP_VERIFIED', p, p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest())
+
+          print('FINAL_JSON', json.dumps({
+              'document_count': count,
+              'reports': [{k: r[k] for k in ('broker', 'report_date', 'title', 'authors', 'rating', 'page_count')} for r in records],
+              'chinese_zip': str(final_cn),
+              'english_zip': str(final_en),
+              'chinese_zip_size': final_cn.stat().st_size,
+              'chinese_zip_sha256': hashlib.sha256(final_cn.read_bytes()).hexdigest(),
+          }, ensure_ascii=False))
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: henghe-precision-300539-broker-deep-reports-20261021
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
