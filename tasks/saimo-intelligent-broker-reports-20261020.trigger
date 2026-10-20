@@ -7,3 +7,4 @@ Inspect report search request schema.
 Query report search pages and APIs.
 Run quick report search probe.
 Inspect anonymous token and search client.
+Query anonymous report APIs.
