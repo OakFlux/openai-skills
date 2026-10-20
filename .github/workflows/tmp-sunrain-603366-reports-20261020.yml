@@ -1,0 +1,316 @@
+name: Build Sunrain 603366 financial-report package
+
+on:
+  push:
+    branches: [tmp-sunrain-603366-reports-20261020]
+    paths: ['.github/workflows/tmp-sunrain-603366-reports-20261020.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='日出东方_603366_2020-2025年报及最新季报'
+          mkdir -p "$PACKAGE"
+
+          cat > /tmp/build.py <<'PY'
+          import html
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+
+          STOCK = '603366'
+          OUT = Path('日出东方_603366_2020-2025年报及最新季报')
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155 Safari/537.36'
+          S = requests.Session()
+          S.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept-Encoding': 'gzip, deflate, br',
+          })
+
+          ANNUAL = f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK}/page_type/ndbg.phtml'
+          Q1 = f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_BulletinYi/stockid/{STOCK}/page_type/yjdbg.phtml'
+          Q3 = f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_BulletinSan/stockid/{STOCK}/page_type/sjdbg.phtml'
+
+          anchor_re = re.compile(r'''<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>''', re.I | re.S)
+          pdf_re = re.compile(r'''https?://[^\s"'<>]+?\.pdf(?:\?[^\s"'<>]*)?''', re.I)
+          revision_words = ('更正后', '更新后', '修订版', '修订稿', '更新版', '修订', '更正')
+
+          def get(url, referer=None, expect_pdf=False):
+              headers = {
+                  'Accept': 'application/pdf,application/octet-stream;q=0.9,text/html;q=0.8,*/*;q=0.7',
+              }
+              if referer:
+                  headers['Referer'] = referer
+              last = None
+              for attempt in range(8):
+                  try:
+                      r = S.get(url, headers=headers, timeout=300, allow_redirects=True)
+                      r.raise_for_status()
+                      if expect_pdf and not r.content.startswith(b'%PDF-'):
+                          raise RuntimeError(f'Expected PDF, got {r.status_code} {r.headers.get("content-type")} {r.content[:60]!r}')
+                      return r.content, r.url
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 + attempt)
+              raise RuntimeError(f'Failed to fetch {url}: {last}')
+
+          def decode(raw):
+              for enc in ('utf-8', 'gb18030', 'gbk'):
+                  try:
+                      return raw.decode(enc)
+                  except UnicodeDecodeError:
+                      pass
+              return raw.decode('utf-8', errors='replace')
+
+          def anchors(url):
+              raw, final = get(url)
+              text = decode(raw)
+              result = []
+              for m in anchor_re.finditer(text):
+                  href = unquote(html.unescape(m.group(1).strip()))
+                  label = re.sub(r'<[^>]+>', '', m.group(2))
+                  label = html.unescape(re.sub(r'\s+', '', label))
+                  result.append((label, urljoin(final, href)))
+              return result
+
+          def choose_annuals():
+              listing = anchors(ANNUAL)
+              records = []
+              for idx, year in enumerate(range(2020, 2026), start=1):
+                  candidates = [
+                      (label, url) for label, url in listing
+                      if (f'{year}年年度报告' in label or f'{year}年度报告' in label)
+                      and '摘要' not in label and '英文' not in label
+                  ]
+                  if not candidates:
+                      raise RuntimeError(f'No annual report found for {year}')
+                  candidates.sort(key=lambda x: (
+                      0 if any(word in x[0] for word in revision_words) else 1,
+                      len(x[0]),
+                  ))
+                  label, detail = candidates[0]
+                  if year == 2020 and not any(word in label for word in revision_words):
+                      raise RuntimeError('2020 annual report revision was expected but not selected')
+                  if year == 2024 and '更正后' not in label:
+                      raise RuntimeError('2024 corrected annual report was expected but not selected')
+                  suffix = '_更正或修订版' if any(word in label for word in revision_words) else ''
+                  records.append({
+                      'order': idx,
+                      'kind': '年度报告',
+                      'period': f'{year}年度',
+                      'title': label,
+                      'detail_url': detail,
+                      'filename': f'{idx:02d}_日出东方_{year}年年度报告{suffix}.pdf',
+                      'min_pages': 50,
+                  })
+              return records
+
+          def choose_latest_quarter(order):
+              q3_candidates = [
+                  (label, url) for label, url in anchors(Q3)
+                  if '2026年' in label
+                  and ('第三季度报告' in label or '三季度报告' in label)
+                  and '摘要' not in label
+              ]
+              if q3_candidates:
+                  q3_candidates.sort(key=lambda x: (0 if any(w in x[0] for w in revision_words) else 1, len(x[0])))
+                  label, detail = q3_candidates[0]
+                  suffix = '_更正或修订版' if any(w in label for w in revision_words) else ''
+                  return {
+                      'order': order,
+                      'kind': '最新季报',
+                      'period': '2026年第三季度',
+                      'title': label,
+                      'detail_url': detail,
+                      'filename': f'{order:02d}_日出东方_2026年第三季度报告{suffix}_最新季报.pdf',
+                      'min_pages': 5,
+                  }
+
+              q1_candidates = [
+                  (label, url) for label, url in anchors(Q1)
+                  if '2026年' in label
+                  and ('第一季度报告' in label or '一季度报告' in label)
+                  and '摘要' not in label
+              ]
+              if not q1_candidates:
+                  raise RuntimeError('No 2026 quarterly report found')
+              q1_candidates.sort(key=lambda x: (0 if any(w in x[0] for w in revision_words) else 1, len(x[0])))
+              label, detail = q1_candidates[0]
+              suffix = '_更正或修订版' if any(w in label for w in revision_words) else ''
+              return {
+                  'order': order,
+                  'kind': '最新季报',
+                  'period': '2026年第一季度',
+                  'title': label,
+                  'detail_url': detail,
+                  'filename': f'{order:02d}_日出东方_2026年第一季度报告{suffix}_最新季报.pdf',
+                  'min_pages': 5,
+              }
+
+          def obtain(detail_url):
+              raw, final = get(detail_url)
+              if raw.startswith(b'%PDF-'):
+                  return raw, final
+              text = decode(raw)
+              candidates = []
+              for m in anchor_re.finditer(text):
+                  href = unquote(html.unescape(m.group(1).strip()))
+                  label = html.unescape(re.sub(r'\s+', '', re.sub(r'<[^>]+>', '', m.group(2))))
+                  full = urljoin(final, href)
+                  if '.pdf' in full.lower() or '下载公告' in label or '公告原文' in label:
+                      candidates.append((0 if '下载公告' in label else 1, full))
+              for m in pdf_re.finditer(text):
+                  candidates.append((2, unquote(html.unescape(m.group(0)))))
+
+              seen = set()
+              errors = []
+              for _, candidate in sorted(candidates, key=lambda x: (x[0], len(x[1]))):
+                  if candidate in seen:
+                      continue
+                  seen.add(candidate)
+                  try:
+                      data, resolved = get(candidate, referer=final, expect_pdf=True)
+                      if len(data) > 50000:
+                          return data, resolved
+                  except Exception as exc:
+                      errors.append(f'{candidate}: {exc}')
+              raise RuntimeError(f'No valid PDF on {detail_url}; candidates={len(candidates)} errors={errors[:5]}')
+
+          records = choose_annuals()
+          records.append(choose_latest_quarter(7))
+
+          for record in records:
+              data, resolved = obtain(record['detail_url'])
+              if len(data) < 50000:
+                  raise RuntimeError(f"PDF too small for {record['title']}: {len(data)}")
+              path = OUT / record['filename']
+              path.write_bytes(data)
+              record['pdf_url'] = resolved
+              record['bytes'] = len(data)
+              print('SAVED', path, len(data), resolved)
+
+          (OUT / '_metadata.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+          python3 /tmp/build.py
+
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf.txt" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+              cat "$pdf.qpdf.txt" >&2
+              exit "$rc"
+            fi
+            rm -f "$pdf.qpdf.txt"
+
+            pages=$(pdfinfo "$pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 5
+
+            pdftotext -f 1 -l 50 "$pdf" "$pdf.txt" 2>/dev/null
+            grep -Eq '日出东方控股股份有限公司|日出东方' "$pdf.txt"
+            rm -f "$pdf.txt"
+
+            pdftoppm -f 1 -l 1 -singlefile -png -r 72 "$pdf" "$pdf.first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 72 "$pdf" "$pdf.last" >/dev/null 2>&1
+            test -s "$pdf.first.png" && test -s "$pdf.last.png"
+            rm -f "$pdf.first.png" "$pdf.last.png"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import json
+          import subprocess
+
+          folder = Path('日出东方_603366_2020-2025年报及最新季报')
+          records = json.loads((folder / '_metadata.json').read_text(encoding='utf-8'))
+          by_name = {r['filename']: r for r in records}
+          pdfs = sorted(folder.glob('*.pdf'))
+          if len(pdfs) != 7:
+              raise SystemExit(f'Expected 7 PDFs, found {len(pdfs)}')
+
+          latest = next(r for r in records if r['kind'] == '最新季报')
+          lines = [
+              '日出东方控股股份有限公司（日出东方，603366）',
+              '2020—2025年年度报告及最新季报',
+              '整理日期：2026-10-20',
+              '',
+              '收录说明：',
+              '1. 收录2020—2025年度报告全文，共6份。',
+              '2. 2020年采用2021年5月29日披露的修订版；2024年采用2025年8月28日披露的更正后版本。',
+              f"3. 截至2026-10-20，最新已披露季度报告为《{latest['title']}》。",
+              '4. 2026年半年度报告不属于季度报告，未用其替代“最新季报”。',
+              '5. 文件均为完整PDF原件；排除年报摘要、英文版和提示性公告。',
+              '',
+              '文件清单：',
+          ]
+          sums = []
+          total_pages = 0
+          total_bytes = 0
+          for pdf in pdfs:
+              r = by_name[pdf.name]
+              data = pdf.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              info = subprocess.check_output(['pdfinfo', str(pdf)], text=True, errors='replace', stderr=subprocess.DEVNULL)
+              pages = int(next(x.split(':', 1)[1].strip() for x in info.splitlines() if x.startswith('Pages:')))
+              if pages < int(r['min_pages']):
+                  raise SystemExit(f'{pdf.name}: only {pages} pages')
+              total_pages += pages
+              total_bytes += len(data)
+              lines += [
+                  f'- {pdf.name}',
+                  f"  类型：{r['kind']}；报告期：{r['period']}；页数：{pages}；大小：{len(data)}字节",
+                  f"  标题：{r['title']}",
+                  f"  PDF来源：{r['pdf_url']}",
+                  f'  SHA-256：{sha}',
+              ]
+              sums.append(f'{sha}  {pdf.name}')
+          lines += [
+              '',
+              f'合计页数：{total_pages}页。',
+              f'PDF原件合计大小：{total_bytes}字节。',
+              '全部PDF均已通过文件头、文件大小、PDF结构、实际页数、正文公司名称及首末页渲染检查。',
+          ]
+          (folder / '00_文件清单与说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (folder / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          (folder / '_metadata.json').unlink()
+          print('\n'.join(lines))
+          PY
+
+          test "$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)" -eq 7
+          zip -q -r -6 package_test.zip "$PACKAGE"
+          unzip -t package_test.zip >/dev/null
+          test "$(unzip -Z1 package_test.zip | grep -c '\.pdf$')" -eq 7
+          rm -f package_test.zip
+          ls -lh "$PACKAGE"
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sunrain-603366-2020-2025-annual-latest-quarter
+          path: 日出东方_603366_2020-2025年报及最新季报/
+          retention-days: 2
+          compression-level: 6
+          if-no-files-found: error
