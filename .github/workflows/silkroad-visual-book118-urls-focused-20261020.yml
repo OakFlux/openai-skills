@@ -1,0 +1,235 @@
+name: Collect Silkroad Visual Book118 preview URLs 20261020
+
+on:
+  push:
+    paths:
+      - '.github/workflows/silkroad-visual-book118-urls-focused-20261020.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install browser tools
+        run: |
+          python -m pip install --quiet playwright requests beautifulsoup4 lxml
+          python -m playwright install chromium
+
+      - name: Collect public preview assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          import json
+          import re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from playwright.async_api import async_playwright
+
+          START_URLS = [
+              'https://max.book118.com/html/2017/0516/107124143.shtm',
+              'https://m.book118.com/html/2017/0516/107124143.shtm',
+          ]
+          relevant_urls = set()
+          relevant_responses = []
+          dom_assets = []
+          page_meta = []
+
+          def is_relevant(url: str) -> bool:
+              u = (url or '').lower()
+              return any(k in u for k in [
+                  'view-cache.book118.com', 'book118.com', 'preview', 'view',
+                  '.png', '.jpg', '.jpeg', '.webp', '.pdf', '107124143',
+                  'document', 'page', 'image', 'api'
+              ])
+
+          async def inspect_url(context, start_url):
+              page = await context.new_page()
+              local_responses = []
+
+              def on_request(req):
+                  try:
+                      if is_relevant(req.url):
+                          relevant_urls.add(req.url)
+                  except Exception:
+                      pass
+
+              async def on_response(resp):
+                  try:
+                      url = resp.url
+                      ct = (resp.headers.get('content-type') or '').lower()
+                      if is_relevant(url) or any(x in ct for x in ['image/', 'application/json', 'text/json']):
+                          relevant_urls.add(url)
+                          item = {
+                              'status': resp.status,
+                              'url': url,
+                              'content_type': ct,
+                          }
+                          if resp.status == 200 and ('json' in ct or 'text' in ct or 'javascript' in ct):
+                              try:
+                                  body = await resp.text()
+                                  if any(k in body.lower() for k in ['view-cache', '107124143', '.png', '.jpg', '.jpeg', '.webp', 'preview', 'page']):
+                                      item['body'] = body[:200000]
+                              except Exception as exc:
+                                  item['body_error'] = repr(exc)
+                          local_responses.append(item)
+                  except Exception:
+                      pass
+
+              page.on('request', on_request)
+              page.on('response', lambda resp: asyncio.create_task(on_response(resp)))
+
+              try:
+                  await page.goto(start_url, wait_until='domcontentloaded', timeout=90000)
+              except Exception as exc:
+                  page_meta.append({'start_url': start_url, 'goto_error': repr(exc), 'current_url': page.url})
+
+              await page.wait_for_timeout(12000)
+
+              # Trigger public lazy loading by scrolling through the page.
+              for _ in range(40):
+                  try:
+                      await page.evaluate('window.scrollBy(0, Math.max(window.innerHeight * 0.85, 700))')
+                  except Exception:
+                      pass
+                  await page.wait_for_timeout(350)
+
+              # Click only public expand/continue-reading controls, never login/payment controls.
+              for selector in [
+                  'text=继续阅读', 'text=展开阅读全文', 'text=展开全文',
+                  'text=查看全文', 'text=查看更多', 'text=下一页'
+              ]:
+                  try:
+                      loc = page.locator(selector)
+                      count = await loc.count()
+                  except Exception:
+                      count = 0
+                  for idx in range(min(count, 8)):
+                      try:
+                          text = (await loc.nth(idx).inner_text()).strip()
+                          if any(bad in text for bad in ['登录', '购买', '支付', 'VIP', '充值']):
+                              continue
+                          await loc.nth(idx).click(timeout=3000)
+                          await page.wait_for_timeout(2500)
+                      except Exception:
+                          pass
+
+              # Scroll again after expansion.
+              for _ in range(30):
+                  try:
+                      await page.evaluate('window.scrollBy(0, Math.max(window.innerHeight * 0.9, 800))')
+                  except Exception:
+                      pass
+                  await page.wait_for_timeout(300)
+
+              try:
+                  title = await page.title()
+              except Exception:
+                  title = ''
+              try:
+                  body = await page.locator('body').inner_text(timeout=10000)
+              except Exception:
+                  body = ''
+              page_meta.append({
+                  'start_url': start_url,
+                  'final_url': page.url,
+                  'title': title,
+                  'body_head': re.sub(r'\s+', ' ', body[:12000]),
+              })
+
+              # Collect all asset-like attributes and useful custom data attributes.
+              try:
+                  assets = await page.locator('*').evaluate_all("""
+                  els => els.map((el, index) => {
+                    const attrs = {};
+                    for (const a of el.attributes || []) {
+                      const n = a.name.toLowerCase();
+                      const v = a.value || '';
+                      if (['src','href','data','data-src','data-original','data-url','data-file','data-fileurl','data-file-url','data-page','data-page-url','data-preview','data-img','data-image'].includes(n) || /(?:src|url|file|page|preview|image)/i.test(n)) attrs[n] = v;
+                    }
+                    return {index, tag: el.tagName, text: (el.innerText || el.alt || '').trim().slice(0,300), attrs};
+                  }).filter(x => Object.keys(x.attrs).length > 0)
+                  """)
+              except Exception:
+                  assets = []
+
+              for item in assets:
+                  resolved = {}
+                  for key, raw in (item.get('attrs') or {}).items():
+                      try:
+                          value = urljoin(page.url, raw)
+                      except Exception:
+                          value = raw
+                      resolved[key] = value
+                      if is_relevant(value):
+                          relevant_urls.add(value)
+                  if any(is_relevant(v) for v in resolved.values()):
+                      dom_assets.append({
+                          'start_url': start_url,
+                          'tag': item.get('tag'),
+                          'text': item.get('text'),
+                          'attrs': resolved,
+                      })
+
+              try:
+                  html = await page.content()
+              except Exception:
+                  html = ''
+              for candidate in re.findall(r'https?://[^\s\"\'<>\\]+', html):
+                  candidate = candidate.replace('\\/','/')
+                  if is_relevant(candidate):
+                      relevant_urls.add(candidate)
+
+              await page.wait_for_timeout(3000)
+              relevant_responses.extend(local_responses)
+              await page.close()
+
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+                  context = await browser.new_context(
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+                      locale='zh-CN',
+                      viewport={'width': 1440, 'height': 1000},
+                  )
+                  for start_url in START_URLS:
+                      await inspect_url(context, start_url)
+                  await browser.close()
+
+          asyncio.run(main())
+
+          image_urls = sorted({u for u in relevant_urls if re.search(r'\.(?:png|jpe?g|webp)(?:[?#]|$)', u, re.I)})
+          view_cache_urls = sorted({u for u in relevant_urls if 'view-cache.book118.com' in u})
+          output = {
+              'page_meta': page_meta,
+              'image_urls': image_urls,
+              'view_cache_urls': view_cache_urls,
+              'all_relevant_urls': sorted(relevant_urls),
+              'dom_assets': dom_assets,
+              'responses': relevant_responses,
+          }
+          Path('book118_preview_assets.json').write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('PAGE_META', json.dumps(page_meta, ensure_ascii=False))
+          print('VIEW_CACHE_COUNT', len(view_cache_urls))
+          print('VIEW_CACHE_URLS', json.dumps(view_cache_urls, ensure_ascii=False))
+          print('IMAGE_COUNT', len(image_urls))
+          print('IMAGE_URLS', json.dumps(image_urls, ensure_ascii=False))
+          # Print compact response bodies that reference preview page URLs.
+          for item in relevant_responses:
+              if item.get('body'):
+                  print('RESPONSE_BODY', json.dumps(item, ensure_ascii=False))
+          PY
+
+      - name: Upload discovery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: silkroad-visual-book118-preview-assets
+          path: book118_preview_assets.json
+          retention-days: 7
+          compression-level: 6
+          if-no-files-found: error
