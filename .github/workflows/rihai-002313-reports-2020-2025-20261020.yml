@@ -1,0 +1,395 @@
+name: Package Rihai Intelligent 002313 reports 20261020
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rihai-002313-reports-2020-2025-20261020.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests pypdf
+
+      - name: Download and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = '002313'
+          COMPANY = '日海智能'
+          TODAY = '2026-10-20'
+          YEARS = list(range(2020, 2026))
+          OUT_ROOT = Path('rihai_reports')
+          PDF_DIR = OUT_ROOT / 'PDF'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def clean_title(value):
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', '', value)
+              value = re.sub(r'\s+', '', value)
+              return value.strip()
+
+          def request_with_retries(method, url, *, attempts=7, timeout=(20, 120), **kwargs):
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      response = session.request(method, url, timeout=timeout, **kwargs)
+                      last = response
+                      if response.status_code == 200 and response.content:
+                          return response
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(2 ** attempt, 15))
+              raise RuntimeError(f'Request failed: {method} {url}; last={last!r}')
+
+          def query_cninfo():
+              print('Resolving company on CNINFO...')
+              search_url = 'https://www.cninfo.com.cn/new/information/topSearch/query'
+              response = request_with_retries(
+                  'GET', search_url,
+                  params={'keyWord': COMPANY, 'maxSecNum': '20'},
+                  headers={
+                      'Referer': 'https://www.cninfo.com.cn/',
+                      'Accept': 'application/json, text/javascript, */*; q=0.01',
+                      'X-Requested-With': 'XMLHttpRequest',
+                  },
+              )
+              companies = response.json()
+              print('CNINFO company candidates:', json.dumps(companies, ensure_ascii=False)[:4000])
+              candidate = None
+              for item in companies:
+                  code = str(item.get('code') or item.get('secCode') or '')
+                  if code == STOCK_CODE:
+                      candidate = item
+                      break
+              if not candidate:
+                  raise RuntimeError('CNINFO company lookup did not return stock 002313')
+              org_id = candidate.get('orgId') or candidate.get('orgid')
+              if not org_id:
+                  raise RuntimeError(f'CNINFO candidate has no orgId: {candidate}')
+              print('CNINFO orgId:', org_id)
+
+              query_url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              all_rows = []
+              for page in range(1, 31):
+                  data = {
+                      'pageNum': str(page),
+                      'pageSize': '30',
+                      'column': 'szse',
+                      'tabName': 'fulltext',
+                      'plate': 'sz',
+                      'stock': f'{STOCK_CODE},{org_id}',
+                      'searchkey': '',
+                      'secid': '',
+                      'category': 'category_ndbg_szsh;category_yjdbg_szsh;category_sjdbg_szsh;',
+                      'trade': '',
+                      'seDate': f'2020-01-01~{TODAY}',
+                      'sortName': 'time',
+                      'sortType': 'desc',
+                      'isHLtitle': 'true',
+                  }
+                  response = request_with_retries(
+                      'POST', query_url, data=data,
+                      headers={
+                          'Referer': f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK_CODE}&orgId={org_id}',
+                          'Origin': 'https://www.cninfo.com.cn',
+                          'Accept': 'application/json, text/javascript, */*; q=0.01',
+                          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                          'X-Requested-With': 'XMLHttpRequest',
+                      },
+                  )
+                  payload = response.json()
+                  rows = payload.get('announcements') or []
+                  print('CNINFO page', page, 'rows', len(rows), 'total', payload.get('totalAnnouncement'))
+                  all_rows.extend(rows)
+                  if not payload.get('hasMore') or not rows:
+                      break
+              normalized = []
+              for row in all_rows:
+                  adjunct = row.get('adjunctUrl') or ''
+                  if adjunct.startswith('http'):
+                      source_url = adjunct
+                  else:
+                      source_url = urljoin('https://static.cninfo.com.cn/', adjunct)
+                  ts = row.get('announcementTime')
+                  if isinstance(ts, (int, float)):
+                      date = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
+                  else:
+                      date = str(row.get('announcementTime') or row.get('announcementDate') or '')[:10]
+                  normalized.append({
+                      'title': clean_title(row.get('announcementTitle')),
+                      'date': date,
+                      'url': source_url,
+                      'source': '巨潮资讯网',
+                      'announcement_id': str(row.get('announcementId') or ''),
+                  })
+              return normalized
+
+          def query_eastmoney():
+              print('Querying Eastmoney announcement mirror...')
+              api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+              rows = []
+              for page in range(1, 31):
+                  params = {
+                      'sr': '-1',
+                      'page_size': '100',
+                      'page_index': str(page),
+                      'ann_type': 'A',
+                      'client_source': 'web',
+                      'stock_list': STOCK_CODE,
+                      'f_node': '0',
+                  }
+                  response = request_with_retries(
+                      'GET', api, params=params,
+                      headers={
+                          'Referer': f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+                          'Accept': 'application/json, text/plain, */*',
+                      },
+                  )
+                  payload = response.json()
+                  data = payload.get('data') or {}
+                  page_rows = data.get('list') or []
+                  print('Eastmoney page', page, 'rows', len(page_rows), 'total', data.get('total_hits'))
+                  for row in page_rows:
+                      title = clean_title(row.get('title'))
+                      art_code = row.get('art_code') or row.get('artCode')
+                      if not art_code:
+                          continue
+                      date = str(row.get('notice_date') or row.get('display_time') or '')[:10]
+                      rows.append({
+                          'title': title,
+                          'date': date,
+                          'url': f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf',
+                          'source': '东方财富公告镜像',
+                          'announcement_id': str(art_code),
+                      })
+                  if not page_rows or len(page_rows) < 100:
+                      break
+              return rows
+
+          candidates = []
+          cninfo_error = None
+          try:
+              candidates.extend(query_cninfo())
+          except Exception as exc:
+              cninfo_error = repr(exc)
+              print('CNINFO query failed:', cninfo_error)
+
+          em_error = None
+          try:
+              em_rows = query_eastmoney()
+              # Add mirror rows only when the same title/date is not already present.
+              existing = {(x['title'], x['date']) for x in candidates}
+              for item in em_rows:
+                  if (item['title'], item['date']) not in existing:
+                      candidates.append(item)
+          except Exception as exc:
+              em_error = repr(exc)
+              print('Eastmoney query failed:', em_error)
+
+          print('Total normalized candidates:', len(candidates))
+          for item in sorted(candidates, key=lambda x: (x['date'], x['title']), reverse=True)[:120]:
+              if any(key in item['title'] for key in ['年度报告', '季度报告']):
+                  print(json.dumps(item, ensure_ascii=False))
+
+          if not candidates:
+              raise RuntimeError(f'No announcement candidates. CNINFO={cninfo_error}; Eastmoney={em_error}')
+
+          def is_excluded_report(title):
+              excluded = [
+                  '摘要', '英文版', '审计报告', '内部控制', '问询函', '回复', '说明',
+                  '意见', '提示性公告', '更正公告', '取消', '董事会', '监事会', '社会责任',
+                  '独立董事', '财务报告', '鉴证报告', '募集资金',
+              ]
+              return any(word in title for word in excluded)
+
+          def choose_annual(year):
+              prefix = f'{year}年年度报告'
+              options = [x for x in candidates if prefix in x['title'] and not is_excluded_report(x['title'])]
+              if not options:
+                  return None
+              def score(x):
+                  title = x['title']
+                  revision = 1 if any(word in title for word in ['修订', '更新', '更正后', '修正版']) else 0
+                  exact = 1 if title in [prefix, f'{COMPANY}：{prefix}', f'{COMPANY}:{prefix}'] else 0
+                  source = 1 if x['source'] == '巨潮资讯网' else 0
+                  return (revision, x['date'], exact, source)
+              return sorted(options, key=score, reverse=True)[0]
+
+          annual = []
+          missing = []
+          for year in YEARS:
+              chosen = choose_annual(year)
+              if chosen:
+                  chosen = dict(chosen)
+                  chosen['kind'] = 'annual'
+                  chosen['period'] = str(year)
+                  annual.append(chosen)
+              else:
+                  missing.append(str(year))
+
+          quarter_pattern = re.compile(r'(20\d{2})年(第一季度报告|第三季度报告)')
+          quarter_options = []
+          for item in candidates:
+              match = quarter_pattern.search(item['title'])
+              if match and not is_excluded_report(item['title']):
+                  item2 = dict(item)
+                  year = int(match.group(1))
+                  q = 1 if '第一季度' in match.group(2) else 3
+                  item2['_year'] = year
+                  item2['_quarter'] = q
+                  quarter_options.append(item2)
+
+          if not quarter_options:
+              raise RuntimeError('No first-quarter or third-quarter report found')
+
+          latest_quarter = sorted(
+              quarter_options,
+              key=lambda x: (x['_year'], x['_quarter'], x['date'], x['source'] == '巨潮资讯网'),
+              reverse=True,
+          )[0]
+          latest_quarter['kind'] = 'quarterly'
+          latest_quarter['period'] = f"{latest_quarter['_year']}Q{latest_quarter['_quarter']}"
+          latest_quarter.pop('_year', None)
+          latest_quarter.pop('_quarter', None)
+
+          if missing:
+              raise RuntimeError('Missing annual reports for years: ' + ', '.join(missing))
+
+          selected = annual + [latest_quarter]
+          print('SELECTED REPORTS:')
+          for item in selected:
+              print(json.dumps(item, ensure_ascii=False))
+
+          def safe_filename(text):
+              text = re.sub(r'[\\/:*?"<>|]+', '_', text)
+              text = re.sub(r'\s+', '', text)
+              return text[:150]
+
+          def download_pdf(item, order):
+              urls = [item['url']]
+              # When CNINFO is selected but fails, try matching Eastmoney mirror candidates.
+              for candidate in candidates:
+                  if candidate['source'] == '东方财富公告镜像' and candidate['title'] == item['title']:
+                      if candidate['url'] not in urls:
+                          urls.append(candidate['url'])
+              last = None
+              for url in urls:
+                  try:
+                      response = request_with_retries(
+                          'GET', url,
+                          headers={
+                              'Referer': 'https://www.cninfo.com.cn/' if 'cninfo' in url else 'https://data.eastmoney.com/',
+                              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                          },
+                          attempts=6,
+                          timeout=(20, 180),
+                      )
+                      content = response.content
+                      if not content.startswith(b'%PDF'):
+                          raise RuntimeError(f'Not a PDF: status={response.status_code}, ct={response.headers.get("content-type")}, head={content[:80]!r}')
+                      filename = f'{order:02d}_{safe_filename(item["title"])}.pdf'
+                      path = PDF_DIR / filename
+                      path.write_bytes(content)
+                      reader = PdfReader(str(path))
+                      pages = len(reader.pages)
+                      if pages < 2:
+                          raise RuntimeError(f'PDF has suspicious page count {pages}: {url}')
+                      sha256 = hashlib.sha256(content).hexdigest()
+                      item['download_url'] = url
+                      item['filename'] = f'PDF/{filename}'
+                      item['bytes'] = len(content)
+                      item['pages'] = pages
+                      item['sha256'] = sha256
+                      print('DOWNLOADED', filename, 'pages', pages, 'bytes', len(content), 'from', url)
+                      return
+                  except Exception as exc:
+                      last = exc
+                      print('DOWNLOAD_ATTEMPT_FAILED', url, repr(exc))
+              raise RuntimeError(f'All download URLs failed for {item["title"]}: {last!r}')
+
+          for index, item in enumerate(selected, start=1):
+              download_pdf(item, index)
+
+          manifest = {
+              'company': COMPANY,
+              'stock_code': STOCK_CODE,
+              'generated_at': TODAY,
+              'scope': '2020-2025年年度报告及截至生成日最新的一季度/三季度报告',
+              'reports': selected,
+              'query_errors': {'cninfo': cninfo_error, 'eastmoney': em_error},
+          }
+          (OUT_ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          lines = [
+              f'# {COMPANY}（{STOCK_CODE}）报告文件清单',
+              '',
+              f'- 打包日期：{TODAY}',
+              '- 范围：2020-2025年年度报告，以及截至打包日最新的一季度或第三季度报告。',
+              '- 文件来源优先采用巨潮资讯网；下载失败时使用东方财富公告镜像。',
+              '',
+              '| 序号 | 报告期 | 公告标题 | 公告日期 | 页数 | 文件 | 来源链接 |',
+              '|---:|---|---|---|---:|---|---|',
+          ]
+          for i, item in enumerate(selected, start=1):
+              lines.append(
+                  f'| {i} | {item["period"]} | {item["title"]} | {item["date"]} | {item["pages"]} | `{item["filename"]}` | {item["download_url"]} |'
+              )
+          lines += [
+              '',
+              '## 校验信息',
+              '',
+          ]
+          for item in selected:
+              lines.append(f'- `{item["filename"]}`  SHA-256: `{item["sha256"]}`')
+          (OUT_ROOT / '文件清单.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          zip_name = f'{COMPANY}_{STOCK_CODE}_2020-2025年报及最新季报_{TODAY.replace("-", "")}.zip'
+          zip_path = Path(zip_name)
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(OUT_ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=str(path.relative_to(OUT_ROOT)))
+          print('ZIP_CREATED', zip_path, zip_path.stat().st_size)
+          print('LATEST_QUARTER', latest_quarter['period'], latest_quarter['title'], latest_quarter['date'])
+          Path('artifact_name.txt').write_text(zip_name, encoding='utf-8')
+          PY
+
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rihai-intelligent-002313-reports-20261020
+          path: |
+            日海智能_002313_2020-2025年报及最新季报_20261020.zip
+            artifact_name.txt
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
