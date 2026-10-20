@@ -1,0 +1,133 @@
+name: Package Ampelon 301413 broker research reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ampelon-301413-broker-reports-20261020.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Download, validate and package public broker PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, re, shutil, time, zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import fitz, requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CODE='301413'; COMPANY='安培龙'; CUTOFF='2026-10-20'; CUT='20261020'
+          API='https://reportapi.eastmoney.com/report/list'
+          PDF='https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+          root_name=f'{COMPANY}_{CODE}_券商深度报告_3份_截至{CUT}'
+          root=Path('work')/root_name; reports_dir=root/'券商深度报告'; preview_dir=root/'首页预览'; dist=Path('dist')
+          for d in (reports_dir, preview_dir, dist): d.mkdir(parents=True, exist_ok=True)
+
+          targets=[
+            dict(broker='山西证券', date='2025-07-30', title='温度、压力及氧传感器夯实基础，力传感器开辟机器人应用新场景', keys=['温度','压力','氧传感器','机器人应用新场景'], min_pages=25),
+            dict(broker='光大证券', date='2025-08-06', title='传感器国产替代龙头，战略发展机器人用力传感器', keys=['传感器国产替代龙头','机器人用力传感器'], min_pages=20),
+            dict(broker='天风证券', date='2024-04-13', title='传感器国产替代先锋，汽车市场有望快速放量', keys=['传感器国产替代先锋','汽车市场有望快速放量'], min_pages=12),
+          ]
+
+          s=requests.Session()
+          retry=Retry(total=6,connect=6,read=6,status=6,backoff_factor=1.0,status_forcelist=(403,408,429,500,502,503,504),allowed_methods=frozenset({'GET'}),raise_on_status=False)
+          s.mount('https://',HTTPAdapter(max_retries=retry))
+          s.headers.update({'User-Agent':'Mozilla/5.0 AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':'https://data.eastmoney.com/report/','Accept':'application/json,text/plain,*/*'})
+
+          rows=[]
+          for page in range(1,6):
+            params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':'2023-01-01','endTime':CUTOFF,'pageNo':str(page),'fields':'','qType':'0','orgCode':'','code':CODE,'rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+            r=s.get(API,params=params,timeout=60); print('LIST',r.status_code,len(r.content),r.url); r.raise_for_status(); data=r.json(); part=data.get('data') or []
+            rows.extend(part); print('LIST_META',json.dumps({'hits':data.get('hits'),'size':data.get('size'),'page':page,'rows':len(part)},ensure_ascii=False))
+            if not part or len(rows)>=int(data.get('hits') or len(rows)): break
+            time.sleep(.8)
+          rows=list({str(x.get('infoCode')):x for x in rows if x.get('infoCode')}.values())
+          if not rows: raise RuntimeError('东方财富公开接口未返回安培龙研报。')
+          for x in rows:
+            print('REPORT',json.dumps({k:x.get(k) for k in ('publishDate','orgSName','title','infoCode','attachPages','attachSize','emRatingName','researcher')},ensure_ascii=False))
+
+          def norm(v): return re.sub(r'[，。、“”‘’（）()：:\s\-_/—]','',str(v or '')).lower()
+          def d10(v): return str(v or '')[:10]
+          selected=[]
+          for t in targets:
+            cand=[]
+            for x in rows:
+              title=str(x.get('title') or ''); broker=str(x.get('orgSName') or ''); n=norm(title)
+              hits=sum(norm(k) in n for k in t['keys'])
+              score=hits*25+(35 if norm(t['broker']) in norm(broker) else 0)+(25 if d10(x.get('publishDate'))==t['date'] else 0)+(35 if norm(t['title']) in n or n in norm(t['title']) else 0)
+              if hits>=max(1,len(t['keys'])-1): cand.append((score,x))
+            if not cand: raise RuntimeError(f"未匹配目标研报：{t['broker']} {t['title']}")
+            cand.sort(key=lambda z:z[0],reverse=True); chosen=dict(cand[0][1]); selected.append((t,chosen)); print('SELECTED',json.dumps({'target':t,'score':cand[0][0],'chosen':chosen},ensure_ascii=False))
+
+          def safe(v): return re.sub(r'_+','_',re.sub(r'[\\/:*?"<>|]','_',re.sub(r'\s+','',v))).strip('_. ')
+          records=[]
+          for t,x in selected:
+            info=str(x['infoCode']); broker=str(x.get('orgSName') or t['broker']); title=str(x.get('title') or t['title']); date=d10(x.get('publishDate')) or t['date']
+            dest=reports_dir/safe(f'{date}_{broker}_{COMPANY}_{title}.pdf'); url=PDF.format(info=info)
+            r=s.get(url,headers={'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},timeout=180)
+            print('PDF_GET',r.status_code,len(r.content),url,r.headers.get('content-type')); r.raise_for_status()
+            if len(r.content)<50000 or not r.content.startswith(b'%PDF'): raise RuntimeError(f'无效PDF {info}: size={len(r.content)} head={r.content[:20]!r}')
+            dest.write_bytes(r.content)
+            reader=PdfReader(str(dest),strict=False); pages=len(reader.pages)
+            if pages<int(t['min_pages']): raise RuntimeError(f'页数低于预期 {dest.name}: {pages} < {t["min_pages"]}')
+            doc=fitz.open(dest)
+            if doc.page_count!=pages: raise RuntimeError(f'页数解析不一致 {dest.name}: {pages}/{doc.page_count}')
+            first=doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.4,1.4),alpha=False); last=doc.load_page(doc.page_count-1).get_pixmap(matrix=fitz.Matrix(.8,.8),alpha=False)
+            if min(first.width,first.height,last.width,last.height)<100: raise RuntimeError(f'页面渲染异常 {dest.name}')
+            first.save(preview_dir/f'{dest.stem}.png'); doc.close()
+            rec={'broker':broker,'report_date':date,'title':title,'authors':x.get('researcher') or '','rating':x.get('emRatingName') or '','info_code':info,'source_url':url,'eastmoney_detail_url':f'https://data.eastmoney.com/report/zw_stock.jshtml?infocode={info}','relative_path':str(dest.relative_to(root)).replace(os.sep,'/'),'file_size_bytes':dest.stat().st_size,'page_count':pages,'sha256':hashlib.sha256(dest.read_bytes()).hexdigest(),'pdf_header_valid':True,'first_page_rendered':True,'last_page_rendered':True}
+            records.append(rec); print('VERIFIED',json.dumps(rec,ensure_ascii=False))
+
+          if len(records)!=3 or len({r['broker'] for r in records})!=3: raise RuntimeError('最终研报数量或券商覆盖不正确。')
+          manifest={'company':COMPANY,'stock_code':CODE,'cutoff_date':CUTOFF,'document_count':3,'selection_policy':'优先选择长篇首次覆盖或公司深度研究，排除3-5页普通业绩点评。','documents':records,'generated_at_utc':datetime.now(timezone.utc).isoformat()}
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (root/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['relative_path']}" for r in records)+'\n',encoding='utf-8')
+          lines=[f'# {COMPANY}（{CODE}）券商深度报告包','',f'- 截止日期：{CUTOFF}','- 来源：东方财富公开券商研报PDF接口。','- 选择原则：优先首次覆盖或长篇公司深度研究，排除3-5页普通业绩点评。','- 校验：PDF文件头、双解析器页数、首末页渲染、SHA-256、ZIP CRC。','- 版权归原券商及作者所有，仅供个人研究参考，不构成投资建议。','','## 文件清单','']
+          for i,r in enumerate(records,1):
+            lines += [f"{i}. `{r['relative_path']}`",f"   - 券商：{r['broker']}",f"   - 日期：{r['report_date']}",f"   - 标题：{r['title']}",f"   - 页数：{r['page_count']}；大小：{r['file_size_bytes']:,} 字节",f"   - 评级：{r['rating'] or '未标注'}",f"   - 来源：{r['source_url']}",f"   - SHA-256：`{r['sha256']}`"]
+          (root/'README.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          final_cn=dist/f'{root_name}.zip'; final_ascii=dist/f'ampelon_301413_broker_deep_reports_3_{CUT}.zip'
+          for p in (final_cn,final_ascii):
+            if p.exists(): p.unlink()
+          with zipfile.ZipFile(final_cn,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+            for p in sorted(root.rglob('*')):
+              if p.is_file(): z.write(p,str(p.relative_to(root.parent)).replace(os.sep,'/'))
+          shutil.copy2(final_cn,final_ascii)
+          for p in (final_cn,final_ascii):
+            with zipfile.ZipFile(p) as z:
+              bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs)!=3: raise RuntimeError(f'ZIP校验失败 {p}: bad={bad}, pdfs={len(pdfs)}')
+            print('ZIP_VERIFIED',p,p.stat().st_size,hashlib.sha256(p.read_bytes()).hexdigest())
+          print('FINAL_JSON',json.dumps({'document_count':3,'reports':[{k:r[k] for k in ('broker','report_date','title','page_count')} for r in records],'chinese_zip':str(final_cn),'chinese_zip_size':final_cn.stat().st_size,'chinese_zip_sha256':hashlib.sha256(final_cn.read_bytes()).hexdigest()},ensure_ascii=False))
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ampelon-301413-broker-deep-reports-20261020
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
