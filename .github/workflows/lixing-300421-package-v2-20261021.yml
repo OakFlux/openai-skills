@@ -1,0 +1,134 @@
+name: Build Lixing 300421 broker reports v2 20261021
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lixing-300421-package-v2-20261021.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf
+
+      - name: Build complete report PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, subprocess, time, zipfile, shutil
+          from pathlib import Path
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          ROOT=Path('力星股份_300421_券商深度报告_2份')
+          PDFDIR=ROOT/'完整PDF';PREV=ROOT/'首页预览';TMP=Path('_page_images')
+          for d in (ROOT,PDFDIR,PREV,TMP):d.mkdir(parents=True,exist_ok=True)
+          reports=[
+            {'id':'4772943','broker':'财通证券','date':'2025-04-08','expected':36,'title':'精密滚动体龙头，陶瓷球/机器人布局迎历史机遇','analysts':'佘炜超、孙瀚栋','rating':'增持','classification':'公司深度研究报告','detail':'https://www.fxbaogao.com/detail/4772943','first_candidates':['https://public.fxbaogao.com/report-image/2025/04/08/4772943-1.png']},
+            {'id':'3457603','broker':'财信证券','date':'2022-11-16','expected':None,'title':'轴承滚子国产替代，下游三大行业需求旺盛','analysts':'袁玮志','rating':'买入','classification':'首次覆盖公司报告','detail':'https://www.fxbaogao.com/detail/3457603','first_candidates':[f'https://public.fxbaogao.com/report-image/2022/11/{d:02d}/3457603-1.png' for d in range(12,19)]},
+          ]
+          s=requests.Session();s.trust_env=False
+          base_headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36','Referer':'https://www.fxbaogao.com/','Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'}
+
+          def fetch_image(url,referer):
+            headers=dict(base_headers);headers['Referer']=referer
+            last=None
+            for attempt in range(6):
+              try:
+                r=s.get(url,headers=headers,timeout=(15,90),allow_redirects=True)
+                last=(r.status_code,len(r.content),r.headers.get('content-type',''),r.url)
+                if r.status_code==200 and len(r.content)>8000:
+                  im=Image.open(io.BytesIO(r.content));im.verify()
+                  return r.content,(im.format or 'PNG').lower(),last
+              except Exception as e:last=('ERR',repr(e))
+              time.sleep(1+attempt)
+            return None,None,last
+
+          def choose_first(rep):
+            probes=[]
+            for u in rep['first_candidates']:
+              data,fmt,meta=fetch_image(u,rep['detail']);probes.append({'url':u,'meta':meta})
+              if data:return u,data,fmt,probes
+            raise RuntimeError('No first page found: '+json.dumps(probes,ensure_ascii=False))
+
+          def page_url(first,n):
+            return re.sub(r'-1\.(png|jpe?g)(?:\?.*)?$',lambda m:f'-{n}.{m.group(1)}',first,flags=re.I)
+
+          manifest=[]
+          for idx,rep in enumerate(reports,1):
+            first,first_data,first_fmt,probes=choose_first(rep)
+            pagefiles=[];imgdir=TMP/rep['id'];imgdir.mkdir(exist_ok=True)
+            max_pages=(rep['expected'] if rep['expected'] else 70)
+            misses=0
+            for n in range(1,max_pages+1):
+              if n==1:data,fmt=first_data,first_fmt
+              else:
+                data,fmt,meta=fetch_image(page_url(first,n),rep['detail'])
+              if data:
+                misses=0
+                ext='jpg' if fmt in ('jpg','jpeg') else fmt
+                p=imgdir/f'{n:03d}.{ext}';p.write_bytes(data);pagefiles.append(p)
+              else:
+                misses+=1
+                if rep['expected']:
+                  raise RuntimeError(f'Missing required page {n}/{rep["expected"]} for {rep["id"]}')
+                if misses>=2:break
+            if rep['expected'] and len(pagefiles)!=rep['expected']:raise RuntimeError(f'Expected {rep["expected"]}, got {len(pagefiles)}')
+            if len(pagefiles)<10:raise RuntimeError(f'Incomplete report {rep["id"]}: {len(pagefiles)} pages')
+            ims=[]
+            for p in pagefiles:
+              with Image.open(p) as im:ims.append(im.convert('RGB').copy())
+            safe=re.sub(r'[\\/:*?"<>|]+','_',rep['title'])
+            pdf=PDFDIR/f'{idx:02d}_{rep["broker"]}_力星股份_{safe}_{rep["date"]}.pdf'
+            ims[0].save(pdf,'PDF',save_all=True,append_images=ims[1:],resolution=150.0,quality=94,optimize=True)
+            for im in ims:im.close()
+            pages=len(PdfReader(str(pdf),strict=False).pages)
+            if pages!=len(pagefiles):raise RuntimeError('PDF page mismatch')
+            subprocess.run(['qpdf','--warning-exit-0','--check',str(pdf)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            prefix=PREV/pdf.stem
+            subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(pdf),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            png=Path(str(prefix)+'.png')
+            if not png.exists() or png.stat().st_size<10000:raise RuntimeError('preview failure')
+            sha=hashlib.sha256(pdf.read_bytes()).hexdigest()
+            manifest.append({**rep,'filename':str(Path('完整PDF')/pdf.name),'actual_pages':pages,'first_page_image_url':first,'first_page_probes':probes,'source_note':'公开研报阅读页逐页原图按原序合成为完整PDF，页面内容未改动','sha256':sha,'bytes':pdf.stat().st_size,'preview_file':str(Path('首页预览')/png.name)})
+
+          lines=['力星股份（300421.SZ）券商深度报告资料包','整理日期：2026-10-21','','收录2份完整券商报告。公开来源提供逐页报告原图，本包按原页序合成为完整PDF，未改动页面内容。','']
+          for i,x in enumerate(manifest,1):
+            lines += [f"{i}. {x['broker']}：《{x['title']}》",f"   日期：{x['date']}；分析师：{x['analysts']}；评级：{x['rating']}",f"   类型：{x['classification']}；完整页数：{x['actual_pages']}页",f"   来源：{x['detail']}",f"   SHA-256：{x['sha256']}",'']
+          lines += ['报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。','已核验页面连续性、PDF页数、qpdf结构、首页渲染和ZIP CRC。']
+          (ROOT/'00_文件清单与说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest),encoding='utf-8')
+          shutil.rmtree(TMP)
+          z=Path('lixing_300421_broker_deep_reports.zip')
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as out:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file():out.write(p,arcname=f'{ROOT.name}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(z) as test:
+            if test.testzip() or len([n for n in test.namelist() if n.lower().endswith('.pdf')])!=2:raise RuntimeError('ZIP validation failed')
+          Path('力星股份_300421_券商深度报告_2份.zip').write_bytes(z.read_bytes())
+          print('FINAL_ZIP',z,z.stat().st_size,'SHA256',hashlib.sha256(z.read_bytes()).hexdigest())
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lixing-300421-broker-reports-v2-final
+          path: |
+            lixing_300421_broker_deep_reports.zip
+            力星股份_300421_券商深度报告_2份.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
