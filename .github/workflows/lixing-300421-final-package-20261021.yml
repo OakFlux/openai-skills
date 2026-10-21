@@ -1,0 +1,148 @@
+name: Build final Lixing 300421 broker reports 20261021
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lixing-300421-final-package-20261021.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pymupdf pypdf
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests, pymupdf
+          from pypdf import PdfReader
+
+          PACKAGE='力星股份_300421_券商深度报告_2份'
+          ROOT=Path(PACKAGE);PDFDIR=ROOT/'原始PDF';PREV=ROOT/'首页预览'
+          for d in (ROOT,PDFDIR,PREV):d.mkdir(parents=True,exist_ok=True)
+          reports=[
+            {
+              'info_code':'AP202208081577012040','broker':'信达证券','date':'2022-08-09',
+              'title':'风电轴承行业深度报告：风机部件国产最后一环，轴承企业百花齐放',
+              'analysts':'武浩','rating':'持有','expected_pages':50,
+              'company_section':'第5.4节“力星股份”，约第46—48页',
+              'classification':'轴承行业深度报告；设有力星股份独立公司章节'
+            },
+            {
+              'info_code':'AP202307311592910914','broker':'国金证券','date':'2023-07-31',
+              'title':'轴承行业研究：机械设备核心部件，机器人有望打开应用',
+              'analysts':'满在朋','rating':'买入（行业）','expected_pages':52,
+              'company_section':'第4.5节“力星股份：国内精密轴承钢球龙头，持续拓宽新应用领域”，约第36—38页',
+              'classification':'轴承行业深度报告；设有力星股份独立公司章节'
+            },
+          ]
+          aliases=['力星股份','江苏力星通用钢球股份有限公司','300421','力星钢球']
+          s=requests.Session();s.trust_env=False
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36'
+
+          def safe(x):return re.sub(r'[\\/:*?"<>|]+','_',re.sub(r'\s+','',x))[:100]
+          manifest=[]
+          for idx,rep in enumerate(reports,1):
+            detail=f"https://data.eastmoney.com/report/info/{rep['info_code']}.html"
+            data=None;pdf_url='';attempts=[]
+            for prefix in ['H3','H2','H1','H4']:
+              u=f"https://pdf.dfcfw.com/pdf/{prefix}_{rep['info_code']}_1.pdf"
+              for attempt in range(5):
+                try:
+                  r=s.get(u,headers={'User-Agent':ua,'Referer':detail,'Accept':'application/pdf,*/*;q=0.8'},timeout=(20,300),allow_redirects=True)
+                  attempts.append({'url':u,'status':r.status_code,'bytes':len(r.content),'content_type':r.headers.get('content-type','')})
+                  if r.status_code==200 and r.content[:5]==b'%PDF-' and len(r.content)>100000:
+                    data=r.content;pdf_url=u;break
+                except Exception as exc:attempts.append({'url':u,'error':repr(exc)})
+                time.sleep(1+attempt)
+              if data:break
+            if not data:raise RuntimeError(f"Download failed: {rep['info_code']} {attempts[-10:]}")
+
+            filename=f"{idx:02d}_{safe(rep['broker'])}_力星股份_{safe(rep['title'])}_{rep['date']}.pdf"
+            dest=PDFDIR/filename;dest.write_bytes(data)
+            reader=PdfReader(str(dest),strict=False);actual_pages=len(reader.pages)
+            if actual_pages!=rep['expected_pages']:
+              raise RuntimeError(f"Page mismatch {filename}: {actual_pages} != {rep['expected_pages']}")
+            subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+
+            doc=pymupdf.open(str(dest));hit_pages=[];snippets=[];occurrences=0
+            for pno in range(doc.page_count):
+              text=doc.load_page(pno).get_text('text') or ''
+              compact=re.sub(r'\s+','',text);hits={}
+              for alias in aliases:
+                n=compact.count(re.sub(r'\s+','',alias))
+                if n:
+                  hits[alias]=n;occurrences+=n
+                  if len(snippets)<16:
+                    pos=text.find(alias)
+                    if pos>=0:snippets.append({'page':pno+1,'alias':alias,'text':' '.join(text[max(0,pos-160):pos+len(alias)+360].split())})
+              if hits:hit_pages.append({'page':pno+1,'hits':hits})
+            doc.close()
+            if occurrences<10 or len(hit_pages)<3:
+              raise RuntimeError(f"Insufficient substantive company coverage in {filename}: pages={len(hit_pages)}, occurrences={occurrences}")
+
+            prefix=PREV/dest.stem
+            subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(dest),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            preview=Path(str(prefix)+'.png')
+            if not preview.exists() or preview.stat().st_size<10000:raise RuntimeError('Preview render failed')
+            sha=hashlib.sha256(data).hexdigest()
+            manifest.append({
+              **rep,'filename':str(Path('原始PDF')/filename),'actual_pages':actual_pages,'bytes':len(data),
+              'company_mention_pages':hit_pages,'company_mention_occurrences':occurrences,
+              'mention_snippets':snippets,'source_report_page':detail,'pdf_url':pdf_url,
+              'sha256':sha,'preview_file':str(Path('首页预览')/preview.name),
+              'download_attempts':attempts,
+              'validation':['PDF header','exact page count','qpdf structure','full-text company-name scan','first-page render']
+            })
+
+          lines=['力星股份（300421.SZ）券商深度报告资料包','整理日期：2026-10-21','',
+                 '公开可直接取得的公司独立深度报告较少。本包选取2份高质量轴承行业深度报告，两份均设有力星股份独立公司章节并进行多页分析，不含普通财报点评。','']
+          for i,x in enumerate(manifest,1):
+            pages=', '.join(str(v['page']) for v in x['company_mention_pages'])
+            lines += [
+              f"{i}. {x['broker']}：《{x['title']}》",
+              f"   日期：{x['date']}；分析师：{x['analysts']}；评级：{x['rating']}；完整页数：{x['actual_pages']}页",
+              f"   公司章节：{x['company_section']}",
+              f"   全文检出力星股份/300421：{x['company_mention_occurrences']}次；命中页：{pages}",
+              f"   文件：{x['filename']}",f"   来源页面：{x['source_report_page']}",f"   SHA-256：{x['sha256']}",'']
+          lines += ['报告内容及版权归原券商与作者所有，仅供研究参考，不构成投资建议。','已核验PDF文件头、实际页数、文档结构、全文公司名称命中、首页渲染、ZIP CRC和SHA-256。']
+          (ROOT/'00_文件清单与说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest),encoding='utf-8')
+
+          zip_path=Path('lixing_300421_broker_deep_reports.zip')
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file():z.write(p,arcname=f'{ROOT.name}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as z:
+            bad=z.testzip();pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=2:raise RuntimeError(f'ZIP validation failed bad={bad} pdfs={len(pdfs)}')
+          chinese=Path(PACKAGE+'.zip');chinese.write_bytes(zip_path.read_bytes())
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'SHA256',hashlib.sha256(zip_path.read_bytes()).hexdigest())
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: lixing-300421-broker-deep-reports-final
+          path: |
+            lixing_300421_broker_deep_reports.zip
+            力星股份_300421_券商深度报告_2份.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
