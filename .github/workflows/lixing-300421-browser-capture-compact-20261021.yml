@@ -1,0 +1,200 @@
+name: Capture Lixing 300421 report rows compact 20261021
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lixing-300421-browser-capture-compact-20261021.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install browser tools
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install chromium
+
+      - name: Capture target rows and request parameters
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          import json
+          import re
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          target_rows = []
+          network = []
+          response_summaries = []
+          dom_rows = []
+          links = []
+
+          def walk(obj, source_url=''):
+              if isinstance(obj, dict):
+                  code = str(obj.get('stockCode') or obj.get('stock_code') or obj.get('code') or '')
+                  name = str(obj.get('stockName') or obj.get('stock_name') or obj.get('name') or '')
+                  title = str(obj.get('title') or obj.get('reportTitle') or '')
+                  if code == '300421' or name == '力星股份' or ('力星股份' in title):
+                      item = dict(obj)
+                      item['_source_url'] = source_url
+                      target_rows.append(item)
+                  for value in obj.values():
+                      walk(value, source_url)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      walk(value, source_url)
+
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+                  context = await browser.new_context(
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+                      locale='zh-CN',
+                      viewport={'width': 1440, 'height': 1000},
+                  )
+                  page = await context.new_page()
+
+                  def on_request(req):
+                      url = req.url
+                      if any(k in url.lower() for k in ['reportapi', '/report/', 'report/list']):
+                          network.append({
+                              'method': req.method,
+                              'url': url,
+                              'post_data': req.post_data,
+                              'resource_type': req.resource_type,
+                          })
+
+                  async def on_response(resp):
+                      try:
+                          url = resp.url
+                          ct = (resp.headers.get('content-type') or '').lower()
+                          if not any(k in url.lower() for k in ['reportapi', '/report/', 'report/list']):
+                              return
+                          summary = {'status': resp.status, 'url': url, 'content_type': ct}
+                          if resp.status == 200 and ('json' in ct or 'javascript' in ct or 'text' in ct):
+                              try:
+                                  body = await resp.text()
+                                  summary['body_length'] = len(body)
+                                  if len(body) <= 2_000_000:
+                                      try:
+                                          obj = json.loads(body)
+                                          walk(obj, url)
+                                          summary['json_keys'] = list(obj.keys())[:30] if isinstance(obj, dict) else []
+                                      except Exception:
+                                          if '300421' in body or '力星股份' in body:
+                                              summary['matching_body_excerpt'] = body[:10000]
+                              except Exception as exc:
+                                  summary['read_error'] = repr(exc)
+                          response_summaries.append(summary)
+                      except Exception:
+                          pass
+
+                  page.on('request', on_request)
+                  page.on('response', lambda resp: asyncio.create_task(on_response(resp)))
+
+                  await page.goto('https://data.eastmoney.com/report/300421.html', wait_until='domcontentloaded', timeout=90000)
+                  await page.wait_for_timeout(18000)
+
+                  # Capture rendered table rows and report links.
+                  try:
+                      rows = await page.locator('table tr').evaluate_all("els => els.map(el => ({text:(el.innerText||'').trim(), html:el.outerHTML.slice(0,5000)}))")
+                      for row in rows:
+                          text = re.sub(r'\\s+', ' ', row.get('text','')).strip()
+                          if text:
+                              dom_rows.append({'text': text, 'html': row.get('html','')})
+                  except Exception as exc:
+                      dom_rows.append({'error': repr(exc)})
+
+                  try:
+                      all_links = await page.locator('a').evaluate_all("els => els.map(a => ({text:(a.innerText||'').trim(), href:a.href})).filter(x => x.href)")
+                      for item in all_links:
+                          blob = (item.get('text','') + ' ' + item.get('href',''))
+                          if any(k in blob for k in ['力星股份', '300421', 'report/info', '研报', '陶瓷球', '滚动体']):
+                              links.append(item)
+                  except Exception as exc:
+                      links.append({'error': repr(exc)})
+
+                  # Try up to 8 next-page clicks if a visible pager exists.
+                  for _ in range(8):
+                      next_loc = page.locator('a:has-text("下一页"), .next, .pagination-next').first
+                      try:
+                          if await next_loc.count() == 0 or not await next_loc.is_visible():
+                              break
+                          cls = (await next_loc.get_attribute('class')) or ''
+                          if 'disabled' in cls:
+                              break
+                          await next_loc.click(timeout=5000)
+                          await page.wait_for_timeout(4000)
+                          rows = await page.locator('table tr').evaluate_all("els => els.map(el => ({text:(el.innerText||'').trim(), html:el.outerHTML.slice(0,5000)}))")
+                          for row in rows:
+                              text = re.sub(r'\\s+', ' ', row.get('text','')).strip()
+                              if text and all(existing.get('text') != text for existing in dom_rows if isinstance(existing, dict)):
+                                  dom_rows.append({'text': text, 'html': row.get('html','')})
+                      except Exception:
+                          break
+
+                  await page.wait_for_timeout(3000)
+                  final_url = page.url
+                  title = await page.title()
+                  body_text = ''
+                  try:
+                      body_text = re.sub(r'\\s+', ' ', (await page.locator('body').inner_text())[:20000])
+                  except Exception:
+                      pass
+                  await browser.close()
+
+              # Deduplicate target rows by infoCode/title/date.
+              dedup = []
+              seen = set()
+              for row in target_rows:
+                  key = (
+                      str(row.get('infoCode') or row.get('info_code') or ''),
+                      str(row.get('title') or row.get('reportTitle') or ''),
+                      str(row.get('publishDate') or row.get('publish_date') or ''),
+                  )
+                  if key not in seen:
+                      seen.add(key)
+                      dedup.append(row)
+
+              output = {
+                  'final_url': final_url,
+                  'title': title,
+                  'target_rows': dedup,
+                  'network': network,
+                  'response_summaries': response_summaries,
+                  'dom_rows': dom_rows,
+                  'links': links,
+                  'body_head': body_text,
+              }
+              Path('lixing_300421_capture.json').write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding='utf-8')
+              Path('lixing_300421_target_rows.json').write_text(json.dumps(dedup, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('TARGET_ROW_COUNT', len(dedup))
+              for row in dedup:
+                  print('TARGET', json.dumps(row, ensure_ascii=False)[:5000])
+              print('NETWORK_COUNT', len(network))
+              for item in network:
+                  print('REQUEST', json.dumps(item, ensure_ascii=False)[:5000])
+              print('DOM_ROW_COUNT', len(dom_rows))
+              for row in dom_rows[:30]:
+                  print('DOM', json.dumps(row, ensure_ascii=False)[:2000])
+
+          asyncio.run(main())
+          PY
+
+      - name: Upload capture
+        uses: actions/upload-artifact@v4
+        with:
+          name: lixing-300421-report-capture-compact
+          path: |
+            lixing_300421_capture.json
+            lixing_300421_target_rows.json
+          retention-days: 7
+          compression-level: 6
+          if-no-files-found: error
