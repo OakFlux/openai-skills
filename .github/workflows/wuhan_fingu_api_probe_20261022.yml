@@ -1,4 +1,4 @@
-name: Probe Wuhan Fingu report API variants 20261022
+name: Package Wuhan Fingu reports by date 20261022
 
 on:
   push:
@@ -10,40 +10,102 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  package:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - run: python -m pip install --quiet requests
-      - name: Probe query variants
+      - run: python -m pip install --quiet requests pypdf
+      - name: Scan dates and download PDFs
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p out/pdfs
           python - <<'PY'
-          import requests, json, itertools
+          import os, re, json, hashlib, zipfile, datetime, time
+          import requests
+          from pypdf import PdfReader
+
+          OUT='out'; PDFDIR=os.path.join(OUT,'pdfs')
           s=requests.Session(); s.trust_env=False
-          h={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/'}
-          base={'industryCode':'*','pageSize':'20','industry':'*','rating':'*','ratingChange':'*','beginTime':'2017-01-01','endTime':'2026-10-22','pageNo':'1','fields':'','qType':'0','orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
-          variants=[
-            ('code_plain',{'code':'002194'}),
-            ('code_suffix',{'code':'002194.SZ'}),
-            ('code_szprefix',{'code':'SZ002194'}),
-            ('code_lowerprefix',{'code':'sz002194'}),
-            ('code_dotprefix',{'code':'sz.002194'}),
-            ('code_marketnum',{'code':'0.002194'}),
-            ('stockCode_plain',{'stockCode':'002194'}),
-            ('both_plain',{'code':'002194','stockCode':'002194'}),
-            ('keyword_name',{'keyword':'武汉凡谷'}),
-            ('keyword_code',{'keyword':'002194'}),
-            ('code_name',{'code':'武汉凡谷'}),
-            ('code_plain_current_window',{'code':'002194','beginTime':'2019-01-01','endTime':'2021-12-31'}),
-            ('code_moutai_control',{'code':'600519'}),
-            ('keyword_moutai_control',{'keyword':'贵州茅台'}),
-          ]
-          for name,extra in variants:
-              p=dict(base);p.update(extra)
+          H={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':'https://data.eastmoney.com/','Accept':'*/*'}
+          dates=[]
+          for start,end in [('2019-10-23','2019-10-30'),('2020-08-09','2020-08-13'),('2020-11-02','2020-11-05')]:
+              d=datetime.date.fromisoformat(start); stop=datetime.date.fromisoformat(end)
+              while d<stop:
+                  dates.append(d.isoformat()); d+=datetime.timedelta(days=1)
+          matches=[]
+          for day in dates:
+              for page in range(1,20):
+                  p={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':day,'endTime':day,'pageNo':str(page),'fields':'','qType':'0','orgCode':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+                  try:
+                      r=s.get('https://reportapi.eastmoney.com/report/list',params=p,headers=H,timeout=(15,45)); obj=r.json()
+                  except Exception as e:
+                      print('LISTERR',day,page,repr(e)); break
+                  rows=obj.get('data') or []
+                  print('DAYPAGE',day,page,'hits',obj.get('hits'),'rows',len(rows),'total',obj.get('TotalPage'))
+                  for row in rows:
+                      if str(row.get('stockCode') or '')=='002194' or str(row.get('stockName') or '')=='武汉凡谷' or '武汉凡谷' in str(row.get('title') or ''):
+                          print('MATCH',json.dumps(row,ensure_ascii=False)); matches.append(row)
+                  if page>=int(obj.get('TotalPage') or 0) or not rows: break
+                  time.sleep(.2)
+          unique=[]; seen=set()
+          for row in matches:
+              key=row.get('infoCode') or (row.get('title'),row.get('publishDate'),row.get('orgSName'))
+              if key in seen: continue
+              seen.add(key); unique.append(row)
+          matches=unique
+          print('MATCHED_TOTAL',len(matches))
+          with open(os.path.join(OUT,'matched_records.json'),'w',encoding='utf-8') as f: json.dump(matches,f,ensure_ascii=False,indent=2)
+
+          def safe(v):
+              return re.sub(r'[\\/:*?"<>|]+','_',re.sub(r'\s+',' ',v).strip())[:150]
+          manifest=[]
+          for row in matches:
+              info=str(row.get('infoCode') or '')
+              if not info: continue
+              url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
               try:
-                  r=s.get('https://reportapi.eastmoney.com/report/list',params=p,headers=h,timeout=30)
-                  o=r.json(); rows=o.get('data') or []
-                  print('\nVARIANT',name,'STATUS',r.status_code,'HITS',o.get('hits'),'URL',r.url)
-                  for x in rows[:5]: print('ROW',x.get('stockCode'),x.get('stockName'),x.get('publishDate'),x.get('orgSName'),x.get('title'),x.get('infoCode'))
-              except Exception as e: print('\nVARIANT',name,'ERROR',repr(e))
+                  r=s.get(url,headers=H,timeout=(15,60),allow_redirects=True); data=r.content
+              except Exception as e:
+                  print('PDFERR',url,repr(e)); continue
+              print('PDFGET',r.status_code,len(data),r.headers.get('content-type',''),url)
+              if not data.startswith(b'%PDF') or len(data)<20000: continue
+              date=str(row.get('publishDate') or '')[:10]
+              broker=str(row.get('orgSName') or '未知券商')
+              title=str(row.get('title') or info)
+              filename=safe(f'{date}_{broker}_{title}')+'.pdf'
+              path=os.path.join(PDFDIR,filename)
+              with open(path,'wb') as f:f.write(data)
+              try:
+                  reader=PdfReader(path); pages=len(reader.pages)
+                  text='\n'.join((reader.pages[i].extract_text() or '') for i in range(min(3,pages)))[:16000]
+              except Exception as e:
+                  print('PARSEERR',filename,repr(e)); os.remove(path); continue
+              if not ('武汉凡谷' in text or '002194' in text or '武漢凡谷' in text):
+                  print('VERIFYFAIL',filename,text[:500]); os.remove(path); continue
+              rec={'filename':filename,'date':date,'broker':broker,'title':title,'info_code':info,'pages':pages,'size_bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'source_url':url,'rating':row.get('emRatingName'),'attach_pages':row.get('attachPages'),'researcher':row.get('researcher') or row.get('author')}
+              manifest.append(rec); print('VERIFIED',json.dumps(rec,ensure_ascii=False))
+          manifest.sort(key=lambda x:(x['pages'],x['date']),reverse=True)
+          with open(os.path.join(OUT,'manifest.json'),'w',encoding='utf-8') as f: json.dump(manifest,f,ensure_ascii=False,indent=2)
+          lines=['# 武汉凡谷（002194）公开券商公司研究报告','',f'已验证完整PDF：{len(manifest)}份','']
+          for i,x in enumerate(manifest,1):
+              lines += [f'## {i}. {x["title"]}',f'- 券商：{x["broker"]}',f'- 日期：{x["date"]}',f'- 页数：{x["pages"]}',f'- 文件：{x["filename"]}',f'- SHA-256：{x["sha256"]}','']
+          lines += ['验证标准：文件头为PDF；可正常解析页数；前三页可识别“武汉凡谷”或“002194”。','来源：东方财富公开研报索引及公开PDF附件。']
+          with open(os.path.join(OUT,'README.md'),'w',encoding='utf-8') as f:f.write('\n'.join(lines))
+          zipname='武汉凡谷_券商报告_公开验证全集.zip'
+          with zipfile.ZipFile(zipname,'w',zipfile.ZIP_DEFLATED) as z:
+              z.write(os.path.join(OUT,'README.md'),'README.md')
+              z.write(os.path.join(OUT,'manifest.json'),'manifest.json')
+              for x in manifest: z.write(os.path.join(PDFDIR,x['filename']),x['filename'])
+          print('FINAL',len(manifest),zipname,os.path.getsize(zipname))
+          if not manifest: raise SystemExit('No verified Wuhan Fingu report found')
           PY
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-public-reports-20261022
+          path: |
+            武汉凡谷_券商报告_公开验证全集.zip
+            out
+          retention-days: 7
+          if-no-files-found: error
