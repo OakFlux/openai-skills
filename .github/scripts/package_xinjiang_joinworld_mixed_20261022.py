@@ -1,0 +1,342 @@
+from __future__ import annotations
+
+import hashlib
+import html as html_lib
+import json
+import re
+import shutil
+import subprocess
+import time
+import zipfile
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+AS_OF = "2026-10-22"
+COMPANY = "新疆众和"
+CODE = "600888"
+PACKAGE_CN = "新疆众和_600888.SH_券商研究资料_1份原始PDF+2份公开网页存档"
+PACKAGE_EN = "Xinjiang_Joinworld_600888_Research_1_Original_PDF_2_Public_Web_Archives"
+
+root = Path(PACKAGE_CN)
+output = Path("artifact_out")
+verify = Path("verify")
+for path in (root, output, verify):
+    path.mkdir(parents=True, exist_ok=True)
+
+session = requests.Session()
+session.trust_env = False
+retry = Retry(
+    total=7,
+    connect=7,
+    read=7,
+    status=7,
+    backoff_factor=1.0,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+    raise_on_status=False,
+)
+session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=6, pool_maxsize=6))
+session.headers.update(
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://data.eastmoney.com/",
+    }
+)
+
+
+def fetch(url: str, *, accept: str = "*/*", timeout: tuple[int, int] = (30, 360)) -> requests.Response:
+    last: object | None = None
+    for attempt in range(6):
+        try:
+            response = session.get(url, headers={"Accept": accept}, timeout=timeout, allow_redirects=True)
+            last = response
+            if response.status_code == 200:
+                return response
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+        time.sleep(1 + attempt)
+    raise RuntimeError(f"Fetch failed: {url}; last={last!r}")
+
+
+records: list[dict[str, object]] = []
+
+# Publicly downloadable original broker PDF.
+pdf_url = "https://pdf.dfcfw.com/pdf/H3_AP202208231577519189_1.pdf"
+pdf_name = "01_2022-08-24_东亚前海证券_首次覆盖报告_多业务领跑行业_布局高端产品成利润增长点_原始PDF.pdf"
+pdf_path = root / pdf_name
+response = fetch(pdf_url, accept="application/pdf,application/octet-stream;q=0.9,*/*;q=0.8")
+if not response.content.startswith(b"%PDF") or len(response.content) < 100_000:
+    raise RuntimeError("Original East Asia Qianhai report did not download as a valid PDF")
+pdf_path.write_bytes(response.content)
+reader = PdfReader(str(pdf_path), strict=False)
+pages = len(reader.pages)
+if pages != 42:
+    raise RuntimeError(f"Unexpected original report page count: {pages}")
+extracted = ""
+for page in reader.pages[:20]:
+    try:
+        extracted += "\n" + (page.extract_text() or "")
+    except Exception:  # noqa: BLE001
+        pass
+if COMPANY not in extracted and CODE not in extracted:
+    raise RuntimeError("Issuer identity not found in original PDF")
+subprocess.run(
+    ["qpdf", "--warning-exit-0", "--check", str(pdf_path)],
+    check=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+for page_number, suffix in ((1, "first"), (pages, "last")):
+    prefix = verify / f"eastasia_{suffix}"
+    subprocess.run(
+        [
+            "pdftoppm",
+            "-f",
+            str(page_number),
+            "-l",
+            str(page_number),
+            "-singlefile",
+            "-png",
+            "-r",
+            "90",
+            str(pdf_path),
+            str(prefix),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    image = Path(str(prefix) + ".png")
+    if not image.exists() or image.stat().st_size < 6_000:
+        raise RuntimeError(f"Original PDF render validation failed on page {page_number}")
+pdf_sha = hashlib.sha256(response.content).hexdigest()
+records.append(
+    {
+        "sequence": 1,
+        "file": pdf_name,
+        "format": "PDF",
+        "source_status": "券商原始完整PDF",
+        "broker": "东亚前海证券",
+        "title": "首次覆盖报告：多业务领跑行业，布局高端产品成利润增长点",
+        "publish_date": "2022-08-24",
+        "pages": pages,
+        "rating": "强烈推荐/买入（公开索引表述存在差异，以报告正文为准）",
+        "analyst": "李子卓",
+        "source_url": pdf_url,
+        "info_page": "https://data.eastmoney.com/report/info/AP202208231577519189.html",
+        "sha256": pdf_sha,
+        "validation": [
+            "PDF header",
+            "issuer identity",
+            "42-page count",
+            "qpdf structure",
+            "first-page render",
+            "last-page render",
+        ],
+    }
+)
+
+archive_specs = [
+    {
+        "sequence": 2,
+        "url": "https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/714521776750/index.phtml",
+        "filename": "02_2022-08-22_浙商证券_全国领先的高纯铝龙头_内生打造铝基新材料平台_公开网页存档.html",
+        "broker": "浙商证券",
+        "title": "深度报告：全国领先的高纯铝龙头，内生打造铝基新材料平台",
+        "publish_date": "2022-08-22",
+        "original_pages": 44,
+        "analyst": "马金龙、刘岗、巩学鹏",
+        "rating": "买入",
+    },
+    {
+        "sequence": 3,
+        "url": "https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/812305320242/index.phtml",
+        "fallback_url": "https://www.sdyanbao.com/detail/922882",
+        "filename": "03_2025-09-27_申万宏源_铝电子材料一体化完备_氧化铝项目有望增厚利润_公开网页存档.html",
+        "broker": "申万宏源",
+        "title": "公司深度：铝电子材料一体化完备，氧化铝项目有望增厚利润",
+        "publish_date": "2025-09-27",
+        "original_pages": 32,
+        "analyst": "郭中伟、马焰明、陈松涛",
+        "rating": "增持（首次）",
+    },
+]
+
+
+def decode_response(page_response: requests.Response) -> str:
+    raw = page_response.content
+    candidates = [page_response.encoding, page_response.apparent_encoding, "gb18030", "utf-8", "gbk"]
+    for encoding in candidates:
+        if not encoding:
+            continue
+        try:
+            text = raw.decode(encoding)
+            if COMPANY in text or "证券研究报告" in text or "投资要点" in text:
+                return text
+        except Exception:  # noqa: BLE001
+            pass
+    return raw.decode("utf-8", errors="replace")
+
+
+def visible_text(source_html: str) -> tuple[str, str]:
+    soup = BeautifulSoup(source_html, "html.parser")
+    page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe", "form"]):
+        tag.decompose()
+    raw_text = soup.get_text("\n", strip=True)
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw_line in raw_text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line or line in seen or len(line) <= 1:
+            continue
+        seen.add(line)
+        lines.append(line)
+    return page_title, "\n".join(lines)
+
+
+for spec in archive_specs:
+    source_url = str(spec["url"])
+    try:
+        page_response = fetch(
+            source_url,
+            accept="text/html,application/xhtml+xml,*/*;q=0.8",
+            timeout=(25, 180),
+        )
+        source_html = decode_response(page_response)
+        page_title, text = visible_text(source_html)
+        if COMPANY not in text and spec.get("fallback_url"):
+            source_url = str(spec["fallback_url"])
+            page_response = fetch(
+                source_url,
+                accept="text/html,application/xhtml+xml,*/*;q=0.8",
+                timeout=(25, 180),
+            )
+            source_html = decode_response(page_response)
+            page_title, text = visible_text(source_html)
+    except Exception:  # noqa: BLE001
+        if not spec.get("fallback_url"):
+            raise
+        source_url = str(spec["fallback_url"])
+        page_response = fetch(
+            source_url,
+            accept="text/html,application/xhtml+xml,*/*;q=0.8",
+            timeout=(25, 180),
+        )
+        source_html = decode_response(page_response)
+        page_title, text = visible_text(source_html)
+
+    if COMPANY not in text or len(text) < 1_000:
+        raise RuntimeError(
+            f"Public page archive failed identity/content check: {spec['title']}; chars={len(text)}"
+        )
+
+    paragraphs = [html_lib.escape(line) for line in text.splitlines()]
+    body_html = "\n".join(f"<p>{line}</p>" for line in paragraphs)
+    disclosure = (
+        "重要说明：本文件是公开研报网页的离线存档，不是券商发布的原始PDF。"
+        f"公开索引显示原报告为{spec['original_pages']}页；原始PDF下载受登录、会员或访问权限限制。"
+        "为避免误导，本存档未使用‘原始报告’表述，也未伪造或重排券商PDF。"
+    )
+    offline_html = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html_lib.escape(str(spec['title']))}｜公开网页存档</title>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;max-width:980px;margin:32px auto;padding:0 24px;line-height:1.75;color:#222}}h1{{line-height:1.35}}.notice{{border:2px solid #9a6700;background:#fff8c5;padding:16px 18px;margin:20px 0}}.meta{{background:#f6f8fa;padding:16px 18px}}p{{margin:.55em 0}}code{{word-break:break-all}}hr{{margin:28px 0}}</style></head>
+<body><h1>{html_lib.escape(str(spec['title']))}</h1>
+<div class="notice"><strong>公开网页存档，非券商原始PDF</strong><br>{html_lib.escape(disclosure)}</div>
+<div class="meta"><strong>机构：</strong>{html_lib.escape(str(spec['broker']))}<br>
+<strong>发布日期：</strong>{spec['publish_date']}<br><strong>公开索引页数：</strong>{spec['original_pages']}页<br>
+<strong>评级：</strong>{html_lib.escape(str(spec['rating']))}<br><strong>分析师：</strong>{html_lib.escape(str(spec['analyst']))}<br>
+<strong>原始公开页面：</strong><code>{html_lib.escape(source_url)}</code><br>
+<strong>网页标题：</strong>{html_lib.escape(page_title)}</div><hr>
+<h2>公开页面可见内容</h2>{body_html}
+<hr><p>存档日期：{AS_OF}。本存档仅保存无需登录即可查看的公开内容。</p></body></html>"""
+    archive_path = root / str(spec["filename"])
+    archive_path.write_text(offline_html, encoding="utf-8")
+    archive_bytes = archive_path.read_bytes()
+    if len(archive_bytes) < 10_000:
+        raise RuntimeError(f"Offline archive unexpectedly small: {archive_path.name}")
+    archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+    records.append(
+        {
+            "sequence": spec["sequence"],
+            "file": spec["filename"],
+            "format": "HTML",
+            "source_status": "公开网页离线存档，非券商原始PDF",
+            "broker": spec["broker"],
+            "title": spec["title"],
+            "publish_date": spec["publish_date"],
+            "original_report_pages_from_public_index": spec["original_pages"],
+            "rating": spec["rating"],
+            "analyst": spec["analyst"],
+            "source_url": source_url,
+            "archived_visible_text_characters": len(text),
+            "sha256": archive_sha,
+            "validation": [
+                "issuer identity",
+                "minimum visible text",
+                "offline self-contained HTML",
+                "explicit non-original disclosure",
+            ],
+        }
+    )
+
+readme = [
+    "新疆众和（600888.SH）券商研究资料包",
+    f"整理日期：{AS_OF}",
+    "",
+    "本包共3项研究资料：1份可公开下载并完成结构核验的券商原始完整PDF，另2份为无需登录即可查看的公开研报网页离线存档。",
+    "公开渠道未取得后两份原始券商PDF，因此没有把网页预览或摘要冒充原始报告。两份HTML文件均在正文顶部明确标注‘非券商原始PDF’。",
+    "",
+    "文件清单：",
+]
+for item in records:
+    page_text = str(item.get("pages") or item.get("original_report_pages_from_public_index") or "")
+    readme.extend(
+        [
+            f"{item['sequence']}. {item['file']}",
+            f"   机构：{item['broker']}",
+            f"   标题：{item['title']}",
+            f"   日期：{item['publish_date']}；页数信息：{page_text}",
+            f"   文件性质：{item['source_status']}",
+            f"   来源：{item['source_url']}",
+            f"   SHA-256：{item['sha256']}",
+            "",
+        ]
+    )
+readme.extend(
+    [
+        "核验说明：原始PDF已检查文件头、公司身份、实际页数、qpdf结构、首末页渲染。网页存档已检查公司身份、公开可见文本长度、离线可读性和非原始文件披露。",
+        "范围说明：不包含需要登录或付费才能获取的文件，也未绕过访问控制。",
+    ]
+)
+(root / "00_文件清单与重要说明.txt").write_text("\n".join(readme), encoding="utf-8")
+(root / "manifest.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+(root / "SHA256SUMS.txt").write_text(
+    "".join(f"{item['sha256']}  {item['file']}\n" for item in records), encoding="utf-8"
+)
+
+cn_zip = output / f"{PACKAGE_CN}.zip"
+with zipfile.ZipFile(cn_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+    for path in sorted(root.iterdir()):
+        archive.write(path, arcname=f"{PACKAGE_CN}/{path.name}")
+with zipfile.ZipFile(cn_zip, "r") as archive:
+    bad = archive.testzip()
+    pdf_count = sum(name.lower().endswith(".pdf") for name in archive.namelist())
+    html_count = sum(name.lower().endswith(".html") for name in archive.namelist())
+    if bad:
+        raise RuntimeError(f"ZIP CRC failure: {bad}")
+    if pdf_count != 1 or html_count != 2:
+        raise RuntimeError(f"Unexpected primary file counts: PDF={pdf_count}, HTML={html_count}")
+
+en_zip = output / f"{PACKAGE_EN}.zip"
+shutil.copy2(cn_zip, en_zip)
+print("FINAL_RECORDS", json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+print("FINAL_ZIP", cn_zip, cn_zip.stat().st_size, hashlib.sha256(cn_zip.read_bytes()).hexdigest(), flush=True)
+print("BACKUP_ZIP", en_zip, en_zip.stat().st_size, hashlib.sha256(en_zip.read_bytes()).hexdigest(), flush=True)
