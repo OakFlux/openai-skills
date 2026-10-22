@@ -1,0 +1,348 @@
+name: Package Xinjiang Joinworld 600888 broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/xinjiang-joinworld-600888-broker-deep-reports-20261022.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY = '新疆众和'
+          FULL_NAME = '新疆众和股份有限公司'
+          CODE = '600888'
+          AS_OF = '2026-10-22'
+
+          DOWNLOADS = Path('downloads')
+          VERIFY = Path('verify')
+          OUTPUT = Path('artifact_out')
+          for path in (DOWNLOADS, VERIFY, OUTPUT):
+              path.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(
+              total=7, connect=7, read=7, status=7,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'], raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          rows: list[dict[str, Any]] = []
+          api = 'https://reportapi.eastmoney.com/report/list'
+          for page in range(1, 8):
+              params = {
+                  'industryCode': '*', 'pageSize': '5000', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2000-01-01', 'endTime': AS_OF,
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': CODE, 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+              response = session.get(api, params=params, timeout=(25, 180))
+              print('API', page, response.status_code, len(response.content), response.url, flush=True)
+              response.raise_for_status()
+              batch = response.json().get('data') or []
+              rows.extend(batch)
+              if len(batch) < 5000:
+                  break
+
+          unique: dict[str, dict[str, Any]] = {}
+          for row in rows:
+              blob = json.dumps(row, ensure_ascii=False)
+              if COMPANY not in blob and CODE not in blob:
+                  continue
+              key = str(row.get('infoCode') or row.get('id') or blob)
+              unique[key] = row
+          metadata = list(unique.values())
+          metadata.sort(key=lambda item: str(item.get('publishDate') or ''), reverse=True)
+          print('METADATA_COUNT', len(metadata), flush=True)
+          for row in metadata:
+              print('META', json.dumps({key: row.get(key) for key in (
+                  'infoCode', 'title', 'orgSName', 'publishDate', 'reportType',
+                  'attachPages', 'attachSize', 'author', 'emRatingName',
+                  'stockName', 'stockCode'
+              )}, ensure_ascii=False), flush=True)
+          if not metadata:
+              raise RuntimeError('No broker research metadata found')
+
+          def pages_from_row(row: dict[str, Any]) -> int:
+              try:
+                  return int(row.get('attachPages') or 0)
+              except Exception:
+                  return 0
+
+          exclusion_terms = (
+              '点评', '季报', '中报', '半年报', '年报', '业绩预告', '业绩快报',
+              '可转债', '转债', '申购', '跟踪报告', '事件点评', '调研', '简评',
+          )
+          deep_terms = ('深度', '首次覆盖', '公司研究', '公司深度', '首次覆盖报告')
+          business_terms = ('高纯铝', '电子铝箔', '电极箔', '铝基', '电子材料', '新材料', '产业链')
+
+          def score(row: dict[str, Any]) -> int:
+              title = str(row.get('title') or '')
+              pages = pages_from_row(row)
+              date = str(row.get('publishDate') or '')
+              value = pages * 8
+              if any(term in title for term in deep_terms): value += 500
+              if any(term in title for term in business_terms): value += 100
+              if any(term in title for term in exclusion_terms): value -= 900
+              if date.startswith(('2026', '2025', '2024', '2023')): value += 40
+              return value
+
+          candidates = []
+          for row in metadata:
+              title = str(row.get('title') or '')
+              info = str(row.get('infoCode') or '')
+              pages = pages_from_row(row)
+              if not info:
+                  continue
+              if any(term in title for term in exclusion_terms):
+                  continue
+              if pages and pages < 12:
+                  continue
+              candidates.append(row)
+          candidates.sort(key=lambda row: (score(row), pages_from_row(row), str(row.get('publishDate') or '')), reverse=True)
+
+          def download_pdf(info_code: str, target: Path) -> str:
+              variants = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_01.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_01.pdf',
+              ]
+              last = None
+              for url in variants:
+                  for attempt in range(3):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},
+                              timeout=(30, 360), allow_redirects=True,
+                          )
+                          last = {'url':url,'status':response.status_code,'bytes':len(response.content)}
+                          print('DOWNLOAD', info_code, response.status_code, len(response.content), url, flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF') and len(response.content) > 80_000:
+                              target.write_bytes(response.content)
+                              return url
+                      except Exception as exc:
+                          last = {'url':url,'error':repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f'Unable to download {info_code}: {last}')
+
+          valid: list[dict[str, Any]] = []
+          seen_hashes: set[str] = set()
+          for row in candidates[:30]:
+              info = str(row.get('infoCode') or '')
+              title = str(row.get('title') or '').strip()
+              broker = str(row.get('orgSName') or row.get('orgName') or '未知机构').strip()
+              date = str(row.get('publishDate') or '')[:10]
+              raw_path = DOWNLOADS / f'{info}.pdf'
+              try:
+                  source_url = download_pdf(info, raw_path)
+                  reader = PdfReader(str(raw_path), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 12:
+                      raw_path.unlink(missing_ok=True)
+                      continue
+
+                  sample_indices = list(range(min(24, pages)))
+                  if pages > 26:
+                      sample_indices += list(range(max(0, pages - 2), pages))
+                  text_parts = []
+                  for index in dict.fromkeys(sample_indices):
+                      try:
+                          text_parts.append(reader.pages[index].extract_text() or '')
+                      except Exception:
+                          pass
+                  compact_text = re.sub(r'\s+', '', '\n'.join(text_parts))
+                  identity_ok = COMPANY in compact_text or FULL_NAME in compact_text or CODE in compact_text
+                  research_ok = any(term in compact_text for term in ('证券研究报告','公司研究报告','公司深度','首次覆盖','投资评级','分析师'))
+                  if not identity_ok or not research_ok:
+                      print('REJECT_IDENTITY', info, title, identity_ok, research_ok, flush=True)
+                      raw_path.unlink(missing_ok=True)
+                      continue
+
+                  qpdf = subprocess.run(
+                      ['qpdf','--warning-exit-0','--check',str(raw_path)],
+                      capture_output=True, text=True,
+                  )
+                  if qpdf.returncode != 0:
+                      raise RuntimeError(qpdf.stdout[-800:] + qpdf.stderr[-800:])
+
+                  for page_number, suffix in ((1,'first'),(pages,'last')):
+                      prefix = VERIFY / f'{info}_{suffix}'
+                      render = subprocess.run(
+                          ['pdftoppm','-f',str(page_number),'-l',str(page_number),'-singlefile','-png','-r','90',str(raw_path),str(prefix)],
+                          capture_output=True, text=True,
+                      )
+                      image = Path(str(prefix) + '.png')
+                      if render.returncode != 0 or not image.exists() or image.stat().st_size < 6_000:
+                          raise RuntimeError(f'Page render failed page {page_number}')
+
+                  data = raw_path.read_bytes()
+                  sha = hashlib.sha256(data).hexdigest()
+                  if sha in seen_hashes:
+                      raw_path.unlink(missing_ok=True)
+                      continue
+                  seen_hashes.add(sha)
+                  record = {
+                      'info_code':info,
+                      'broker':broker,
+                      'title':title,
+                      'publish_date':date,
+                      'author':row.get('author'),
+                      'rating':row.get('emRatingName'),
+                      'pages':pages,
+                      'bytes':len(data),
+                      'sha256':sha,
+                      'source_url':source_url,
+                      'metadata_pages':pages_from_row(row),
+                      'score':score(row),
+                      'file':str(raw_path),
+                  }
+                  valid.append(record)
+                  print('VALID', json.dumps({k:record[k] for k in ('broker','title','publish_date','pages','score')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('CANDIDATE_ERROR', info, title, repr(exc), flush=True)
+                  raw_path.unlink(missing_ok=True)
+
+          if len(valid) < 2:
+              raise RuntimeError(f'Only {len(valid)} complete company research PDFs passed validation')
+
+          valid.sort(key=lambda item:(item['score'], item['pages'], item['publish_date']), reverse=True)
+          selected = []
+          used_brokers = set()
+          for item in valid:
+              if item['broker'] in used_brokers:
+                  continue
+              selected.append(item)
+              used_brokers.add(item['broker'])
+              if len(selected) == 3:
+                  break
+          if len(selected) < min(3, len(valid)):
+              for item in valid:
+                  if item not in selected:
+                      selected.append(item)
+                  if len(selected) == 3:
+                      break
+          selected = selected[:3]
+          count = len(selected)
+
+          package_cn = f'新疆众和_600888.SH_券商深度报告_{count}份'
+          package_en = f'Xinjiang_Joinworld_600888_Broker_Deep_Research_{count}_Reports'
+          root = Path(package_cn)
+          root.mkdir(parents=True, exist_ok=True)
+
+          def safe_name(text: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]+','_',str(text)).strip(' ._')[:105]
+
+          manifest = []
+          selected.sort(key=lambda item:item['publish_date'], reverse=True)
+          for index, record in enumerate(selected, start=1):
+              filename = f'{index:02d}_{record["publish_date"]}_{safe_name(record["broker"])}_{safe_name(record["title"])}.pdf'
+              shutil.copy2(record['file'], root / filename)
+              entry = {key:value for key,value in record.items() if key not in ('file','score')}
+              entry['filename'] = filename
+              manifest.append(entry)
+
+          readme = [
+              f'新疆众和（600888.SH）券商深度研究报告合集（{count}份）',
+              f'整理日期：{AS_OF}',
+              '',
+              '筛选口径：仅收录直接覆盖新疆众和的完整公司研究报告；排除财报点评、季度点评、可转债申购报告、网页摘要和行业报告。',
+              '',
+              '文件清单：',
+          ]
+          for index, item in enumerate(manifest, start=1):
+              authors = item.get('author') or []
+              if isinstance(authors, list):
+                  authors_text = '、'.join(str(x).split('.')[-1] for x in authors)
+              else:
+                  authors_text = str(authors)
+              readme.extend([
+                  f'{index}. {item["filename"]}',
+                  f'   机构：{item["broker"]}',
+                  f'   标题：{item["title"]}',
+                  f'   日期：{item["publish_date"]}；实际页数：{item["pages"]}',
+                  f'   评级：{item.get("rating") or "未标注"}；分析师：{authors_text or "未标注"}',
+                  f'   来源：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ])
+          readme.append('核验项目：公司身份、研究报告属性、实际页数、PDF结构、首末页渲染、重复文件、SHA-256及ZIP CRC。')
+
+          (root / '00_文件清单与范围说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in manifest), encoding='utf-8')
+
+          cn_zip = OUTPUT / f'{package_cn}.zip'
+          with zipfile.ZipFile(cn_zip,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as archive:
+              for path in sorted(root.iterdir()):
+                  archive.write(path, arcname=f'{package_cn}/{path.name}')
+          with zipfile.ZipFile(cn_zip,'r') as archive:
+              bad = archive.testzip()
+              pdf_count = sum(name.lower().endswith('.pdf') for name in archive.namelist())
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              if pdf_count != count:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} != {count}')
+
+          en_zip = OUTPUT / f'{package_en}.zip'
+          shutil.copy2(cn_zip, en_zip)
+          print('FINAL_COUNT', count, flush=True)
+          print('FINAL_MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', cn_zip, cn_zip.stat().st_size, hashlib.sha256(cn_zip.read_bytes()).hexdigest(), flush=True)
+          print('BACKUP_ZIP', en_zip, en_zip.stat().st_size, hashlib.sha256(en_zip.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinjiang-joinworld-600888-broker-deep-reports-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
