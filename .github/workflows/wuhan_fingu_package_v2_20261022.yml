@@ -1,91 +1,262 @@
-name: Inspect KXJSKT report endpoints 20261022
+name: Build Wuhan Fingu deep report package 20261022
 
 on:
   push:
     branches: [main]
     paths:
       - .github/workflows/wuhan_fingu_package_v2_20261022.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  inspect:
+  package:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 25
     steps:
-      - run: python -m pip install --quiet selenium requests beautifulsoup4 lxml
-      - name: Inspect page and scripts
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pymupdf pypdf
+
+      - name: Discover download validate and package
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out/scripts
+          mkdir -p work/pdfs work/previews
           python - <<'PY'
-          import json, os, time, re, requests
-          from selenium import webdriver
-          from selenium.webdriver.chrome.options import Options
-          from selenium.webdriver.common.by import By
+          from __future__ import annotations
+          import hashlib, json, os, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests, pymupdf
+          from pypdf import PdfReader
 
-          target='https://www.kxjskt.com/wap/news/index.html'
-          o=Options()
-          for a in ['--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1920,3000','--lang=zh-CN','--ignore-certificate-errors']:
-              o.add_argument(a)
-          o.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36')
-          o.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
-          d=webdriver.Chrome(options=o); d.set_page_load_timeout(60)
-          d.get(target); time.sleep(10)
-          print('PAGE',d.current_url,d.title,flush=True)
-          source=d.page_source
-          open('out/page.html','w',encoding='utf-8').write(source)
-          d.save_screenshot('out/page.png')
-          items=[]
-          for sel,attr in [('a','href'),('script','src'),('link','href'),('img','src'),('iframe','src')]:
-              for e in d.find_elements(By.CSS_SELECTOR,sel):
-                  v=e.get_attribute(attr)
-                  if v:
-                      items.append({'tag':sel,'url':v,'text':(e.text or '')[:500],'outer':e.get_attribute('outerHTML')[:1200]})
-          json.dump(items,open('out/dom.json','w',encoding='utf-8'),ensure_ascii=False,indent=2)
-          net=[]
-          for item in d.get_log('performance'):
-              try:
-                  m=json.loads(item['message'])['message']; method=m.get('method'); p=m.get('params',{}); obj=p.get('request') or p.get('response') or {}; u=obj.get('url')
-                  if u: net.append({'method':method,'url':u,'status':obj.get('status'),'mimeType':obj.get('mimeType')})
-              except Exception:
-                  pass
-          json.dump(net,open('out/network.json','w',encoding='utf-8'),ensure_ascii=False,indent=2)
-          cookies={c['name']:c['value'] for c in d.get_cookies()}; d.quit()
-          print('DOM_COUNT',len(items),'NET_COUNT',len(net),flush=True)
-          for x in net:
-              if any(k in x['url'].lower() for k in ['api','json','pdf','report','download','news']):
-                  print('NET',json.dumps(x,ensure_ascii=False),flush=True)
-          for x in items:
-              blob=(x.get('url','')+' '+x.get('text','')).lower()
-              if any(k in blob for k in ['api','pdf','report','download','研报']):
-                  print('DOM',json.dumps(x,ensure_ascii=False),flush=True)
+          ROOT=Path('work')
+          PDFDIR=ROOT/'pdfs'
+          PREVDIR=ROOT/'previews'
+          PACKAGE='武汉凡谷_002194_券商深度报告_3份'
+          OUTDIR=Path(PACKAGE)
+          OUTPDF=OUTDIR/'原始PDF'
+          OUTPREV=OUTDIR/'首页预览'
+          for d in (PDFDIR,PREVDIR,OUTDIR,OUTPDF,OUTPREV): d.mkdir(parents=True,exist_ok=True)
 
-          s=requests.Session(); s.trust_env=False; s.cookies.update(cookies)
-          h={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':target}
-          scripts=[x['url'] for x in items if x['tag']=='script']
-          script_index=[]
-          for i,u in enumerate(scripts):
-              try:
-                  r=s.get(u,headers=h,timeout=(15,60)); text=r.text
-                  open(f'out/scripts/{i}.js','w',encoding='utf-8',errors='replace').write(text)
-                  hits=[p for p in ['fetch(', 'axios', '/api/', '.pdf', 'download', 'report', 'stockCode', 'search'] if p.lower() in text.lower()]
-                  rec={'index':i,'url':u,'status':r.status_code,'bytes':len(r.content),'hits':hits}
-                  script_index.append(rec); print('SCRIPT',json.dumps(rec,ensure_ascii=False),flush=True)
-                  for line in text.splitlines():
-                      low=line.lower()
-                      if any(p in low for p in ['/api/','.pdf','download','stockcode','reportapi','search']):
-                          print('JS_LINE',i,line[:3000],flush=True)
-              except Exception as e:
-                  script_index.append({'index':i,'url':u,'error':repr(e)})
-          json.dump(script_index,open('out/script_index.json','w',encoding='utf-8'),ensure_ascii=False,indent=2)
+          s=requests.Session(); s.trust_env=False
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          H={'User-Agent':UA,'Accept':'application/json,text/plain,*/*','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://data.eastmoney.com/report/'}
+          API='https://reportapi.eastmoney.com/report/list'
+          windows=[
+            ('2019-07-01','2019-09-30'),
+            ('2019-11-01','2020-01-31'),
+            ('2020-07-01','2020-09-30'),
+            ('2020-10-01','2021-03-31'),
+            ('2022-01-01','2026-10-22'),
+          ]
+          title_terms=['滤波器','基站天线','射频','5G核心器件','5G创新大周期','国产化','通信设备','通信行业','核心供应商','天线及滤波器']
+          rows=[];seen=set();request_log=[]
+          for begin,end in windows:
+            for qtype in ['1','0']:
+              total=1
+              for page in range(1,151):
+                if page>total: break
+                p={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':begin,'endTime':end,'pageNo':str(page),'fields':'','qType':qtype,
+                  'orgCode':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)
+                }
+                payload=None;last={}
+                for attempt in range(6):
+                  try:
+                    r=s.get(API,params=p,headers=H,timeout=(20,120))
+                    last={'begin':begin,'end':end,'qType':qtype,'page':page,'status':r.status_code,'bytes':len(r.content),'url':r.url}
+                    if r.status_code==200:
+                      payload=r.json(); break
+                  except Exception as exc: last={'begin':begin,'end':end,'qType':qtype,'page':page,'error':repr(exc)}
+                  time.sleep(1+attempt)
+                request_log.append(last)
+                if payload is None: break
+                total=min(int(payload.get('TotalPage') or 1),150)
+                data=payload.get('data') or []
+                if isinstance(data,dict): data=data.get('list') or data.get('data') or []
+                if not data: break
+                for row in data:
+                  if not isinstance(row,dict): continue
+                  title=str(row.get('title') or '')
+                  if not any(t in title for t in title_terms): continue
+                  info=str(row.get('infoCode') or '')
+                  key=info or (title,str(row.get('publishDate')),str(row.get('orgSName')))
+                  if key in seen: continue
+                  seen.add(key); rows.append(row)
+                if page>=total or len(data)<100: break
+                time.sleep(.18)
+
+          def pages_meta(row):
+            try:return int(float(row.get('attachPages') or 0))
+            except:return 0
+          def score_title(row):
+            title=str(row.get('title') or '')
+            pages=pages_meta(row)
+            score=pages
+            weights={
+              '滤波器':90,'基站天线':90,'射频':70,'5G核心器件':110,
+              '国产化':45,'核心供应商':40,'深度':30,'专题':25,'行业研究':20,
+            }
+            for k,w in weights.items():
+              if k in title:score+=w
+            if pages>=20:score+=40
+            if pages>=40:score+=50
+            if pages<8:score-=80
+            return score
+          rows.sort(key=score_title,reverse=True)
+          (ROOT/'candidate_metadata.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CANDIDATES',len(rows))
+          for r in rows[:80]: print('CAND',r.get('infoCode'),r.get('publishDate'),r.get('orgSName'),r.get('attachPages'),r.get('title'))
+
+          aliases=['武汉凡谷','武汉凡谷电子技术股份有限公司','002194','武漢凡谷']
+          scanned=[]
+          def download_pdf(row):
+            info=str(row.get('infoCode') or '')
+            detail=f'https://data.eastmoney.com/report/info/{info}.html'
+            attempts=[]
+            for prefix in ['H3','H2','H1','H4']:
+              u=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+              for attempt in range(4):
+                try:
+                  rr=s.get(u,headers={'User-Agent':UA,'Referer':detail,'Accept':'application/pdf,*/*;q=0.8'},timeout=(20,240),allow_redirects=True)
+                  attempts.append({'url':u,'status':rr.status_code,'bytes':len(rr.content),'content_type':rr.headers.get('content-type','')})
+                  if rr.status_code==200 and rr.content[:5]==b'%PDF-' and len(rr.content)>80000:
+                    return rr.content,u,attempts
+                except Exception as exc:attempts.append({'url':u,'error':repr(exc)})
+                time.sleep(.8+attempt)
+            return None,'',attempts
+
+          for idx,row in enumerate(rows[:90],1):
+            pages_hint=pages_meta(row)
+            if pages_hint and pages_hint<8: continue
+            data,url,attempts=download_pdf(row)
+            if not data:
+              scanned.append({'row':row,'downloaded':False,'attempts':attempts});continue
+            info=str(row.get('infoCode') or '')
+            temp=PDFDIR/f'{info}.pdf';temp.write_bytes(data)
+            try:
+              doc=pymupdf.open(str(temp))
+            except Exception as exc:
+              scanned.append({'row':row,'downloaded':True,'parse_error':repr(exc)});continue
+            hit_pages=[]; snippets=[]; occurrences=0
+            for pno in range(doc.page_count):
+              text=doc.load_page(pno).get_text('text') or ''
+              compact=re.sub(r'\s+','',text)
+              ph={}
+              for a in aliases:
+                n=compact.count(re.sub(r'\s+','',a))
+                if n:
+                  ph[a]=n;occurrences+=n
+                  if len(snippets)<24:
+                    pos=text.find(a)
+                    if pos>=0: snippets.append({'page':pno+1,'alias':a,'text':' '.join(text[max(0,pos-220):pos+len(a)+520].split())})
+              if ph: hit_pages.append({'page':pno+1,'hits':ph})
+            actual_pages=doc.page_count;doc.close()
+            title=str(row.get('title') or '')
+            substantive=(len(hit_pages)>=2 and occurrences>=3) or (len(hit_pages)>=1 and occurrences>=6)
+            quality=score_title(row)+len(hit_pages)*180+occurrences*25
+            if actual_pages>=20:quality+=50
+            if actual_pages>=40:quality+=50
+            rec={
+              'row':row,'downloaded':True,'pdf_url':url,'attempts':attempts,
+              'actual_pages':actual_pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),
+              'hit_pages':hit_pages,'occurrences':occurrences,'snippets':snippets,
+              'substantive':substantive,'quality_score':quality,'temp_file':str(temp),
+            }
+            scanned.append(rec)
+            print('SCAN',info,'pages',actual_pages,'hit_pages',len(hit_pages),'occ',occurrences,'substantive',substantive,'title',title)
+          (ROOT/'scan_results.json').write_text(json.dumps(scanned,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+
+          eligible=[x for x in scanned if x.get('substantive')]
+          eligible.sort(key=lambda x:(x['quality_score'],x['actual_pages']),reverse=True)
+          selected=[];used_titles=set();used_brokers=set()
+          for x in eligible:
+            row=x['row'];title=str(row.get('title') or '');broker=str(row.get('orgSName') or row.get('orgName') or '未知券商')
+            norm=re.sub(r'\W+','',title)
+            if norm in used_titles:continue
+            # Prefer broker diversity, but allow same broker if needed.
+            if broker in used_brokers and len([e for e in eligible if str(e['row'].get('orgSName') or '') not in used_brokers])>0 and len(selected)<2:
+              continue
+            selected.append(x);used_titles.add(norm);used_brokers.add(broker)
+            if len(selected)==3:break
+          if len(selected)<2:
+            for x in eligible:
+              if x not in selected:
+                selected.append(x)
+                if len(selected)>=2:break
+          if len(selected)<2:
+            raise RuntimeError('Fewer than two substantive public broker deep reports found; eligible='+json.dumps([{'title':e['row'].get('title'),'broker':e['row'].get('orgSName'),'pages':e['actual_pages'],'hits':e['hit_pages'],'occ':e['occurrences']} for e in eligible],ensure_ascii=False))
+
+          def safe(text):
+            return re.sub(r'[\\/:*?"<>|]+','_',re.sub(r'\s+',' ',text).strip())[:110]
+          manifest=[]
+          for i,x in enumerate(selected,1):
+            row=x['row']; title=str(row.get('title') or ''); broker=str(row.get('orgSName') or row.get('orgName') or '未知券商')
+            date=str(row.get('publishDate') or '')[:10]
+            filename=f'{i:02d}_{safe(broker)}_武汉凡谷相关深度_{safe(title)}_{date}.pdf'
+            src=Path(x['temp_file']);dest=OUTPDF/filename;dest.write_bytes(src.read_bytes())
+            # Structural verification.
+            reader=PdfReader(str(dest),strict=False);actual_pages=len(reader.pages)
+            subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            prefix=OUTPREV/dest.stem
+            subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(dest),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            preview=Path(str(prefix)+'.png')
+            if not preview.exists() or preview.stat().st_size<8000:raise RuntimeError('Preview failed '+filename)
+            manifest.append({
+              'filename':str(Path('原始PDF')/filename),'broker':broker,'date':date,'title':title,
+              'analysts':row.get('researcher') or row.get('author'),'rating':row.get('emRatingName') or row.get('sRatingName'),
+              'classification':'行业/产业链深度报告，正文对武汉凡谷有实质分析',
+              'pages':actual_pages,'size_bytes':dest.stat().st_size,'sha256':x['sha256'],
+              'company_hit_pages':x['hit_pages'],'company_occurrences':x['occurrences'],'company_snippets':x['snippets'],
+              'source_report_page':f"https://data.eastmoney.com/report/info/{row.get('infoCode')}.html",'pdf_url':x['pdf_url'],
+              'preview_file':str(Path('首页预览')/preview.name),
+              'validation':['PDF header','page count','qpdf structure','full-text company scan','first-page render'],
+            })
+
+          lines=['武汉凡谷（002194.SZ）券商深度研究资料包','整理日期：2026-10-22','',
+                 '说明：公开渠道可直接取得的武汉凡谷公司独立深度报告很少。本包收录2—3份高质量5G射频、基站天线或滤波器行业深度报告；每份报告均经全文核验，对武汉凡谷有明确实质分析，不含普通网页摘要。','']
+          for i,x in enumerate(manifest,1):
+            page_list='、'.join(str(v['page']) for v in x['company_hit_pages'])
+            lines += [
+              f"{i}. {x['broker']}：《{x['title']}》",
+              f"   日期：{x['date']}；分析师：{x['analysts']}；完整页数：{x['pages']}页",
+              f"   武汉凡谷/002194全文命中：{x['company_occurrences']}次；命中页：{page_list}",
+              f"   文件：{x['filename']}",f"   来源页面：{x['source_report_page']}",f"   SHA-256：{x['sha256']}",'']
+          lines += ['报告内容及版权归原券商与作者所有，仅供研究参考，不构成投资建议。','已核验PDF文件头、实际页数、文档结构、全文公司名称命中、首页渲染及ZIP CRC。']
+          (OUTDIR/'00_文件清单与说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (OUTDIR/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUTDIR/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest),encoding='utf-8')
+          (OUTDIR/'候选报告筛选记录.json').write_text(json.dumps([{
+            'title':x['row'].get('title'),'broker':x['row'].get('orgSName'),'date':str(x['row'].get('publishDate'))[:10],
+            'pages':x.get('actual_pages'),'company_hit_pages':x.get('hit_pages'),'occurrences':x.get('occurrences'),'substantive':x.get('substantive'),
+          } for x in scanned if x.get('downloaded')],ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUTDIR/'request_log.json').write_text(json.dumps(request_log,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          eng=Path('wuhan_fingu_002194_broker_deep_reports.zip')
+          chi=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(eng,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+            for p in sorted(OUTDIR.rglob('*')):
+              if p.is_file():z.write(p,arcname=f'{OUTDIR.name}/{p.relative_to(OUTDIR)}')
+          with zipfile.ZipFile(eng) as z:
+            bad=z.testzip();pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=len(manifest) or len(pdfs)<2:raise RuntimeError(f'ZIP validation failed bad={bad} pdfs={len(pdfs)} manifest={len(manifest)}')
+          chi.write_bytes(eng.read_bytes())
+          print('FINAL_ZIP',eng,eng.stat().st_size,'SHA256',hashlib.sha256(eng.read_bytes()).hexdigest())
+          print('FINAL_MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
           PY
-      - uses: actions/upload-artifact@v4
-        if: always()
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
         with:
-          name: kxjskt-wuhan-fingu-inspection
-          path: out
-          retention-days: 3
+          name: wuhan-fingu-002194-broker-deep-reports-final
+          path: |
+            wuhan_fingu_002194_broker_deep_reports.zip
+            武汉凡谷_002194_券商深度报告_3份.zip
+          retention-days: 30
+          compression-level: 0
           if-no-files-found: error
