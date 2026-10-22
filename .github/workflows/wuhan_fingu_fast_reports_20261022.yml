@@ -1,0 +1,154 @@
+name: Fast Wuhan Fingu deep report package 20261022
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/wuhan_fingu_fast_reports_20261022.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pymupdf pypdf
+
+      - name: Fetch exact historical reports and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib,json,re,subprocess,time,zipfile
+          from pathlib import Path
+          import requests,pymupdf
+          from pypdf import PdfReader
+
+          root=Path('武汉凡谷_002194_券商深度报告_3份')
+          pdfdir=root/'原始PDF';prevdir=root/'首页预览'
+          for d in (root,pdfdir,prevdir):d.mkdir(parents=True,exist_ok=True)
+          s=requests.Session();s.trust_env=False
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          headers={'User-Agent':ua,'Referer':'https://data.eastmoney.com/report/','Accept':'application/json,text/plain,*/*'}
+          api='https://reportapi.eastmoney.com/report/list'
+          windows=[
+            ('2019-08-15','2019-08-23'),
+            ('2019-12-15','2019-12-22'),
+            ('2020-08-07','2020-08-14'),
+          ]
+          wanted=[
+            '5G核心器件基站滤波器',
+            '爆发前夜',
+            '5G基站天线及滤波器',
+            '产业链投资机会梳理',
+            '5G创新大周期',
+            '射频滤波器国产化机遇解析',
+          ]
+          candidates=[];seen=set();requests_log=[]
+          for begin,end in windows:
+            for qtype in ['1','0']:
+              total=1
+              for page in range(1,30):
+                if page>total:break
+                p={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':begin,'endTime':end,'pageNo':str(page),'fields':'','qType':qtype,'orgCode':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+                r=s.get(api,params=p,headers=headers,timeout=(15,90));requests_log.append({'url':r.url,'status':r.status_code,'bytes':len(r.content)})
+                if r.status_code!=200:break
+                o=r.json();total=int(o.get('TotalPage') or 1);rows=o.get('data') or []
+                if isinstance(rows,dict):rows=rows.get('list') or rows.get('data') or []
+                for row in rows:
+                  title=str(row.get('title') or '')
+                  if not any(k in title for k in wanted):continue
+                  info=str(row.get('infoCode') or '')
+                  if info and info not in seen:
+                    seen.add(info);candidates.append(row);print('MATCH',info,row.get('publishDate'),row.get('orgSName'),row.get('attachPages'),title)
+                if page>=total or len(rows)<100:break
+                time.sleep(.15)
+          (root/'候选元数据.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CANDIDATE_COUNT',len(candidates))
+          aliases=['武汉凡谷','武汉凡谷电子技术股份有限公司','002194','武漢凡谷']
+          results=[]
+          for row in candidates:
+            info=str(row.get('infoCode') or '')
+            detail=f'https://data.eastmoney.com/report/info/{info}.html'
+            data=None;pdfurl='';attempts=[]
+            for h in ['H3','H2','H1','H4']:
+              u=f'https://pdf.dfcfw.com/pdf/{h}_{info}_1.pdf'
+              rr=s.get(u,headers={'User-Agent':ua,'Referer':detail,'Accept':'application/pdf,*/*;q=0.8'},timeout=(20,180),allow_redirects=True)
+              attempts.append({'url':u,'status':rr.status_code,'bytes':len(rr.content),'type':rr.headers.get('content-type','')})
+              if rr.status_code==200 and rr.content[:5]==b'%PDF-' and len(rr.content)>80000:
+                data=rr.content;pdfurl=u;break
+            if not data:
+              results.append({'row':row,'downloaded':False,'attempts':attempts});continue
+            doc=pymupdf.open(stream=data,filetype='pdf');hit_pages=[];occ=0;snips=[]
+            for pno in range(doc.page_count):
+              text=doc.load_page(pno).get_text('text') or '';compact=re.sub(r'\s+','',text);ph={}
+              for a in aliases:
+                n=compact.count(re.sub(r'\s+','',a))
+                if n:
+                  ph[a]=n;occ+=n
+                  if len(snips)<20:
+                    pos=text.find(a)
+                    if pos>=0:snips.append({'page':pno+1,'alias':a,'text':' '.join(text[max(0,pos-180):pos+len(a)+420].split())})
+              if ph:hit_pages.append({'page':pno+1,'hits':ph})
+            pages=doc.page_count;doc.close()
+            substantive=(len(hit_pages)>=1 and occ>=2)
+            results.append({'row':row,'downloaded':True,'data':data,'pdf_url':pdfurl,'attempts':attempts,'pages':pages,'hit_pages':hit_pages,'occurrences':occ,'snippets':snips,'substantive':substantive,'sha256':hashlib.sha256(data).hexdigest()})
+            print('SCAN',info,'pages',pages,'hit_pages',len(hit_pages),'occ',occ,'substantive',substantive)
+          eligible=[x for x in results if x.get('substantive')]
+          eligible.sort(key=lambda x:(len(x['hit_pages']),x['occurrences'],x['pages']),reverse=True)
+          selected=[];titles=set()
+          for x in eligible:
+            t=str(x['row'].get('title') or '');norm=re.sub(r'\W+','',t)
+            if norm in titles:continue
+            selected.append(x);titles.add(norm)
+            if len(selected)==3:break
+          if len(selected)<2:
+            raise RuntimeError('Only '+str(len(selected))+' substantive reports found. Results='+json.dumps([{ 'title':x['row'].get('title'),'broker':x['row'].get('orgSName'),'pages':x.get('pages'),'hits':x.get('hit_pages'),'occ':x.get('occurrences'),'substantive':x.get('substantive')} for x in results],ensure_ascii=False))
+          def safe(t):return re.sub(r'[\\/:*?"<>|]+','_',re.sub(r'\s+',' ',t).strip())[:105]
+          manifest=[]
+          for i,x in enumerate(selected,1):
+            row=x['row'];broker=str(row.get('orgSName') or row.get('orgName') or '未知券商');date=str(row.get('publishDate') or '')[:10];title=str(row.get('title') or '')
+            fn=f'{i:02d}_{safe(broker)}_武汉凡谷相关深度_{safe(title)}_{date}.pdf';dest=pdfdir/fn;dest.write_bytes(x['data'])
+            pages=len(PdfReader(str(dest),strict=False).pages)
+            subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            pp=prevdir/dest.stem
+            subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(dest),str(pp)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            preview=Path(str(pp)+'.png')
+            manifest.append({'filename':str(Path('原始PDF')/fn),'broker':broker,'date':date,'title':title,'analysts':row.get('researcher') or row.get('author'),'pages':pages,'bytes':len(x['data']),'sha256':x['sha256'],'company_hit_pages':x['hit_pages'],'company_occurrences':x['occurrences'],'company_snippets':x['snippets'],'source_report_page':f'https://data.eastmoney.com/report/info/{row.get("infoCode")}.html','pdf_url':x['pdf_url'],'preview_file':str(Path('首页预览')/preview.name),'classification':'行业/产业链深度报告；正文明确分析武汉凡谷'})
+          lines=['武汉凡谷（002194.SZ）券商深度研究资料包','整理日期：2026-10-22','',f'收录{len(manifest)}份公开券商原始完整PDF。公开可直接取得的公司独立深度报告较少，本包选取5G射频、基站天线与滤波器深度报告，每份均经全文核验并明确分析武汉凡谷。','']
+          for i,x in enumerate(manifest,1):
+            hp='、'.join(str(v['page']) for v in x['company_hit_pages'])
+            lines += [f"{i}. {x['broker']}：《{x['title']}》",f"   日期：{x['date']}；分析师：{x['analysts']}；完整页数：{x['pages']}页",f"   武汉凡谷/002194命中：{x['company_occurrences']}次；页码：{hp}",f"   文件：{x['filename']}",f"   SHA-256：{x['sha256']}",'']
+          lines += ['报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。','已验证PDF文件头、页数、qpdf结构、全文公司命中、首页渲染和ZIP CRC。']
+          (root/'00_文件清单与说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest),encoding='utf-8')
+          (root/'request_log.json').write_text(json.dumps(requests_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          eng=Path('wuhan_fingu_002194_broker_deep_reports.zip');chi=Path('武汉凡谷_002194_券商深度报告_3份.zip')
+          with zipfile.ZipFile(eng,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(root.rglob('*')):
+              if p.is_file():z.write(p,arcname=f'{root.name}/{p.relative_to(root)}')
+          with zipfile.ZipFile(eng) as z:
+            bad=z.testzip();pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=len(manifest):raise RuntimeError(f'ZIP validation failed bad={bad} pdfs={len(pdfs)} manifest={len(manifest)}')
+          chi.write_bytes(eng.read_bytes())
+          print('FINAL_ZIP',eng,eng.stat().st_size,'SHA256',hashlib.sha256(eng.read_bytes()).hexdigest())
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-fast-deep-reports-final
+          path: |
+            wuhan_fingu_002194_broker_deep_reports.zip
+            武汉凡谷_002194_券商深度报告_3份.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
