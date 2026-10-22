@@ -1,0 +1,391 @@
+name: Build Wuhan Fingu 002194 reports 20261022
+
+on:
+  push:
+    paths:
+      - '.github/workflows/wuhan-fingu-002194-reports-20261022.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from typing import Any, Iterable
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '002194'
+          COMPANY = '武汉凡谷'
+          COMPANY_FULL = '武汉凡谷电子技术股份有限公司'
+          CUTOFF = '2026-10-22'
+          YEARS = list(range(2020, 2026))
+          PACKAGE_CN = '武汉凡谷_002194_2020-2025年报及最新季报'
+          PACKAGE_EN = 'wuhan_fingu_002194_2020_2025_annual_latest_quarterly'
+          ROOT = Path(PACKAGE_CN)
+          PDF_DIR = ROOT / '原始PDF'
+          PREVIEW_DIR = ROOT / '首页预览'
+          for d in (ROOT, PDF_DIR, PREVIEW_DIR):
+              d.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.trust_env = False
+          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          s.headers.update({
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www.cninfo.com.cn/',
+          })
+
+          def retry_get(url: str, *, timeout=(20, 180), headers=None) -> requests.Response:
+              last = None
+              for attempt in range(7):
+                  try:
+                      r = s.get(url, timeout=timeout, headers=headers, allow_redirects=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code} {url} {r.text[:200]}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'GET failed {url}: {last!r}')
+
+          def recursive_dicts(obj: Any) -> Iterable[dict[str, Any]]:
+              if isinstance(obj, dict):
+                  yield obj
+                  for v in obj.values():
+                      yield from recursive_dicts(v)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      yield from recursive_dicts(v)
+
+          # Resolve CNINFO organization id from the official Shenzhen stock list.
+          stock_json = retry_get('https://www.cninfo.com.cn/new/data/szse_stock.json', timeout=(20, 120)).json()
+          org_id = None
+          stock_entry = None
+          for row in recursive_dicts(stock_json):
+              row_code = str(row.get('code') or row.get('secCode') or row.get('stockCode') or '')
+              if row_code == CODE:
+                  stock_entry = row
+                  org_id = str(row.get('orgId') or row.get('orgid') or row.get('org_id') or '') or None
+                  if org_id:
+                      break
+          if not org_id:
+              raise RuntimeError(f'Could not resolve CNINFO org id for {CODE}; matching entry={stock_entry!r}')
+          stock_param = f'{CODE},{org_id}'
+          print('CNINFO_STOCK', CODE, org_id, stock_entry)
+
+          query_url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          post_headers = {
+              'User-Agent': ua,
+              'Referer': 'https://www.cninfo.com.cn/new/commonUrl?url=disclosure/list/notice',
+              'Origin': 'https://www.cninfo.com.cn',
+              'X-Requested-With': 'XMLHttpRequest',
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'Accept': 'application/json, text/javascript, */*; q=0.01',
+          }
+
+          announcements: list[dict[str, Any]] = []
+          seen_ids: set[str] = set()
+          page = 1
+          while page <= 80:
+              form = {
+                  'pageNum': str(page),
+                  'pageSize': '30',
+                  'column': 'szse',
+                  'tabName': 'fulltext',
+                  'plate': 'sz',
+                  'stock': stock_param,
+                  'searchkey': '',
+                  'secid': '',
+                  'category': '',
+                  'trade': '',
+                  'seDate': f'2020-01-01~{CUTOFF}',
+                  'sortName': '',
+                  'sortType': '',
+                  'isHLtitle': 'true',
+              }
+              payload = None
+              last = None
+              for attempt in range(7):
+                  try:
+                      r = s.post(query_url, data=form, headers=post_headers, timeout=(20, 180))
+                      last = {'status': r.status_code, 'bytes': len(r.content), 'prefix': r.text[:300]}
+                      if r.status_code == 200:
+                          payload = r.json()
+                          break
+                  except Exception as exc:
+                      last = {'error': repr(exc)}
+                  time.sleep(1 + attempt)
+              if payload is None:
+                  raise RuntimeError(f'CNINFO query failed page {page}: {last}')
+              rows = payload.get('announcements') or []
+              if not rows:
+                  break
+              for row in rows:
+                  ann_id = str(row.get('announcementId') or row.get('id') or row.get('adjunctUrl') or '')
+                  if ann_id and ann_id not in seen_ids:
+                      seen_ids.add(ann_id)
+                      announcements.append(row)
+              total_pages = int(payload.get('totalpages') or payload.get('totalPages') or 0)
+              print('CNINFO_PAGE', page, 'ROWS', len(rows), 'TOTAL_PAGES', total_pages)
+              if total_pages and page >= total_pages:
+                  break
+              if len(rows) < 30 and not total_pages:
+                  break
+              page += 1
+              time.sleep(0.12)
+
+          if not announcements:
+              raise RuntimeError('CNINFO returned no announcements for the company/date range')
+
+          def clean_title(value: Any) -> str:
+              x = html.unescape(str(value or ''))
+              x = re.sub(r'<[^>]+>', '', x)
+              return re.sub(r'\s+', '', x)
+
+          def ann_dt(row: dict[str, Any]) -> datetime:
+              v = row.get('announcementTime')
+              try:
+                  n = int(v)
+                  if n > 10_000_000_000:
+                      n /= 1000
+                  return datetime.fromtimestamp(n, tz=timezone.utc).astimezone(timezone(timedelta(hours=8)))
+              except Exception:
+                  pass
+              for k in ('announcementDate', 'adjunctTime', 'publishDate'):
+                  txt = str(row.get(k) or '')[:19]
+                  for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                      try:
+                          return datetime.strptime(txt, fmt).replace(tzinfo=timezone(timedelta(hours=8)))
+                      except Exception:
+                          continue
+              return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+          def pdf_url(row: dict[str, Any]) -> str:
+              adjunct = str(row.get('adjunctUrl') or row.get('url') or '').strip()
+              if not adjunct:
+                  raise RuntimeError(f'Announcement has no PDF URL: {row}')
+              return urljoin('https://static.cninfo.com.cn/', adjunct)
+
+          def annual_candidates(year: int) -> list[dict[str, Any]]:
+              include = f'{year}年年度报告'
+              excluded = ('摘要', '英文', '审计报告', '鉴证报告', '审核报告', '更正公告', '取消',
+                          '提示性公告', '问询函', '回复', '说明', '内部控制', '社会责任', '董事会')
+              out = []
+              for row in announcements:
+                  title = clean_title(row.get('announcementTitle'))
+                  if include not in title or any(x in title for x in excluded):
+                      continue
+                  score = 0
+                  if title == include:
+                      score += 100
+                  if any(x in title for x in ('更新后', '更正后', '修订稿', '修订版')):
+                      score += 150
+                  score += int(ann_dt(row).timestamp() / 86400)
+                  out.append({**row, '_title': title, '_score': score})
+              return sorted(out, key=lambda x: (x['_score'], ann_dt(x)), reverse=True)
+
+          quarter_pattern = re.compile(r'2026年(?:第一季度报告|第三季度报告)')
+          quarter_excluded = ('更正公告', '取消', '提示性公告', '问询函', '回复', '英文')
+          q_candidates = []
+          for row in announcements:
+              title = clean_title(row.get('announcementTitle'))
+              if not quarter_pattern.search(title) or any(x in title for x in quarter_excluded):
+                  continue
+              period_score = 3 if '第三季度报告' in title else 1
+              revision_score = 10 if any(x in title for x in ('更新后', '更正后', '修订稿', '修订版')) else 0
+              q_candidates.append({**row, '_title': title, '_score': period_score * 1_000_000 + revision_score * 10_000 + int(ann_dt(row).timestamp() / 86400)})
+          q_candidates.sort(key=lambda x: (x['_score'], ann_dt(x)), reverse=True)
+
+          candidate_dump = {
+              'annual': {str(y): [{
+                  'title': x['_title'], 'announcementTime': ann_dt(x).isoformat(),
+                  'adjunctUrl': x.get('adjunctUrl'), 'announcementId': x.get('announcementId')
+              } for x in annual_candidates(y)] for y in YEARS},
+              'quarterly_2026': [{
+                  'title': x['_title'], 'announcementTime': ann_dt(x).isoformat(),
+                  'adjunctUrl': x.get('adjunctUrl'), 'announcementId': x.get('announcementId')
+              } for x in q_candidates],
+          }
+          (ROOT / '候选公告筛选记录.json').write_text(json.dumps(candidate_dump, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def download_and_validate(row: dict[str, Any], min_pages: int) -> tuple[bytes, int, str, str]:
+              url = pdf_url(row)
+              headers = {
+                  'User-Agent': ua,
+                  'Referer': 'https://www.cninfo.com.cn/',
+                  'Accept': 'application/pdf,*/*;q=0.8',
+              }
+              r = retry_get(url, timeout=(30, 420), headers=headers)
+              data = r.content
+              if data[:5] != b'%PDF-' or len(data) < 80_000:
+                  raise RuntimeError(f'Invalid PDF response {url}: status={r.status_code} bytes={len(data)} prefix={data[:20]!r}')
+              tmp = ROOT / '_validation_tmp.pdf'
+              tmp.write_bytes(data)
+              reader = PdfReader(str(tmp), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'Too few pages: {pages} < {min_pages} for {url}')
+              text = ''
+              for p in reader.pages[:min(8, pages)]:
+                  try:
+                      text += '\n' + (p.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', text)
+              if len(compact) > 500 and not any(x in compact for x in (COMPANY, COMPANY_FULL, CODE)):
+                  raise RuntimeError(f'Issuer identity mismatch for {url}')
+              subprocess.run(['qpdf', '--warning-exit-0', '--check', str(tmp)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              tmp.unlink(missing_ok=True)
+              return data, pages, url, r.url
+
+          manifest: list[dict[str, Any]] = []
+          sequence = 1
+
+          for year in YEARS:
+              candidates = annual_candidates(year)
+              if not candidates:
+                  raise RuntimeError(f'No full annual report candidate found for {year}; candidate dump written')
+              errors = []
+              selected = None
+              for cand in candidates:
+                  try:
+                      data, pages, source_url, final_url = download_and_validate(cand, min_pages=70)
+                      selected = (cand, data, pages, source_url, final_url)
+                      break
+                  except Exception as exc:
+                      errors.append({'title': cand['_title'], 'url': pdf_url(cand), 'error': repr(exc)})
+              if selected is None:
+                  raise RuntimeError(f'All {year} annual report candidates failed: {errors}')
+              cand, data, pages, source_url, final_url = selected
+              title = cand['_title']
+              filename = f'{sequence:02d}_{COMPANY}_{title}.pdf'
+              dest = PDF_DIR / filename
+              dest.write_bytes(data)
+              prefix = PREVIEW_DIR / dest.stem
+              subprocess.run(['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(dest), str(prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'Preview render failed for {filename}')
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  'type': 'annual_report', 'report_year': year, 'title': title,
+                  'filename': str(Path('原始PDF') / filename), 'pages': pages, 'bytes': len(data),
+                  'announcement_date': ann_dt(cand).strftime('%Y-%m-%d'),
+                  'announcement_id': cand.get('announcementId'), 'source_url': source_url,
+                  'final_url': final_url, 'sha256': sha,
+                  'preview_file': str(Path('首页预览') / preview.name),
+              })
+              sequence += 1
+
+          if not q_candidates:
+              raise RuntimeError('No 2026 first/third-quarter report candidate found')
+          q_errors = []
+          q_selected = None
+          for cand in q_candidates:
+              try:
+                  data, pages, source_url, final_url = download_and_validate(cand, min_pages=5)
+                  q_selected = (cand, data, pages, source_url, final_url)
+                  break
+              except Exception as exc:
+                  q_errors.append({'title': cand['_title'], 'url': pdf_url(cand), 'error': repr(exc)})
+          if q_selected is None:
+              raise RuntimeError(f'All quarterly candidates failed: {q_errors}')
+          cand, data, pages, source_url, final_url = q_selected
+          q_title = cand['_title']
+          filename = f'{sequence:02d}_{COMPANY}_{q_title}.pdf'
+          dest = PDF_DIR / filename
+          dest.write_bytes(data)
+          prefix = PREVIEW_DIR / dest.stem
+          subprocess.run(['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(dest), str(prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          preview = Path(str(prefix) + '.png')
+          if not preview.exists() or preview.stat().st_size < 10_000:
+              raise RuntimeError(f'Preview render failed for {filename}')
+          sha = hashlib.sha256(data).hexdigest()
+          manifest.append({
+              'type': 'latest_quarterly_report', 'report_year': 2026, 'title': q_title,
+              'filename': str(Path('原始PDF') / filename), 'pages': pages, 'bytes': len(data),
+              'announcement_date': ann_dt(cand).strftime('%Y-%m-%d'),
+              'announcement_id': cand.get('announcementId'), 'source_url': source_url,
+              'final_url': final_url, 'sha256': sha,
+              'preview_file': str(Path('首页预览') / preview.name),
+          })
+
+          total_pages = sum(x['pages'] for x in manifest)
+          lines = [
+              f'{COMPANY_FULL}（{CODE}.SZ）2020—2025年报及最新季报资料包',
+              f'整理截止日期：{CUTOFF}', '',
+              f'本包共收录{len(manifest)}份原始PDF，合计{total_pages}页。',
+              '口径：2020—2025年年度报告全文各1份；最新季报为截至整理日已披露的2026年第一季度或第三季度报告中期间最新者。', '',
+          ]
+          for i, x in enumerate(manifest, 1):
+              lines += [
+                  f"{i}. {x['title']}",
+                  f"   公告日期：{x['announcement_date']}；页数：{x['pages']}；文件：{x['filename']}",
+                  f"   来源：{x['source_url']}",
+                  f"   SHA-256：{x['sha256']}", '',
+              ]
+          lines += [
+              '所有PDF均来自巨潮资讯网披露文件。',
+              '已核验项目：PDF文件头、实际页数、公司名称/证券代码、qpdf文档结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest), encoding='utf-8')
+
+          zip_en = Path(PACKAGE_EN + '.zip')
+          with zipfile.ZipFile(zip_en, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{ROOT.name}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_en) as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP validation failed bad={bad} pdfs={len(pdfs)}')
+          zip_cn = Path(PACKAGE_CN + '.zip')
+          zip_cn.write_bytes(zip_en.read_bytes())
+          zip_sha = hashlib.sha256(zip_en.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_en, zip_en.stat().st_size, 'SHA256', zip_sha)
+          print('LATEST_QUARTER', q_title, 'PAGES', pages, 'ANNOUNCEMENT_DATE', ann_dt(cand).strftime('%Y-%m-%d'))
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-002194-reports-final
+          path: |
+            wuhan_fingu_002194_2020_2025_annual_latest_quarterly.zip
+            武汉凡谷_002194_2020-2025年报及最新季报.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
