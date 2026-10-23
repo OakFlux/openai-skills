@@ -1,0 +1,151 @@
+name: Recover Wuhan Fingu report from public web archives
+
+on:
+  push:
+    branches:
+      - tmp/wuhan-fingu-broker-reports-20261023-v1
+    paths:
+      - .github/workflows/wuhan-fingu-archive-recovery-20261023-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  archive-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Query Internet Archive and Common Crawl
+        run: |
+          python -m pip install --quiet requests warcio beautifulsoup4
+          mkdir -p out/wayback out/commoncrawl out/extracted
+          python - <<'PY'
+          import gzip, hashlib, io, json, re, traceback
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from warcio.archiveiterator import ArchiveIterator
+
+          OUT=Path('out')
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/155 Safari/537.36'})
+          targets=[
+            'https://bg.sgpjbg.com/baogao/16990.html',
+            'http://bg.sgpjbg.com/baogao/16990.html',
+            'https://www.sgpjbg.com/baogao/16990.html',
+            'http://www.sgpjbg.com/baogao/16990.html',
+            'https://bg.sgpjbg.com/bgdown/16990.html',
+            'http://bg.sgpjbg.com/bgdown/16990.html',
+            'https://www.sgpjbg.com/bgdown/16990.html',
+            'http://www.sgpjbg.com/bgdown/16990.html',
+          ]
+
+          def safe(x): return re.sub(r'[^A-Za-z0-9._-]+','_',x)[:180]
+          def save_payload(folder,name,data):
+              p=OUT/folder/name; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(data); return p
+          def analyze(data,base,label):
+              rec={'label':label,'bytes':len(data),'magic':data[:16].hex(),'sha256':hashlib.sha256(data).hexdigest()}
+              if data.startswith(b'%PDF-'):
+                  p=save_payload('extracted',safe(label)+'.pdf',data); rec['saved']=str(p)
+              else:
+                  text=data.decode('utf-8','replace')
+                  p=save_payload('extracted',safe(label)+'.html',data); rec['saved']=str(p)
+                  soup=BeautifulSoup(text,'html.parser')
+                  links=[]
+                  for tag in soup.find_all(True):
+                      for a in ['href','src','data-src','data-url','data-href','content']:
+                          v=tag.get(a)
+                          if not v: continue
+                          u=urljoin(base,v)
+                          low=(u+' '+tag.get_text(' ',strip=True)).lower()
+                          if any(k in low for k in ['.pdf','16990','bgdown','download','attach','file','preview']): links.append(u)
+                  # Also regex absolute/relative URLs in scripts.
+                  for m in re.findall(r'''(?i)(https?://[^\s"'<>]+|/[A-Za-z0-9_./?=&%-]*(?:16990|\.pdf)[A-Za-z0-9_./?=&%-]*)''',text):
+                      links.append(urljoin(base,m))
+                  rec['links']=list(dict.fromkeys(links))[:1000]
+                  rec['text']=' '.join(soup.get_text(' ',strip=True).split())[:8000]
+              return rec
+
+          results={'wayback':[],'commoncrawl':[]}
+          # Internet Archive CDX.
+          for ti,t in enumerate(targets):
+              try:
+                  params={'url':t,'output':'json','filter':'statuscode:200','fl':'timestamp,original,statuscode,mimetype,digest,length','collapse':'digest'}
+                  r=s.get('https://web.archive.org/cdx/search/cdx',params=params,timeout=(20,120))
+                  info={'target':t,'status':r.status_code,'bytes':len(r.content),'url':r.url,'body':r.text[:2000]}
+                  print('CDX',json.dumps(info,ensure_ascii=False))
+                  rows=r.json() if r.status_code==200 else []
+                  if rows and isinstance(rows[0],list):
+                      headers=rows[0]
+                      for j,row in enumerate(rows[1:][-12:]):
+                          d=dict(zip(headers,row)); ts=d.get('timestamp')
+                          snap=f'https://web.archive.org/web/{ts}id_/{d.get("original",t)}'
+                          try:
+                              rr=s.get(snap,timeout=(20,180),allow_redirects=True)
+                              a=analyze(rr.content,rr.url,f'wayback_{ti}_{j}_{ts}')
+                              a.update({'target':t,'snapshot':snap,'status':rr.status_code,'final':rr.url,'ctype':rr.headers.get('content-type'),'cdx':d})
+                              results['wayback'].append(a)
+                              print('WAYBACK',json.dumps(a,ensure_ascii=False)[:12000])
+                          except Exception as e:
+                              results['wayback'].append({'target':t,'snapshot':snap,'error':repr(e)})
+              except Exception as e:
+                  results['wayback'].append({'target':t,'cdx_error':repr(e),'traceback':traceback.format_exc()})
+
+          # Common Crawl recent indexes.
+          try:
+              ci=s.get('https://index.commoncrawl.org/collinfo.json',timeout=(20,120)).json()
+          except Exception as e:
+              ci=[]; results['commoncrawl'].append({'collinfo_error':repr(e)})
+          indexes=[x.get('id') for x in ci[:20] if x.get('id')]
+          print('INDEXES',indexes)
+          for index in indexes:
+              endpoint=f'https://index.commoncrawl.org/{index}-index'
+              for ti,t in enumerate(targets):
+                  try:
+                      rr=s.get(endpoint,params={'url':t,'output':'json','filter':'status:200'},timeout=(20,120))
+                      if rr.status_code!=200 or not rr.text.strip(): continue
+                      lines=[json.loads(x) for x in rr.text.splitlines() if x.strip().startswith('{')]
+                      for j,d in enumerate(lines[-8:]):
+                          fn=d.get('filename'); off=int(d.get('offset',0)); length=int(d.get('length',0))
+                          if not fn or length<=0: continue
+                          u='https://data.commoncrawl.org/'+fn
+                          h={'Range':f'bytes={off}-{off+length-1}'}
+                          wr=s.get(u,headers=h,timeout=(20,240))
+                          raw=wr.content
+                          try: stream=gzip.GzipFile(fileobj=io.BytesIO(raw))
+                          except Exception: stream=io.BytesIO(raw)
+                          payload=None; warc_headers={}; http_headers={}
+                          try:
+                              for record in ArchiveIterator(stream):
+                                  if record.rec_type in ('response','resource'):
+                                      payload=record.content_stream().read()
+                                      warc_headers=dict(record.rec_headers.headers)
+                                      if record.http_headers: http_headers=dict(record.http_headers.headers)
+                                      break
+                          except Exception as e:
+                              print('WARC_ERROR',index,t,repr(e))
+                          if payload is None: continue
+                          a=analyze(payload,t,f'cc_{index}_{ti}_{j}')
+                          a.update({'index':index,'target':t,'record':d,'warc_headers':warc_headers,'http_headers':http_headers})
+                          results['commoncrawl'].append(a)
+                          print('CC',json.dumps(a,ensure_ascii=False)[:12000])
+                  except Exception as e:
+                      # Keep only actual error text in log; don't flood JSON for empty indexes.
+                      if '404' not in repr(e): print('CC_QUERY_ERROR',index,t,repr(e))
+
+          (OUT/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('EXTRACTED',[(p.name,p.stat().st_size) for p in (OUT/'extracted').glob('*')])
+          PY
+          find out -type f -printf '%p\t%s bytes\n' | sort
+
+      - name: Upload archive recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-web-archive-recovery
+          path: out
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
