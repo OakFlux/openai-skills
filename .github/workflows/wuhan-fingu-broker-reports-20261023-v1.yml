@@ -1,0 +1,223 @@
+name: Collect Wuhan Fingu public broker report PDFs
+
+on:
+  push:
+    branches:
+      - tmp/wuhan-fingu-broker-reports-20261023-v1
+    paths:
+      - .github/workflows/wuhan-fingu-broker-reports-20261023-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Search metadata and download original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pdfs out/previews
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import quote
+
+          import requests
+          from pypdf import PdfReader
+
+          ROOT = Path('out')
+          PDF_DIR = ROOT / 'pdfs'
+          PREVIEW_DIR = ROOT / 'previews'
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def get_json(url: str):
+              last = None
+              for attempt in range(4):
+                  try:
+                      r = s.get(url, timeout=(20, 180), allow_redirects=True)
+                      print('JSON', r.status_code, len(r.content), r.url)
+                      r.raise_for_status()
+                      return r.json()
+                  except Exception as exc:
+                      last = exc
+                      print('JSON_ERROR', url, attempt, repr(exc))
+                      time.sleep(2 + attempt)
+              raise last
+
+          all_matches = []
+          for year in range(2017, 2027):
+              urls = [
+                  f'https://raw.githubusercontent.com/metatools2023/reportlists/main/site/data/index-{year}.json',
+                  f'https://reportlists.pages.dev/data/index-{year}.json',
+              ]
+              data = None
+              for url in urls:
+                  try:
+                      data = get_json(url)
+                      break
+                  except Exception:
+                      continue
+              if not data:
+                  print('NO_INDEX', year)
+                  continue
+              for r in data.get('reports', []):
+                  title = str(r.get('t') or '')
+                  stock = str(r.get('s') or '')
+                  if stock == '武汉凡谷' or '武汉凡谷' in title or '002194' in title:
+                      item = {
+                          'year': year,
+                          'infoCode': str(r.get('i') or ''),
+                          'publishDate': str(r.get('d') or ''),
+                          'title': title,
+                          'org': str(r.get('o') or ''),
+                          'industry': str(r.get('n') or ''),
+                          'rating': str(r.get('r') or ''),
+                          'researcher': str(r.get('a') or ''),
+                          'stock': stock,
+                          'qType': r.get('q'),
+                      }
+                      if item['infoCode'] and not any(x['infoCode'] == item['infoCode'] for x in all_matches):
+                          all_matches.append(item)
+
+          all_matches.sort(key=lambda x: (x['publishDate'], x['infoCode']), reverse=True)
+          print('MATCH_COUNT', len(all_matches))
+          for x in all_matches:
+              print('MATCH', json.dumps(x, ensure_ascii=False))
+          (ROOT / 'matches.json').write_text(json.dumps(all_matches, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def safe_name(text: str, limit: int = 80) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', text).strip(' ._')
+              return text[:limit] or 'report'
+
+          inventory = []
+          for idx, meta in enumerate(all_matches, 1):
+              code = meta['infoCode']
+              candidates = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{code}_1.pdf',
+              ]
+              downloaded = None
+              attempts = []
+              for url in candidates:
+                  try:
+                      rr = s.get(
+                          url,
+                          timeout=(20, 240),
+                          allow_redirects=True,
+                          headers={
+                              'Referer': 'https://reportlists.pages.dev/',
+                              'Accept': 'application/pdf,*/*;q=0.8',
+                          },
+                      )
+                      rec = {
+                          'url': url,
+                          'status': rr.status_code,
+                          'bytes': len(rr.content),
+                          'contentType': rr.headers.get('content-type', ''),
+                          'magic': rr.content[:8].hex(),
+                          'finalUrl': rr.url,
+                      }
+                      attempts.append(rec)
+                      print('PDF_PROBE', json.dumps(rec, ensure_ascii=False))
+                      if rr.status_code == 200 and rr.content.startswith(b'%PDF-') and len(rr.content) > 20000:
+                          downloaded = (url, rr.content)
+                          break
+                  except Exception as exc:
+                      attempts.append({'url': url, 'error': repr(exc)})
+                      print('PDF_ERROR', url, repr(exc))
+
+              item = dict(meta)
+              item['downloadAttempts'] = attempts
+              if not downloaded:
+                  item['downloaded'] = False
+                  inventory.append(item)
+                  continue
+
+              url, content = downloaded
+              filename = (
+                  f"{idx:02d}_{safe_name(meta['publishDate'])}_{safe_name(meta['org'])}_"
+                  f"{safe_name(meta['title'], 95)}_{code}.pdf"
+              )
+              path = PDF_DIR / filename
+              path.write_bytes(content)
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  pages = len(reader.pages)
+                  encrypted = bool(reader.is_encrypted)
+                  sample_parts = []
+                  for pno in range(min(3, pages)):
+                      try:
+                          sample_parts.append(reader.pages[pno].extract_text() or '')
+                      except Exception as exc:
+                          sample_parts.append(f'[EXTRACT_ERROR {exc!r}]')
+                  sample = '\n'.join(sample_parts)
+                  valid = pages > 0
+              except Exception as exc:
+                  pages = 0
+                  encrypted = None
+                  sample = ''
+                  valid = False
+                  item['parseError'] = repr(exc)
+
+              item.update({
+                  'downloaded': True,
+                  'downloadUrl': url,
+                  'filename': filename,
+                  'bytes': len(content),
+                  'sha256': hashlib.sha256(content).hexdigest(),
+                  'pages': pages,
+                  'encrypted': encrypted,
+                  'validPdf': valid,
+                  'sampleText': sample[:6000],
+              })
+              inventory.append(item)
+
+          (ROOT / 'inventory.json').write_text(json.dumps(inventory, ensure_ascii=False, indent=2), encoding='utf-8')
+          summary = []
+          for x in inventory:
+              summary.append({k: x.get(k) for k in [
+                  'publishDate','org','researcher','rating','title','infoCode','downloaded','filename','pages','bytes','sha256','downloadUrl'
+              ]})
+          (ROOT / 'inventory_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('DOWNLOADED', sum(1 for x in inventory if x.get('downloaded')), 'OF', len(inventory))
+          PY
+
+          for f in out/pdfs/*.pdf; do
+            [ -e "$f" ] || continue
+            echo "===== $f ====="
+            pdfinfo "$f" | sed -n '1,25p'
+            qpdf --check "$f"
+            base=$(basename "$f" .pdf)
+            pdftoppm -f 1 -l 1 -r 120 -png -singlefile "$f" "out/previews/$base" >/dev/null 2>&1
+          done
+          find out -maxdepth 2 -type f -printf '%p\t%s bytes\n' | sort
+
+      - name: Upload collection
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-public-broker-reports-collection
+          path: out
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
