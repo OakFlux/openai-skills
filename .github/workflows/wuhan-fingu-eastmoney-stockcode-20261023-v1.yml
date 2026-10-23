@@ -1,0 +1,143 @@
+name: Download Wuhan Fingu reports by exact stock code
+
+on:
+  push:
+    branches:
+      - tmp/wuhan-fingu-broker-reports-20261023-v1
+    paths:
+      - .github/workflows/wuhan-fingu-eastmoney-stockcode-20261023-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Query exact stock code and download PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pdfs out/previews
+          python - <<'PY'
+          import csv, hashlib, json, re, time
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('out'); PDF=OUT/'pdfs'
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/',
+              'Accept':'application/json,text/plain,*/*',
+          })
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          all_rows=[]; request_log=[]
+          # Split ranges to avoid any server date-window limits.
+          ranges=[('2007-01-01','2012-12-31'),('2013-01-01','2018-12-31'),('2019-01-01','2022-12-31'),('2023-01-01','2026-10-23')]
+          for begin,end in ranges:
+              for page in range(1,30):
+                  params={
+                      'industryCode':'*','pageSize':100,'industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':begin,'endTime':end,'pageNo':page,'fields':'','qType':0,
+                      'orgCode':'','rcode':'','stockCodes':'002194','_':int(time.time()*1000),
+                  }
+                  try:
+                      r=s.get(endpoint,params=params,timeout=(20,120))
+                      request_log.append({'range':[begin,end],'page':page,'status':r.status_code,'bytes':len(r.content),'url':r.url,'head':r.text[:200]})
+                      print('REQ',r.status_code,len(r.content),r.url)
+                      r.raise_for_status()
+                      obj=r.json(); rows=obj.get('data') or []
+                      for x in rows:
+                          # Defensive verification: exact security only.
+                          if str(x.get('stockCode') or '')=='002194' or str(x.get('stockName') or '')=='武汉凡谷':
+                              all_rows.append(x)
+                      pages=int(obj.get('TotalPage') or 0)
+                      print('PAGE_DATA',len(rows),'TOTAL_PAGES',pages,'HITS',obj.get('hits'))
+                      if page>=max(1,pages) or not rows: break
+                  except Exception as e:
+                      request_log.append({'range':[begin,end],'page':page,'error':repr(e)})
+                      print('ERR',begin,end,page,repr(e)); break
+
+          dedup={str(x.get('infoCode') or ''):x for x in all_rows if x.get('infoCode')}
+          rows=sorted(dedup.values(),key=lambda x:(str(x.get('publishDate') or ''),str(x.get('infoCode') or '')),reverse=True)
+          (OUT/'metadata.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'request_log.json').write_text(json.dumps(request_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('EXACT_MATCHES',len(rows))
+          for x in rows: print('META',json.dumps(x,ensure_ascii=False)[:8000])
+
+          def safe(s,limit=105):
+              return re.sub(r'[\\/:*?"<>|\r\n\t]+','_',str(s or '')).strip(' ._')[:limit] or 'report'
+
+          inv=[]
+          for idx,x in enumerate(rows,1):
+              code=str(x.get('infoCode') or '')
+              candidates=[
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{code}_1.pdf',
+              ]
+              attempts=[]; saved=None
+              for u in candidates:
+                  try:
+                      rr=s.get(u,timeout=(20,240),allow_redirects=True,headers={'Referer':'https://data.eastmoney.com/'})
+                      a={'url':u,'status':rr.status_code,'bytes':len(rr.content),'ctype':rr.headers.get('content-type'),'magic':rr.content[:12].hex(),'final':rr.url}
+                      attempts.append(a); print('PDF_PROBE',json.dumps(a,ensure_ascii=False))
+                      if rr.status_code==200 and rr.content.startswith(b'%PDF-') and len(rr.content)>20000:
+                          day=str(x.get('publishDate') or '')[:10]
+                          org=str(x.get('orgSName') or x.get('orgName') or '')
+                          title=str(x.get('title') or '')
+                          fn=f'{idx:02d}_{safe(day)}_{safe(org)}_{safe(title)}_{code}.pdf'
+                          p=PDF/fn; p.write_bytes(rr.content)
+                          reader=PdfReader(str(p),strict=False)
+                          pages=len(reader.pages); encrypted=bool(reader.is_encrypted)
+                          sample=[]
+                          for n in range(min(4,pages)):
+                              try: sample.append(reader.pages[n].extract_text() or '')
+                              except Exception as e: sample.append(f'[EXTRACT_ERROR {e!r}]')
+                          saved={
+                              'filename':fn,'downloadUrl':u,'bytes':len(rr.content),'pages':pages,
+                              'encrypted':encrypted,'sha256':hashlib.sha256(rr.content).hexdigest(),
+                              'sampleText':'\n'.join(sample)[:12000],
+                          }
+                          break
+                  except Exception as e:
+                      attempts.append({'url':u,'error':repr(e)})
+              inv.append({'metadata':x,'attempts':attempts,'saved':saved})
+          (OUT/'inventory.json').write_text(json.dumps(inv,ensure_ascii=False,indent=2),encoding='utf-8')
+          with (OUT/'inventory.csv').open('w',newline='',encoding='utf-8-sig') as f:
+              w=csv.writer(f); w.writerow(['date','broker','analyst','rating','title','infoCode','pages','bytes','filename','sha256','downloadUrl'])
+              for z in inv:
+                  x=z['metadata']; y=z['saved'] or {}
+                  w.writerow([str(x.get('publishDate') or '')[:10],x.get('orgSName') or x.get('orgName'),x.get('researcher'),x.get('emRatingName') or x.get('sRatingName'),x.get('title'),x.get('infoCode'),y.get('pages'),y.get('bytes'),y.get('filename'),y.get('sha256'),y.get('downloadUrl')])
+          print('DOWNLOADED',sum(1 for z in inv if z['saved']),'OF',len(inv))
+          PY
+
+          for f in out/pdfs/*.pdf; do
+            [ -e "$f" ] || continue
+            echo "===== $f ====="
+            pdfinfo "$f" | sed -n '1,30p'
+            qpdf --check "$f"
+            base=$(basename "$f" .pdf)
+            pdftoppm -f 1 -l 1 -r 120 -png -singlefile "$f" "out/previews/$base" >/dev/null 2>&1
+          done
+          find out -type f -printf '%p\t%s bytes\n' | sort
+
+      - name: Upload exact-stock reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-eastmoney-exact-stockcode
+          path: out
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
