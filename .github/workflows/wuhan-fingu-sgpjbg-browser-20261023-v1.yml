@@ -1,0 +1,199 @@
+name: Probe Wuhan Fingu SGPJBG report with browser
+
+on:
+  push:
+    branches:
+      - tmp/wuhan-fingu-broker-reports-20261023-v1
+    paths:
+      - .github/workflows/wuhan-fingu-sgpjbg-browser-20261023-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf curl openssl
+          python -m pip install --quiet selenium requests beautifulsoup4
+          which google-chrome || which chromium || which chromium-browser || true
+          google-chrome --version || chromium --version || true
+
+      - name: Browser and network probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/downloads out/screens out/html out/logs
+          python - <<'PY'
+          import json, os, re, time, hashlib, traceback
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+
+          OUT=Path('out')
+          DOWNLOAD=(OUT/'downloads').resolve()
+          urls=[
+            'https://www.sgpjbg.com/labels/dianyuanemiluboqi.html',
+            'https://bg.sgpjbg.com/zhuanti/xintiandichanjituanbaogao.html',
+            'https://bg.sgpjbg.com/baogao/16990.html',
+            'https://www.sgpjbg.com/baogao/16990.html',
+            'https://bg.sgpjbg.com/bgdown/16990.html',
+            'http://bg.sgpjbg.com/baogao/16990.html',
+            'http://bg.sgpjbg.com/bgdown/16990.html',
+          ]
+
+          def make_driver(hostmap=False):
+              options=Options()
+              options.add_argument('--headless=new')
+              options.add_argument('--no-sandbox')
+              options.add_argument('--disable-dev-shm-usage')
+              options.add_argument('--disable-gpu')
+              options.add_argument('--ignore-certificate-errors')
+              options.add_argument('--allow-insecure-localhost')
+              options.add_argument('--disable-blink-features=AutomationControlled')
+              options.add_argument('--window-size=1440,1600')
+              options.add_argument('--lang=zh-CN')
+              options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36')
+              if hostmap:
+                  options.add_argument('--host-resolver-rules=MAP bg.sgpjbg.com 113.240.68.55, MAP www.sgpjbg.com 113.240.68.55')
+              options.set_capability('goog:loggingPrefs', {'performance':'ALL','browser':'ALL'})
+              options.add_experimental_option('prefs', {
+                  'download.default_directory': str(DOWNLOAD),
+                  'download.prompt_for_download': False,
+                  'download.directory_upgrade': True,
+                  'plugins.always_open_pdf_externally': True,
+                  'safebrowsing.enabled': True,
+              })
+              d=webdriver.Chrome(options=options)
+              d.set_page_load_timeout(75)
+              try:
+                  d.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior':'allow','downloadPath':str(DOWNLOAD)})
+              except Exception:
+                  pass
+              return d
+
+          all_records=[]
+          candidate_urls=set()
+          cookie_jar=[]
+          for mode in ['normal','hostmap']:
+              try:
+                  driver=make_driver(hostmap=(mode=='hostmap'))
+              except Exception as e:
+                  (OUT/'logs'/f'driver_{mode}.txt').write_text(traceback.format_exc(),encoding='utf-8')
+                  continue
+              try:
+                  for idx,u in enumerate(urls):
+                      rec={'mode':mode,'requested':u}
+                      try:
+                          t=time.time()
+                          driver.get(u)
+                          time.sleep(5)
+                          rec.update({
+                              'elapsed':round(time.time()-t,2),
+                              'current_url':driver.current_url,
+                              'title':driver.title,
+                              'source_len':len(driver.page_source),
+                          })
+                          source=driver.page_source
+                          (OUT/'html'/f'{mode}_{idx}.html').write_text(source,encoding='utf-8',errors='replace')
+                          driver.save_screenshot(str(OUT/'screens'/f'{mode}_{idx}.png'))
+                          soup=BeautifulSoup(source,'html.parser')
+                          links=[]
+                          for tag in soup.find_all(True):
+                              for attr in ['href','src','data-src','data-url','data-href','content']:
+                                  v=tag.get(attr)
+                                  if not v: continue
+                                  full=urljoin(driver.current_url,v)
+                                  label=' '.join(tag.get_text(' ',strip=True).split())[:200]
+                                  low=(full+' '+label).lower()
+                                  if any(k in low for k in ['16990','.pdf','download','bgdown','报告','研报','file','preview','attach']):
+                                      links.append({'tag':tag.name,'attr':attr,'label':label,'url':full})
+                                      candidate_urls.add(full)
+                          rec['links']=links[:1000]
+                          rec['body']=' '.join(soup.get_text(' ',strip=True).split())[:10000]
+                          try:
+                              cookie_jar=driver.get_cookies()
+                          except Exception: pass
+                          logs=[]
+                          for raw in driver.get_log('performance'):
+                              try:
+                                  msg=json.loads(raw['message'])['message']
+                                  if msg.get('method')=='Network.responseReceived':
+                                      p=msg.get('params',{})
+                                      rsp=p.get('response',{})
+                                      ru=rsp.get('url','')
+                                      mime=rsp.get('mimeType','')
+                                      if '16990' in ru or '.pdf' in ru.lower() or 'bgdown' in ru or 'application/pdf' in mime.lower() or 'octet-stream' in mime.lower():
+                                          x={'url':ru,'status':rsp.get('status'),'mime':mime,'headers':rsp.get('headers',{})}
+                                          logs.append(x); candidate_urls.add(ru)
+                              except Exception: pass
+                          rec['network']=logs
+                      except Exception as e:
+                          rec['error']=repr(e)
+                          rec['traceback']=traceback.format_exc()
+                      all_records.append(rec)
+                      print(json.dumps(rec,ensure_ascii=False)[:12000])
+              finally:
+                  try: driver.quit()
+                  except Exception: pass
+
+          (OUT/'browser_records.json').write_text(json.dumps(all_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'candidate_urls.json').write_text(json.dumps(sorted(candidate_urls),ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'cookies.json').write_text(json.dumps(cookie_jar,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Replay all browser-discovered candidates with cookies.
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':'https://bg.sgpjbg.com/baogao/16990.html','Accept':'application/pdf,text/html,*/*;q=0.8'})
+          for c in cookie_jar:
+              try: s.cookies.set(c['name'],c['value'],domain=c.get('domain'),path=c.get('path','/'))
+              except Exception: pass
+          replay=[]
+          manual=[
+            'https://bg.sgpjbg.com/bgdown/16990.html',
+            'https://bg.sgpjbg.com/baogao/16990.html',
+            'https://www.sgpjbg.com/bgdown/16990.html',
+          ]
+          for n,u in enumerate(list(dict.fromkeys(manual+sorted(candidate_urls)))):
+              if not u.startswith(('http://','https://')): continue
+              try:
+                  r=s.get(u,timeout=(20,120),allow_redirects=True)
+                  item={'url':u,'status':r.status_code,'final':r.url,'bytes':len(r.content),'ctype':r.headers.get('content-type'),'headers':dict(r.headers),'magic':r.content[:12].hex()}
+                  replay.append(item); print('REPLAY',json.dumps(item,ensure_ascii=False))
+                  if r.content.startswith(b'%PDF-') and len(r.content)>20000:
+                      name=f'candidate_{n:03d}.pdf'; p=DOWNLOAD/name; p.write_bytes(r.content)
+                      item['saved']=name; item['sha256']=hashlib.sha256(r.content).hexdigest()
+                  elif len(r.content)>1000:
+                      (OUT/'html'/f'replay_{n:03d}.bin').write_bytes(r.content)
+              except Exception as e:
+                  replay.append({'url':u,'error':repr(e)})
+          (OUT/'replay.json').write_text(json.dumps(replay,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('DOWNLOADS',[(p.name,p.stat().st_size) for p in DOWNLOAD.glob('*')])
+          PY
+
+          for f in out/downloads/*.pdf; do
+            [ -e "$f" ] || continue
+            echo "===== $f ====="
+            pdfinfo "$f" | sed -n '1,30p'
+            qpdf --check "$f"
+          done
+          find out -type f -printf '%p\t%s bytes\n' | sort
+
+      - name: Upload browser probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-sgpjbg-browser-probe
+          path: out
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
