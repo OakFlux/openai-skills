@@ -1,0 +1,130 @@
+name: Query exact Wuhan Fingu Eastmoney report records
+
+on:
+  push:
+    branches:
+      - tmp/wuhan-fingu-broker-reports-20261023-v1
+    paths:
+      - .github/workflows/wuhan-fingu-eastmoney-exact-api-20261023-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-api:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query API and download PDFs
+        run: |
+          python -m pip install --quiet requests pypdf
+          mkdir -p out/pdfs
+          python - <<'PY'
+          import hashlib, json, re, time
+          from datetime import date, timedelta
+          from pathlib import Path
+          from urllib.parse import urlencode
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('out'); PDF=OUT/'pdfs'
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/',
+              'Accept':'*/*',
+          })
+          api='https://reportapi.eastmoney.com/report/list'
+          ranges=[
+              ('2019-10-20','2019-10-31'),
+              ('2020-08-01','2020-08-20'),
+              ('2020-10-25','2020-11-10'),
+              ('2007-11-20','2007-12-20'),
+          ]
+          keywords=['武汉凡谷','002194','专注基站射频三十年','Q3业绩增长提速','克服疫情影响','新周期开启','三季度盈利能力改善','公司与国际巨头一起成长','关注华为之外的新增市场空间','国内领先的射频器件供应商']
+
+          def parse(text):
+              t=text.strip()
+              if t.startswith('datatable'):
+                  m=re.search(r'\((.*)\)',t,re.S); t=m.group(1) if m else t
+              return json.loads(t)
+          raw_records=[]; request_log=[]
+          for begin,end in ranges:
+              for q in (0,1,2):
+                  for page in range(1,21):
+                      params={
+                          'beginTime':begin,'endTime':end,'pageNo':page,'pageSize':100,'qType':q,
+                          'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+                          'orgCode':'','rcode':'','fields':'','_':int(time.time()*1000),
+                      }
+                      url=api+'?'+urlencode(params)
+                      try:
+                          r=s.get(url,timeout=(20,90))
+                          item={'range':[begin,end],'qType':q,'page':page,'status':r.status_code,'bytes':len(r.content),'url':r.url,'head':r.text[:300]}
+                          request_log.append(item); print('REQ',json.dumps(item,ensure_ascii=False))
+                          if r.status_code!=200: break
+                          obj=parse(r.text); data=obj.get('data') or []
+                          for rec in data:
+                              blob=' '.join(str(v or '') for v in rec.values())
+                              if any(k in blob for k in keywords):
+                                  rec=dict(rec); rec['_qType']=q; rec['_range']=[begin,end]; raw_records.append(rec)
+                          total_pages=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+                          if page>=total_pages or not data: break
+                      except Exception as e:
+                          request_log.append({'range':[begin,end],'qType':q,'page':page,'error':repr(e)})
+                          print('ERR',begin,end,q,page,repr(e)); break
+          # Deduplicate by infoCode.
+          by={}
+          for x in raw_records:
+              key=str(x.get('infoCode') or x.get('info_code') or '')
+              if key: by[key]=x
+          matches=list(by.values())
+          matches.sort(key=lambda x:str(x.get('publishDate') or ''),reverse=True)
+          (OUT/'request_log.json').write_text(json.dumps(request_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'matches_raw.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCHES',len(matches))
+          for x in matches: print('MATCH',json.dumps(x,ensure_ascii=False)[:12000])
+
+          def safe(x): return re.sub(r'[\\/:*?"<>|\r\n\t]+','_',str(x or '')).strip(' ._')[:100]
+          inventory=[]
+          for idx,x in enumerate(matches,1):
+              code=str(x.get('infoCode') or '')
+              title=str(x.get('title') or '')
+              org=str(x.get('orgSName') or x.get('orgName') or '')
+              day=str(x.get('publishDate') or '')[:10]
+              candidates=[
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{code}_1.pdf',
+                  str(x.get('encodeUrl') or ''),
+              ]
+              attempts=[]; saved=None
+              for u in candidates:
+                  if not u.startswith('http'): continue
+                  try:
+                      rr=s.get(u,timeout=(20,180),allow_redirects=True,headers={'Referer':'https://data.eastmoney.com/'})
+                      a={'url':u,'status':rr.status_code,'bytes':len(rr.content),'ctype':rr.headers.get('content-type'),'magic':rr.content[:12].hex(),'final':rr.url}
+                      attempts.append(a); print('PDF',json.dumps(a,ensure_ascii=False))
+                      if rr.status_code==200 and rr.content.startswith(b'%PDF-') and len(rr.content)>20000:
+                          fn=f'{idx:02d}_{safe(day)}_{safe(org)}_{safe(title)}_{code}.pdf'; p=PDF/fn; p.write_bytes(rr.content)
+                          reader=PdfReader(str(p),strict=False); pages=len(reader.pages)
+                          text='\n'.join((reader.pages[i].extract_text() or '') for i in range(min(3,pages)))
+                          saved={'filename':fn,'url':u,'bytes':len(rr.content),'pages':pages,'sha256':hashlib.sha256(rr.content).hexdigest(),'sampleText':text[:5000]}
+                          break
+                  except Exception as e: attempts.append({'url':u,'error':repr(e)})
+              inventory.append({'metadata':x,'attempts':attempts,'saved':saved})
+          (OUT/'inventory.json').write_text(json.dumps(inventory,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SAVED',sum(1 for x in inventory if x['saved']))
+          PY
+          find out -type f -printf '%p\t%s bytes\n' | sort
+
+      - name: Upload exact API recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-eastmoney-exact-api
+          path: out
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
