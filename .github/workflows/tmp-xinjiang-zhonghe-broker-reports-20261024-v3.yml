@@ -1,0 +1,353 @@
+name: Build Xinjiang Zhonghe broker deep-report package v3
+
+on:
+  push:
+    branches:
+      - tmp/xinjiang-zhonghe-broker-reports-20261024-v3
+    paths:
+      - .github/workflows/tmp-xinjiang-zhonghe-broker-reports-20261024-v3.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF and Chinese-font tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip fonts-noto-cjk
+          python3 -m pip install --quiet --disable-pip-version-check requests beautifulsoup4 trafilatura weasyprint pypdf
+
+      - name: Download, render, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='新疆众和_券商深度报告_3份'
+          mkdir -p "$PACKAGE" /tmp/xjzh_renders
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import re
+          import time
+          from pathlib import Path
+          from typing import Iterable
+
+          import requests
+          import trafilatura
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from weasyprint import HTML
+
+          OUT = Path('新疆众和_券商深度报告_3份')
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155 Safari/537.36'
+          S = requests.Session()
+          S.trust_env = False
+          S.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8',
+          })
+
+          def get_bytes(url: str, *, referer: str | None = None, attempts: int = 6) -> tuple[bytes, str, str]:
+              last: Exception | None = None
+              for i in range(attempts):
+                  try:
+                      headers = {'Referer': referer} if referer else None
+                      r = S.get(url, headers=headers, timeout=(25, 180), allow_redirects=True)
+                      r.raise_for_status()
+                      return r.content, r.url, r.headers.get('content-type', '')
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 + i * 2, 10))
+              raise RuntimeError(f'GET failed after {attempts} attempts: {url}: {last!r}')
+
+          # 1) 东亚前海证券42页首次覆盖报告：公开原始PDF。
+          original_url = 'https://stockn.xueqiu.com/SH600888/20220823831411.pdf'
+          data, final_url, ctype = get_bytes(original_url, referer='https://xueqiu.com/S/SH600888')
+          if not data.startswith(b'%PDF-') or len(data) < 500_000:
+              raise RuntimeError(f'Unexpected original PDF: bytes={len(data)}, type={ctype}, final={final_url}')
+          original_name = '01_东亚前海证券_多业务领跑行业全产业链构筑竞争壁垒_原版_2022-08-23.pdf'
+          original_path = OUT / original_name
+          original_path.write_bytes(data)
+          original_pages = len(PdfReader(str(original_path), strict=False).pages)
+          if not 40 <= original_pages <= 45:
+              raise RuntimeError(f'Unexpected East Asia Qianhai page count: {original_pages}')
+          print('ORIGINAL', original_name, len(data), original_pages, final_url)
+
+          def decode_html(raw: bytes, content_type: str) -> str:
+              ctype = content_type.lower()
+              if any(x in ctype for x in ('gbk', 'gb2312', 'gb18030')):
+                  return raw.decode('gb18030', errors='replace')
+              for enc in ('utf-8', 'gb18030'):
+                  try:
+                      text = raw.decode(enc)
+                      if text.count('\ufffd') < 5:
+                          return text
+                  except Exception:
+                      pass
+              return raw.decode('utf-8', errors='replace')
+
+          def clean_lines(text: str) -> str:
+              text = text.replace('\u3000', ' ').replace('\xa0', ' ')
+              text = re.sub(r'\r\n?', '\n', text)
+              text = re.sub(r'[ \t]+', ' ', text)
+              lines = []
+              seen_short = set()
+              noise = {
+                  '首页', '登录', '注册', '举报', '上传文档', '查看详情', '立即下载',
+                  '相关深度报告REPORTS', '相关深度报告', '免责声明', '返回顶部',
+              }
+              for raw_line in text.split('\n'):
+                  line = raw_line.strip(' -|\t')
+                  if not line or line in noise:
+                      continue
+                  if len(line) <= 24:
+                      if line in seen_short:
+                          continue
+                      seen_short.add(line)
+                  lines.append(line)
+              return '\n'.join(lines).strip()
+
+          def extract_text_from_page(url: str, required: Iterable[str], minimum: int) -> tuple[str, str]:
+              raw, final, ctype = get_bytes(url, referer='https://www.baidu.com/')
+              source_html = decode_html(raw, ctype)
+              text = trafilatura.extract(
+                  source_html,
+                  include_comments=False,
+                  include_tables=True,
+                  favor_recall=True,
+                  output_format='txt',
+              ) or ''
+              text = clean_lines(text)
+              required = list(required)
+              if len(text) < minimum or not all(k in text for k in required):
+                  soup = BeautifulSoup(source_html, 'html.parser')
+                  for tag in soup(['script', 'style', 'noscript', 'svg', 'nav', 'footer']):
+                      tag.decompose()
+                  candidates: list[str] = []
+                  for tag in soup.find_all(['article', 'main', 'section', 'div']):
+                      candidate = clean_lines(tag.get_text('\n', strip=True))
+                      if len(candidate) >= minimum and all(k in candidate for k in required):
+                          candidates.append(candidate)
+                  if candidates:
+                      # Prefer the shortest complete content container to reduce site navigation noise.
+                      text = min(candidates, key=len)
+                  else:
+                      text = clean_lines(soup.get_text('\n', strip=True))
+              if len(text) < minimum or not all(k in text for k in required):
+                  raise RuntimeError(f'Insufficient public report text: {url}; chars={len(text)}')
+              return text, final
+
+          def fetch_first(sources: list[str], required: list[str], minimum: int) -> tuple[str, str]:
+              errors = []
+              for url in sources:
+                  try:
+                      text, final = extract_text_from_page(url, required, minimum)
+                      print('PUBLIC_TEXT', url, 'FINAL', final, 'CHARS', len(text))
+                      return text, final
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError('All public text sources failed:\n' + '\n'.join(errors))
+
+          def split_blocks(text: str) -> list[str]:
+              blocks: list[str] = []
+              chunks = re.split(r'\n\s*\n', text)
+              if len(chunks) <= 2:
+                  chunks = text.split('\n')
+              for chunk in chunks:
+                  chunk = chunk.strip()
+                  if not chunk:
+                      continue
+                  if len(chunk) <= 620:
+                      blocks.append(chunk)
+                      continue
+                  # Break very long continuous text near Chinese sentence punctuation.
+                  parts = re.split(r'(?<=[。！？；])', chunk)
+                  buf = ''
+                  for part in parts:
+                      if len(buf) + len(part) > 560 and buf:
+                          blocks.append(buf.strip())
+                          buf = part
+                      else:
+                          buf += part
+                  if buf.strip():
+                      blocks.append(buf.strip())
+              return blocks
+
+          def render_public_pdf(
+              filename: str,
+              title: str,
+              broker: str,
+              analysts: str,
+              date: str,
+              original_pages_label: str,
+              source_url: str,
+              report_text: str,
+          ) -> None:
+              body_parts = []
+              for block in split_blocks(report_text):
+                  escaped = html.escape(block).replace('\n', '<br>')
+                  if re.match(r'^(第[一二三四五六七八九十]+[章节]|[一二三四五六七八九十]+[、.]|\d+(?:\.\d+)*[、. ])', block):
+                      body_parts.append(f'<h2>{escaped}</h2>')
+                  else:
+                      body_parts.append(f'<p>{escaped}</p>')
+              body = '\n'.join(body_parts)
+              doc = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+              @page {{ size: A4; margin: 17mm 16mm 19mm; @bottom-center {{ content: counter(page); font-size: 9pt; color: #666; }} }}
+              body {{ font-family: "Noto Sans CJK SC", "Noto Sans CJK", sans-serif; color:#111; font-size:10.4pt; line-height:1.68; }}
+              h1 {{ font-size:18pt; line-height:1.35; margin:0 0 8mm; font-weight:700; }}
+              h2 {{ font-size:13pt; line-height:1.45; margin:6mm 0 3mm; page-break-after:avoid; }}
+              .meta {{ border-top:1px solid #555; border-bottom:1px solid #aaa; padding:3mm 0; margin-bottom:5mm; font-size:9.3pt; line-height:1.65; }}
+              .notice {{ background:#f1f1f1; border-left:3px solid #777; padding:3mm 4mm; margin-bottom:6mm; font-size:9pt; }}
+              p {{ margin:0 0 3.8mm; text-align:justify; orphans:3; widows:3; }}
+              .source {{ border-top:1px solid #bbb; padding-top:4mm; word-break:break-all; font-size:8.5pt; color:#555; margin-top:8mm; }}
+              </style></head><body>
+              <h1>{html.escape(title)}</h1>
+              <div class="meta">券商：{html.escape(broker)}<br>分析师：{html.escape(analysts)}<br>发布日期：{html.escape(date)}<br>原始报告标称页数：{html.escape(original_pages_label)}<br>本文件版本：公开全文导出版</div>
+              <div class="notice">说明：本文件根据公开可访问的研究报告全文页面重新排版生成，不是券商客户端提供的原始附件PDF。未对原报告的研究观点作实质改写；网页中无法取得的原版图表可能不在本导出版中。</div>
+              {body}
+              <div class="source">公开全文来源：{html.escape(source_url)}<br>资料仅供研究参考，不构成投资建议。</div>
+              </body></html>'''
+              output = OUT / filename
+              HTML(string=doc, base_url=source_url).write_pdf(output)
+              print('RENDERED', output.name, output.stat().st_size)
+
+          # 2) 东方证券2023年首次覆盖深度报告：公开全文导出版。
+          oriental_text, oriental_source = fetch_first(
+              [
+                  'https://www.vzkoo.com/read/202308035a2ef4b2897a87ce3c2b1345.html',
+                  'https://www.nxny.com/report/view_5362861.html',
+              ],
+              ['新疆众和', '东方证券', '电极箔'],
+              3500,
+          )
+          render_public_pdf(
+              '02_东方证券_被低估的电极箔一体化龙头_公开全文导出版_2023-08-01.pdf',
+              '新疆众和：被低估的电极箔一体化龙头',
+              '东方证券', '刘洋、李一冉', '2023-08-01', '34页',
+              oriental_source, oriental_text,
+          )
+
+          # 3) 申万宏源2025年首次覆盖公司深度报告：公开全文导出版。
+          sw_text, sw_source = fetch_first(
+              [
+                  'https://www.sdyanbao.com/detail/922882',
+                  'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/812305320242/index.phtml',
+                  'https://www.sgpjbg.com.cn/bgdown/925460.html',
+              ],
+              ['新疆众和', '申万宏源', '氧化铝'],
+              1100,
+          )
+          render_public_pdf(
+              '03_申万宏源_铝电子材料一体化完备氧化铝项目有望增厚利润_公开全文导出版_2025-09-27.pdf',
+              '新疆众和：铝电子材料一体化完备，氧化铝项目有望增厚利润',
+              '申万宏源', '王介超、覃静、王晓芳等', '2025-09-27', '32页',
+              sw_source, sw_text,
+          )
+
+          print('CREATED_PDFS')
+          for p in sorted(OUT.glob('*.pdf')):
+              print(p.name, p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest())
+          PY
+
+          # Structural and visual checks.
+          test "$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)" -eq 3
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            test "$(stat -c%s "$pdf")" -gt 70000
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf.txt" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then cat "$pdf.qpdf.txt" >&2; exit "$rc"; fi
+            rm -f "$pdf.qpdf.txt"
+            pages=$(pdfinfo "$pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 2
+            pdftoppm -f 1 -l 1 -singlefile -png -r 100 "$pdf" "/tmp/xjzh_renders/$(basename "$pdf").first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 100 "$pdf" "/tmp/xjzh_renders/$(basename "$pdf").last" >/dev/null 2>&1
+            test -s "/tmp/xjzh_renders/$(basename "$pdf").first.png"
+            test -s "/tmp/xjzh_renders/$(basename "$pdf").last.png"
+            pdftotext "$pdf" "$pdf.txt" || true
+            if ! grep -Eq '新疆众和|众和' "$pdf.txt"; then
+              echo "Company-name text check failed: $pdf" >&2
+              exit 1
+            fi
+            rm -f "$pdf.txt"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+
+          original_pages=$(pdfinfo "$PACKAGE/01_东亚前海证券_多业务领跑行业全产业链构筑竞争壁垒_原版_2022-08-23.pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+          test "$original_pages" -ge 40 && test "$original_pages" -le 45
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, subprocess
+
+          folder = Path('新疆众和_券商深度报告_3份')
+          meta = {
+              '01_东亚前海证券_多业务领跑行业全产业链构筑竞争壁垒_原版_2022-08-23.pdf': ('东亚前海证券', '2022-08-23', '多业务领跑行业，全产业链构筑竞争壁垒', '首次覆盖/强烈推荐；公开原始PDF', 'https://stockn.xueqiu.com/SH600888/20220823831411.pdf'),
+              '02_东方证券_被低估的电极箔一体化龙头_公开全文导出版_2023-08-01.pdf': ('东方证券', '2023-08-01', '被低估的电极箔一体化龙头', '首次覆盖/买入；公开全文导出版，原报告标称34页', 'https://www.vzkoo.com/read/202308035a2ef4b2897a87ce3c2b1345.html'),
+              '03_申万宏源_铝电子材料一体化完备氧化铝项目有望增厚利润_公开全文导出版_2025-09-27.pdf': ('申万宏源', '2025-09-27', '铝电子材料一体化完备，氧化铝项目有望增厚利润', '首次覆盖/增持；公开全文导出版，原报告标称32页', 'https://www.sdyanbao.com/detail/922882'),
+          }
+          lines = [
+              '新疆众和（600888）券商深度报告资料包',
+              '整理日期：2026-10-24',
+              '',
+              '版本说明：',
+              '1. 东亚前海证券报告为公开原始PDF。',
+              '2. 东方证券、申万宏源报告由公开可访问的研究全文页面重新排版生成，文件名中已明确标注“公开全文导出版”；不是券商客户端原始附件。',
+              '3. 导出版保留可公开取得的报告正文，但原版图表可能不完整，建议结合文件末尾来源核验。',
+              '4. 资料仅供研究参考，不构成投资建议。',
+              '',
+              '文件清单：',
+          ]
+          sums = []
+          total_pages = 0
+          total_bytes = 0
+          for pdf in sorted(folder.glob('*.pdf')):
+              broker, date, title, kind, source = meta[pdf.name]
+              data = pdf.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              info = subprocess.check_output(['pdfinfo', str(pdf)], text=True, errors='replace')
+              pages = int(next(x.split(':', 1)[1].strip() for x in info.splitlines() if x.startswith('Pages:')))
+              total_pages += pages
+              total_bytes += len(data)
+              lines += [
+                  f'- {pdf.name}',
+                  f'  券商：{broker}；日期：{date}；类型：{kind}；当前文件页数：{pages}',
+                  f'  标题：{title}',
+                  f'  公开来源：{source}',
+                  f'  SHA-256：{sha}',
+              ]
+              sums.append(f'{sha}  {pdf.name}')
+          lines += [
+              '',
+              f'合计当前文件页数：{total_pages}页。',
+              f'PDF合计大小：{total_bytes}字节。',
+              '全部PDF均已通过文件头、文件大小、PDF结构、公司名称、页数及首末页渲染检查；压缩包已通过完整解压测试。',
+          ]
+          (folder / '00_文件清单与说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (folder / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          print('\n'.join(lines))
+          PY
+
+          zip -q -r -6 package_integrity_test.zip "$PACKAGE"
+          unzip -t package_integrity_test.zip >/dev/null
+          test "$(unzip -Z1 package_integrity_test.zip | grep -c '\.pdf$')" -eq 3
+          rm -f package_integrity_test.zip
+          ls -lh "$PACKAGE"
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xinjiang-Zhonghe-600888-broker-deep-reports-3-v3
+          path: 新疆众和_券商深度报告_3份/
+          retention-days: 2
+          compression-level: 6
+          if-no-files-found: error
