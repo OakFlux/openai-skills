@@ -1,0 +1,258 @@
+name: Build Wufang Optoelectronics 002962 broker reports package 20261028
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/wufang-002962-broker-reports-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE='002962'
+          COMPANY='五方光电'
+          COMPANY_FULL='湖北五方光电股份有限公司'
+          AS_OF='2026-10-28'
+          PACKAGE='五方光电_002962_券商深度与首次覆盖报告_完整版_截至20261028'
+          ROOT=Path(PACKAGE)
+          PDF_DIR=ROOT/'PDF原文'
+          PREVIEW_DIR=ROOT/'首页预览'
+          PDF_DIR.mkdir(parents=True,exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True,exist_ok=True)
+
+          session=requests.Session(); session.trust_env=False
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api='https://reportapi.eastmoney.com/report/list'
+          rows=[]
+          for page in range(1,15):
+              params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*',
+                  'ratingChange':'*','beginTime':'2010-01-01','endTime':'2030-12-31',
+                  'pageNo':str(page),'fields':'','qType':'0','orgCode':'','code':STOCK_CODE,
+                  'rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)
+              }
+              r=session.get(api,params=params,timeout=(20,120)); r.raise_for_status()
+              d=r.json(); batch=d.get('data') or []
+              print('INDEX_PAGE',page,'HITS',d.get('hits'),'ROWS',len(batch))
+              if not batch: break
+              rows.extend(batch)
+              if len(batch)<100: break
+
+          by_code={}
+          for x in rows:
+              code=str(x.get('infoCode') or '')
+              if code: by_code.setdefault(code,x)
+          rows=list(by_code.values())
+
+          def safe_int(v,default=0):
+              try: return int(v or default)
+              except Exception: return default
+
+          def score(x):
+              title=str(x.get('title') or '')
+              pages=safe_int(x.get('attachPages'))
+              date=str(x.get('publishDate') or '')
+              s=0
+              for k,w in [
+                  ('首次覆盖',240),('公司首次覆盖',240),('公司深度',220),('深度报告',210),
+                  ('新股覆盖',180),('首次评级',170),('专题研究',110),('公司研究',90),
+                  ('滤光片',55),('光学',45),('光电',35),('摄像头',30),('成长',25),('龙头',25),
+                  ('车载',20),('生物识别',20),('多摄',15)
+              ]:
+                  if k in title: s+=w
+              for k,w in [
+                  ('年报点评',320),('季报点评',320),('中报点评',320),('半年报点评',320),
+                  ('一季报点评',320),('三季报点评',320),('事件点评',220),('公告点评',220),
+                  ('业绩快报点评',250),('业绩点评',180),('调研简报',100),('投资者关系',100)
+              ]:
+                  if k in title: s-=w
+              if pages>=30: s+=90
+              elif pages>=24: s+=75
+              elif pages>=18: s+=60
+              elif pages>=14: s+=40
+              elif pages>=10: s+=20
+              elif pages>=8: s+=10
+              if date[:4]>='2024': s+=25
+              elif date[:4]>='2021': s+=15
+              return (s,pages,date)
+
+          candidates=[]
+          for x in rows:
+              title=str(x.get('title') or '')
+              pages=safe_int(x.get('attachPages'))
+              if str(x.get('stockCode') or STOCK_CODE)!=STOCK_CODE: continue
+              if pages and pages<8: continue
+              if any(k in title for k in ['年报点评','季报点评','中报点评','半年报点评','一季报点评','三季报点评','业绩快报点评','业绩点评']):
+                  continue
+              candidates.append(x)
+          candidates.sort(key=score,reverse=True)
+          print('CANDIDATE_COUNT',len(candidates))
+          for x in candidates[:40]:
+              print('CANDIDATE',json.dumps({k:x.get(k) for k in ['title','orgSName','orgName','publishDate','infoCode','attachPages','researcher','emRatingName','sRatingName']},ensure_ascii=False),'SCORE',score(x))
+
+          def download(code):
+              last=None
+              for prefix in ['H3','H2','H1','H4']:
+                  url=f'https://pdf.dfcfw.com/pdf/{prefix}_{code}_1.pdf'
+                  for attempt in range(7):
+                      try:
+                          r=session.get(url,timeout=(25,360),allow_redirects=True,headers={
+                              'User-Agent':session.headers['User-Agent'],
+                              'Referer':'https://data.eastmoney.com/report/',
+                              'Accept':'application/pdf,*/*;q=0.8',
+                          })
+                          last={'url':url,'status':r.status_code,'bytes':len(r.content),'content_type':r.headers.get('content-type',''),'final_url':r.url}
+                          if r.status_code==200 and r.content[:5]==b'%PDF-' and len(r.content)>100000:
+                              return r.content,url,last
+                      except Exception as exc:
+                          last={'url':url,'error':repr(exc)}
+                      time.sleep(1+attempt)
+              return None,None,last
+
+          validated=[]; failures=[]; brokers=set()
+          for diversity_pass in (True,False):
+              for x in candidates:
+                  if len(validated)>=3: break
+                  code=str(x.get('infoCode') or '')
+                  if not code or any(v['info_code']==code for v in validated): continue
+                  broker=str(x.get('orgSName') or x.get('orgName') or '券商')
+                  if diversity_pass and broker in brokers: continue
+                  data,url,meta=download(code)
+                  if not data:
+                      failures.append({'code':code,'title':x.get('title'),'stage':'download','meta':meta}); continue
+                  tmp=Path(f'_candidate_{code}.pdf'); tmp.write_bytes(data)
+                  try:
+                      reader=PdfReader(str(tmp),strict=False); pages=len(reader.pages)
+                      if pages<8: raise RuntimeError(f'too few pages {pages}')
+                      text='\n'.join((p.extract_text() or '') for p in reader.pages[:min(25,pages)])
+                      ctext=re.sub(r'\s+','',text)
+                      if not any(k in ctext for k in [COMPANY,COMPANY_FULL,STOCK_CODE]):
+                          raise RuntimeError('issuer identity mismatch')
+                      subprocess.run(['qpdf','--warning-exit-0','--check',str(tmp)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                      validated.append({'row':x,'info_code':code,'data':data,'pdf_url':url,'download_meta':meta,'actual_pages':pages,'broker':broker})
+                      brokers.add(broker)
+                  except Exception as exc:
+                      failures.append({'code':code,'title':x.get('title'),'stage':'validate','error':repr(exc)})
+                  finally:
+                      tmp.unlink(missing_ok=True)
+              if len(validated)>=3: break
+
+          if len(validated)<2:
+              raise RuntimeError(f'Only {len(validated)} usable reports found: {failures}')
+          validated=validated[:3]
+
+          def safe_name(s):
+              s=re.sub(r'[\\/:*?"<>|]+','_',str(s or ''))
+              s=re.sub(r'\s+','',s).strip('._')
+              return s[:100] or '报告'
+
+          manifest=[]
+          for idx,item in enumerate(validated,1):
+              x=item['row']; data=item['data']; broker=item['broker']
+              date=str(x.get('publishDate') or '')[:10]
+              title=str(x.get('title') or '')
+              filename=f'{idx:02d}_{safe_name(broker)}_五方光电_{safe_name(title)}_{date}.pdf'
+              dest=PDF_DIR/filename; dest.write_bytes(data)
+              prefix=PREVIEW_DIR/dest.stem
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','140','-singlefile',str(dest),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              preview=Path(str(prefix)+'.png')
+              if not preview.exists() or preview.stat().st_size<10000:
+                  raise RuntimeError(f'preview failed: {filename}')
+              sha=hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  'title':title,'broker':broker,'broker_full':x.get('orgName'),'date':date,
+                  'analysts':x.get('researcher'),'rating':x.get('emRatingName') or x.get('sRatingName'),
+                  'info_code':item['info_code'],'index_pages':x.get('attachPages'),'actual_pages':item['actual_pages'],
+                  'bytes':len(data),'filename':filename,'pdf_url':item['pdf_url'],
+                  'source_report_page':f"https://data.eastmoney.com/report/info/{item['info_code']}.html",
+                  'sha256':sha,'download_meta':item['download_meta'],
+                  'preview_file':str(Path('首页预览')/preview.name),
+                  'document_nature':'券商原始完整PDF',
+                  'validation':['PDF header','issuer identity','minimum page count','qpdf structure','first-page render'],
+              })
+
+          readme=[
+              '湖北五方光电股份有限公司（002962.SZ）券商深度与首次覆盖报告资料包',
+              f'整理基准日：{AS_OF}','',
+              f'本包收录{len(manifest)}份公开可直接取得并完成全文核验的券商原始完整PDF。',
+              '筛选标准：优先首次覆盖、公司深度和较长篇公司研究；排除年报、季报、中报及事件短评。',''
+          ]
+          for i,m in enumerate(manifest,1):
+              readme += [
+                  f"{i}. {m['broker']}：《{m['title']}》",
+                  f"   日期：{m['date']}；分析师：{m['analysts'] or '未列示'}；评级：{m['rating'] or '未列示'}",
+                  f"   完整页数：{m['actual_pages']}页；文件：PDF原文/{m['filename']}",
+                  f"   来源页面：{m['source_report_page']}",
+                  f"   SHA-256：{m['sha256']}",'',
+              ]
+          readme += [
+              '报告内容和版权归原券商及作者所有，仅供研究参考，不构成投资建议。',
+              '核验项目：PDF文件头、公司名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。'
+          ]
+          (ROOT/'00_文件清单与说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'candidate_reports.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'failures.json').write_text(json.dumps(failures,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{m['sha256']}  PDF原文/{m['filename']}\n" for m in manifest),encoding='utf-8')
+
+          zpath=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file(): z.write(p,arcname=f'{PACKAGE}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zpath) as z:
+              bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs)!=len(manifest) or not (2<=len(pdfs)<=3):
+                  raise RuntimeError(f'zip validation failed bad={bad} pdfs={len(pdfs)} manifest={len(manifest)}')
+          short=Path('wufang_002962_broker_deep_reports.zip')
+          short.write_bytes(zpath.read_bytes())
+          print('FINAL_ZIP',zpath,zpath.stat().st_size,'SHA256',hashlib.sha256(zpath.read_bytes()).hexdigest())
+          print('REPORT_COUNT',len(manifest))
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: wufang-002962-broker-reports-final-20261028
+          path: |
+            五方光电_002962_券商深度与首次覆盖报告_完整版_截至20261028.zip
+            wufang_002962_broker_deep_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
