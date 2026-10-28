@@ -1,0 +1,397 @@
+name: Build Hongfucheng broker research package
+
+on:
+  push:
+    branches: [tmp-hongfucheng-broker-reports-20261028]
+    paths: ['.github/workflows/tmp-hongfucheng-broker-package-20261028.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools and Chinese fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip fonts-noto-cjk
+          python3 -m pip install --quiet --disable-pip-version-check requests beautifulsoup4 trafilatura weasyprint pypdf
+
+      - name: Download, render, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='鸿富诚_301716_券商研究资料_3份'
+          mkdir -p "$PACKAGE" /tmp/hfc_broker_check
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          from pathlib import Path
+
+          import requests
+          import trafilatura
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+          from weasyprint import HTML
+
+          OUT = Path('鸿富诚_301716_券商研究资料_3份')
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          S = requests.Session()
+          S.trust_env = False
+          retry = Retry(
+              total=7, connect=7, read=7, status=7, backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'], raise_on_status=False,
+          )
+          S.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=6, pool_maxsize=6))
+          S.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+          })
+
+          def fetch(url: str, *, accept: str = '*/*', referer: str | None = None) -> requests.Response:
+              last = None
+              for attempt in range(7):
+                  try:
+                      headers = {'Accept': accept}
+                      if referer:
+                          headers['Referer'] = referer
+                      r = S.get(url, headers=headers, timeout=(30, 300), allow_redirects=True)
+                      last = r
+                      if r.status_code == 200:
+                          return r
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'fetch failed: {url}; last={last!r}')
+
+          records = []
+
+          # 1) Publicly downloadable original PDF: Huajin Securities.
+          huajin_url = 'https://pdf.dfcfw.com/pdf/H3_AP202609171829531594_1.pdf'
+          r = fetch(
+              huajin_url,
+              accept='application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              referer='https://data.eastmoney.com/report/info/AP202609171829531594.html',
+          )
+          if not r.content.startswith(b'%PDF-') or len(r.content) < 100_000:
+              raise RuntimeError(f'Huajin file is not a valid PDF: {len(r.content)} {r.headers.get("content-type")}')
+          huajin_name = '01_华金证券_新股覆盖研究鸿富诚_原始PDF_2026-09-17.pdf'
+          huajin_path = OUT / huajin_name
+          huajin_path.write_bytes(r.content)
+          huajin_pages = len(PdfReader(str(huajin_path), strict=False).pages)
+          if huajin_pages != 13:
+              raise RuntimeError(f'Unexpected Huajin page count: {huajin_pages}')
+          records.append({
+              'order': 1,
+              'file': huajin_name,
+              'broker': '华金证券',
+              'date': '2026-09-17',
+              'title': '新股覆盖研究：鸿富诚',
+              'file_status': '券商原始完整PDF',
+              'original_report_pages': 13,
+              'current_file_pages': huajin_pages,
+              'source': r.url,
+              'info_page': 'https://data.eastmoney.com/report/info/AP202609171829531594.html',
+          })
+          print('ORIGINAL', huajin_name, huajin_pages, len(r.content), r.url)
+
+          def decode_response(resp: requests.Response) -> str:
+              raw = resp.content
+              ctype = (resp.headers.get('content-type') or '').lower()
+              encs = []
+              if any(x in ctype for x in ('gbk', 'gb2312', 'gb18030')):
+                  encs.append('gb18030')
+              encs.extend([resp.encoding, resp.apparent_encoding, 'utf-8', 'gb18030'])
+              seen = set()
+              for enc in encs:
+                  if not enc or enc in seen:
+                      continue
+                  seen.add(enc)
+                  try:
+                      text = raw.decode(enc)
+                      if text.count('\ufffd') < 12:
+                          return text
+                  except Exception:
+                      pass
+              return raw.decode('utf-8', errors='replace')
+
+          def clean_text(text: str) -> str:
+              text = text.replace('\u3000', ' ').replace('\xa0', ' ')
+              text = re.sub(r'\r\n?', '\n', text)
+              text = re.sub(r'[ \t]+', ' ', text)
+              noise = {
+                  '首页', '登录', '注册', '举报', '立即下载', '下载', '获取积分',
+                  '报告精读', '知识库', '返回顶部', '免责声明', '相关推荐',
+              }
+              lines = []
+              seen_short = set()
+              for raw in text.splitlines():
+                  line = raw.strip(' \t|-')
+                  if not line or line in noise:
+                      continue
+                  if len(line) <= 28:
+                      if line in seen_short:
+                          continue
+                      seen_short.add(line)
+                  lines.append(line)
+              return '\n'.join(lines).strip()
+
+          def extract_public_page(urls: list[str], required: list[str], minimum: int) -> tuple[str, str]:
+              errors = []
+              for url in urls:
+                  try:
+                      resp = fetch(url, accept='text/html,application/xhtml+xml,*/*;q=0.8', referer='https://www.baidu.com/')
+                      source_html = decode_response(resp)
+                      text = trafilatura.extract(
+                          source_html,
+                          include_comments=False,
+                          include_tables=True,
+                          favor_recall=True,
+                          output_format='txt',
+                      ) or ''
+                      text = clean_text(text)
+                      if len(text) < minimum or not all(k in text for k in required):
+                          soup = BeautifulSoup(source_html, 'html.parser')
+                          for tag in soup(['script', 'style', 'noscript', 'svg', 'nav', 'footer', 'form', 'iframe']):
+                              tag.decompose()
+                          candidates = []
+                          for tag in soup.find_all(['article', 'main', 'section', 'div']):
+                              candidate = clean_text(tag.get_text('\n', strip=True))
+                              if len(candidate) >= minimum and all(k in candidate for k in required):
+                                  candidates.append(candidate)
+                          text = min(candidates, key=len) if candidates else clean_text(soup.get_text('\n', strip=True))
+                      if len(text) < minimum or not all(k in text for k in required):
+                          raise RuntimeError(f'insufficient page text: chars={len(text)}')
+                      print('PUBLIC_PAGE', url, 'FINAL', resp.url, 'CHARS', len(text))
+                      return text, resp.url
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError('all public-page sources failed:\n' + '\n'.join(errors))
+
+          def split_blocks(text: str) -> list[str]:
+              chunks = re.split(r'\n\s*\n', text)
+              if len(chunks) < 3:
+                  chunks = text.split('\n')
+              out = []
+              for chunk in chunks:
+                  chunk = chunk.strip()
+                  if not chunk:
+                      continue
+                  if len(chunk) <= 650:
+                      out.append(chunk)
+                      continue
+                  buf = ''
+                  for part in re.split(r'(?<=[。！？；])', chunk):
+                      if len(buf) + len(part) > 580 and buf:
+                          out.append(buf.strip())
+                          buf = part
+                      else:
+                          buf += part
+                  if buf.strip():
+                      out.append(buf.strip())
+              return out
+
+          def render_digest(
+              filename: str,
+              title: str,
+              broker: str,
+              analysts: str,
+              date: str,
+              original_pages: int,
+              source: str,
+              text: str,
+          ) -> int:
+              body = []
+              for block in split_blocks(text):
+                  escaped = html.escape(block).replace('\n', '<br>')
+                  if re.match(r'^(公司|行业|核心|盈利|估值|竞争|风险|投资|业务|技术|财务|市场|一[、.]|二[、.]|三[、.]|四[、.]|\d+(?:\.\d+)*[、. ])', block):
+                      body.append(f'<h2>{escaped}</h2>')
+                  else:
+                      body.append(f'<p>{escaped}</p>')
+              doc = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+              @page {{ size:A4; margin:17mm 16mm 19mm; @bottom-center {{ content:counter(page); font-size:9pt; color:#666; }} }}
+              body {{ font-family:"Noto Sans CJK SC","Noto Sans CJK",sans-serif; color:#111; font-size:10.3pt; line-height:1.68; }}
+              h1 {{ font-size:18pt; line-height:1.38; margin:0 0 7mm; }}
+              h2 {{ font-size:13pt; line-height:1.45; margin:6mm 0 3mm; page-break-after:avoid; }}
+              .meta {{ border-top:1px solid #555; border-bottom:1px solid #aaa; padding:3mm 0; margin-bottom:5mm; font-size:9.2pt; line-height:1.65; }}
+              .notice {{ background:#f2f2f2; border-left:3px solid #777; padding:3.5mm 4mm; margin-bottom:6mm; font-size:9pt; }}
+              p {{ margin:0 0 3.8mm; text-align:justify; orphans:3; widows:3; }}
+              .source {{ border-top:1px solid #bbb; padding-top:4mm; word-break:break-all; font-size:8.5pt; color:#555; margin-top:8mm; }}
+              </style></head><body>
+              <h1>{html.escape(title)}</h1>
+              <div class="meta">券商：{html.escape(broker)}<br>分析师：{html.escape(analysts)}<br>发布日期：{date}<br>原始报告公开索引页数：{original_pages}页<br>本文件版本：公开报告精读版</div>
+              <div class="notice"><strong>版本说明：</strong>本文件根据无需登录即可访问的公开“报告精读/研报正文”页面排版生成，不是券商客户端发布的原始附件PDF。它保留公开页面可见的核心分析内容，但不包含原始报告的全部图表、附录和版式。</div>
+              {''.join(body)}
+              <div class="source">公开页面来源：{html.escape(source)}<br>资料仅供研究参考，不构成投资建议。</div>
+              </body></html>'''
+              path = OUT / filename
+              HTML(string=doc, base_url=source).write_pdf(path)
+              pages = len(PdfReader(str(path), strict=False).pages)
+              print('DIGEST', filename, pages, path.stat().st_size)
+              return pages
+
+          # 2) China Merchants Securities: public digest of a 34-page company deep report.
+          cms_text, cms_source = extract_public_page(
+              [
+                  'https://www.vzkoo.com/read/12022132820200019cfeb045aa08.html',
+                  'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/8/rptid/846066662705/index.phtml',
+              ],
+              ['鸿富诚', '热界面材料'],
+              1800,
+          )
+          cms_name = '02_招商证券_从传统功能材料到高端TIM_AI芯片散热打开成长空间_公开精读版_2026-10-23.pdf'
+          cms_pages = render_digest(
+              cms_name,
+              '鸿富诚：从传统功能材料到高端TIM，AI芯片散热打开成长空间',
+              '招商证券', '李哲瀚、郭倩倩、罗嘉成', '2026-10-23', 34,
+              cms_source, cms_text,
+          )
+          records.append({
+              'order': 2,
+              'file': cms_name,
+              'broker': '招商证券',
+              'date': '2026-10-23',
+              'title': '从传统功能材料到高端TIM，AI芯片散热打开成长空间',
+              'file_status': '公开报告精读版，非券商原始附件',
+              'original_report_pages': 34,
+              'current_file_pages': cms_pages,
+              'source': cms_source,
+              'original_document_page': 'https://m.vzkoo.com/document/1202198429850001d848ae44166e.html',
+          })
+
+          # 3) Huayuan Securities: public digest of a 71-page deep report.
+          hy_text, hy_source = extract_public_page(
+              [
+                  'https://www.vzkoo.com/read/11640677078400014c9f8511543b.html',
+                  'https://m.vzkoo.com/document/11640589727900012c76cc9443ec.html',
+              ],
+              ['鸿富诚', '数据中心'],
+              1800,
+          )
+          hy_name = '03_华源证券_深耕电子功能材料数据中心建设深度受益_公开精读版_2026-09-09.pdf'
+          hy_pages = render_digest(
+              hy_name,
+              '鸿富诚：深耕电子功能材料，数据中心建设深度受益',
+              '华源证券', '公开页面未完整列示', '2026-09-09', 71,
+              hy_source, hy_text,
+          )
+          records.append({
+              'order': 3,
+              'file': hy_name,
+              'broker': '华源证券',
+              'date': '2026-09-09',
+              'title': '深耕电子功能材料，数据中心建设深度受益',
+              'file_status': '公开报告精读版，非券商原始附件',
+              'original_report_pages': 71,
+              'current_file_pages': hy_pages,
+              'source': hy_source,
+              'original_document_page': 'https://m.vzkoo.com/document/11640589727900012c76cc9443ec.html',
+          })
+
+          (OUT / '_metadata.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+          test "$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)" -eq 3
+
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            test "$(stat -c%s "$pdf")" -gt 70000
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf.txt" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then cat "$pdf.qpdf.txt" >&2; exit "$rc"; fi
+            rm -f "$pdf.qpdf.txt"
+            pages=$(pdfinfo "$pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 2
+            pdftotext -f 1 -l "$pages" "$pdf" "$pdf.txt" 2>/dev/null || true
+            grep -Eq '深圳市鸿富诚新材料股份有限公司|鸿富诚' "$pdf.txt"
+            case "$(basename "$pdf")" in
+              01_*) grep -Eq '华金证券' "$pdf.txt" ;;
+              02_*) grep -Eq '招商证券' "$pdf.txt" ;;
+              03_*) grep -Eq '华源证券' "$pdf.txt" ;;
+            esac
+            rm -f "$pdf.txt"
+            stem="/tmp/hfc_broker_check/$(basename "$pdf")"
+            pdftoppm -f 1 -l 1 -singlefile -png -r 90 "$pdf" "$stem.first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 90 "$pdf" "$stem.last" >/dev/null 2>&1
+            test -s "$stem.first.png" && test -s "$stem.last.png"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+
+          test "$(pdfinfo "$PACKAGE/01_华金证券_新股覆盖研究鸿富诚_原始PDF_2026-09-17.pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')" -eq 13
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+
+          folder = Path('鸿富诚_301716_券商研究资料_3份')
+          records = json.loads((folder / '_metadata.json').read_text(encoding='utf-8'))
+          lines = [
+              '鸿富诚（301716）券商研究资料包',
+              '整理日期：2026-10-28',
+              '',
+              '重要版本说明：',
+              '1. 华金证券《新股覆盖研究：鸿富诚》为公开渠道直接下载的券商原始完整PDF，共13页。',
+              '2. 招商证券34页公司深度报告、华源证券71页深度报告的原始附件在公开平台需要登录或积分；本包未绕过访问控制。',
+              '3. 后两份文件依据无需登录即可访问的公开报告精读页面排版生成，已在文件名及首页标注“公开精读版”，不等同于原始券商PDF，原报告图表和附录可能缺失。',
+              '4. 资料仅供研究参考，不构成投资建议。',
+              '',
+              '文件清单：',
+          ]
+          sums = []
+          total_pages = 0
+          total_bytes = 0
+          for r in sorted(records, key=lambda x: x['order']):
+              path = folder / r['file']
+              data = path.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              total_pages += int(r['current_file_pages'])
+              total_bytes += len(data)
+              lines += [
+                  f"- {path.name}",
+                  f"  券商：{r['broker']}；发布日期：{r['date']}",
+                  f"  标题：{r['title']}",
+                  f"  文件性质：{r['file_status']}",
+                  f"  原报告公开索引页数：{r['original_report_pages']}；当前文件页数：{r['current_file_pages']}",
+                  f"  公开来源：{r['source']}",
+                  f"  SHA-256：{sha}",
+              ]
+              sums.append(f'{sha}  {path.name}')
+          lines += [
+              '',
+              f'当前3份PDF合计页数：{total_pages}页。',
+              f'当前PDF合计大小：{total_bytes}字节。',
+              '全部文件均已通过PDF文件头、文件大小、结构完整性、公司名称、券商名称、实际页数及首末页渲染检查。',
+          ]
+          (folder / '00_文件清单与版本说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (folder / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          (folder / '_metadata.json').unlink()
+          print('\n'.join(lines))
+          PY
+
+          zip -q -r -6 package_test.zip "$PACKAGE"
+          unzip -t package_test.zip >/dev/null
+          test "$(unzip -Z1 package_test.zip | grep -c '\.pdf$')" -eq 3
+          rm -f package_test.zip
+          ls -lh "$PACKAGE"
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: HFC-301716-broker-research-package-3
+          path: 鸿富诚_301716_券商研究资料_3份/
+          retention-days: 2
+          compression-level: 6
+          if-no-files-found: error
