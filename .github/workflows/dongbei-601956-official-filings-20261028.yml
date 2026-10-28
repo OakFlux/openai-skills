@@ -1,0 +1,533 @@
+name: Package Dongbei Group 601956 official filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dongbei-601956-official-filings-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install validation dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Discover, download, validate and package official PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          import zipfile
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CODE = '601956'
+          PREDECESSOR_CODE = '900956'
+          COMPANY = '东贝集团'
+          FULL_COMPANY = '湖北东贝机电集团股份有限公司'
+          PREDECESSOR = '黄石东贝电器股份有限公司'
+          CUTOFF = '2026-10-28'
+          CUT = '20261028'
+          ROOT_NAME = f'{COMPANY}_{CODE}_上市以来全部年报_上市核心文件及最新季报_截至{CUT}'
+          ROOT = Path('work') / ROOT_NAME
+          DIST = Path('dist')
+          LISTING_DIR = ROOT / '00_上市核心文件（替代常规招股说明书）'
+          ANNUAL_DIR = ROOT / '01_年度报告'
+          QUARTER_DIR = ROOT / '02_最新季度报告'
+          PREVIEW_DIR = ROOT / '首页预览'
+          for d in (LISTING_DIR, ANNUAL_DIR, QUARTER_DIR, PREVIEW_DIR, DIST):
+              d.mkdir(parents=True, exist_ok=True)
+
+          def make_session() -> requests.Session:
+              s = requests.Session()
+              retry = Retry(
+                  total=6, connect=6, read=6, status=6, backoff_factor=1.0,
+                  status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({'GET', 'POST'}), raise_on_status=False,
+              )
+              s.mount('https://', HTTPAdapter(max_retries=retry))
+              s.mount('http://', HTTPAdapter(max_retries=retry))
+              s.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155 Safari/537.36',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                  'Connection': 'keep-alive',
+              })
+              return s
+
+          S = make_session()
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', '', value)
+              value = value.replace('\u3000', ' ').replace(' ', ' ')
+              return re.sub(r'\s+', '', value).strip()
+
+          def parse_jsonp(text: str) -> dict[str, Any]:
+              text = text.strip()
+              if text.startswith('{'):
+                  return json.loads(text)
+              left = text.find('(')
+              right = text.rfind(')')
+              if left < 0 or right <= left:
+                  raise ValueError(f'无法解析JSONP，前200字符：{text[:200]!r}')
+              return json.loads(text[left + 1:right])
+
+          def sse_query(product_id: str, begin: str, end: str, report_type: str = '', key_word: str = '') -> list[dict[str, Any]]:
+              endpoints = [
+                  'https://query.sse.com.cn/security/stock/queryCompanyBulletin.do',
+                  'https://query.sse.com.cn/security/stock/queryCompanyBulletinNew.do',
+              ]
+              out: list[dict[str, Any]] = []
+              for endpoint in endpoints:
+                  callback = 'jsonpCallback601956'
+                  params = {
+                      'jsonCallBack': callback,
+                      'isPagination': 'true',
+                      'productId': product_id,
+                      'keyWord': key_word,
+                      'securityType': '0101,120100,020100,020200,120200',
+                      'reportType2': 'DQBG' if report_type else '',
+                      'reportType': report_type,
+                      'beginDate': begin,
+                      'endDate': end,
+                      'pageHelp.pageSize': '100',
+                      'pageHelp.pageCount': '50',
+                      'pageHelp.pageNo': '1',
+                      'pageHelp.beginPage': '1',
+                      'pageHelp.cacheSize': '1',
+                      'pageHelp.endPage': '5',
+                      '_': '1793184000000',
+                  }
+                  headers = {
+                      'Referer': 'https://www.sse.com.cn/disclosure/listedinfo/announcement/',
+                      'Accept': 'application/json, text/javascript, */*; q=0.01',
+                      'X-Requested-With': 'XMLHttpRequest',
+                  }
+                  try:
+                      r = S.get(endpoint, params=params, headers=headers, timeout=90)
+                      print('SSE_QUERY', endpoint, product_id, report_type, key_word, r.status_code, len(r.content), r.url)
+                      if r.status_code != 200:
+                          continue
+                      data = parse_jsonp(r.text)
+                      page = data.get('pageHelp') or data.get('result') or {}
+                      rows = page.get('data') if isinstance(page, dict) else None
+                      if rows is None:
+                          rows = data.get('data') or []
+                      for row in rows or []:
+                          title = clean_title(str(row.get('TITLE') or row.get('title') or ''))
+                          raw_url = str(row.get('URL') or row.get('url') or '')
+                          if not title or not raw_url:
+                              continue
+                          if raw_url.startswith('http'):
+                              pdf_url = raw_url
+                          else:
+                              pdf_url = urljoin('https://www.sse.com.cn/', raw_url)
+                          date = str(row.get('SSEDATE') or row.get('date') or row.get('bulletinDate') or '')[:10]
+                          out.append({
+                              'title': title,
+                              'source_url': pdf_url,
+                              'announcement_date': date,
+                              'source': 'SSE',
+                          })
+                      if out:
+                          break
+                  except Exception as exc:
+                      print('SSE_QUERY_ERROR', endpoint, repr(exc))
+              return out
+
+          def resolve_cninfo_org(code: str) -> str:
+              urls = [
+                  'https://www.cninfo.com.cn/new/data/sse_stock.json',
+                  f'https://www.cninfo.com.cn/new/information/topSearch/query?keyWord={code}&maxNum=20',
+              ]
+              for url in urls:
+                  try:
+                      r = S.get(url, headers={'Referer': 'https://www.cninfo.com.cn/'}, timeout=60)
+                      print('ORG_LOOKUP', code, r.status_code, len(r.content), url)
+                      if r.status_code != 200:
+                          continue
+                      data = r.json()
+                      items: list[Any] = []
+                      if isinstance(data, dict):
+                          for k in ('stockList', 'data', 'result', 'records'):
+                              v = data.get(k)
+                              if isinstance(v, list):
+                                  items.extend(v)
+                          if not items:
+                              items = [data]
+                      elif isinstance(data, list):
+                          items = data
+                      for item in items:
+                          if not isinstance(item, dict):
+                              continue
+                          c = str(item.get('code') or item.get('stockCode') or item.get('secCode') or '')
+                          org = str(item.get('orgId') or item.get('orgid') or item.get('org_id') or '')
+                          if c == code and org:
+                              print('ORG_RESOLVED', code, org)
+                              return org
+                  except Exception as exc:
+                      print('ORG_LOOKUP_ERROR', code, repr(exc))
+              return ''
+
+          ORG_CURRENT = resolve_cninfo_org(CODE)
+          ORG_OLD = resolve_cninfo_org(PREDECESSOR_CODE)
+
+          def cninfo_query(code: str = '', org: str = '', searchkey: str = '', category: str = '', date_range: str = '') -> list[dict[str, Any]]:
+              stock = f'{code},{org}' if code and org else code
+              payload = {
+                  'pageNum': '1',
+                  'pageSize': '30',
+                  'column': 'sse',
+                  'tabName': 'fulltext',
+                  'plate': 'sh',
+                  'stock': stock,
+                  'searchkey': searchkey,
+                  'secid': '',
+                  'category': category,
+                  'trade': '',
+                  'seDate': date_range,
+                  'sortName': '',
+                  'sortType': '',
+                  'isHLtitle': 'true',
+              }
+              headers = {
+                  'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock',
+                  'Origin': 'https://www.cninfo.com.cn',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'Accept': 'application/json, text/plain, */*',
+              }
+              try:
+                  r = S.post('https://www.cninfo.com.cn/new/hisAnnouncement/query', data=payload, headers=headers, timeout=90)
+                  print('CNINFO_QUERY', stock, category, searchkey, date_range, r.status_code, len(r.content))
+                  r.raise_for_status()
+                  data = r.json()
+                  rows = data.get('announcements') or []
+                  out = []
+                  for row in rows:
+                      title = clean_title(str(row.get('announcementTitle') or ''))
+                      path = str(row.get('adjunctUrl') or '').lstrip('/')
+                      if not title or not path:
+                          continue
+                      ts = int(row.get('announcementTime') or 0)
+                      date = datetime.fromtimestamp(ts / 1000, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d') if ts else ''
+                      out.append({
+                          'title': title,
+                          'source_url': 'https://static.cninfo.com.cn/' + path,
+                          'announcement_date': date,
+                          'announcement_time': ts,
+                          'source': 'CNINFO',
+                      })
+                  for x in out:
+                      print('CNINFO_ROW', x['announcement_date'], x['title'], x['source_url'])
+                  return out
+              except Exception as exc:
+                  print('CNINFO_QUERY_ERROR', stock, category, searchkey, repr(exc))
+                  return []
+
+          candidates: list[dict[str, Any]] = []
+
+          # Official annual reports from both disclosure systems.
+          candidates += cninfo_query(CODE, ORG_CURRENT, category='category_ndbg_szsh', date_range='2021-01-01~2026-10-28')
+          candidates += sse_query(CODE, '2020-01-01', CUTOFF, report_type='YEARLY')
+          for year in range(2020, 2026):
+              candidates += cninfo_query(CODE, ORG_CURRENT, searchkey=f'{year}年年度报告', date_range=f'{year + 1}-01-01~{year + 1}-06-30')
+
+          # Latest third-quarter report.
+          candidates += cninfo_query(CODE, ORG_CURRENT, category='category_sjdbg_szsh', date_range='2026-10-20~2026-10-28')
+          candidates += cninfo_query(CODE, ORG_CURRENT, searchkey='2026年第三季度报告', date_range='2026-10-20~2026-10-28')
+          candidates += sse_query(CODE, '2026-10-20', '2026-10-28', report_type='QUATER3')
+
+          # Listing documents. The merger report was disclosed under predecessor Dongbei B shares.
+          candidates += cninfo_query(PREDECESSOR_CODE, ORG_OLD, searchkey='换股吸收合并', date_range='2020-06-01~2020-10-31')
+          candidates += cninfo_query(CODE, ORG_CURRENT, searchkey='上市公告书', date_range='2020-12-01~2020-12-31')
+          candidates += cninfo_query(PREDECESSOR_CODE, ORG_OLD, searchkey='上市公告书', date_range='2020-12-01~2020-12-31')
+          candidates += cninfo_query('', '', searchkey='东贝集团换股吸收合并东贝B股上市公告书', date_range='2020-12-20~2020-12-31')
+          candidates += sse_query(CODE, '2020-12-01', '2020-12-31', key_word='上市公告书')
+          candidates += sse_query(PREDECESSOR_CODE, '2020-06-01', '2020-10-31', key_word='换股吸收合并')
+
+          # Known official fallbacks, independently verified through public exchange/disclosure records.
+          candidates.append({
+              'title': '湖北东贝机电集团股份有限公司换股吸收合并黄石东贝电器股份有限公司暨关联交易报告书（修订稿）',
+              'source_url': 'https://static.cninfo.com.cn/finalpage/2020-09-30/1208514501.PDF',
+              'announcement_date': '2020-09-30',
+              'source': 'CNINFO_HARDCODED_OFFICIAL',
+          })
+          candidates.append({
+              'title': '湖北东贝机电集团股份有限公司2026年第三季度报告',
+              'source_url': 'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-10-24/601956_20261024_L6BB.pdf',
+              'announcement_date': '2026-10-24',
+              'source': 'SSE_HARDCODED_OFFICIAL',
+          })
+
+          # Deduplicate normalized candidates.
+          dedup: dict[tuple[str, str], dict[str, Any]] = {}
+          for x in candidates:
+              t = clean_title(str(x.get('title') or ''))
+              u = str(x.get('source_url') or '')
+              if t and u:
+                  x = dict(x)
+                  x['title'] = t
+                  dedup[(t, u)] = x
+          candidates = list(dedup.values())
+          print('TOTAL_CANDIDATES', len(candidates))
+          for x in sorted(candidates, key=lambda z: (z.get('announcement_date') or '', z['title'])):
+              print('CANDIDATE', json.dumps(x, ensure_ascii=False))
+
+          def annual_rank(x: dict[str, Any]) -> tuple[int, int, str]:
+              t = x['title']
+              revised = 2 if any(k in t for k in ('修订', '更新', '更正后', '补充后')) else 1
+              exact = 2 if re.search(r'20\d{2}年年度报告(?:（[^）]+）)?$', t) else 1
+              return revised, exact, str(x.get('announcement_date') or '')
+
+          selected_annuals: list[dict[str, Any]] = []
+          for year in range(2020, 2026):
+              rows = []
+              for x in candidates:
+                  if not re.search(fr'{year}年年度报告', x['title']):
+                      continue
+                  if any(k in x['title'] for k in ('摘要', '英文版', '更正公告', '提示性公告', '取消', '审计报告', '董事会', '监事会', '问询函', '回复')):
+                      continue
+                  rows.append(x)
+              if not rows:
+                  raise RuntimeError(f'未找到{year}年完整年度报告。')
+              chosen = dict(max(rows, key=annual_rank))
+              chosen.update(doc_type='annual_report', report_year=year)
+              selected_annuals.append(chosen)
+
+          quarter_rows = []
+          for x in candidates:
+              if re.search(r'2026年(?:第三|三)季度报告', x['title']) and not any(k in x['title'] for k in ('摘要', '更正公告', '提示性公告', '说明')):
+                  quarter_rows.append(x)
+          if not quarter_rows:
+              raise RuntimeError('未找到2026年第三季度报告。')
+          latest_quarter = dict(max(quarter_rows, key=lambda x: str(x.get('announcement_date') or '')))
+          latest_quarter.update(doc_type='quarterly_report', report_year=2026, quarter=3)
+
+          merger_rows = []
+          for x in candidates:
+              t = x['title']
+              if '换股吸收合并黄石东贝电器股份有限公司暨关联交易报告书' in t and not any(k in t for k in ('摘要', '反馈意见回复', '提示性公告')):
+                  merger_rows.append(x)
+          if not merger_rows:
+              raise RuntimeError('未找到正式换股吸收合并交易报告书。')
+          merger_report = dict(max(merger_rows, key=lambda x: (2 if '修订稿' in x['title'] else 1, str(x.get('announcement_date') or ''))))
+          merger_report['doc_type'] = 'merger_report'
+
+          listing_rows = []
+          for x in candidates:
+              t = x['title']
+              if '上市公告书' in t and ('东贝' in t or '换股吸收合并' in t) and '摘要' not in t:
+                  listing_rows.append(x)
+          if not listing_rows:
+              raise RuntimeError('未找到换股吸收合并上市公告书。')
+          listing_notice = dict(max(listing_rows, key=lambda x: str(x.get('announcement_date') or '')))
+          listing_notice['doc_type'] = 'listing_notice'
+
+          selected = [merger_report, listing_notice, *selected_annuals, latest_quarter]
+          print('SELECTED_DOCUMENTS')
+          for x in selected:
+              print(json.dumps(x, ensure_ascii=False))
+
+          def safe_name(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|]', '_', value)
+              value = re.sub(r'\s+', '', value)
+              return re.sub(r'_+', '_', value).strip('_. ')
+
+          def download_pdf(url: str, dest: Path) -> None:
+              headers = {
+                  'Referer': 'https://www.sse.com.cn/',
+                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              }
+              r = S.get(url, headers=headers, timeout=240, allow_redirects=True)
+              print('DOWNLOAD', r.status_code, len(r.content), url, r.url, r.headers.get('content-type'))
+              r.raise_for_status()
+              if len(r.content) < 50_000 or not r.content.startswith(b'%PDF'):
+                  raise RuntimeError(f'下载内容不是完整PDF: {url}; size={len(r.content)} head={r.content[:20]!r}')
+              dest.write_bytes(r.content)
+
+          records: list[dict[str, Any]] = []
+          for item in selected:
+              dtype = item['doc_type']
+              if dtype == 'merger_report':
+                  filename = '2020_东贝集团_换股吸收合并东贝B股暨关联交易报告书_修订稿.pdf'
+                  dest = LISTING_DIR / filename
+                  period = '2020上市文件'
+              elif dtype == 'listing_notice':
+                  filename = '2020_东贝集团_换股吸收合并东贝B股上市公告书.pdf'
+                  dest = LISTING_DIR / filename
+                  period = '2020上市文件'
+              elif dtype == 'annual_report':
+                  year = int(item['report_year'])
+                  suffix = '_修订或更新版' if any(k in item['title'] for k in ('修订', '更新', '更正后', '补充后')) else ''
+                  filename = f'{year}_东贝集团_{year}年年度报告{suffix}.pdf'
+                  dest = ANNUAL_DIR / filename
+                  period = str(year)
+              else:
+                  filename = '2026Q3_东贝集团_2026年第三季度报告.pdf'
+                  dest = QUARTER_DIR / filename
+                  period = '2026Q3'
+              dest = dest.with_name(safe_name(dest.name))
+              download_pdf(item['source_url'], dest)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'PDF页数异常: {dest} -> {pages}')
+              if reader.is_encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception as exc:
+                      raise RuntimeError(f'PDF加密且无法读取: {dest}: {exc}')
+              doc = fitz.open(dest)
+              if doc.page_count != pages:
+                  raise RuntimeError(f'PDF解析器页数不一致: {dest}: pypdf={pages}, fitz={doc.page_count}')
+              first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+              last = doc.load_page(doc.page_count - 1).get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 100:
+                  raise RuntimeError(f'PDF页面渲染异常: {dest}')
+              first.save(PREVIEW_DIR / f'{dest.stem}.png')
+              probe = ''
+              for i in range(min(6, doc.page_count)):
+                  try:
+                      probe += doc.load_page(i).get_text('text')
+                  except Exception:
+                      pass
+              doc.close()
+              if not any(k in probe for k in (COMPANY, FULL_COMPANY, PREDECESSOR, CODE, PREDECESSOR_CODE)):
+                  print('WARNING_COMPANY_TEXT_NOT_FOUND', dest.name)
+
+              rec = {
+                  'document_type': dtype,
+                  'period': period,
+                  'announcement_title': item['title'],
+                  'announcement_date': item.get('announcement_date') or '',
+                  'source_url': item['source_url'],
+                  'source_system': item.get('source') or '',
+                  'relative_path': str(dest.relative_to(ROOT)).replace(os.sep, '/'),
+                  'file_name': dest.name,
+                  'file_size_bytes': dest.stat().st_size,
+                  'page_count': pages,
+                  'sha256': hashlib.sha256(dest.read_bytes()).hexdigest(),
+                  'pdf_header_valid': True,
+                  'first_page_rendered': True,
+                  'last_page_rendered': True,
+              }
+              records.append(rec)
+              print('VERIFIED', json.dumps(rec, ensure_ascii=False))
+
+          annual_years = sorted(int(r['period']) for r in records if r['document_type'] == 'annual_report')
+          if annual_years != [2020, 2021, 2022, 2023, 2024, 2025]:
+              raise RuntimeError(f'年度报告年份不完整: {annual_years}')
+          if len(records) != 9:
+              raise RuntimeError(f'最终PDF数量异常: {len(records)}，预期9份。')
+
+          manifest = {
+              'company': COMPANY,
+              'full_company_name': FULL_COMPANY,
+              'stock_code': CODE,
+              'predecessor_company': PREDECESSOR,
+              'predecessor_stock_code': PREDECESSOR_CODE,
+              'cutoff_date': CUTOFF,
+              'annual_report_years': annual_years,
+              'latest_quarter': '2026Q3',
+              'document_count': len(records),
+              'listing_document_note': '东贝集团并非通过常规IPO上市，而是发行股份换股吸收合并东贝B股后于2020年12月25日在上交所上市。因此不存在常规最终版IPO招股说明书；本包以正式换股吸收合并暨关联交易报告书（修订稿）和上市公告书作为对应的核心上市文件。',
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['relative_path']}" for r in records) + '\n', encoding='utf-8')
+
+          readme = [
+              f'# {COMPANY}（{CODE}）官方披露文件包', '',
+              f'- 截止日期：{CUTOFF}',
+              '- 年度报告：2020—2025年完整年度报告，共6份。',
+              '- 最新季度报告：2026年第三季度报告。',
+              '- 上市核心文件：换股吸收合并暨关联交易报告书（修订稿）及上市公告书。',
+              '- 说明：东贝集团通过换股吸收合并东贝B股实现A股上市，不存在常规最终版IPO招股说明书；上述两份上市核心文件承担相应的信息披露功能。',
+              '- 来源：上海证券交易所、巨潮资讯网官方原始PDF。',
+              '- 已排除年度报告摘要、英文版、提示性公告、单独审计报告及重复文件。',
+              '- 已完成PDF文件头、双解析器页数、首末页渲染、SHA-256及ZIP CRC校验。', '',
+              '## 文件清单', '',
+          ]
+          for i, r in enumerate(records, 1):
+              readme += [
+                  f"{i}. `{r['relative_path']}`",
+                  f"   - 披露标题：{r['announcement_title']}",
+                  f"   - 披露日期：{r['announcement_date']}",
+                  f"   - 页数：{r['page_count']}；文件大小：{r['file_size_bytes']:,} 字节",
+                  f"   - 官方来源：{r['source_url']}",
+                  f"   - SHA-256：`{r['sha256']}`",
+              ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          final_cn = DIST / f'{ROOT_NAME}.zip'
+          final_en = DIST / f'dongbei_group_601956_all_annual_reports_listing_documents_latest_quarter_{CUT}.zip'
+          for p in (final_cn, final_en):
+              if p.exists():
+                  p.unlink()
+          with zipfile.ZipFile(final_cn, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, str(p.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(final_cn, final_en)
+
+          for p in (final_cn, final_en):
+              with zipfile.ZipFile(p) as zf:
+                  bad = zf.testzip()
+                  pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+                  if bad or len(pdfs) != len(records):
+                      raise RuntimeError(f'ZIP校验失败 {p}: bad={bad}, pdfs={len(pdfs)}, expected={len(records)}')
+              print('ZIP_VERIFIED', p, p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest())
+
+          print('FINAL_JSON', json.dumps({
+              'document_count': len(records),
+              'annual_years': annual_years,
+              'latest_quarter': '2026Q3',
+              'chinese_zip': str(final_cn),
+              'english_zip': str(final_en),
+              'chinese_zip_size': final_cn.stat().st_size,
+              'chinese_zip_sha256': hashlib.sha256(final_cn.read_bytes()).hexdigest(),
+              'documents': [{k: r[k] for k in ('document_type', 'period', 'file_name', 'page_count')} for r in records],
+          }, ensure_ascii=False))
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dongbei-601956-official-filings-20261028
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
