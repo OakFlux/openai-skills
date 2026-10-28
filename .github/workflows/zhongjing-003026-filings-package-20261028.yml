@@ -1,0 +1,445 @@
+name: Build Zhongjing 003026 filings package 20261028
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/zhongjing-003026-filings-package-20261028.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4 lxml
+
+      - name: Discover, download, validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CODE = '003026'
+          SHORT = '中晶科技'
+          FULL = '浙江中晶科技股份有限公司'
+          TODAY = '2026-10-28'
+          ROOT = Path('中晶科技_003026_全部年报_招股说明书_最新季报')
+          PDF_DIR = ROOT / '原始PDF'
+          PREVIEW_DIR = ROOT / '首页预览'
+          for d in (ROOT, PDF_DIR, PREVIEW_DIR):
+              d.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=003026&orgId=',
+              'Origin': 'https://www.cninfo.com.cn',
+              'X-Requested-With': 'XMLHttpRequest',
+          })
+
+          request_log: list[dict[str, Any]] = []
+
+          def clean_title(value: Any) -> str:
+              text = html.unescape(str(value or ''))
+              text = BeautifulSoup(text, 'lxml').get_text(' ', strip=True)
+              return re.sub(r'\s+', '', text)
+
+          def get_json(url: str, **kwargs: Any) -> Any:
+              last: dict[str, Any] = {}
+              for attempt in range(6):
+                  try:
+                      r = s.get(url, timeout=(20, 120), **kwargs)
+                      last = {'method': 'GET', 'url': r.url, 'status': r.status_code, 'bytes': len(r.content), 'content_type': r.headers.get('content-type', '')}
+                      request_log.append(last)
+                      if r.status_code == 200:
+                          return r.json()
+                  except Exception as exc:
+                      last = {'method': 'GET', 'url': url, 'error': repr(exc), 'attempt': attempt + 1}
+                      request_log.append(last)
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'GET JSON failed: {url}: {last}')
+
+          def post_json(url: str, data: dict[str, str]) -> Any:
+              last: dict[str, Any] = {}
+              for attempt in range(7):
+                  try:
+                      r = s.post(url, data=data, timeout=(20, 120))
+                      last = {'method': 'POST', 'url': r.url, 'status': r.status_code, 'bytes': len(r.content), 'content_type': r.headers.get('content-type', ''), 'data': data}
+                      request_log.append(last)
+                      if r.status_code == 200:
+                          return r.json()
+                  except Exception as exc:
+                      last = {'method': 'POST', 'url': url, 'error': repr(exc), 'attempt': attempt + 1, 'data': data}
+                      request_log.append(last)
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'POST JSON failed: {url}: {last}')
+
+          def walk_find(obj: Any) -> list[dict[str, Any]]:
+              out: list[dict[str, Any]] = []
+              if isinstance(obj, dict):
+                  code_values = [str(obj.get(k) or '') for k in ('code', 'secCode', 'stockCode', 'zqdm', 'symbol')]
+                  if CODE in code_values:
+                      out.append(obj)
+                  for v in obj.values():
+                      out.extend(walk_find(v))
+              elif isinstance(obj, list):
+                  for v in obj:
+                      out.extend(walk_find(v))
+              return out
+
+          org_id = ''
+          mapping_sources = [
+              'https://www.cninfo.com.cn/new/data/szse_stock.json',
+              'https://www.cninfo.com.cn/new/data/szse_stock.json?v=20261028',
+          ]
+          mapping_matches: list[dict[str, Any]] = []
+          for u in mapping_sources:
+              try:
+                  obj = get_json(u)
+                  mapping_matches = walk_find(obj)
+                  if mapping_matches:
+                      break
+              except Exception:
+                  continue
+          for m in mapping_matches:
+              for k in ('orgId', 'orgid', 'organizationId', 'companyId'):
+                  if m.get(k):
+                      org_id = str(m[k])
+                      break
+              if org_id:
+                  break
+          print('ORG_ID', org_id, 'MAPPING_MATCHES', json.dumps(mapping_matches[:3], ensure_ascii=False))
+
+          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          all_rows: list[dict[str, Any]] = []
+          seen: set[str] = set()
+
+          query_specs = [
+              {'category': '', 'searchkey': ''},
+              {'category': 'category_ndbg_szsh', 'searchkey': ''},
+              {'category': 'category_sjdbg_szsh', 'searchkey': ''},
+              {'category': '', 'searchkey': '招股说明书'},
+              {'category': '', 'searchkey': '2026年第三季度报告'},
+              {'category': '', 'searchkey': FULL},
+          ]
+          stock_values = []
+          if org_id:
+              stock_values.append(f'{CODE},{org_id}')
+          stock_values += [CODE, '']
+          stock_values = list(dict.fromkeys(stock_values))
+
+          for spec in query_specs:
+              for stock_value in stock_values:
+                  for page in range(1, 11):
+                      data = {
+                          'pageNum': str(page),
+                          'pageSize': '100',
+                          'column': 'szse',
+                          'tabName': 'fulltext',
+                          'plate': 'sz',
+                          'stock': stock_value,
+                          'searchkey': spec['searchkey'],
+                          'secid': '',
+                          'category': spec['category'],
+                          'trade': '',
+                          'seDate': f'2019-01-01~{TODAY}',
+                          'sortName': 'time',
+                          'sortType': 'desc',
+                          'isHLtitle': 'true',
+                      }
+                      try:
+                          payload = post_json(endpoint, data)
+                      except Exception:
+                          break
+                      rows = payload.get('announcements') or payload.get('announcementList') or []
+                      if not isinstance(rows, list):
+                          rows = []
+                      added = 0
+                      for row in rows:
+                          if not isinstance(row, dict):
+                              continue
+                          sec_code = str(row.get('secCode') or row.get('stockCode') or '')
+                          sec_name = clean_title(row.get('secName') or row.get('stockName') or '')
+                          title = clean_title(row.get('announcementTitle') or row.get('title') or '')
+                          if sec_code and sec_code != CODE:
+                              continue
+                          if sec_name and SHORT not in sec_name and FULL not in sec_name:
+                              continue
+                          key = str(row.get('announcementId') or row.get('announcementTime') or '') + '|' + title + '|' + str(row.get('adjunctUrl') or '')
+                          if key in seen:
+                              continue
+                          seen.add(key)
+                          all_rows.append(row)
+                          added += 1
+                      total_pages = int(payload.get('totalpages') or payload.get('totalPages') or 0)
+                      has_more = bool(payload.get('hasMore'))
+                      print('QUERY', spec, 'stock', stock_value, 'page', page, 'rows', len(rows), 'added', added, 'total_pages', total_pages, 'has_more', has_more)
+                      if not rows or (total_pages and page >= total_pages) or (not total_pages and not has_more):
+                          break
+                      time.sleep(0.35)
+
+          def ann_time(row: dict[str, Any]) -> int:
+              value = row.get('announcementTime') or row.get('announcementDate') or 0
+              try:
+                  return int(value)
+              except Exception:
+                  text = str(value)
+                  digits = re.sub(r'\D', '', text)
+                  return int(digits[:14] or 0)
+
+          def title_of(row: dict[str, Any]) -> str:
+              return clean_title(row.get('announcementTitle') or row.get('title') or '')
+
+          def adjunct_of(row: dict[str, Any]) -> str:
+              return str(row.get('adjunctUrl') or row.get('url') or '').strip()
+
+          # If queries with a blank stock returned unrelated entries, this keeps only the issuer's records.
+          issuer_rows: list[dict[str, Any]] = []
+          for row in all_rows:
+              t = title_of(row)
+              code = str(row.get('secCode') or row.get('stockCode') or '')
+              name = clean_title(row.get('secName') or row.get('stockName') or '')
+              if code == CODE or SHORT in name or FULL in name or SHORT in t:
+                  issuer_rows.append(row)
+          all_rows = issuer_rows
+          print('TOTAL_ISSUER_ROWS', len(all_rows))
+          for row in sorted(all_rows, key=ann_time, reverse=True):
+              print('ANN', ann_time(row), title_of(row), adjunct_of(row))
+
+          annual_selected: list[tuple[str, dict[str, Any]]] = []
+          for year in range(2020, 2026):
+              target = f'{year}年年度报告'
+              candidates = []
+              for row in all_rows:
+                  t = title_of(row)
+                  if target not in t:
+                      continue
+                  if any(x in t for x in ['摘要', '审计报告', '内部控制', '董事会', '监事会', '工作报告', '问询', '回复', '说明会', '取消', '提示性公告']):
+                      continue
+                  if '更正公告' in t or ('关于' in t and target in t):
+                      continue
+                  score = 0
+                  if re.search(rf'(^|[:：]){year}年年度报告$', t):
+                      score += 100
+                  if any(x in t for x in ['更新后', '修订版', '更正后']):
+                      score += 30
+                  if '全文' in t:
+                      score += 10
+                  score += min(ann_time(row) // 10**8, 999999)
+                  candidates.append((score, ann_time(row), row))
+              if not candidates:
+                  raise RuntimeError(f'Missing full annual report for {year}. Available titles: {[title_of(x) for x in all_rows]}')
+              candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+              annual_selected.append((f'{year}年年度报告', candidates[0][2]))
+
+          prospectus_candidates = []
+          for row in all_rows:
+              t = title_of(row)
+              if '招股说明书' not in t:
+                  continue
+              if any(x in t for x in ['摘要', '提示性公告', '问询', '回复', '核查', '法律意见', '保荐', '审核', '发行公告', '上市公告书']):
+                  continue
+              score = 0
+              if '首次公开发行股票招股说明书' in t:
+                  score += 100
+              if any(x in t for x in ['注册稿', '更新稿']):
+                  score += 10
+              if any(x in t for x in ['申报稿', '上会稿']):
+                  score -= 20
+              score += min(ann_time(row) // 10**8, 999999)
+              prospectus_candidates.append((score, ann_time(row), row))
+          if not prospectus_candidates:
+              raise RuntimeError(f'Missing full prospectus. Available titles: {[title_of(x) for x in all_rows]}')
+          prospectus_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+          prospectus_selected = ('首次公开发行股票招股说明书', prospectus_candidates[0][2])
+
+          quarter_candidates = []
+          for row in all_rows:
+              t = title_of(row)
+              if '2026年第三季度报告' not in t:
+                  continue
+              if any(x in t for x in ['更正公告', '关于']):
+                  continue
+              score = 100
+              if any(x in t for x in ['更新后', '修订版', '更正后']):
+                  score += 20
+              quarter_candidates.append((score, ann_time(row), row))
+          if not quarter_candidates:
+              raise RuntimeError(f'Missing 2026 Q3 report. Available titles: {[title_of(x) for x in all_rows]}')
+          quarter_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+          quarter_selected = ('2026年第三季度报告', quarter_candidates[0][2])
+
+          selections = annual_selected + [prospectus_selected, quarter_selected]
+
+          def safe_name(text: str) -> str:
+              text = re.sub(r'[\\/:*?"<>|]+', '_', text)
+              text = re.sub(r'\s+', '', text)
+              return text[:100]
+
+          manifest: list[dict[str, Any]] = []
+          for idx, (label, row) in enumerate(selections, 1):
+              title = title_of(row)
+              adjunct = adjunct_of(row)
+              if not adjunct:
+                  raise RuntimeError(f'No adjunct URL for {title}')
+              if adjunct.startswith('//'):
+                  pdf_url = 'https:' + adjunct
+              elif adjunct.startswith('http://') or adjunct.startswith('https://'):
+                  pdf_url = adjunct.replace('http://', 'https://', 1)
+              else:
+                  pdf_url = 'https://static.cninfo.com.cn/' + adjunct.lstrip('/')
+
+              data = None
+              attempts: list[dict[str, Any]] = []
+              for attempt in range(7):
+                  try:
+                      rr = s.get(pdf_url, headers={
+                          'User-Agent': s.headers['User-Agent'],
+                          'Referer': 'https://www.cninfo.com.cn/',
+                          'Accept': 'application/pdf,*/*;q=0.8',
+                      }, timeout=(30, 360), allow_redirects=True)
+                      meta = {'url': pdf_url, 'status': rr.status_code, 'bytes': len(rr.content), 'content_type': rr.headers.get('content-type', ''), 'final_url': rr.url}
+                      attempts.append(meta)
+                      if rr.status_code == 200 and rr.content[:5] == b'%PDF-' and len(rr.content) > 50_000:
+                          data = rr.content
+                          break
+                  except Exception as exc:
+                      attempts.append({'url': pdf_url, 'error': repr(exc)})
+                  time.sleep(1 + attempt)
+              if data is None:
+                  raise RuntimeError(f'PDF download failed for {title}: {attempts}')
+
+              filename = f'{idx:02d}_{safe_name(label)}_{safe_name(title)}.pdf'
+              dest = PDF_DIR / filename
+              dest.write_bytes(data)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              min_pages = 5
+              if '年度报告' in label:
+                  min_pages = 80
+              elif '招股说明书' in label:
+                  min_pages = 100
+              if pages < min_pages:
+                  raise RuntimeError(f'Unexpectedly short PDF {filename}: {pages} pages')
+
+              text = ''
+              for page in reader.pages[:min(8, pages)]:
+                  try:
+                      text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', text)
+              identity_hits = [x for x in (SHORT, FULL, CODE) if re.sub(r'\s+', '', x) in compact]
+              if len(compact) > 500 and not identity_hits:
+                  raise RuntimeError(f'Issuer identity mismatch for {filename}')
+
+              subprocess.run(['qpdf', '--warning-exit-0', '--check', str(dest)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              prefix = PREVIEW_DIR / dest.stem
+              subprocess.run(['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(dest), str(prefix)], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'Preview render failed for {filename}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  'label': label,
+                  'filename': str(Path('原始PDF') / filename),
+                  'announcement_title': title,
+                  'announcement_time': ann_time(row),
+                  'announcement_id': row.get('announcementId'),
+                  'adjunct_url': adjunct,
+                  'source_url': pdf_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'identity_hits': identity_hits,
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'download_attempts': attempts,
+                  'validation': ['PDF header', 'issuer identity', 'page count', 'qpdf structure', 'first-page render'],
+              })
+
+          readme = [
+              '浙江中晶科技股份有限公司（003026.SZ）定期报告与发行文件资料包',
+              '整理日期：2026-10-28',
+              '',
+              '收录范围：上市以来全部年度报告全文、首次公开发行股票招股说明书全文，以及截至整理日最新披露的季度报告。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {item['label']}",
+                  f"   公告标题：{item['announcement_title']}",
+                  f"   页数：{item['pages']}页；文件：{item['filename']}",
+                  f"   来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          readme += [
+              '所有文件均来自公开信息披露附件，仅供研究与查阅。',
+              '核验项目：PDF文件头、公司名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'all_cninfo_candidates.json').write_text(json.dumps([{**row, '_clean_title': title_of(row)} for row in all_rows], ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+          (ROOT / 'request_log.json').write_text(json.dumps(request_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f"{item['sha256']}  {item['filename']}\n" for item in manifest), encoding='utf-8')
+
+          zip_cn = Path('中晶科技_003026_全部年报_招股说明书_最新季报.zip')
+          with zipfile.ZipFile(zip_cn, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{ROOT.name}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_cn) as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              if len(pdfs) != len(manifest) or len(pdfs) != 8:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)} vs {len(manifest)}')
+
+          zip_en = Path('zhongjing_003026_all_annual_reports_prospectus_latest_quarter.zip')
+          zip_en.write_bytes(zip_cn.read_bytes())
+          print('FINAL_ZIP', zip_cn, zip_cn.stat().st_size, 'SHA256', hashlib.sha256(zip_cn.read_bytes()).hexdigest())
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongjing-003026-filings-package-final
+          path: |
+            中晶科技_003026_全部年报_招股说明书_最新季报.zip
+            zhongjing_003026_all_annual_reports_prospectus_latest_quarter.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
