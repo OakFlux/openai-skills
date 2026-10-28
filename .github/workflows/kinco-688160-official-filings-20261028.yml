@@ -1,0 +1,469 @@
+name: Package Kinco 688160 official filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/kinco-688160-official-filings-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf 'pymupdf<2'
+
+      - name: Discover, download, validate, and package official PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          import zipfile
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CODE = '688160'
+          COMPANY = '步科股份'
+          FULL_COMPANY = '上海步科自动化股份有限公司'
+          CUTOFF = '2026-10-28'
+          CUTOFF_COMPACT = '20261028'
+          ROOT_NAME = f'{COMPANY}_{CODE}_上市以来全部年报_招股说明书及最新季报_截至{CUTOFF_COMPACT}'
+          ROOT = Path('work') / ROOT_NAME
+          DIST = Path('dist')
+          PROSPECTUS_DIR = ROOT / '00_招股说明书'
+          ANNUAL_DIR = ROOT / '01_年度报告'
+          QUARTER_DIR = ROOT / '02_最新季度报告'
+          PREVIEW_DIR = ROOT / '首页预览'
+          for directory in (PROSPECTUS_DIR, ANNUAL_DIR, QUARTER_DIR, PREVIEW_DIR, DIST):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          def make_session() -> requests.Session:
+              s = requests.Session()
+              retry = Retry(
+                  total=6, connect=6, read=6, status=6, backoff_factor=1.0,
+                  status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({'GET', 'POST'}), raise_on_status=False,
+              )
+              s.mount('https://', HTTPAdapter(max_retries=retry))
+              s.mount('http://', HTTPAdapter(max_retries=retry))
+              s.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                  'Connection': 'keep-alive',
+              })
+              return s
+
+          S = make_session()
+
+          def get_text(url: str, referer: str | None = None) -> tuple[str, str]:
+              headers = {'Referer': referer} if referer else None
+              r = S.get(url, headers=headers, timeout=90, allow_redirects=True)
+              print('GET_PAGE', r.status_code, len(r.content), url, '->', r.url)
+              r.raise_for_status()
+              apparent = r.apparent_encoding or 'utf-8'
+              for encoding in (r.encoding, apparent, 'gb18030', 'utf-8'):
+                  if not encoding:
+                      continue
+                  try:
+                      return r.content.decode(encoding, errors='strict'), r.url
+                  except Exception:
+                      pass
+              return r.content.decode('utf-8', errors='replace'), r.url
+
+          def clean(value: str) -> str:
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', '', value)
+              value = value.replace('\u3000', ' ').replace(' ', ' ')
+              return re.sub(r'\s+', '', value).strip()
+
+          TARGETS: dict[str, dict[str, Any]] = {
+              'prospectus': {
+                  'phrases': ['首次公开发行股票并在科创板上市招股说明书'],
+                  'date_range': '2020-10-01~2020-11-30',
+                  'searchkey': '步科股份首次公开发行股票并在科创板上市招股说明书',
+                  'doc_type': 'prospectus',
+              },
+              'annual_2020': {'phrases': ['2020年年度报告'], 'date_range': '2021-04-01~2021-05-31', 'searchkey': '步科股份2020年年度报告', 'doc_type': 'annual_report', 'year': 2020},
+              'annual_2021': {'phrases': ['2021年年度报告'], 'date_range': '2022-04-01~2022-05-31', 'searchkey': '步科股份2021年年度报告', 'doc_type': 'annual_report', 'year': 2021},
+              'annual_2022': {'phrases': ['2022年年度报告'], 'date_range': '2023-03-01~2023-04-30', 'searchkey': '步科股份2022年年度报告', 'doc_type': 'annual_report', 'year': 2022},
+              'annual_2023': {'phrases': ['2023年年度报告'], 'date_range': '2024-03-01~2024-04-30', 'searchkey': '步科股份2023年年度报告', 'doc_type': 'annual_report', 'year': 2023},
+              'annual_2024': {'phrases': ['2024年年度报告'], 'date_range': '2025-04-01~2025-05-31', 'searchkey': '步科股份2024年年度报告', 'doc_type': 'annual_report', 'year': 2024},
+              'annual_2025': {'phrases': ['2025年年度报告'], 'date_range': '2026-03-01~2026-04-30', 'searchkey': '步科股份2025年年度报告', 'doc_type': 'annual_report', 'year': 2025},
+              'quarter_2026Q1': {'phrases': ['2026年第一季度报告'], 'date_range': '2026-04-01~2026-05-31', 'searchkey': '步科股份2026年第一季度报告', 'doc_type': 'quarterly_report', 'year': 2026, 'quarter': 1},
+          }
+
+          # Already independently verified official URLs. Discovery fills the remaining targets.
+          discovered: dict[str, str] = {
+              'annual_2020': 'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2021-04-21/688160_20210421_2.pdf',
+              'annual_2024': 'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2025-04-25/688160_20250425_680M.pdf',
+              'annual_2025': 'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-03/688160_20260403_16A8.pdf',
+              'quarter_2026Q1': 'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-28/688160_20260428_OJ7D.pdf',
+          }
+          discovery_notes: dict[str, list[str]] = {key: [] for key in TARGETS}
+
+          PDF_URL_RE = re.compile(r'''https?://[^\s"'<>]+?\.pdf(?:\?[^\s"'<>]*)?''', re.I)
+
+          def official_pdf_urls(text: str, base_url: str) -> list[str]:
+              normalized = html.unescape(text).replace('\\/', '/')
+              urls: list[str] = []
+              for match in PDF_URL_RE.finditer(normalized):
+                  urls.append(match.group(0))
+              soup = BeautifulSoup(normalized, 'html.parser')
+              for tag in soup.find_all(['a', 'iframe', 'embed', 'object']):
+                  for attr in ('href', 'src', 'data'):
+                      value = tag.get(attr)
+                      if value and '.pdf' in value.lower():
+                          urls.append(urljoin(base_url, value))
+              result = []
+              seen = set()
+              for url in urls:
+                  url = url.rstrip('),;]')
+                  if url.startswith('http://static.sse.com.cn/'):
+                      url = 'https://' + url[len('http://'):]
+                  if url.startswith('http://static.cninfo.com.cn/'):
+                      url = 'https://' + url[len('http://'):]
+                  lower = url.lower()
+                  if not any(host in lower for host in ('static.sse.com.cn/', 'static.cninfo.com.cn/', 'big5.sse.com.cn/')):
+                      continue
+                  if url not in seen:
+                      seen.add(url)
+                      result.append(url)
+              return result
+
+          def match_target(text: str) -> list[str]:
+              compact = clean(text)
+              matches = []
+              for key, spec in TARGETS.items():
+                  if key in discovered:
+                      continue
+                  if any(clean(phrase) in compact for phrase in spec['phrases']):
+                      # Reject summaries and unrelated notice rows.
+                      if '摘要' in compact or '更正公告' in compact or '提示性公告' in compact:
+                          continue
+                      matches.append(key)
+              return matches
+
+          # 1) Crawl Sohu event pages, which expose official SSE PDF URLs in each row.
+          for page_no in range(1, 21):
+              url = f'https://q.stock.sohu.com/cn/{CODE}/bw_{page_no}.shtml'
+              try:
+                  text, final_url = get_text(url)
+              except Exception as exc:
+                  print('SOHU_BW_ERROR', page_no, repr(exc))
+                  continue
+              soup = BeautifulSoup(text, 'html.parser')
+              blocks = list(soup.find_all('tr')) + list(soup.find_all('li'))
+              for block in blocks:
+                  block_text = block.get_text(' ', strip=True)
+                  keys = match_target(block_text)
+                  if not keys:
+                      continue
+                  urls = official_pdf_urls(str(block), final_url)
+                  if not urls:
+                      # Some Sohu rows place the official URL as plain text immediately after the title.
+                      raw = str(block)
+                      urls = official_pdf_urls(raw, final_url)
+                  for key in keys:
+                      if urls:
+                          discovered[key] = urls[0]
+                          discovery_notes[key].append(f'Sohu event page {page_no}: {block_text[:200]}')
+                          print('DISCOVERED_BW', key, discovered[key])
+              if len(discovered) == len(TARGETS):
+                  break
+
+          # 2) Crawl Sohu announcement indexes and then matching detail pages.
+          if len(discovered) < len(TARGETS):
+              for page_no in range(1, 31):
+                  index_url = f'https://q.stock.sohu.com/cn/{CODE}/gsgg_{page_no}.shtml'
+                  try:
+                      text, final_url = get_text(index_url)
+                  except Exception as exc:
+                      print('SOHU_GSGG_ERROR', page_no, repr(exc))
+                      continue
+                  soup = BeautifulSoup(text, 'html.parser')
+                  for anchor in soup.find_all('a', href=True):
+                      anchor_text = anchor.get_text(' ', strip=True)
+                      keys = match_target(anchor_text)
+                      if not keys:
+                          continue
+                      detail_url = urljoin(final_url, anchor['href'])
+                      try:
+                          detail_text, detail_final = get_text(detail_url, referer=final_url)
+                      except Exception as exc:
+                          print('SOHU_DETAIL_ERROR', detail_url, repr(exc))
+                          continue
+                      urls = official_pdf_urls(detail_text, detail_final)
+                      for key in keys:
+                          if urls:
+                              discovered[key] = urls[0]
+                              discovery_notes[key].append(f'Sohu announcement detail: {anchor_text}')
+                              print('DISCOVERED_DETAIL', key, discovered[key])
+                  if len(discovered) == len(TARGETS):
+                      break
+
+          # 3) Targeted CNINFO fallback. Exact company/title searches are filtered by security code.
+          def cninfo_query(searchkey: str, date_range: str, stock_value: str) -> list[dict[str, Any]]:
+              api = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              rows: list[dict[str, Any]] = []
+              for page in range(1, 11):
+                  payload = {
+                      'pageNum': str(page), 'pageSize': '100', 'column': 'sse', 'tabName': 'fulltext',
+                      'plate': 'sh', 'stock': stock_value, 'searchkey': searchkey, 'secid': '',
+                      'category': '', 'trade': '', 'seDate': date_range, 'sortName': 'time',
+                      'sortType': 'desc', 'isHLtitle': 'true',
+                  }
+                  response = S.post(api, data=payload, headers={
+                      'Origin': 'https://www.cninfo.com.cn',
+                      'Referer': 'https://www.cninfo.com.cn/new/fulltextSearch',
+                      'X-Requested-With': 'XMLHttpRequest',
+                  }, timeout=90)
+                  print('CNINFO_QUERY', response.status_code, len(response.content), searchkey, stock_value, page)
+                  if response.status_code != 200:
+                      continue
+                  data = response.json()
+                  batch = data.get('announcements') or []
+                  rows.extend(batch)
+                  total = int(data.get('totalAnnouncement') or 0)
+                  if not batch or len(rows) >= total:
+                      break
+              return rows
+
+          for key, spec in TARGETS.items():
+              if key in discovered:
+                  continue
+              candidates: list[dict[str, Any]] = []
+              for stock_value in ('', f'{CODE},'):
+                  try:
+                      candidates.extend(cninfo_query(spec['searchkey'], spec['date_range'], stock_value))
+                  except Exception as exc:
+                      print('CNINFO_ERROR', key, stock_value, repr(exc))
+              for row in candidates:
+                  sec_code = str(row.get('secCode') or '')
+                  title = clean(str(row.get('announcementTitle') or ''))
+                  if sec_code != CODE:
+                      continue
+                  if any(bad in title for bad in ('摘要', '更正公告', '提示性公告')):
+                      continue
+                  if not any(clean(phrase) in title for phrase in spec['phrases']):
+                      continue
+                  path = str(row.get('adjunctUrl') or '').lstrip('/')
+                  if path:
+                      discovered[key] = 'https://static.cninfo.com.cn/' + path
+                      discovery_notes[key].append(f'CNINFO targeted search: {title}')
+                      print('DISCOVERED_CNINFO', key, discovered[key])
+                      break
+
+          missing = [key for key in TARGETS if key not in discovered]
+          print('DISCOVERY_RESULT', json.dumps(discovered, ensure_ascii=False, indent=2))
+          if missing:
+              raise RuntimeError(f'Missing official PDF URLs for: {missing}')
+
+          def safe_name(value: str) -> str:
+              return re.sub(r'_+', '_', re.sub(r'[\\/:*?"<>|]', '_', value)).strip('_. ')
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          records: list[dict[str, Any]] = []
+          for key in ['prospectus', 'annual_2020', 'annual_2021', 'annual_2022', 'annual_2023', 'annual_2024', 'annual_2025', 'quarter_2026Q1']:
+              spec = TARGETS[key]
+              source_url = discovered[key]
+              response = S.get(source_url, headers={
+                  'Referer': 'https://www.sse.com.cn/',
+                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              }, timeout=240, allow_redirects=True)
+              print('DOWNLOAD', key, response.status_code, len(response.content), source_url, '->', response.url)
+              response.raise_for_status()
+              if len(response.content) < 50_000 or not response.content.startswith(b'%PDF'):
+                  raise RuntimeError(f'Not a complete PDF for {key}: size={len(response.content)}, url={source_url}')
+
+              if key == 'prospectus':
+                  destination = PROSPECTUS_DIR / '2020_步科股份_首次公开发行股票并在科创板上市招股说明书.pdf'
+                  period = 'IPO'
+              elif spec['doc_type'] == 'annual_report':
+                  year = int(spec['year'])
+                  destination = ANNUAL_DIR / f'{year}_步科股份_{year}年年度报告.pdf'
+                  period = str(year)
+              else:
+                  destination = QUARTER_DIR / '2026Q1_步科股份_2026年第一季度报告.pdf'
+                  period = '2026Q1'
+              destination = destination.with_name(safe_name(destination.name))
+              destination.write_bytes(response.content)
+
+              reader = PdfReader(str(destination), strict=False)
+              if reader.is_encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception as exc:
+                      raise RuntimeError(f'Encrypted PDF cannot be opened: {destination}: {exc}')
+              page_count = len(reader.pages)
+              min_pages = 200 if key == 'prospectus' else (50 if spec['doc_type'] == 'annual_report' else 5)
+              if page_count < min_pages:
+                  raise RuntimeError(f'Unexpectedly short PDF for {key}: {page_count} pages')
+
+              doc = fitz.open(destination)
+              if doc.page_count != page_count:
+                  raise RuntimeError(f'Parser page mismatch for {key}: pypdf={page_count}, fitz={doc.page_count}')
+              first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+              last = doc.load_page(doc.page_count - 1).get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 100:
+                  raise RuntimeError(f'Render validation failed for {key}')
+              first.save(PREVIEW_DIR / f'{destination.stem}.png')
+
+              probe = ''
+              for page_index in range(min(12, doc.page_count)):
+                  try:
+                      probe += doc.load_page(page_index).get_text('text')
+                  except Exception:
+                      pass
+              doc.close()
+              compact_probe = clean(probe)
+              if COMPANY not in compact_probe and FULL_COMPANY not in compact_probe and CODE not in compact_probe:
+                  raise RuntimeError(f'Company identity not found in {key}')
+              if key == 'prospectus' and '招股说明书' not in compact_probe:
+                  raise RuntimeError('Downloaded IPO document is not the final prospectus')
+              if spec['doc_type'] == 'annual_report' and f"{spec['year']}年年度报告" not in compact_probe:
+                  raise RuntimeError(f'Annual report period not found in {key}')
+              if spec['doc_type'] == 'quarterly_report' and '2026年第一季度报告' not in compact_probe:
+                  raise RuntimeError('Quarterly report period not found')
+
+              record = {
+                  'document_type': spec['doc_type'],
+                  'period': period,
+                  'source_url': source_url,
+                  'resolved_url': response.url,
+                  'discovery_notes': discovery_notes[key],
+                  'relative_path': str(destination.relative_to(ROOT)).replace(os.sep, '/'),
+                  'file_name': destination.name,
+                  'file_size_bytes': destination.stat().st_size,
+                  'page_count': page_count,
+                  'sha256': sha256(destination),
+                  'pdf_header_valid': True,
+                  'first_page_rendered': True,
+                  'last_page_rendered': True,
+                  'company_identity_validated': True,
+                  'period_validated': True,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False))
+
+          annual_years = sorted(int(record['period']) for record in records if record['document_type'] == 'annual_report')
+          if annual_years != [2020, 2021, 2022, 2023, 2024, 2025]:
+              raise RuntimeError(f'Annual coverage mismatch: {annual_years}')
+
+          manifest = {
+              'company': COMPANY,
+              'full_company_name': FULL_COMPANY,
+              'stock_code': CODE,
+              'market': '上海证券交易所科创板',
+              'listing_date': '2020-11-12',
+              'cutoff_date': CUTOFF,
+              'annual_report_years': annual_years,
+              'latest_quarter': '2026Q1',
+              'latest_quarter_note': '截至2026-10-28，2026年第三季度报告预约披露日为2026-10-30，尚未正式披露；因此收录2026年第一季度报告作为最新正式独立季报。',
+              'document_count': len(records),
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{record['sha256']}  {record['relative_path']}" for record in records) + '\n',
+              encoding='utf-8',
+          )
+
+          readme = [
+              f'# {COMPANY}（{CODE}）上市以来官方披露文件包', '',
+              f'- 截止日期：{CUTOFF}',
+              '- 来源：上海证券交易所或巨潮资讯网官方原始PDF。',
+              '- 收录：最终正式版IPO招股说明书、上市以来2020—2025年全部年度报告全文、截至截止日最新正式独立季度报告。',
+              '- 最新季报说明：2026年第三季度报告预约于2026年10月30日披露，截至本包截止日尚未发布，因此采用2026年第一季度报告。',
+              '- 排除：年度报告摘要、招股意向书、申报稿、提示性公告及重复文件。',
+              '- 校验：PDF文件头、双解析器页数、公司身份、报告期、首末页渲染、SHA-256及ZIP CRC。', '',
+              '## 文件清单', '',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. `{record['relative_path']}`",
+                  f"   - 类型/期间：{record['document_type']} / {record['period']}",
+                  f"   - 页数：{record['page_count']}；大小：{record['file_size_bytes']:,}字节",
+                  f"   - 官方来源：{record['source_url']}",
+                  f"   - SHA-256：`{record['sha256']}`",
+              ])
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          chinese_zip = DIST / f'{ROOT_NAME}.zip'
+          english_zip = DIST / f'kinco_688160_all_annual_reports_prospectus_latest_quarter_{CUTOFF_COMPACT}.zip'
+          for path in (chinese_zip, english_zip):
+              if path.exists():
+                  path.unlink()
+          with zipfile.ZipFile(chinese_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(chinese_zip, english_zip)
+
+          for path in (chinese_zip, english_zip):
+              with zipfile.ZipFile(path, 'r') as archive:
+                  bad = archive.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {path}: {bad}')
+                  pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if len(pdfs) != 8:
+                      raise RuntimeError(f'Unexpected PDF count in ZIP: {len(pdfs)}')
+              print('ZIP_VERIFIED', path, path.stat().st_size, sha256(path))
+
+          print('FINAL_JSON', json.dumps({
+              'annual_years': annual_years,
+              'latest_quarter': '2026Q1',
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'chinese_zip': str(chinese_zip),
+              'english_zip': str(english_zip),
+              'chinese_zip_size': chinese_zip.stat().st_size,
+              'chinese_zip_sha256': sha256(chinese_zip),
+              'records': records,
+          }, ensure_ascii=False))
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kinco-688160-official-filings-20261028
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
