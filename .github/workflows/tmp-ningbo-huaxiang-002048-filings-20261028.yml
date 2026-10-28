@@ -1,0 +1,309 @@
+name: Build Ningbo Huaxiang 002048 filing package
+
+on:
+  push:
+    branches: [tmp-ningbo-huaxiang-002048-filings-20261028]
+    paths: ['.github/workflows/tmp-ningbo-huaxiang-002048-filings-20261028.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+          python3 -m pip install --quiet --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='宁波华翔_002048_2020-2025年报_最新季报'
+          mkdir -p "$PACKAGE" /tmp/nbhx_check
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('宁波华翔_002048_2020-2025年报_最新季报')
+          ANNUAL_INDEX = 'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/002048/page_type/ndbg.phtml'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(
+              total=8, connect=8, read=8, status=8, backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'], raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=6, pool_maxsize=6))
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+          })
+
+          def fetch(url: str, *, pdf: bool = False, referer: str | None = None, attempts: int = 8) -> requests.Response:
+              last = None
+              for i in range(attempts):
+                  try:
+                      headers = {}
+                      if pdf:
+                          headers['Accept'] = 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'
+                      if referer:
+                          headers['Referer'] = referer
+                      response = session.get(url, headers=headers or None, timeout=(30, 420), allow_redirects=True)
+                      response.raise_for_status()
+                      if pdf and not response.content.startswith(b'%PDF-'):
+                          raise RuntimeError(f'not PDF: type={response.headers.get("content-type")} head={response.content[:40]!r}')
+                      return response
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 + i, 10))
+              raise RuntimeError(f'fetch failed: {url}; last={last!r}')
+
+          def decode_response(response: requests.Response) -> str:
+              raw = response.content
+              ctype = (response.headers.get('content-type') or '').lower()
+              encodings = []
+              if any(key in ctype for key in ('gbk', 'gb2312', 'gb18030')):
+                  encodings.append('gb18030')
+              encodings.extend([response.encoding, response.apparent_encoding, 'utf-8', 'gb18030', 'gbk'])
+              best = None
+              seen = set()
+              for encoding in encodings:
+                  if not encoding or encoding in seen:
+                      continue
+                  seen.add(encoding)
+                  try:
+                      text = raw.decode(encoding)
+                  except Exception:
+                      continue
+                  score = text.count('\ufffd')
+                  if best is None or score < best[0]:
+                      best = (score, text)
+              return best[1] if best else raw.decode('utf-8', errors='replace')
+
+          def normalize(text: str) -> str:
+              return re.sub(r'\s+', '', text or '')
+
+          index_response = fetch(ANNUAL_INDEX)
+          index_html = decode_response(index_response)
+          soup = BeautifulSoup(index_html, 'html.parser')
+          annual_links: dict[int, str] = {}
+          for anchor in soup.find_all('a', href=True):
+              label = normalize(anchor.get_text('', strip=True))
+              if '摘要' in label:
+                  continue
+              for year in range(2020, 2026):
+                  marker = f'{year}年年度报告'
+                  if marker in label and ('宁波华翔' in label or '宁波华翔电子股份有限公司' in label):
+                      annual_links.setdefault(year, urljoin(index_response.url, unquote(html.unescape(anchor['href'].strip()))))
+          missing = [year for year in range(2020, 2026) if year not in annual_links]
+          if missing:
+              raise RuntimeError(f'Missing annual report links for years: {missing}; found={annual_links}')
+
+          pdf_pattern = re.compile(r'''(?:https?:)?//[^\s"'<>]+?\.pdf(?:\?[^\s"'<>]*)?''', re.I)
+
+          def candidate_pdf_urls(detail_url: str) -> list[str]:
+              response = fetch(detail_url)
+              if response.content.startswith(b'%PDF-'):
+                  return [response.url]
+              text = decode_response(response)
+              detail_soup = BeautifulSoup(text, 'html.parser')
+              scored: list[tuple[int, str]] = []
+              for anchor in detail_soup.find_all('a', href=True):
+                  label = normalize(anchor.get_text('', strip=True))
+                  href = unquote(html.unescape(anchor.get('href', '').strip()))
+                  full = urljoin(response.url, href)
+                  if '.pdf' in full.lower() or '下载公告' in label or '公告原文' in label or label == '下载':
+                      rank = 0 if '下载公告' in label else 1 if '.pdf' in full.lower() else 2
+                      scored.append((rank, full))
+              for match in pdf_pattern.finditer(text):
+                  token = unquote(html.unescape(match.group(0)))
+                  if token.startswith('//'):
+                      token = 'https:' + token
+                  scored.append((2, token))
+              out: list[str] = []
+              seen: set[str] = set()
+              for _, candidate in sorted(scored, key=lambda item: (item[0], len(item[1]))):
+                  variants = [candidate]
+                  if candidate.startswith('http://'):
+                      variants.insert(0, 'https://' + candidate[7:])
+                  for variant in variants:
+                      if variant not in seen:
+                          seen.add(variant)
+                          out.append(variant)
+              return out
+
+          def obtain_pdf(detail_url: str) -> tuple[bytes, str]:
+              errors = []
+              for candidate in candidate_pdf_urls(detail_url):
+                  try:
+                      response = fetch(candidate, pdf=True, referer=detail_url, attempts=5)
+                      if len(response.content) < 50_000:
+                          raise RuntimeError(f'too small: {len(response.content)} bytes')
+                      return response.content, response.url
+                  except Exception as exc:
+                      errors.append(f'{candidate}: {exc!r}')
+              raise RuntimeError(f'No valid PDF from {detail_url}; errors={errors[:12]}')
+
+          records = []
+          for order, year in enumerate(range(2020, 2026), start=1):
+              detail_url = annual_links[year]
+              data, final_url = obtain_pdf(detail_url)
+              filename = f'{order:02d}_宁波华翔_{year}年年度报告.pdf'
+              path = OUT / filename
+              path.write_bytes(data)
+              pages = len(PdfReader(str(path), strict=False).pages)
+              if pages < 80:
+                  raise RuntimeError(f'{filename}: suspicious annual-report page count {pages}')
+              records.append({
+                  'order': order,
+                  'period': f'{year}年年度报告',
+                  'filename': filename,
+                  'detail_url': detail_url,
+                  'pdf_url': final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+              })
+              print('SAVED', filename, 'pages=', pages, 'bytes=', len(data), 'url=', final_url)
+
+          # As of 2026-10-28 the 2026 Q3 report is scheduled for 2026-10-30 and is not yet disclosed.
+          quarter_url = 'https://static.cninfo.com.cn/finalpage/2026-04-28/1225202599.PDF'
+          quarter_response = fetch(
+              quarter_url,
+              pdf=True,
+              referer='https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002048',
+          )
+          quarter_filename = '07_宁波华翔_2026年第一季度报告_最新季报.pdf'
+          quarter_path = OUT / quarter_filename
+          quarter_path.write_bytes(quarter_response.content)
+          quarter_pages = len(PdfReader(str(quarter_path), strict=False).pages)
+          if quarter_pages < 5:
+              raise RuntimeError(f'{quarter_filename}: suspicious quarterly-report page count {quarter_pages}')
+          records.append({
+              'order': 7,
+              'period': '2026年第一季度报告（截至2026-10-28的最新已披露季报）',
+              'filename': quarter_filename,
+              'detail_url': 'https://static.cninfo.com.cn/finalpage/2026-04-28/1225202599.PDF',
+              'pdf_url': quarter_response.url,
+              'pages': quarter_pages,
+              'bytes': len(quarter_response.content),
+          })
+          print('SAVED', quarter_filename, 'pages=', quarter_pages, 'bytes=', len(quarter_response.content), 'url=', quarter_response.url)
+
+          (OUT / '_metadata.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+          test "$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)" -eq 7
+
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            test "$(stat -c%s "$pdf")" -gt 50000
+
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf.txt" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+              cat "$pdf.qpdf.txt" >&2
+              exit "$rc"
+            fi
+            rm -f "$pdf.qpdf.txt"
+
+            pages=$(pdfinfo "$pdf" 2>/dev/null | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 5
+            pdftotext -f 1 -l "$pages" "$pdf" "$pdf.txt" 2>/dev/null || true
+            grep -Eq '宁波华翔电子股份有限公司|宁波华翔' "$pdf.txt"
+            rm -f "$pdf.txt"
+
+            stem="/tmp/nbhx_check/$(basename "$pdf")"
+            pdftoppm -f 1 -l 1 -singlefile -png -r 90 "$pdf" "$stem.first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 90 "$pdf" "$stem.last" >/dev/null 2>&1
+            test -s "$stem.first.png" && test -s "$stem.last.png"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import json
+
+          folder = Path('宁波华翔_002048_2020-2025年报_最新季报')
+          records = json.loads((folder / '_metadata.json').read_text(encoding='utf-8'))
+          records.sort(key=lambda item: item['order'])
+
+          lines = [
+              '宁波华翔电子股份有限公司（宁波华翔，002048）',
+              '2020—2025年年度报告及最新季度报告资料包',
+              '整理日期：2026-10-28',
+              '',
+              '收录说明：',
+              '1. 本包收录2020—2025年度报告全文，以及截至2026年10月28日已正式披露的最新季度报告。',
+              '2. 公司2026年第三季度报告预约于2026年10月30日披露，当前尚未正式发布；因此最新季报为2026年第一季度报告。',
+              '3. 2026年半年度报告不属于季度报告，未用其替代最新季报。',
+              '4. 全部文件均为公开披露渠道下载的完整原始PDF。',
+              '',
+              '文件清单：',
+          ]
+          sums = []
+          total_pages = 0
+          total_bytes = 0
+          for record in records:
+              path = folder / record['filename']
+              data = path.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              total_pages += int(record['pages'])
+              total_bytes += len(data)
+              lines += [
+                  f'- {path.name}',
+                  f"  报告期：{record['period']}；页数：{record['pages']}；大小：{len(data)}字节",
+                  f"  披露详情页：{record['detail_url']}",
+                  f"  PDF来源：{record['pdf_url']}",
+                  f'  SHA-256：{sha}',
+              ]
+              sums.append(f'{sha}  {path.name}')
+
+          lines += [
+              '',
+              f'合计页数：{total_pages}页。',
+              f'PDF原件合计大小：{total_bytes}字节。',
+              '全部PDF均已通过文件头、文件大小、结构完整性、实际页数、正文公司名称及首末页渲染检查。',
+          ]
+          (folder / '00_文件清单与说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (folder / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          (folder / '_metadata.json').unlink()
+          print('\n'.join(lines))
+          PY
+
+          zip -q -r -6 package_test.zip "$PACKAGE"
+          unzip -t package_test.zip >/dev/null
+          test "$(unzip -Z1 package_test.zip | grep -c '\.pdf$')" -eq 7
+          rm -f package_test.zip
+          ls -lh "$PACKAGE"
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ningbo-Huaxiang-002048-2020-2025-annual-latest-quarter
+          path: 宁波华翔_002048_2020-2025年报_最新季报/
+          retention-days: 2
+          compression-level: 6
+          if-no-files-found: error
