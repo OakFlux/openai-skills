@@ -1,0 +1,237 @@
+name: Build Hanshow 301275 broker deep reports 20261028
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/hanshow-301275-broker-deep-reports-20261028.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          CODE='301275'; SHORT='汉朔科技'; FULL='汉朔科技股份有限公司'
+          ROOT_NAME='汉朔科技_301275_券商深度报告'
+          ROOT=Path(ROOT_NAME); PDFDIR=ROOT/'原始PDF'; PREV=ROOT/'首页预览'
+          for d in (ROOT,PDFDIR,PREV): d.mkdir(parents=True,exist_ok=True)
+
+          session=requests.Session(); session.trust_env=False
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          session.headers.update({'User-Agent':ua,'Referer':'https://data.eastmoney.com/report/','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          api='https://reportapi.eastmoney.com/report/list'
+          request_log=[]; rows=[]; seen=set()
+
+          # Exact dates cover known company-depth / first-coverage reports.
+          dates=['2025-02-22','2025-02-23','2025-04-01','2025-05-12','2025-05-13','2025-07-16','2025-07-17','2025-09-18','2025-09-22','2026-07-16','2026-10-14']
+          for day in dates:
+            for qtype in ('0','1','2'):
+              total=1
+              for page in range(1,8):
+                if page>total: break
+                params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':day,'endTime':day,'pageNo':str(page),'fields':'','qType':qtype,'orgCode':'','author':'','code':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+                payload=None
+                for attempt in range(5):
+                  try:
+                    r=session.get(api,params=params,timeout=(20,120))
+                    request_log.append({'day':day,'qtype':qtype,'page':page,'url':r.url,'status':r.status_code,'bytes':len(r.content),'prefix':r.text[:160]})
+                    if r.status_code==200: payload=r.json(); break
+                  except Exception as exc:
+                    request_log.append({'day':day,'qtype':qtype,'page':page,'attempt':attempt+1,'error':repr(exc)})
+                  time.sleep(1+attempt)
+                if payload is None: break
+                current=payload.get('data') or []
+                if isinstance(current,dict): current=current.get('list') or current.get('data') or []
+                if not isinstance(current,list): current=[]
+                total=int(payload.get('TotalPage') or payload.get('totalPage') or 1)
+                for row in current:
+                  if not isinstance(row,dict): continue
+                  code=str(row.get('stockCode') or ''); name=str(row.get('stockName') or '')
+                  if code==CODE or SHORT in name or SHORT in str(row.get('title') or ''):
+                    key=str(row.get('infoCode') or '') or json.dumps(row,ensure_ascii=False,sort_keys=True)
+                    if key not in seen: seen.add(key); rows.append(row)
+                if page>=total or not current: break
+
+          # Reliable public fallbacks confirmed through searchable report pages.
+          fallbacks=[
+            {'infoCode':'AP202502221643395731','stockCode':CODE,'stockName':SHORT,'orgSName':'华金证券','publishDate':'2025-02-22 00:00:00.000','attachPages':10,'title':'新股覆盖研究：汉朔科技','researcher':'李蕙','emRatingName':'新股覆盖'},
+            {'infoCode':'AP202509221748334984','stockCode':CODE,'stockName':SHORT,'orgSName':'华安证券','publishDate':'2025-09-22 00:00:00.000','attachPages':0,'title':'全球化布局的智慧零售平台型公司','researcher':'陈耀波,李元晨','emRatingName':'买入（首次覆盖）'},
+          ]
+          for row in fallbacks:
+            if row['infoCode'] not in seen: seen.add(row['infoCode']); rows.append(row)
+
+          def page_meta(row):
+            try: return int(float(row.get('attachPages') or 0))
+            except: return 0
+          def date_text(row): return str(row.get('publishDate') or '')[:10]
+          def norm(v): return re.sub(r'\s+','',str(v or ''))
+          def safe(v): return re.sub(r'[\\/:*?"<>|]+','_',re.sub(r'\s+','',str(v)))[:105]
+
+          preferred=[
+            ('全球AI零售龙头加速崛起',900),
+            ('电子价签全球龙头，AI驱动零售数字化平台升级',850),
+            ('全球化布局的智慧零售平台型公司',800),
+            ('电子价签行业领跑者',760),
+            ('电子价签龙头，深度赋能泛零售行业数字化变革',740),
+            ('电子价签解决方案龙头厂商',700),
+            ('全球电子价签龙头',650),
+            ('首次覆盖',500),
+            ('公司深度',450),
+            ('新股覆盖研究',250),
+          ]
+          excluded=['点评','半年报','中报','季报','年报','周报','日报','快报','调研纪要']
+          candidates=[]
+          for row in rows:
+            title=str(row.get('title') or ''); broker=str(row.get('orgSName') or row.get('orgName') or ''); info=str(row.get('infoCode') or '')
+            code=str(row.get('stockCode') or ''); name=str(row.get('stockName') or '')
+            if not info or not broker: continue
+            if code not in ('',CODE) and SHORT not in name: continue
+            if any(x in title for x in excluded) and '首次覆盖' not in title: continue
+            score=page_meta(row)*10 + sum(w for p,w in preferred if norm(p) in norm(title))
+            if date_text(row)>='2026-01-01': score+=120
+            elif date_text(row)>='2025-07-01': score+=60
+            candidates.append({**row,'_score':score})
+          candidates.sort(key=lambda r:(int(r['_score']),page_meta(r),date_text(r)),reverse=True)
+          print('CANDIDATES')
+          for row in candidates:
+            print(json.dumps({'infoCode':row.get('infoCode'),'broker':row.get('orgSName'),'date':date_text(row),'pages':page_meta(row),'title':row.get('title'),'score':row.get('_score')},ensure_ascii=False))
+
+          def download(row):
+            info=str(row.get('infoCode') or ''); detail=f'https://data.eastmoney.com/report/info/{info}.html'; attempts=[]
+            for prefix in ('H3','H2','H1','H4'):
+              url=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+              for attempt in range(5):
+                try:
+                  r=session.get(url,headers={'User-Agent':ua,'Referer':detail,'Accept':'application/pdf,*/*;q=0.8'},timeout=(30,300),allow_redirects=True)
+                  attempts.append({'url':url,'status':r.status_code,'bytes':len(r.content),'content_type':r.headers.get('content-type',''),'final_url':r.url})
+                  if r.status_code==200 and r.content[:5]==b'%PDF-' and len(r.content)>80000:
+                    return r.content,url,attempts
+                except Exception as exc:
+                  attempts.append({'url':url,'attempt':attempt+1,'error':repr(exc)})
+                time.sleep(1+attempt)
+            raise RuntimeError('download failed')
+
+          aliases={
+            '中泰证券':['中泰证券','ZHONGTAI SECURITIES'],
+            '金元证券':['金元证券','GOLDSTATE SECURITIES'],
+            '华安证券':['华安证券','HUAAN SECURITIES'],
+            '西部证券':['西部证券','WESTERN SECURITIES'],
+            '海通证券':['海通证券','HAITONG SECURITIES'],
+            '国泰海通':['国泰海通','GUOTAI HAITONG'],
+            '华西证券':['华西证券','HUAXI SECURITIES'],
+            '华金证券':['华金证券','HUAJIN SECURITIES'],
+            '中金公司':['中金公司','中国国际金融','CICC'],
+          }
+
+          manifest=[]; used=set(); errors=[]
+          for row in candidates:
+            if len(manifest)>=3: break
+            broker=str(row.get('orgSName') or row.get('orgName') or '')
+            if broker in used: continue
+            temp=None
+            try:
+              data,src,attempts=download(row)
+              temp=PDFDIR/f'_tmp_{row.get("infoCode")}.pdf'; temp.write_bytes(data)
+              reader=PdfReader(str(temp),strict=False); pages=len(reader.pages)
+              if pages<10: raise RuntimeError(f'short pdf {pages}')
+              text=''
+              for p in reader.pages[:min(35,pages)]:
+                try: text+='\n'+(p.extract_text() or '')
+                except Exception: pass
+              compact=norm(text)
+              id_hits=[x for x in (SHORT,FULL,CODE) if norm(x) in compact]
+              broker_names=aliases.get(broker,[broker])
+              broker_hits=[x for x in broker_names if norm(x).lower() in compact.lower()]
+              if len(compact)>500 and not id_hits: raise RuntimeError('issuer mismatch')
+              if len(compact)>500 and not broker_hits: raise RuntimeError('broker mismatch')
+              title=str(row.get('title') or ''); date=date_text(row)
+              fn=f'{len(manifest)+1:02d}_{safe(broker)}_汉朔科技_{safe(title)}_{date}.pdf'
+              dest=PDFDIR/fn; temp.replace(dest)
+              subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              prefix=PREV/dest.stem
+              subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(dest),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              preview=Path(str(prefix)+'.png')
+              if not preview.exists() or preview.stat().st_size<9000: raise RuntimeError('preview failed')
+              sha=hashlib.sha256(data).hexdigest()
+              manifest.append({
+                'broker':broker,'date':date,'title':title,'analysts':row.get('researcher') or row.get('author'),
+                'rating':row.get('emRatingName') or row.get('sRatingName'),'metadata_pages':page_meta(row),
+                'actual_pages':pages,'filename':str(Path('原始PDF')/fn),'bytes':len(data),'sha256':sha,
+                'info_code':row.get('infoCode'),'source_report_page':f'https://data.eastmoney.com/report/info/{row.get("infoCode")}.html',
+                'source_pdf_url':src,'identity_hits':id_hits,'broker_hits':broker_hits,
+                'preview_file':str(Path('首页预览')/preview.name),'selection_score':row.get('_score'),
+                'download_attempts':attempts,'validation':['PDF header','issuer identity','broker identity','page count','qpdf structure','first-page render']
+              })
+              used.add(broker)
+            except Exception as exc:
+              errors.append({'broker':broker,'title':row.get('title'),'info_code':row.get('infoCode'),'error':repr(exc)})
+              if temp and temp.exists(): temp.unlink()
+
+          if len(manifest)<2:
+            raise RuntimeError('fewer than two verified reports '+json.dumps(errors,ensure_ascii=False))
+
+          total_pages=sum(x['actual_pages'] for x in manifest)
+          readme=['汉朔科技股份有限公司（301275.SZ）券商深度研究报告资料包','整理日期：2026-10-28','',
+                  f'本包收录{len(manifest)}份公开可直接取得并通过完整性核验的券商原始PDF。',
+                  '筛选口径：优先公司深度、首次覆盖、新股覆盖与投资价值研究，并尽量选择不同券商；未用普通财报点评凑数。','']
+          for i,x in enumerate(manifest,1):
+            readme += [f"{i}. {x['broker']}：《{x['title']}》",
+                       f"   日期：{x['date']}；分析师：{x['analysts']}；评级/类型：{x['rating']}",
+                       f"   完整页数：{x['actual_pages']}页；文件：{x['filename']}",
+                       f"   来源页面：{x['source_report_page']}",
+                       f"   SHA-256：{x['sha256']}",'']
+          readme += [f'合计：{len(manifest)}份PDF，{total_pages}页。',
+                     '报告内容及版权归原券商与作者所有，仅供研究参考，不构成投资建议。',
+                     '核验项目：PDF文件头、公司名称/证券代码、券商标识、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。']
+          (ROOT/'00_文件清单与说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'candidate_ranking.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+          (ROOT/'download_errors.json').write_text(json.dumps(errors,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'request_log.json').write_text(json.dumps(request_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest),encoding='utf-8')
+
+          zcn=Path(f'汉朔科技_301275_券商深度报告_{len(manifest)}份.zip')
+          with zipfile.ZipFile(zcn,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file(): z.write(p,arcname=f'{ROOT.name}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zcn) as z:
+            bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=len(manifest): raise RuntimeError(f'zip failed bad={bad} pdfs={len(pdfs)} manifest={len(manifest)}')
+          zen=Path('hanshow_301275_broker_deep_reports.zip'); zen.write_bytes(zcn.read_bytes())
+          print('FINAL_ZIP',zcn,zcn.stat().st_size,'SHA256',hashlib.sha256(zcn.read_bytes()).hexdigest())
+          print('TOTAL_PAGES',total_pages)
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          print('ERRORS',json.dumps(errors,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: hanshow-301275-broker-deep-reports-final
+          path: |
+            汉朔科技_301275_券商深度报告_*.zip
+            hanshow_301275_broker_deep_reports.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
