@@ -1,0 +1,184 @@
+name: Package Dongbei Group filings via announcement index
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dongbei-601956-official-filings-eastmoney-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+      - name: Discover and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, os, re, shutil, zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+          import fitz, requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CODE='601956'; OLD='900956'; COMPANY='东贝集团'; FULL='湖北东贝机电集团股份有限公司'; PRE='黄石东贝电器股份有限公司'
+          CUTOFF='2026-10-28'; CUT='20261028'
+          ROOT_NAME=f'{COMPANY}_{CODE}_上市以来全部年报_上市核心文件及最新季报_截至{CUT}'
+          ROOT=Path('work')/ROOT_NAME; DIST=Path('dist')
+          LISTING=ROOT/'00_上市核心文件（替代常规招股说明书）'; ANNUAL=ROOT/'01_年度报告'; QUARTER=ROOT/'02_最新季度报告'; PREVIEW=ROOT/'首页预览'
+          for d in (LISTING,ANNUAL,QUARTER,PREVIEW,DIST): d.mkdir(parents=True,exist_ok=True)
+
+          s=requests.Session()
+          retry=Retry(total=5,connect=5,read=5,status=5,backoff_factor=.8,status_forcelist=(403,408,429,500,502,503,504),allowed_methods=frozenset({'GET'}),raise_on_status=False)
+          s.mount('https://',HTTPAdapter(max_retries=retry))
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':'https://data.eastmoney.com/','Accept':'application/json,text/plain,*/*'})
+
+          LIST_API='https://np-anotice-stock.eastmoney.com/api/security/ann'
+          CONTENT_API='https://np-cnotice-stock.eastmoney.com/api/content/ann'
+
+          def list_announcements(code:str,begin:str,end:str)->list[dict[str,Any]]:
+            out=[]
+            for page in range(1,15):
+              params={'sr':'-1','page_size':'100','page_index':str(page),'ann_type':'A','client_source':'web','stock_list':code,'f_node':'0','s_node':'0','begin_time':begin,'end_time':end}
+              r=s.get(LIST_API,params=params,timeout=90); print('LIST',code,page,r.status_code,len(r.content),r.url); r.raise_for_status(); data=r.json(); block=data.get('data') or {}; rows=block.get('list') or []
+              print('META',code,page,'rows',len(rows),'total',block.get('total_hits'))
+              out.extend(rows)
+              for x in rows:
+                print('ANN',code,json.dumps({k:x.get(k) for k in ('notice_date','display_time','title','art_code','columns','codes')},ensure_ascii=False))
+              total=int(block.get('total_hits') or 0)
+              if not rows or len(out)>=total: break
+            return out
+
+          raw=list_announcements(CODE,'2020-01-01',CUTOFF)+list_announcements(OLD,'2020-01-01','2020-12-31')
+          rows=[]; seen=set()
+          for x in raw:
+            art=str(x.get('art_code') or '')
+            if not art or art in seen: continue
+            seen.add(art)
+            title=str(x.get('title') or x.get('title_ch') or '').strip()
+            date=str(x.get('notice_date') or x.get('display_time') or '')[:10]
+            codes=x.get('codes') or []
+            stock_codes=[str(c.get('stock_code') or '') for c in codes if isinstance(c,dict)]
+            short_names=[str(c.get('short_name') or '') for c in codes if isinstance(c,dict)]
+            rows.append({'title':title,'art_code':art,'announcement_date':date,'stock_codes':stock_codes,'short_names':short_names,'raw':x})
+          print('UNIQUE',len(rows))
+
+          def annual_rank(x):
+            t=x['title']; return (2 if any(k in t for k in ('修订','更新','更正后','补充后')) else 1,2 if re.search(r'20\d{2}年年度报告(?:（[^）]+）)?$',t) else 1,x['announcement_date'])
+
+          annuals=[]
+          for y in range(2020,2026):
+            c=[x for x in rows if re.search(fr'{y}年年度报告',x['title']) and not any(k in x['title'] for k in ('摘要','英文版','更正公告','提示性公告','审计报告','问询函','回复'))]
+            print('ANNUAL_CANDIDATES',y,json.dumps([{k:z[k] for k in ('title','art_code','announcement_date')} for z in c],ensure_ascii=False))
+            if not c: raise RuntimeError(f'未找到{y}年完整年度报告')
+            z=dict(max(c,key=annual_rank)); z.update(doc_type='annual_report',report_year=y); annuals.append(z)
+
+          q=[x for x in rows if re.search(r'2026年(?:第三|三)季度报告',x['title']) and not any(k in x['title'] for k in ('摘要','更正公告','提示性公告'))]
+          if not q:
+            q=[{'title':'湖北东贝机电集团股份有限公司2026年第三季度报告','art_code':'','announcement_date':'2026-10-24','source_url':'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-10-24/601956_20261024_L6BB.pdf'}]
+          quarter=dict(max(q,key=lambda x:x['announcement_date'])); quarter.update(doc_type='quarterly_report',report_year=2026,quarter=3)
+
+          m=[x for x in rows if '换股吸收合并黄石东贝电器股份有限公司暨关联交易报告书' in x['title'] and not any(k in x['title'] for k in ('摘要','反馈意见回复','提示性公告'))]
+          if not m:
+            m=[{'title':'湖北东贝机电集团股份有限公司换股吸收合并黄石东贝电器股份有限公司暨关联交易报告书（修订稿）','art_code':'','announcement_date':'2020-09-30','source_url':'https://static.cninfo.com.cn/finalpage/2020-09-30/1208514501.PDF'}]
+          merger=dict(max(m,key=lambda x:(2 if '修订稿' in x['title'] else 1,x['announcement_date']))); merger['doc_type']='merger_report'
+
+          l=[x for x in rows if '上市公告书' in x['title'] and ('东贝' in x['title'] or '换股吸收合并' in x['title']) and '摘要' not in x['title']]
+          print('LISTING_CANDIDATES',json.dumps([{k:z[k] for k in ('title','art_code','announcement_date')} for z in l],ensure_ascii=False))
+          if not l: raise RuntimeError('未找到换股吸收合并上市公告书')
+          listing=dict(max(l,key=lambda x:x['announcement_date'])); listing['doc_type']='listing_notice'
+          selected=[merger,listing,*annuals,quarter]
+          print('SELECTED_SET')
+          for x in selected: print(json.dumps(x,ensure_ascii=False))
+
+          def candidate_pdf_urls(x):
+            if x.get('source_url'): return [x['source_url']]
+            art=x['art_code']
+            return [f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf']
+
+          def resolve_content_pdf(art):
+            try:
+              r=s.get(CONTENT_API,params={'art_code':art,'client_source':'web','page_index':'1'},timeout=60); print('CONTENT',art,r.status_code,len(r.content)); r.raise_for_status(); text=r.text
+              urls=re.findall(r'https?://[^"\\]+?\.pdf(?:\?[^"\\]*)?',text,re.I)
+              return list(dict.fromkeys(urls))
+            except Exception as e: print('CONTENT_ERR',art,repr(e)); return []
+
+          def download_item(x,dest):
+            urls=candidate_pdf_urls(x)
+            if x.get('art_code'): urls+=resolve_content_pdf(x['art_code'])
+            errors=[]
+            for url in dict.fromkeys(urls):
+              try:
+                r=s.get(url,headers={'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},timeout=180,allow_redirects=True)
+                print('PDF',r.status_code,len(r.content),url,r.url,r.headers.get('content-type'))
+                if r.status_code==200 and len(r.content)>50000 and r.content.startswith(b'%PDF'):
+                  dest.write_bytes(r.content); return url
+                errors.append((url,r.status_code,len(r.content),r.content[:20]))
+              except Exception as e: errors.append((url,repr(e)))
+            raise RuntimeError(f'无法下载完整PDF {x.get("title")}: {errors}')
+
+          def safe(v): return re.sub(r'_+','_',re.sub(r'[\\/:*?"<>|]','_',re.sub(r'\s+','',v))).strip('_. ')
+          recs=[]
+          for x in selected:
+            typ=x['doc_type']
+            if typ=='merger_report': dest=LISTING/'2020_东贝集团_换股吸收合并东贝B股暨关联交易报告书_修订稿.pdf'; period='2020上市文件'
+            elif typ=='listing_notice': dest=LISTING/'2020_东贝集团_换股吸收合并东贝B股上市公告书.pdf'; period='2020上市文件'
+            elif typ=='annual_report': y=x['report_year']; suffix='_修订或更新版' if any(k in x['title'] for k in ('修订','更新','更正后','补充后')) else ''; dest=ANNUAL/f'{y}_东贝集团_{y}年年度报告{suffix}.pdf'; period=str(y)
+            else: dest=QUARTER/'2026Q3_东贝集团_2026年第三季度报告.pdf'; period='2026Q3'
+            dest=dest.with_name(safe(dest.name)); source=download_item(x,dest)
+            reader=PdfReader(str(dest),strict=False); pages=len(reader.pages)
+            if pages<2: raise RuntimeError(f'页数异常 {dest}: {pages}')
+            doc=fitz.open(dest)
+            if doc.page_count!=pages: raise RuntimeError(f'页数解析不一致 {dest}: {pages}/{doc.page_count}')
+            first=doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.4,1.4),alpha=False); last=doc.load_page(doc.page_count-1).get_pixmap(matrix=fitz.Matrix(.8,.8),alpha=False)
+            if min(first.width,first.height,last.width,last.height)<100: raise RuntimeError(f'页面渲染失败 {dest}')
+            first.save(PREVIEW/f'{dest.stem}.png'); doc.close()
+            rec={'document_type':typ,'period':period,'announcement_title':x['title'],'announcement_date':x['announcement_date'],'art_code':x.get('art_code') or '','source_url':source,'relative_path':str(dest.relative_to(ROOT)).replace(os.sep,'/'),'file_name':dest.name,'file_size_bytes':dest.stat().st_size,'page_count':pages,'sha256':hashlib.sha256(dest.read_bytes()).hexdigest()}
+            recs.append(rec); print('VERIFIED',json.dumps(rec,ensure_ascii=False))
+
+          years=sorted(int(r['period']) for r in recs if r['document_type']=='annual_report')
+          if years!=[2020,2021,2022,2023,2024,2025] or len(recs)!=9: raise RuntimeError(f'文件集合异常 years={years}, count={len(recs)}')
+          manifest={'company':COMPANY,'full_company_name':FULL,'stock_code':CODE,'predecessor_company':PRE,'predecessor_stock_code':OLD,'cutoff_date':CUTOFF,'annual_report_years':years,'latest_quarter':'2026Q3','document_count':len(recs),'listing_document_note':'东贝集团通过换股吸收合并东贝B股实现A股上市，不存在常规最终版IPO招股说明书；本包收录正式交易报告书（修订稿）和上市公告书作为上市核心文件。','documents':recs,'generated_at_utc':datetime.now(timezone.utc).isoformat()}
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['relative_path']}" for r in recs)+'\n',encoding='utf-8')
+          lines=[f'# {COMPANY}（{CODE}）官方披露文件包','',f'- 截止日期：{CUTOFF}','- 年度报告：2020—2025年完整年度报告，共6份。','- 最新季度报告：2026年第三季度报告。','- 上市核心文件：换股吸收合并暨关联交易报告书（修订稿）及上市公告书。','- 说明：公司通过换股吸收合并东贝B股上市，不存在常规最终版IPO招股说明书。','- PDF来源：交易所/指定披露网站原文或东方财富公告原文镜像。','- 已完成PDF结构、页数、首末页渲染、SHA-256及ZIP CRC校验。','','## 文件清单','']
+          for i,r in enumerate(recs,1): lines += [f"{i}. `{r['relative_path']}`",f"   - 标题：{r['announcement_title']}",f"   - 日期：{r['announcement_date']}",f"   - 页数：{r['page_count']}；大小：{r['file_size_bytes']:,} 字节",f"   - 来源：{r['source_url']}",f"   - SHA-256：`{r['sha256']}`"]
+          (ROOT/'README.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          cn=DIST/f'{ROOT_NAME}.zip'; en=DIST/f'dongbei_group_601956_all_annual_reports_listing_documents_latest_quarter_{CUT}.zip'
+          for p in (cn,en):
+            if p.exists(): p.unlink()
+          with zipfile.ZipFile(cn,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file(): z.write(p,str(p.relative_to(ROOT.parent)).replace(os.sep,'/'))
+          shutil.copy2(cn,en)
+          for p in (cn,en):
+            with zipfile.ZipFile(p) as z:
+              bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs)!=9: raise RuntimeError(f'ZIP校验失败 {p}: bad={bad}, pdfs={len(pdfs)}')
+          print('FINAL_JSON',json.dumps({'document_count':9,'annual_years':years,'latest_quarter':'2026Q3','chinese_zip':str(cn),'english_zip':str(en),'size':cn.stat().st_size,'sha256':hashlib.sha256(cn.read_bytes()).hexdigest(),'documents':[{k:r[k] for k in ('document_type','period','file_name','page_count')} for r in recs]},ensure_ascii=False))
+          PY
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dongbei-601956-official-filings-eastmoney-20261028
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
