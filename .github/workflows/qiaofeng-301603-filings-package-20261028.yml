@@ -1,0 +1,385 @@
+name: Build Qiaofeng Intelligent 301603 filings package 20261028
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/qiaofeng-301603-filings-package-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = '301603'
+          COMPANY_SHORT = '乔锋智能'
+          COMPANY_FULL = '乔锋智能装备股份有限公司'
+          COMPANY_ALIASES = ['乔锋智能', '乔锋智能装备股份有限公司', '301603']
+          AS_OF = '2026-10-28'
+          PACKAGE = '乔锋智能_301603_全部年报_招股说明书_最新季报_截至20261028'
+          ROOT = Path(PACKAGE)
+          PDF_DIR = ROOT / 'PDF原文'
+          PREVIEW_DIR = ROOT / '首页预览'
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          all_rows: list[dict[str, Any]] = []
+          search_pages: list[dict[str, Any]] = []
+          for page in range(1, 101):
+              params = {
+                  'sr':'-1', 'page_size':'100', 'page_index':str(page),
+                  'ann_type':'A', 'client_source':'web', 'stock_list':STOCK_CODE,
+                  'f_node':'0', 's_node':'0',
+              }
+              data = None
+              last: Any = None
+              for attempt in range(8):
+                  try:
+                      r = session.get(api, params=params, timeout=(20, 120))
+                      last = {'status':r.status_code,'text':r.text[:300]}
+                      if r.status_code == 200:
+                          data = r.json()
+                          break
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              if data is None:
+                  raise RuntimeError(f'Announcement API failed page {page}: {last}')
+              rows = ((data.get('data') or {}).get('list') or [])
+              search_pages.append({'page':page,'count':len(rows)})
+              if not rows:
+                  break
+              all_rows.extend(rows)
+              if len(rows) < 100:
+                  break
+              time.sleep(0.08)
+
+          def compact(text: str) -> str:
+              text = html.unescape(str(text or ''))
+              text = re.sub(r'<[^>]+>', '', text)
+              return re.sub(r'\s+', '', text)
+
+          def art_code(row: dict[str, Any]) -> str:
+              return str(row.get('art_code') or row.get('artCode') or '')
+
+          def date_value(row: dict[str, Any]) -> str:
+              return str(row.get('display_time') or row.get('notice_date') or '')
+
+          bad_common = [
+              '摘要','英文版','取消','问询','回复','审计报告','董事会','监事会',
+              '提示性公告','社会责任报告','环境、社会及管治报告','可持续发展报告',
+              '独立董事述职报告','内部控制评价报告','财务决算报告','说明会',
+              '募集资金','会计师事务所','前期会计差错更正后的财务报表',
+              '财务报表及相关附注','债券年度报告','公司债券年度报告','债券半年度报告',
+          ]
+
+          def choose_report(variants: list[str], label: str, extra_bad: list[str] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+              extra_bad = extra_bad or []
+              candidates: list[tuple[int, str, dict[str, Any], str]] = []
+              for row in all_rows:
+                  raw = str(row.get('title') or '')
+                  title = compact(raw)
+                  matched = next((key for key in variants if compact(key) in title), None)
+                  if not matched:
+                      continue
+                  if any(compact(x) in title for x in bad_common + extra_bad):
+                      continue
+                  score = 50
+                  key = compact(matched)
+                  if title.endswith(key): score += 35
+                  if title == key: score += 20
+                  if COMPANY_SHORT in title or COMPANY_FULL in title or STOCK_CODE in title: score += 15
+                  if any(x in title for x in ['更正后','修订版','更新后','修订稿']): score += 100
+                  if any(x in title for x in ['取消版','已取消']): score -= 200
+                  candidates.append((score, date_value(row), row, matched))
+              candidates.sort(key=lambda x:(x[0],x[1]), reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'Missing report: {label} / {variants}')
+              log = [
+                  {'label':label,'matched_variant':matched,'score':score,'date':date,
+                   'title':row.get('title'),'art_code':art_code(row)}
+                  for score,date,row,matched in candidates[:20]
+              ]
+              return candidates[0][2], log
+
+          annual_candidates: dict[str, list[dict[str, Any]]] = {}
+          for row in all_rows:
+              title = compact(row.get('title') or '')
+              if any(compact(x) in title for x in bad_common):
+                  continue
+              match = re.search(r'(20\d{2})年年度报告', title)
+              if not match:
+                  continue
+              year = match.group(1)
+              if int(year) > 2025:
+                  continue
+              annual_candidates.setdefault(year, []).append(row)
+
+          if not annual_candidates:
+              raise RuntimeError('No annual reports found')
+
+          selected: list[dict[str, Any]] = []
+          candidate_logs: dict[str, Any] = {}
+          for year in sorted(annual_candidates):
+              candidates = []
+              for row in annual_candidates[year]:
+                  title = compact(row.get('title') or '')
+                  score = 50
+                  if title.endswith(f'{year}年年度报告'): score += 35
+                  if COMPANY_SHORT in title or COMPANY_FULL in title or STOCK_CODE in title: score += 15
+                  if any(x in title for x in ['更正后','修订版','更新后','修订稿']): score += 100
+                  candidates.append((score, date_value(row), row))
+              candidates.sort(key=lambda x:(x[0],x[1]), reverse=True)
+              row = candidates[0][2]
+              candidate_logs[f'{year}年年度报告'] = [
+                  {'score':score,'date':date,'title':r.get('title'),'art_code':art_code(r)}
+                  for score,date,r in candidates[:20]
+              ]
+              selected.append({
+                  'label':f'{year}年年度报告',
+                  'filename':f'{len(selected)+1:02d}_乔锋智能_{year}年年度报告.pdf',
+                  'doc_type':'年度报告','period':year,'min_pages':60,'row':row,
+              })
+
+          prospectus_candidates = []
+          for row in all_rows:
+              title = compact(row.get('title') or '')
+              if '招股说明书' not in title:
+                  continue
+              if any(x in title for x in ['招股意向书','问询','回复','摘要']):
+                  continue
+              score = 50
+              if '首次公开发行股票并在创业板上市招股说明书' in title: score += 100
+              if any(x in title for x in ['申报稿','上会稿','注册稿','预披露更新']): score -= 50
+              if COMPANY_SHORT in title or COMPANY_FULL in title or STOCK_CODE in title: score += 15
+              prospectus_candidates.append((score, date_value(row), row))
+          prospectus_candidates.sort(key=lambda x:(x[0],x[1]), reverse=True)
+          if not prospectus_candidates:
+              raise RuntimeError('Missing final prospectus')
+          prospectus_row = prospectus_candidates[0][2]
+          candidate_logs['招股说明书'] = [
+              {'score':score,'date':date,'title':r.get('title'),'art_code':art_code(r)}
+              for score,date,r in prospectus_candidates[:20]
+          ]
+          selected.append({
+              'label':'首次公开发行股票并在创业板上市招股说明书',
+              'filename':f'{len(selected)+1:02d}_乔锋智能_首次公开发行股票并在创业板上市招股说明书.pdf',
+              'doc_type':'招股说明书','period':'IPO','min_pages':100,'row':prospectus_row,
+          })
+
+          quarter_options = [
+              (['2026年第三季度报告','2026年三季度报告'], '2026Q3'),
+              (['2026年第一季度报告','2026年一季度报告'], '2026Q1'),
+              (['2025年第三季度报告','2025年三季度报告'], '2025Q3'),
+              (['2025年第一季度报告','2025年一季度报告'], '2025Q1'),
+          ]
+          quarter_row = None
+          quarter_period = None
+          quarter_log: list[dict[str, Any]] = []
+          for variants, period in quarter_options:
+              try:
+                  quarter_row, quarter_log = choose_report(variants, period)
+                  quarter_period = period
+                  break
+              except RuntimeError:
+                  continue
+          if quarter_row is None or quarter_period is None:
+              raise RuntimeError('Missing latest quarterly report')
+          candidate_logs['最新季报'] = quarter_log
+          selected.append({
+              'label':str(quarter_row.get('title') or quarter_period),
+              'filename':f'{len(selected)+1:02d}_乔锋智能_{quarter_period}_最新季报.pdf',
+              'doc_type':'最新季报','period':quarter_period,'min_pages':5,'row':quarter_row,
+          })
+
+          def fetch_pdf(art: str, referer: str) -> tuple[bytes, dict[str, Any], str]:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{art}_1.pdf',
+              ]
+              last: dict[str, Any] = {}
+              for url in urls:
+                  for attempt in range(6):
+                      try:
+                          rr = session.get(url, timeout=(30, 480), allow_redirects=True, headers={
+                              'User-Agent':session.headers['User-Agent'], 'Referer':referer,
+                              'Accept':'application/pdf,*/*;q=0.8',
+                          })
+                          last = {'url':url,'status':rr.status_code,'final_url':rr.url,
+                                  'content_type':rr.headers.get('content-type',''),'bytes':len(rr.content)}
+                          if rr.status_code == 200 and rr.content[:5] == b'%PDF-' and len(rr.content) > 30_000:
+                              return rr.content, last, url
+                      except Exception as exc:
+                          last = {'url':url,'error':repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f'PDF download failed {art}: {last}')
+
+          manifest: list[dict[str, Any]] = []
+          for original in selected:
+              spec = dict(original)
+              row = spec.pop('row')
+              art = art_code(row)
+              if not art:
+                  raise RuntimeError(f'No art code for {spec["filename"]}')
+              detail_page = f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{art}.html'
+              data, download_meta, mirror_pdf = fetch_pdf(art, detail_page)
+              dest = PDF_DIR / spec['filename']
+              dest.write_bytes(data)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'Too few pages {dest.name}: {pages} < {spec["min_pages"]}')
+
+              extracted = ''
+              for p in reader.pages[:min(30, pages)]:
+                  try:
+                      extracted += '\n' + (p.extract_text() or '')
+                  except Exception:
+                      pass
+              identity_ok = any(alias in extracted for alias in COMPANY_ALIASES)
+              if not identity_ok:
+                  raise RuntimeError(f'Issuer identity check failed: {dest.name}')
+
+              subprocess.run(
+                  ['qpdf','--warning-exit-0','--check',str(dest)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              prefix = PREVIEW_DIR / dest.stem
+              subprocess.run([
+                  'pdftoppm','-f','1','-l','1','-png','-r','125','-singlefile',str(dest),str(prefix)
+              ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 8_000:
+                  raise RuntimeError(f'Preview render failed: {dest.name}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  **spec,
+                  'announcement_title':row.get('title'),
+                  'announcement_date':row.get('display_time') or row.get('notice_date'),
+                  'art_code':art,
+                  'announcement_detail_page':detail_page,
+                  'pdf_source_url':mirror_pdf,
+                  'official_cninfo_index':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK_CODE}',
+                  'official_szse_listing_page':'https://www.szse.cn/disclosure/notice/t20240709_608091.html',
+                  'actual_pages':pages,
+                  'bytes':len(data),
+                  'sha256':sha,
+                  'identity_text_check':identity_ok,
+                  'download_meta':download_meta,
+                  'preview_file':str(Path('首页预览') / preview.name),
+                  'validation':['PDF header','announcement-title match','issuer identity','minimum page count','qpdf structure','first-page render'],
+              })
+
+          annual_years = [x['period'] for x in manifest if x['doc_type'] == '年度报告']
+          readme = [
+              '乔锋智能装备股份有限公司（301603.SZ）全部已披露年度报告、招股说明书及最新季度报告资料包',
+              f'整理基准日：{AS_OF}',
+              '',
+              '收录范围：',
+              f'1. 全部已披露完整年度报告：{", ".join(annual_years)}，共{len(annual_years)}份。',
+              '2. 首次公开发行股票并在创业板上市招股说明书正式版，共1份。',
+              f'3. 截至整理基准日最新独立季度报告：{quarter_period}，共1份。',
+              '',
+              '筛选规则：排除年度报告摘要、招股意向书、申报稿/问询回复、英文版、提示性公告及其他非完整全文；招股说明书优先选择上市前最终正式版本。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {item['filename']}",
+                  f"   文件类型：{item['doc_type']}；公告标题：{item['announcement_title']}",
+                  f"   公告日期：{item['announcement_date']}；实际页数：{item['actual_pages']}页；大小：{item['bytes']}字节",
+                  f"   公告页面：{item['announcement_detail_page']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          readme += [
+              '来源说明：PDF由公开公告镜像下载，并与公司名称、证券代码、公告标题和报告期逐一匹配；包内保留公告来源和官方信息披露索引。',
+              '核验项目：PDF文件头、公告标题、发行人名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'candidate_selection_log.json').write_text(json.dumps(candidate_logs, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'announcement_search_log.json').write_text(
+              json.dumps({'pages':search_pages,'rows_scanned':len(all_rows)}, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  PDF原文/{item['filename']}\n" for item in manifest), encoding='utf-8'
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{PACKAGE}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [name for name in z.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(manifest):
+                  raise RuntimeError(f'PDF count mismatch: zip={len(pdfs)}, manifest={len(manifest)}')
+
+          short_path = Path('qiaofeng_301603_filings_20261028.zip')
+          short_path.write_bytes(zip_path.read_bytes())
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'SHA256', zip_sha)
+          print('ANNUAL_YEARS', annual_years)
+          print('LATEST_QUARTER', quarter_period)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: qiaofeng-301603-filings-final-20261028
+          path: |
+            乔锋智能_301603_全部年报_招股说明书_最新季报_截至20261028.zip
+            qiaofeng_301603_filings_20261028.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
