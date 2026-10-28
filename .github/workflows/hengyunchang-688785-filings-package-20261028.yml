@@ -1,0 +1,236 @@
+name: Build Hengyunchang 688785 filings package 20261028
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/hengyunchang-688785-filings-package-20261028.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '688785'
+          SHORT = '恒运昌'
+          FULL = '深圳市恒运昌真空技术股份有限公司'
+          PACKAGE = '恒运昌_688785_全部年报_招股说明书_最新季报'
+          ROOT = Path(PACKAGE)
+          PDF_DIR = ROOT / '原始PDF'
+          PREVIEW_DIR = ROOT / '首页预览'
+          for d in (ROOT, PDF_DIR, PREVIEW_DIR):
+              d.mkdir(parents=True, exist_ok=True)
+
+          docs = [
+              {
+                  'label': '2025年年度报告',
+                  'title': '恒运昌：2025年年度报告',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2026-04-28/1225214508.PDF',
+                  'expected_pages': 219,
+                  'min_bytes': 500_000,
+              },
+              {
+                  'label': '首次公开发行股票并在科创板上市招股说明书',
+                  'title': '恒运昌：首次公开发行股票并在科创板上市招股说明书',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2026-01-22/1224944615.PDF',
+                  'expected_pages': 408,
+                  'min_bytes': 2_000_000,
+              },
+              {
+                  'label': '2026年第三季度报告',
+                  'title': '恒运昌：2026年第三季度报告',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2026-10-28/1225632367.PDF',
+                  'expected_pages': 14,
+                  'min_bytes': 50_000,
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def safe_name(text: str) -> str:
+              text = re.sub(r'[\\/:*?"<>|]+', '_', text)
+              return re.sub(r'\s+', '', text)[:120]
+
+          manifest = []
+          total_pages = 0
+          for idx, doc in enumerate(docs, 1):
+              data = None
+              attempts = []
+              for attempt in range(7):
+                  try:
+                      response = session.get(doc['url'], timeout=(30, 360), allow_redirects=True)
+                      meta = {
+                          'status': response.status_code,
+                          'bytes': len(response.content),
+                          'content_type': response.headers.get('content-type', ''),
+                          'final_url': response.url,
+                      }
+                      attempts.append(meta)
+                      if (
+                          response.status_code == 200
+                          and response.content[:5] == b'%PDF-'
+                          and len(response.content) >= doc['min_bytes']
+                      ):
+                          data = response.content
+                          break
+                  except Exception as exc:
+                      attempts.append({'error': repr(exc), 'attempt': attempt + 1})
+                  time.sleep(1 + attempt)
+              if data is None:
+                  raise RuntimeError(f"Download failed: {doc['title']}: {attempts}")
+
+              filename = f"{idx:02d}_{safe_name(doc['label'])}.pdf"
+              dest = PDF_DIR / filename
+              dest.write_bytes(data)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages != doc['expected_pages']:
+                  raise RuntimeError(
+                      f"Page count mismatch for {filename}: {pages} != {doc['expected_pages']}"
+                  )
+              total_pages += pages
+
+              text = ''
+              for page in reader.pages[: min(10, pages)]:
+                  try:
+                      text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', text)
+              identity_hits = [
+                  value for value in (SHORT, FULL, CODE)
+                  if re.sub(r'\s+', '', value) in compact
+              ]
+              if len(compact) > 500 and not identity_hits:
+                  raise RuntimeError(f'Issuer identity mismatch: {filename}')
+
+              subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(dest)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              prefix = PREVIEW_DIR / dest.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(dest), str(prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'First-page render failed: {filename}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  'label': doc['label'],
+                  'title': doc['title'],
+                  'filename': str(Path('原始PDF') / filename),
+                  'source_url': doc['url'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'identity_hits': identity_hits,
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'download_attempts': attempts,
+                  'validation': [
+                      'PDF header', 'issuer identity', 'exact page count',
+                      'qpdf structure', 'first-page render',
+                  ],
+              })
+
+          readme = [
+              '深圳市恒运昌真空技术股份有限公司（688785.SH）定期报告与发行文件资料包',
+              '整理日期：2026-10-28',
+              '',
+              '恒运昌于2026年1月28日在上海证券交易所科创板上市。',
+              '因此，截至整理日，上市后已披露的年度报告全文仅有2025年年度报告。',
+              '本包同时收录首次公开发行股票并在科创板上市招股说明书，以及最新披露的2026年第三季度报告。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme += [
+                  f"{i}. {item['label']}",
+                  f"   页数：{item['pages']}页；文件：{item['filename']}",
+                  f"   来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+          readme += [
+              f'合计：{len(manifest)}份PDF，{total_pages}页。',
+              '全部PDF均为公开信息披露原始附件。',
+              '已核验PDF文件头、公司名称/证券代码、精确页数、文档结构、首页渲染、ZIP CRC和SHA-256。',
+          ]
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['filename']}\n" for item in manifest),
+              encoding='utf-8',
+          )
+
+          zip_cn = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_cn, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{ROOT.name}/{path.relative_to(ROOT)}')
+
+          with zipfile.ZipFile(zip_cn) as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad or len(pdfs) != len(docs):
+                  raise RuntimeError(f'ZIP validation failed: bad={bad}, pdf_count={len(pdfs)}')
+
+          zip_en = Path('hengyunchang_688785_all_annual_prospectus_latest_quarter.zip')
+          zip_en.write_bytes(zip_cn.read_bytes())
+          zip_sha = hashlib.sha256(zip_cn.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_cn, zip_cn.stat().st_size, 'SHA256', zip_sha)
+          print('TOTAL_PAGES', total_pages)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: hengyunchang-688785-filings-final
+          path: |
+            恒运昌_688785_全部年报_招股说明书_最新季报.zip
+            hengyunchang_688785_all_annual_prospectus_latest_quarter.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
