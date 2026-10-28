@@ -1,0 +1,321 @@
+name: Build Guangyang 002708 filing package
+
+on:
+  push:
+    branches: [tmp-guangyang-002708-filings-20261028]
+    paths: ['.github/workflows/tmp-guangyang-002708-filings-20261028.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+          python3 -m pip install --quiet --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='光洋股份_002708_2020-2025年报_最新季报'
+          mkdir -p "$PACKAGE" /tmp/guangyang_check
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK = '002708'
+          COMPANY = '光洋股份'
+          FULL_COMPANY = '常州光洋轴承股份有限公司'
+          OUT = Path('光洋股份_002708_2020-2025年报_最新季报')
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155 Safari/537.36'
+
+          S = requests.Session()
+          S.trust_env = False
+          S.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+          })
+
+          ANNUAL = f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK}/page_type/ndbg.phtml'
+          Q1 = f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_BulletinYi/stockid/{STOCK}/page_type/yjdbg.phtml'
+          Q3 = f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK}/page_type/sjdbg.phtml'
+          REVISION_WORDS = ('更新后', '修订版', '修订稿', '更正后', '更新版', '修订', '更正')
+
+          def fetch(url: str, *, referer: str | None = None, expect_pdf: bool = False, attempts: int = 8) -> tuple[bytes, str, str]:
+              last = None
+              for i in range(attempts):
+                  try:
+                      headers = {}
+                      if referer:
+                          headers['Referer'] = referer
+                      if expect_pdf:
+                          headers['Accept'] = 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'
+                      r = S.get(url, headers=headers or None, timeout=(30, 300), allow_redirects=True)
+                      r.raise_for_status()
+                      if expect_pdf and not r.content.startswith(b'%PDF-'):
+                          raise RuntimeError(f'not PDF: status={r.status_code}, type={r.headers.get("content-type")}, head={r.content[:40]!r}')
+                      return r.content, r.url, r.headers.get('content-type', '')
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 + i, 10))
+              raise RuntimeError(f'fetch failed: {url}: {last!r}')
+
+          def decode(raw: bytes, content_type: str = '') -> str:
+              ctype = content_type.lower()
+              preferred = []
+              if any(x in ctype for x in ('gbk', 'gb2312', 'gb18030')):
+                  preferred.append('gb18030')
+              preferred.extend(['utf-8', 'gb18030', 'gbk'])
+              for enc in preferred:
+                  try:
+                      text = raw.decode(enc)
+                      if text.count('\ufffd') < 8:
+                          return text
+                  except UnicodeDecodeError:
+                      pass
+              return raw.decode('utf-8', errors='replace')
+
+          def page_links(url: str) -> list[tuple[str, str]]:
+              raw, final, ctype = fetch(url)
+              text = decode(raw, ctype)
+              soup = BeautifulSoup(text, 'html.parser')
+              items: list[tuple[str, str]] = []
+              for a in soup.find_all('a', href=True):
+                  label = re.sub(r'\s+', '', a.get_text('', strip=True))
+                  href = unquote(html.unescape(a.get('href', '').strip()))
+                  if href:
+                      items.append((label, urljoin(final, href)))
+              return items
+
+          def choose_annuals() -> list[dict]:
+              items = page_links(ANNUAL)
+              rows = []
+              for index, year in enumerate(range(2020, 2026), 1):
+                  candidates = []
+                  for label, url in items:
+                      if (f'{year}年年度报告' in label or f'{year}年度报告' in label) and '摘要' not in label and '英文' not in label:
+                          candidates.append((label, url))
+                  if not candidates:
+                      raise RuntimeError(f'No full annual report found for {year}')
+                  candidates.sort(key=lambda x: (
+                      0 if any(w in x[0] for w in REVISION_WORDS) else 1,
+                      len(x[0]),
+                  ))
+                  label, detail = candidates[0]
+                  suffix = '_更新或修订版' if any(w in label for w in REVISION_WORDS) else ''
+                  rows.append({
+                      'order': index,
+                      'kind': '年度报告',
+                      'period': f'{year}年度',
+                      'title': label,
+                      'detail_url': detail,
+                      'filename': f'{index:02d}_光洋股份_{year}年年度报告{suffix}.pdf',
+                      'min_pages': 50,
+                  })
+              return rows
+
+          def choose_latest_quarter() -> dict:
+              # As of 2026-10-28, the company has announced that 2026Q3 will be disclosed on 2026-10-30.
+              # Therefore the latest already disclosed quarterly report remains 2026Q1.
+              items = page_links(Q1)
+              candidates = []
+              for label, url in items:
+                  if '2026年' in label and ('第一季度报告' in label or '一季度报告' in label) and '摘要' not in label:
+                      candidates.append((label, url))
+              if not candidates:
+                  raise RuntimeError('No 2026 first-quarter report found')
+              candidates.sort(key=lambda x: (
+                  0 if any(w in x[0] for w in REVISION_WORDS) else 1,
+                  len(x[0]),
+              ))
+              label, detail = candidates[0]
+              suffix = '_更新或修订版' if any(w in label for w in REVISION_WORDS) else ''
+              return {
+                  'order': 7,
+                  'kind': '最新季报',
+                  'period': '2026年第一季度',
+                  'title': label,
+                  'detail_url': detail,
+                  'filename': f'07_光洋股份_2026年第一季度报告{suffix}_最新季报.pdf',
+                  'min_pages': 5,
+              }
+
+          PDF_URL_RE = re.compile(r'''https?://[^\s"'<>]+?\.pdf(?:\?[^\s"'<>]*)?''', re.I)
+
+          def pdf_candidates(detail_url: str) -> list[str]:
+              raw, final, ctype = fetch(detail_url)
+              if raw.startswith(b'%PDF-'):
+                  return [final]
+              text = decode(raw, ctype)
+              soup = BeautifulSoup(text, 'html.parser')
+              scored: list[tuple[int, str]] = []
+              for a in soup.find_all('a', href=True):
+                  label = re.sub(r'\s+', '', a.get_text('', strip=True))
+                  href = unquote(html.unescape(a.get('href', '').strip()))
+                  full = urljoin(final, href)
+                  lower = full.lower()
+                  if '.pdf' in lower or '下载公告' in label or '公告原文' in label or label == '下载':
+                      score = 0 if '下载公告' in label else 1 if '.pdf' in lower else 2
+                      scored.append((score, full))
+              for m in PDF_URL_RE.finditer(text):
+                  scored.append((2, unquote(html.unescape(m.group(0)))))
+              # Sina detail pages sometimes embed uppercase .PDF or protocol-relative links in scripts.
+              for m in re.finditer(r'''(?:https?:)?//[^\s"'<>]+?\.PDF(?:\?[^\s"'<>]*)?''', text, re.I):
+                  token = unquote(html.unescape(m.group(0)))
+                  if token.startswith('//'):
+                      token = 'https:' + token
+                  scored.append((2, token))
+
+              seen = set()
+              result = []
+              for _, candidate in sorted(scored, key=lambda x: (x[0], len(x[1]))):
+                  variants = [candidate]
+                  if candidate.startswith('http://'):
+                      variants.insert(0, 'https://' + candidate[len('http://'):])
+                  for variant in variants:
+                      if variant not in seen:
+                          seen.add(variant)
+                          result.append(variant)
+              return result
+
+          def obtain_pdf(row: dict) -> tuple[bytes, str]:
+              errors = []
+              for candidate in pdf_candidates(row['detail_url']):
+                  try:
+                      data, final, _ = fetch(candidate, referer=row['detail_url'], expect_pdf=True, attempts=5)
+                      if len(data) < 50_000:
+                          raise RuntimeError(f'PDF too small: {len(data)}')
+                      return data, final
+                  except Exception as exc:
+                      errors.append(f'{candidate}: {exc!r}')
+              raise RuntimeError(f'No valid PDF for {row["title"]}; errors={errors[:8]}')
+
+          rows = choose_annuals()
+          rows.append(choose_latest_quarter())
+
+          for row in rows:
+              data, pdf_url = obtain_pdf(row)
+              path = OUT / row['filename']
+              path.write_bytes(data)
+              row['pdf_url'] = pdf_url
+              row['bytes'] = len(data)
+              row['pages'] = len(PdfReader(str(path), strict=False).pages)
+              if row['pages'] < row['min_pages']:
+                  raise RuntimeError(f'{path.name}: unexpected page count {row["pages"]}')
+              print('SAVED', path.name, row['pages'], len(data), pdf_url)
+
+          (OUT / '_metadata.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+          test "$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)" -eq 7
+
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            test "$(stat -c%s "$pdf")" -gt 50000
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf.txt" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+              cat "$pdf.qpdf.txt" >&2
+              exit "$rc"
+            fi
+            rm -f "$pdf.qpdf.txt"
+
+            pages=$(pdfinfo "$pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 5
+
+            pdftotext -f 1 -l 60 "$pdf" "$pdf.txt" 2>/dev/null || true
+            grep -Eq '常州光洋轴承股份有限公司|光洋股份' "$pdf.txt"
+            rm -f "$pdf.txt"
+
+            stem="/tmp/guangyang_check/$(basename "$pdf")"
+            pdftoppm -f 1 -l 1 -singlefile -png -r 90 "$pdf" "$stem.first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 90 "$pdf" "$stem.last" >/dev/null 2>&1
+            test -s "$stem.first.png" && test -s "$stem.last.png"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import json
+
+          folder = Path('光洋股份_002708_2020-2025年报_最新季报')
+          rows = json.loads((folder / '_metadata.json').read_text(encoding='utf-8'))
+          rows.sort(key=lambda x: x['order'])
+          lines = [
+              '常州光洋轴承股份有限公司（光洋股份，002708）',
+              '2020—2025年年度报告及最新已披露季度报告',
+              '整理日期：2026-10-28',
+              '',
+              '收录说明：',
+              '1. 收录2020—2025年度报告全文，共6份；若公开目录存在更新、修订或更正版本，优先采用后续版本。',
+              '2. 截至2026-10-28，公司已公告2026年第三季度报告拟于2026-10-30披露，因此当前最新已披露季报为2026年第一季度报告。',
+              '3. 2026年半年度报告不属于季度报告，未用半年报替代“最新季报”。',
+              '4. 排除年度报告摘要、季度报告摘要、英文版及提示性公告。',
+              '',
+              '文件清单：',
+          ]
+          sums = []
+          total_pages = 0
+          total_bytes = 0
+          for row in rows:
+              path = folder / row['filename']
+              data = path.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              total_pages += int(row['pages'])
+              total_bytes += len(data)
+              lines += [
+                  f"- {path.name}",
+                  f"  类型：{row['kind']}；报告期：{row['period']}；页数：{row['pages']}；大小：{len(data)}字节",
+                  f"  公告标题：{row['title']}",
+                  f"  PDF来源：{row['pdf_url']}",
+                  f"  SHA-256：{sha}",
+              ]
+              sums.append(f'{sha}  {path.name}')
+          lines += [
+              '',
+              f'合计页数：{total_pages}页。',
+              f'PDF原件合计大小：{total_bytes}字节。',
+              '全部PDF均已通过文件头、文件大小、PDF结构、实际页数、正文公司名称及首末页渲染检查。',
+          ]
+          (folder / '00_文件清单与说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (folder / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          (folder / '_metadata.json').unlink()
+          print('\n'.join(lines))
+          PY
+
+          zip -q -r -6 package_integrity_test.zip "$PACKAGE"
+          unzip -t package_integrity_test.zip >/dev/null
+          test "$(unzip -Z1 package_integrity_test.zip | grep -c '\.pdf$')" -eq 7
+          rm -f package_integrity_test.zip
+          ls -lh "$PACKAGE"
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Guangyang-002708-2020-2025-annual-latest-quarter
+          path: 光洋股份_002708_2020-2025年报_最新季报/
+          retention-days: 2
+          compression-level: 6
+          if-no-files-found: error
