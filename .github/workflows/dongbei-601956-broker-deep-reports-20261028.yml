@@ -1,0 +1,390 @@
+name: Package Dongbei Group 601956 broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dongbei-601956-broker-deep-reports-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Discover, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY = '东贝集团'
+          FULL_COMPANY = '湖北东贝机电集团股份有限公司'
+          PREDECESSOR = '黄石东贝电器股份有限公司'
+          CODE = '601956'
+          OLD_CODE = '900956'
+          CUTOFF = '2026-10-28'
+          CUT = '20261028'
+          API = 'https://reportapi.eastmoney.com/report/list'
+          ROOT = Path('work') / f'{COMPANY}_{CODE}_券商深度报告_待定份数_截至{CUT}'
+          REPORTS = ROOT / '券商深度报告'
+          PREVIEWS = ROOT / '首页预览'
+          DIST = Path('dist')
+          for d in (REPORTS, PREVIEWS, DIST):
+              d.mkdir(parents=True, exist_ok=True)
+
+          def make_session() -> requests.Session:
+              s = requests.Session()
+              retry = Retry(
+                  total=6, connect=6, read=6, status=6, backoff_factor=1.0,
+                  status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({'GET'}), raise_on_status=False,
+              )
+              s.mount('https://', HTTPAdapter(max_retries=retry))
+              s.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+                  'Referer': 'https://data.eastmoney.com/report/',
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              })
+              return s
+
+          S = make_session()
+
+          def fetch_rows(code: str) -> list[dict]:
+              rows: list[dict] = []
+              for page in range(1, 12):
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2005-01-01', 'endTime': CUTOFF,
+                      'pageNo': str(page), 'fields': '', 'qType': '0',
+                      'orgCode': '', 'code': code, 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  }
+                  r = S.get(API, params=params, timeout=90)
+                  print('LIST', code, r.status_code, len(r.content), r.url)
+                  r.raise_for_status()
+                  data = r.json()
+                  part = data.get('data') or []
+                  rows.extend(part)
+                  print('LIST_META', json.dumps({
+                      'code': code, 'page': page, 'hits': data.get('hits'),
+                      'size': data.get('size'), 'rows': len(part), 'acc': len(rows),
+                  }, ensure_ascii=False))
+                  for x in part:
+                      print('REPORT', code, json.dumps({k: x.get(k) for k in (
+                          'publishDate', 'orgSName', 'orgName', 'title', 'infoCode',
+                          'attachPages', 'attachSize', 'emRatingName', 'researcher',
+                          'reportType', 'stockCode', 'stockName'
+                      )}, ensure_ascii=False))
+                  if not part or len(rows) >= int(data.get('hits') or len(rows)):
+                      break
+                  time.sleep(0.4)
+              return rows
+
+          all_rows: list[dict] = []
+          for c in (CODE, OLD_CODE):
+              try:
+                  for x in fetch_rows(c):
+                      y = dict(x)
+                      y['_queried_code'] = c
+                      all_rows.append(y)
+              except Exception as exc:
+                  print('LIST_ERROR', c, repr(exc))
+
+          dedup: dict[str, dict] = {}
+          for x in all_rows:
+              info = str(x.get('infoCode') or '')
+              if info:
+                  dedup[info] = x
+          rows = list(dedup.values())
+          if not rows:
+              raise RuntimeError('东方财富公开研报接口未返回东贝集团或东贝B股研报。')
+
+          def date10(v: object) -> str:
+              return str(v or '')[:10]
+
+          def year_of(v: object) -> int:
+              try:
+                  return int(str(v or '')[:4])
+              except Exception:
+                  return 0
+
+          def score(x: dict) -> float:
+              title = str(x.get('title') or '')
+              pages = int(x.get('attachPages') or 0)
+              year = year_of(x.get('publishDate'))
+              current = str(x.get('_queried_code') or '') == CODE
+              s = pages * 5 + max(0, year - 2010) * 3 + (25 if current else 0)
+              if any(k in title for k in ('深度报告', '公司深度', '深度研究')):
+                  s += 180
+              if any(k in title for k in ('首次覆盖', '首次披露')):
+                  s += 140
+              if any(k in title for k in ('龙头', '压缩机', '制冷', '成长', '智能制造', '变频')):
+                  s += 18
+              if pages >= 30:
+                  s += 90
+              elif pages >= 20:
+                  s += 55
+              elif pages >= 15:
+                  s += 30
+              if any(k in title for k in ('点评', '年报', '季报', '中报', '半年报', '业绩快报', '事件点评')):
+                  s -= 160
+              if any(k in title for k in ('转债', '增发', '发行', '新股定价')):
+                  s -= 170
+              return s
+
+          def is_candidate(x: dict) -> bool:
+              title = str(x.get('title') or '')
+              pages = int(x.get('attachPages') or 0)
+              if pages < 10:
+                  return False
+              if any(k in title for k in ('转债', '增发', '发行', '新股定价')):
+                  return False
+              return True
+
+          candidates = [(score(x), x) for x in rows if is_candidate(x)]
+          candidates.sort(
+              key=lambda z: (z[0], int(z[1].get('attachPages') or 0), date10(z[1].get('publishDate'))),
+              reverse=True,
+          )
+          print('RANKED_CANDIDATES')
+          for sc, x in candidates:
+              print('RANK', sc, json.dumps({k: x.get(k) for k in (
+                  'publishDate', 'orgSName', 'orgName', 'title', 'infoCode',
+                  'attachPages', 'emRatingName', 'researcher', 'reportType',
+                  '_queried_code', 'stockCode', 'stockName'
+              )}, ensure_ascii=False))
+
+          def safe(v: str) -> str:
+              v = re.sub(r'[\\/:*?"<>|]', '_', v)
+              v = re.sub(r'\s+', '', v)
+              return re.sub(r'_+', '_', v).strip('_. ')
+
+          def pdf_urls(info: str) -> list[str]:
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+              ]
+
+          def try_download_validate(sc: float, x: dict) -> tuple[dict, Path] | None:
+              info = str(x.get('infoCode') or '')
+              broker = str(x.get('orgSName') or x.get('orgName') or '未知券商')
+              title = str(x.get('title') or '').strip()
+              date = date10(x.get('publishDate'))
+              dest = REPORTS / safe(f'{date}_{broker}_{COMPANY}_{title}.pdf')
+              errors = []
+              for url in pdf_urls(info):
+                  try:
+                      r = S.get(url, headers={
+                          'Referer': 'https://data.eastmoney.com/',
+                          'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                      }, timeout=180)
+                      print('PDF_GET', r.status_code, len(r.content), url, r.headers.get('content-type'))
+                      if r.status_code != 200 or len(r.content) < 50_000 or not r.content.startswith(b'%PDF'):
+                          errors.append((url, r.status_code, len(r.content), repr(r.content[:20])))
+                          continue
+                      dest.write_bytes(r.content)
+                      reader = PdfReader(str(dest), strict=False)
+                      pages = len(reader.pages)
+                      if pages < 10:
+                          raise RuntimeError(f'实际页数过少: {pages}')
+                      doc = fitz.open(dest)
+                      if doc.page_count != pages:
+                          raise RuntimeError(f'页数解析不一致: pypdf={pages}, fitz={doc.page_count}')
+                      first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+                      last = doc.load_page(doc.page_count - 1).get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False)
+                      if min(first.width, first.height, last.width, last.height) < 100:
+                          raise RuntimeError('首末页渲染异常')
+                      probe = ''
+                      for i in range(min(6, doc.page_count)):
+                          try:
+                              probe += doc.load_page(i).get_text('text')
+                          except Exception:
+                              pass
+                      first.save(PREVIEWS / f'{dest.stem}.png')
+                      doc.close()
+                      if not any(k in probe for k in (COMPANY, FULL_COMPANY, PREDECESSOR, CODE, OLD_CODE)):
+                          print('WARNING_TEXT_PROBE', dest.name)
+                      rec = {
+                          'broker': broker,
+                          'report_date': date,
+                          'title': title,
+                          'authors': x.get('researcher') or '',
+                          'rating': x.get('emRatingName') or '',
+                          'info_code': info,
+                          'queried_code': x.get('_queried_code') or '',
+                          'stock_name': x.get('stockName') or '',
+                          'ranking_score': sc,
+                          'source_url': url,
+                          'eastmoney_detail_url': f'https://data.eastmoney.com/report/info/{info}.html',
+                          'relative_path': str(dest.relative_to(ROOT)).replace(os.sep, '/'),
+                          'file_size_bytes': dest.stat().st_size,
+                          'page_count': pages,
+                          'sha256': hashlib.sha256(dest.read_bytes()).hexdigest(),
+                          'pdf_header_valid': True,
+                          'first_page_rendered': True,
+                          'last_page_rendered': True,
+                      }
+                      print('VERIFIED', json.dumps(rec, ensure_ascii=False))
+                      return rec, dest
+                  except Exception as exc:
+                      errors.append((url, repr(exc)))
+                      if dest.exists():
+                          dest.unlink()
+              print('CANDIDATE_FAILED', info, broker, title, errors)
+              return None
+
+          records: list[dict] = []
+          selected_infos: set[str] = set()
+          selected_brokers: set[str] = set()
+
+          # Pass 1: different brokers, highest-scoring reports.
+          for sc, x in candidates:
+              if len(records) >= 3:
+                  break
+              info = str(x.get('infoCode') or '')
+              broker = str(x.get('orgSName') or x.get('orgName') or '未知券商')
+              if info in selected_infos or broker in selected_brokers:
+                  continue
+              result = try_download_validate(sc, x)
+              if result:
+                  rec, _ = result
+                  records.append(rec)
+                  selected_infos.add(info)
+                  selected_brokers.add(broker)
+
+          # Pass 2: allow repeated brokers if necessary.
+          if len(records) < 3:
+              for sc, x in candidates:
+                  if len(records) >= 3:
+                      break
+                  info = str(x.get('infoCode') or '')
+                  if info in selected_infos:
+                      continue
+                  result = try_download_validate(sc, x)
+                  if result:
+                      rec, _ = result
+                      records.append(rec)
+                      selected_infos.add(info)
+
+          if len(records) < 2:
+              raise RuntimeError(f'仅成功取得{len(records)}份完整研报，少于用户要求的2份。')
+
+          count = len(records)
+          actual_root_name = f'{COMPANY}_{CODE}_券商深度报告_精选{count}份_截至{CUT}'
+          new_root = ROOT.parent / actual_root_name
+          if new_root.exists():
+              shutil.rmtree(new_root)
+          ROOT.rename(new_root)
+          ROOT = new_root
+          REPORTS = ROOT / '券商深度报告'
+          PREVIEWS = ROOT / '首页预览'
+
+          manifest = {
+              'company': COMPANY,
+              'full_company_name': FULL_COMPANY,
+              'stock_code': CODE,
+              'predecessor_company': PREDECESSOR,
+              'predecessor_stock_code': OLD_CODE,
+              'cutoff_date': CUTOFF,
+              'document_count': count,
+              'selection_policy': '优先选择页数较长的首次覆盖、公司深度或主题深度研究；排除可转债、增发及普通短篇业绩点评；优先覆盖不同券商。若现代码报告不足，则补充前身东贝B股时期的完整公司研究报告。',
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['relative_path']}" for r in records) + '\n', encoding='utf-8')
+
+          lines = [
+              f'# {COMPANY}（{CODE}）券商深度报告包', '',
+              f'- 截止日期：{CUTOFF}',
+              f'- 收录数量：{count}份完整PDF。',
+              '- 来源：东方财富公开券商研报PDF接口。',
+              '- 选择原则：优先页数较长的首次覆盖、公司深度或主题深度研究，排除普通短篇业绩点评、可转债及增发报告。',
+              '- 校验：PDF文件头、双解析器页数、首末页渲染、SHA-256、ZIP CRC。',
+              '- 版权归原券商及作者所有，仅供个人研究参考，不构成投资建议。', '',
+              '## 文件清单', '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines += [
+                  f"{i}. `{r['relative_path']}`",
+                  f"   - 券商：{r['broker']}",
+                  f"   - 日期：{r['report_date']}",
+                  f"   - 标题：{r['title']}",
+                  f"   - 作者：{r['authors'] or '未标注'}",
+                  f"   - 评级：{r['rating'] or '未标注'}",
+                  f"   - 页数：{r['page_count']}；大小：{r['file_size_bytes']:,} 字节",
+                  f"   - 来源：{r['source_url']}",
+                  f"   - SHA-256：`{r['sha256']}`",
+              ]
+          (ROOT / 'README.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          final_cn = DIST / f'{actual_root_name}.zip'
+          final_en = DIST / f'dongbei_group_601956_broker_deep_reports_{count}_{CUT}.zip'
+          for p in (final_cn, final_en):
+              if p.exists():
+                  p.unlink()
+          with zipfile.ZipFile(final_cn, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, str(p.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(final_cn, final_en)
+
+          for p in (final_cn, final_en):
+              with zipfile.ZipFile(p) as zf:
+                  bad = zf.testzip()
+                  pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+                  if bad or len(pdfs) != count:
+                      raise RuntimeError(f'ZIP校验失败 {p}: bad={bad}, pdfs={len(pdfs)}, expected={count}')
+              print('ZIP_VERIFIED', p, p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest())
+
+          print('FINAL_JSON', json.dumps({
+              'document_count': count,
+              'reports': [{k: r[k] for k in ('broker', 'report_date', 'title', 'authors', 'rating', 'page_count')} for r in records],
+              'chinese_zip': str(final_cn),
+              'english_zip': str(final_en),
+              'chinese_zip_size': final_cn.stat().st_size,
+              'chinese_zip_sha256': hashlib.sha256(final_cn.read_bytes()).hexdigest(),
+          }, ensure_ascii=False))
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dongbei-601956-broker-deep-reports-20261028
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
