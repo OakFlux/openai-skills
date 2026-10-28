@@ -1,0 +1,253 @@
+name: Package Dongbei Group broker diligence reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dongbei-601956-broker-diligence-reports-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY = '东贝集团'
+          CODE = '601956'
+          CUTOFF = '2026-10-28'
+          CUT = '20261028'
+          ROOT_NAME = f'{COMPANY}_{CODE}_券商深度尽调报告_2份_截至{CUT}'
+          ROOT = Path('work') / ROOT_NAME
+          REPORTS = ROOT / '券商深度尽调报告'
+          PREVIEWS = ROOT / '首页预览'
+          DIST = Path('dist')
+          for d in (REPORTS, PREVIEWS, DIST):
+              d.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '中信建投证券',
+                  'date': '2020-08',
+                  'title': '关于湖北东贝机电集团股份有限公司换股吸收合并黄石东贝电器股份有限公司暨关联交易之财务顾问报告（修订稿）',
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H2_AN202008121398085220_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H3_AN202008121398085220_1.pdf',
+                  ],
+                  'detail_url': 'https://data.eastmoney.com/notices/detail/900956/AN202008121398085220.html',
+              },
+              {
+                  'broker': '海通证券',
+                  'date': '2020-09',
+                  'title': '关于湖北东贝机电集团股份有限公司换股吸收合并黄石东贝电器股份有限公司暨关联交易之独立财务顾问报告',
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H2_AN202009011405813614_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H3_AN202009011405813614_1.pdf',
+                  ],
+                  'detail_url': 'https://data.eastmoney.com/notices/detail/900956/AN202009011405813614.html',
+              },
+          ]
+
+          session = requests.Session()
+          retry = Retry(
+              total=7, connect=7, read=7, status=7, backoff_factor=1.2,
+              status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+              allowed_methods=frozenset({'GET'}), raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def safe_name(value: str) -> str:
+              value = re.sub(r'[\\/:*?"<>|]', '_', value)
+              value = re.sub(r'\s+', '', value)
+              return re.sub(r'_+', '_', value).strip('_. ')
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          records = []
+          for item in reports:
+              filename = safe_name(f"{item['date']}_{item['broker']}_{COMPANY}_{item['title']}.pdf")
+              dest = REPORTS / filename
+              errors = []
+              source_url = ''
+              for url in item['urls']:
+                  try:
+                      r = session.get(
+                          url,
+                          headers={'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},
+                          timeout=240,
+                          allow_redirects=True,
+                      )
+                      print('DOWNLOAD', r.status_code, len(r.content), url, r.url, r.headers.get('content-type'))
+                      if r.status_code == 200 and len(r.content) > 500_000 and r.content.startswith(b'%PDF'):
+                          dest.write_bytes(r.content)
+                          source_url = url
+                          break
+                      errors.append((url, r.status_code, len(r.content), repr(r.content[:32])))
+                  except Exception as exc:
+                      errors.append((url, repr(exc)))
+              if not dest.exists():
+                  raise RuntimeError(f"无法下载完整PDF: {item['title']}; errors={errors}")
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < 100:
+                  raise RuntimeError(f'报告页数异常，可能不是完整深度文件: {dest.name}, pages={pages}')
+
+              doc = fitz.open(dest)
+              if doc.page_count != pages:
+                  raise RuntimeError(f'双解析器页数不一致: {dest.name}: pypdf={pages}, fitz={doc.page_count}')
+              first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+              last = doc.load_page(doc.page_count - 1).get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 100:
+                  raise RuntimeError(f'页面渲染异常: {dest.name}')
+              first.save(PREVIEWS / f'{dest.stem}.png')
+
+              probe = ''
+              for i in range(min(8, doc.page_count)):
+                  try:
+                      probe += doc.load_page(i).get_text('text')
+                  except Exception:
+                      pass
+              doc.close()
+              required = ['湖北东贝机电集团股份有限公司', item['broker']]
+              missing = [x for x in required if x not in probe]
+              if missing:
+                  raise RuntimeError(f'首页文本身份校验失败: {dest.name}; missing={missing}')
+
+              rec = {
+                  'broker': item['broker'],
+                  'report_date': item['date'],
+                  'title': item['title'],
+                  'document_class': '财务顾问/独立财务顾问深度尽调报告',
+                  'source_url': source_url,
+                  'detail_url': item['detail_url'],
+                  'relative_path': str(dest.relative_to(ROOT)).replace(os.sep, '/'),
+                  'file_name': dest.name,
+                  'file_size_bytes': dest.stat().st_size,
+                  'page_count': pages,
+                  'sha256': sha256(dest),
+                  'pdf_header_valid': True,
+                  'first_page_rendered': True,
+                  'last_page_rendered': True,
+              }
+              records.append(rec)
+              print('VERIFIED', json.dumps(rec, ensure_ascii=False))
+
+          if len(records) != 2:
+              raise RuntimeError(f'文件数量异常: {len(records)}')
+
+          manifest = {
+              'company': COMPANY,
+              'stock_code': CODE,
+              'cutoff_date': CUTOFF,
+              'document_count': len(records),
+              'important_note': '公开个股研报数据库未检索到常规卖方首次覆盖或公司深度报告。本包收录两份由不同券商出具、对公司及换股吸收合并事项进行系统尽职调查的长篇财务顾问报告，作为可公开取得的最接近券商深度研究材料。',
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['relative_path']}" for r in records) + '\n', encoding='utf-8')
+
+          lines = [
+              f'# {COMPANY}（{CODE}）券商深度尽调报告包', '',
+              f'- 截止日期：{CUTOFF}',
+              '- 收录数量：2份完整PDF，分别由中信建投证券、海通证券出具。',
+              '- 文件性质：财务顾问/独立财务顾问深度尽调报告，不是常规带投资评级的卖方个股研究报告。',
+              '- 选择原因：公开个股研报数据库未检索到常规首次覆盖或公司深度报告；这两份文件均系统覆盖公司业务、行业、财务、交易安排、风险及核查意见。',
+              '- 校验：PDF文件头、双解析器页数、首页身份文本、首末页渲染、SHA-256、ZIP CRC。',
+              '- 版权归原券商及相关权利人所有，仅供个人研究参考，不构成投资建议。', '',
+              '## 文件清单', '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines += [
+                  f"{i}. `{r['relative_path']}`",
+                  f"   - 券商：{r['broker']}",
+                  f"   - 日期：{r['report_date']}",
+                  f"   - 标题：{r['title']}",
+                  f"   - 页数：{r['page_count']}；大小：{r['file_size_bytes']:,} 字节",
+                  f"   - 原始PDF：{r['source_url']}",
+                  f"   - SHA-256：`{r['sha256']}`",
+              ]
+          (ROOT / 'README.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          final_cn = DIST / f'{ROOT_NAME}.zip'
+          final_en = DIST / f'dongbei_group_601956_broker_diligence_reports_2_{CUT}.zip'
+          for p in (final_cn, final_en):
+              if p.exists():
+                  p.unlink()
+          with zipfile.ZipFile(final_cn, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, str(p.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(final_cn, final_en)
+
+          for p in (final_cn, final_en):
+              with zipfile.ZipFile(p, 'r') as zf:
+                  bad = zf.testzip()
+                  pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+                  if bad or len(pdfs) != 2:
+                      raise RuntimeError(f'ZIP校验失败: {p}, bad={bad}, pdfs={len(pdfs)}')
+              print('ZIP_VERIFIED', p, p.stat().st_size, sha256(p))
+
+          print('FINAL_JSON', json.dumps({
+              'document_count': 2,
+              'reports': [{k: r[k] for k in ('broker', 'report_date', 'title', 'page_count')} for r in records],
+              'chinese_zip': str(final_cn),
+              'english_zip': str(final_en),
+              'size': final_cn.stat().st_size,
+              'sha256': sha256(final_cn),
+          }, ensure_ascii=False))
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dongbei-601956-broker-diligence-reports-20261028
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
