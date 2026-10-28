@@ -1,0 +1,277 @@
+name: Build Dafeng 603081 annual and latest-quarter package
+
+on:
+  push:
+    branches: [tmp-dafeng-603081-filings-20261028]
+    paths: ['.github/workflows/tmp-dafeng-package-20261028.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+          python3 -m pip install --quiet --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='大丰实业_603081_2020-2025年报_最新季报'
+          mkdir -p "$PACKAGE" /tmp/dafeng_check
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('大丰实业_603081_2020-2025年报_最新季报')
+          records = [
+              {
+                  'order': 1,
+                  'period': '2020年年度报告',
+                  'filename': '01_大丰实业_2020年年度报告.pdf',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=603081&id=7160346',
+              },
+              {
+                  'order': 2,
+                  'period': '2021年年度报告',
+                  'filename': '02_大丰实业_2021年年度报告.pdf',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=603081&id=8064767',
+              },
+              {
+                  'order': 3,
+                  'period': '2022年年度报告',
+                  'filename': '03_大丰实业_2022年年度报告.pdf',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=603081&id=9131129',
+              },
+              {
+                  'order': 4,
+                  'period': '2023年年度报告',
+                  'filename': '04_大丰实业_2023年年度报告.pdf',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=603081&id=10059752',
+              },
+              {
+                  'order': 5,
+                  'period': '2024年年度报告',
+                  'filename': '05_大丰实业_2024年年度报告.pdf',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=603081&id=11044258',
+              },
+              {
+                  'order': 6,
+                  'period': '2025年年度报告',
+                  'filename': '06_大丰实业_2025年年度报告.pdf',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=603081&id=12119104',
+              },
+              {
+                  'order': 7,
+                  'period': '2026年第一季度报告（截至2026-10-28的最新季报）',
+                  'filename': '07_大丰实业_2026年第一季度报告_最新季报.pdf',
+                  'detail_url': 'https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=603081&id=12119109',
+              },
+          ]
+
+          S = requests.Session()
+          S.trust_env = False
+          S.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+          })
+
+          def fetch(url: str, *, pdf: bool = False, referer: str | None = None, attempts: int = 8):
+              last = None
+              for i in range(attempts):
+                  try:
+                      headers = {}
+                      if pdf:
+                          headers['Accept'] = 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'
+                      if referer:
+                          headers['Referer'] = referer
+                      r = S.get(url, headers=headers or None, timeout=(30, 360), allow_redirects=True)
+                      r.raise_for_status()
+                      if pdf and not r.content.startswith(b'%PDF-'):
+                          raise RuntimeError(f'not PDF: {r.headers.get("content-type")} {r.content[:40]!r}')
+                      return r
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 + i, 10))
+              raise RuntimeError(f'fetch failed: {url}; last={last!r}')
+
+          def decode(raw: bytes, ctype: str = '') -> str:
+              encs = []
+              if any(x in ctype.lower() for x in ('gbk', 'gb2312', 'gb18030')):
+                  encs.append('gb18030')
+              encs.extend(['utf-8', 'gb18030', 'gbk'])
+              best = None
+              for enc in encs:
+                  try:
+                      text = raw.decode(enc)
+                  except Exception:
+                      continue
+                  score = text.count('\ufffd')
+                  if best is None or score < best[0]:
+                      best = (score, text)
+              return best[1] if best else raw.decode('utf-8', errors='replace')
+
+          pdf_re = re.compile(r'''(?:https?:)?//[^\s"'<>]+?\.pdf(?:\?[^\s"'<>]*)?''', re.I)
+
+          def candidate_pdf_urls(detail_url: str) -> list[str]:
+              r = fetch(detail_url)
+              if r.content.startswith(b'%PDF-'):
+                  return [r.url]
+              text = decode(r.content, r.headers.get('content-type', ''))
+              soup = BeautifulSoup(text, 'html.parser')
+              scored = []
+              for a in soup.find_all('a', href=True):
+                  label = re.sub(r'\s+', '', a.get_text('', strip=True))
+                  href = unquote(html.unescape(a.get('href', '').strip()))
+                  full = urljoin(r.url, href)
+                  if '.pdf' in full.lower() or '下载公告' in label or '公告原文' in label or label == '下载':
+                      rank = 0 if '下载公告' in label else 1 if '.pdf' in full.lower() else 2
+                      scored.append((rank, full))
+              for m in pdf_re.finditer(text):
+                  token = unquote(html.unescape(m.group(0)))
+                  if token.startswith('//'):
+                      token = 'https:' + token
+                  scored.append((2, token))
+              seen = set()
+              out = []
+              for _, candidate in sorted(scored, key=lambda x: (x[0], len(x[1]))):
+                  variants = [candidate]
+                  if candidate.startswith('http://'):
+                      variants.insert(0, 'https://' + candidate[7:])
+                  for v in variants:
+                      if v not in seen:
+                          seen.add(v)
+                          out.append(v)
+              return out
+
+          def obtain_pdf(detail_url: str):
+              errors = []
+              for candidate in candidate_pdf_urls(detail_url):
+                  try:
+                      r = fetch(candidate, pdf=True, referer=detail_url, attempts=5)
+                      if len(r.content) < 50_000:
+                          raise RuntimeError(f'too small: {len(r.content)}')
+                      return r.content, r.url
+                  except Exception as exc:
+                      errors.append(f'{candidate}: {exc!r}')
+              raise RuntimeError(f'No valid PDF from {detail_url}; {errors[:10]}')
+
+          for item in records:
+              data, final_url = obtain_pdf(item['detail_url'])
+              path = OUT / item['filename']
+              path.write_bytes(data)
+              pages = len(PdfReader(str(path), strict=False).pages)
+              if pages < 5:
+                  raise RuntimeError(f'{path.name}: suspicious page count {pages}')
+              item['pages'] = pages
+              item['bytes'] = len(data)
+              item['pdf_url'] = final_url
+              print('SAVED', path.name, 'pages=', pages, 'bytes=', len(data), 'url=', final_url)
+
+          (OUT / '_metadata.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+          test "$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)" -eq 7
+
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            test "$(stat -c%s "$pdf")" -gt 50000
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf.txt" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+              cat "$pdf.qpdf.txt" >&2
+              exit "$rc"
+            fi
+            rm -f "$pdf.qpdf.txt"
+
+            pages=$(pdfinfo "$pdf" 2>/dev/null | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 5
+            pdftotext -f 1 -l "$pages" "$pdf" "$pdf.txt" 2>/dev/null || true
+            grep -Eq '浙江大丰实业股份有限公司|大丰实业' "$pdf.txt"
+            rm -f "$pdf.txt"
+
+            stem="/tmp/dafeng_check/$(basename "$pdf")"
+            pdftoppm -f 1 -l 1 -singlefile -png -r 90 "$pdf" "$stem.first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 90 "$pdf" "$stem.last" >/dev/null 2>&1
+            test -s "$stem.first.png" && test -s "$stem.last.png"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+
+          folder = Path('大丰实业_603081_2020-2025年报_最新季报')
+          records = json.loads((folder / '_metadata.json').read_text(encoding='utf-8'))
+          records.sort(key=lambda x: x['order'])
+          lines = [
+              '浙江大丰实业股份有限公司（大丰实业，603081）',
+              '2020—2025年年度报告及最新季度报告资料包',
+              '整理日期：2026-10-28',
+              '',
+              '收录说明：',
+              '1. 本包收录2020—2025年度报告全文，以及截至2026年10月28日已正式披露的最新季报。',
+              '2. 公开披露目录中尚未出现2026年第三季度报告，因此当前最新季报为2026年第一季度报告；半年度报告不作为季度报告替代。',
+              '3. 全部文件均为公开披露渠道下载的完整原始PDF。',
+              '',
+              '文件清单：',
+          ]
+          sums=[]; total_pages=0; total_bytes=0
+          for r in records:
+              p = folder / r['filename']
+              data = p.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              total_pages += int(r['pages']); total_bytes += len(data)
+              lines += [
+                  f'- {p.name}',
+                  f"  报告期：{r['period']}；页数：{r['pages']}；大小：{len(data)}字节",
+                  f"  披露详情页：{r['detail_url']}",
+                  f"  PDF来源：{r['pdf_url']}",
+                  f"  SHA-256：{sha}",
+              ]
+              sums.append(f'{sha}  {p.name}')
+          lines += [
+              '',
+              f'合计页数：{total_pages}页。',
+              f'PDF原件合计大小：{total_bytes}字节。',
+              '全部PDF均已通过文件头、文件大小、结构完整性、实际页数、正文公司名称及首末页渲染检查。',
+          ]
+          (folder / '00_文件清单与说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (folder / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          (folder / '_metadata.json').unlink()
+          print('\n'.join(lines))
+          PY
+
+          zip -q -r -6 package_test.zip "$PACKAGE"
+          unzip -t package_test.zip >/dev/null
+          test "$(unzip -Z1 package_test.zip | grep -c '\.pdf$')" -eq 7
+          rm -f package_test.zip
+          ls -lh "$PACKAGE"
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dafeng-603081-2020-2025-annual-latest-quarter
+          path: 大丰实业_603081_2020-2025年报_最新季报/
+          retention-days: 2
+          compression-level: 6
+          if-no-files-found: error
