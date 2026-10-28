@@ -1,0 +1,381 @@
+name: Package Chengxing broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/chengxing-600078-broker-reports-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf beautifulsoup4 pillow
+
+      - name: Download, verify, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import ast
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          ROOT = Path('deliverable')
+          REPORT_DIR = ROOT / 'reports'
+          DEBUG_DIR = ROOT / 'debug'
+          REPORT_DIR.mkdir(parents=True, exist_ok=True)
+          DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          records: list[dict] = []
+          debug_lines: list[str] = []
+
+          def log(message: str) -> None:
+              print(message, flush=True)
+              debug_lines.append(message)
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def inspect_pdf_bytes(data: bytes) -> tuple[int, str]:
+              if not data.startswith(b'%PDF'):
+                  raise ValueError('not a PDF signature')
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              pages = len(reader.pages)
+              if pages < 1:
+                  raise ValueError('zero pages')
+              text_parts = []
+              for index in sorted(set([0, min(1, pages - 1), pages - 1])):
+                  try:
+                      text_parts.append(reader.pages[index].extract_text() or '')
+                  except Exception as exc:
+                      text_parts.append(f'[extract error: {exc}]')
+              return pages, '\n'.join(text_parts)[:8000]
+
+          def save_pdf(data: bytes, filename: str, metadata: dict) -> Path:
+              pages, sample = inspect_pdf_bytes(data)
+              path = REPORT_DIR / filename
+              path.write_bytes(data)
+              metadata = dict(metadata)
+              metadata.update({
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha256(path),
+                  'sample_text': re.sub(r'\s+', ' ', sample)[:600],
+              })
+              records.append(metadata)
+              log(f"SAVED {filename}: pages={pages}, bytes={len(data)}")
+              return path
+
+          def get(url: str, *, referer: str | None = None, timeout: int = 60) -> requests.Response:
+              headers = {'Referer': referer} if referer else None
+              last_exc = None
+              for attempt in range(4):
+                  try:
+                      response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      log(f"GET {url} -> {response.status_code} {response.url} {response.headers.get('content-type')} {len(response.content)}")
+                      return response
+                  except Exception as exc:
+                      last_exc = exc
+                      log(f"GET ERROR attempt={attempt+1} url={url}: {exc}")
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'GET failed: {url}: {last_exc}')
+
+          def download_known(url: str, filename: str, metadata: dict) -> bool:
+              try:
+                  r = get(url, referer='https://data.eastmoney.com/report/')
+                  r.raise_for_status()
+                  save_pdf(r.content, filename, {**metadata, 'source_url': url, 'resolved_url': r.url})
+                  return True
+              except Exception as exc:
+                  log(f"KNOWN DOWNLOAD FAILED {url}: {exc}")
+                  return False
+
+          # Two directly downloadable original broker PDFs.
+          download_known(
+              'https://pdf.dfcfw.com/pdf/H3_AP201909231365520171_1.pdf',
+              '01_太平洋证券_2019-09-22_磷化工一体化发展受益黄磷涨价弹性大.pdf',
+              {
+                  'company': '澄星股份（600078）',
+                  'broker': '太平洋证券',
+                  'date': '2019-09-22',
+                  'title': '磷化工一体化发展，受益黄磷涨价弹性大',
+                  'authors': '柳强、张波',
+                  'type': '公司点评/公司研究',
+              },
+          )
+
+          download_known(
+              'https://pdf.dfcfw.com/pdf/H3_AS201202240003333503_1.pdf?1406662556000.pdf=',
+              '02_国元证券_2010_一体化与节能减排提升竞争优势.pdf',
+              {
+                  'company': '澄星股份（600078）',
+                  'broker': '国元证券',
+                  'date': '2010',
+                  'title': '一体化与节能减排提升竞争优势',
+                  'authors': '',
+                  'type': '公司研究简报',
+              },
+          )
+
+          # Try to recover a third, longer company report from Hibor or Fxbaogao.
+          url_pattern = re.compile(r'''(?:(?:https?:)?//[^\s"'<>]+|/[A-Za-z0-9_./?=&%+-]+)''', re.I)
+
+          def candidate_urls_from_text(text: str, base: str) -> list[str]:
+              candidates: list[str] = []
+              # Explicit JS variables used by Hibor pages.
+              for name in ('viewUrl', 'downloadUrl', 'newContentUrl', 'ncid'):
+                  for pattern in [
+                      rf'''(?:var\s+)?{name}\s*=\s*(["'])(.*?)\1''',
+                      rf'''{name}\s*:\s*(["'])(.*?)\1''',
+                  ]:
+                      for m in re.finditer(pattern, text, re.I | re.S):
+                          value = m.group(2).replace('\\/', '/')
+                          try:
+                              value = ast.literal_eval(repr(value))
+                          except Exception:
+                              pass
+                          log(f"VAR {name}={value}")
+                          if name != 'ncid':
+                              candidates.append(urljoin(base, value))
+              for raw in url_pattern.findall(text.replace('\\/', '/')):
+                  raw = raw.rstrip('),;]')
+                  low = raw.lower()
+                  if any(k in low for k in ('.pdf', 'download', 'docview', 'viewfile', 'docfile', 'file/down', 'report-cn/', 'report/')):
+                      if raw.startswith('//'):
+                          raw = 'https:' + raw
+                      candidates.append(urljoin(base, raw))
+              soup = BeautifulSoup(text, 'html.parser')
+              for tag in soup.find_all(['a', 'iframe', 'embed', 'object', 'script']):
+                  for attr in ('href', 'src', 'data'):
+                      value = tag.get(attr)
+                      if value and any(k in value.lower() for k in ('.pdf', 'download', 'view', 'file')):
+                          candidates.append(urljoin(base, value))
+              deduped = []
+              seen = set()
+              for item in candidates:
+                  item = item.replace('&amp;', '&')
+                  if item not in seen:
+                      seen.add(item)
+                      deduped.append(item)
+              return deduped
+
+          def try_pdf_candidates(candidates: list[str], filename: str, metadata: dict, referer: str) -> bool:
+              for candidate in candidates:
+                  try:
+                      r = get(candidate, referer=referer)
+                      ctype = (r.headers.get('content-type') or '').lower()
+                      if r.content.startswith(b'%PDF'):
+                          save_pdf(r.content, filename, {**metadata, 'source_url': referer, 'resolved_url': r.url})
+                          return True
+                      # Some endpoints return JSON with a nested URL.
+                      if 'json' in ctype or r.text.lstrip().startswith(('{', '[')):
+                          try:
+                              payload = r.json()
+                              text = json.dumps(payload, ensure_ascii=False)
+                              nested = candidate_urls_from_text(text, r.url)
+                              if nested and try_pdf_candidates(nested, filename, metadata, referer):
+                                  return True
+                          except Exception:
+                              pass
+                  except Exception as exc:
+                      log(f"CANDIDATE FAILED {candidate}: {exc}")
+              return False
+
+          third_saved = False
+          hibor_reports = [
+              (
+                  'https://www.hibor.com.cn/docdetail_96264.html',
+                  '03_联合证券_2008-07-02_确定性繁荣.pdf',
+                  {
+                      'company': '澄星股份（600078）',
+                      'broker': '联合证券',
+                      'date': '2008-07-02',
+                      'title': '确定性繁荣',
+                      'authors': '肖晖、潘波',
+                      'type': '公司深度研究',
+                  },
+              ),
+              (
+                  'https://www.hibor.com.cn/docdetail_126270.html',
+                  '03_东方证券_2008-10-27_业绩符合预期产品价格下滑.pdf',
+                  {
+                      'company': '澄星股份（600078）',
+                      'broker': '东方证券',
+                      'date': '2008-10-27',
+                      'title': '业绩符合预期，产品价格下滑',
+                      'authors': '庄琰',
+                      'type': '公司研究',
+                  },
+              ),
+          ]
+
+          for page_url, filename, metadata in hibor_reports:
+              if third_saved:
+                  break
+              try:
+                  page = get(page_url, referer='https://www.hibor.com.cn/')
+                  html = page.text
+                  (DEBUG_DIR / (Path(filename).stem + '.html')).write_text(html, encoding='utf-8', errors='ignore')
+                  candidates = candidate_urls_from_text(html, page.url)
+
+                  # Follow Hibor's deferred content endpoint when present.
+                  new_content = None
+                  ncid = None
+                  m = re.search(r'''(?:var\s+)?newContentUrl\s*=\s*(["'])(.*?)\1''', html, re.I | re.S)
+                  if m:
+                      new_content = urljoin(page.url, m.group(2).replace('\\/', '/'))
+                  m = re.search(r'''(?:var\s+)?ncid\s*=\s*(["']?)([^;"'\r\n]+)\1''', html, re.I)
+                  if m:
+                      ncid = m.group(2).strip()
+                  if new_content and ncid:
+                      try:
+                          content_resp = session.post(new_content, data={'ncid': ncid}, headers={'Referer': page.url}, timeout=60)
+                          log(f"POST {new_content} ncid={ncid} -> {content_resp.status_code} {len(content_resp.content)}")
+                          (DEBUG_DIR / (Path(filename).stem + '_content.html')).write_text(content_resp.text, encoding='utf-8', errors='ignore')
+                          candidates.extend(candidate_urls_from_text(content_resp.text, content_resp.url))
+                      except Exception as exc:
+                          log(f"HIBOR deferred content failed: {exc}")
+
+                  # Common legacy endpoint guesses based on the document id in the page URL.
+                  doc_id_match = re.search(r'_(\d+)\.html', page_url)
+                  if doc_id_match:
+                      doc_id = doc_id_match.group(1)
+                      guesses = [
+                          f'https://www.hibor.com.cn/HiborWeb/DocView/DocView.aspx?id={doc_id}',
+                          f'https://www.hibor.com.cn/HiborWeb/DocDownload/DocDownload.aspx?id={doc_id}',
+                          f'https://www.hibor.com.cn/HiborWeb/DocDetailNew/Download?id={doc_id}',
+                          f'https://www.hibor.com.cn/DocView_{doc_id}.html',
+                          f'https://www.hibor.com.cn/Download_{doc_id}.html',
+                      ]
+                      candidates.extend(guesses)
+
+                  if try_pdf_candidates(candidates, filename, metadata, page.url):
+                      third_saved = True
+              except Exception as exc:
+                  log(f"HIBOR PAGE FAILED {page_url}: {exc}")
+
+          # Fxbaogao fallback for the 2014 Anxin report.
+          if not third_saved:
+              report_id = 1492879
+              fx_meta = {
+                  'company': '澄星股份（600078）',
+                  'broker': '安信证券',
+                  'date': '2014-10-15',
+                  'title': '国内磷酸龙头，矿、电、磷一体化成本优势显著',
+                  'authors': '王席鑫、孙琦祥、袁善宸',
+                  'type': '公司深度研究',
+              }
+              endpoints = [
+                  f'https://api.fxbaogao.com/mofoun/report/report/file/downloadReport?reportId={report_id}',
+                  f'https://api.fxbaogao.com/mofoun/report/report/report/preDownV2?reportId={report_id}',
+                  f'https://api.fxbaogao.com/mofoun/report/report/downloadReportByBean?reportId={report_id}',
+                  f'https://api.fxbaogao.com/mofoun/report/report/getReportPreviewImages?reportId={report_id}',
+                  f'https://www.fxbaogao.com/view?id={report_id}',
+                  f'https://www.fxbaogao.com/detail/{report_id}',
+              ]
+              candidates = list(endpoints)
+              for endpoint in endpoints:
+                  try:
+                      r = get(endpoint, referer=f'https://www.fxbaogao.com/view?id={report_id}')
+                      if r.content.startswith(b'%PDF'):
+                          save_pdf(
+                              r.content,
+                              '03_安信证券_2014-10-15_国内磷酸龙头矿电磷一体化成本优势显著.pdf',
+                              {**fx_meta, 'source_url': endpoint, 'resolved_url': r.url},
+                          )
+                          third_saved = True
+                          break
+                      text = r.text
+                      (DEBUG_DIR / f'fx_{report_id}_{abs(hash(endpoint))}.txt').write_text(text[:500000], encoding='utf-8', errors='ignore')
+                      candidates.extend(candidate_urls_from_text(text, r.url))
+                  except Exception as exc:
+                      log(f"FX ENDPOINT FAILED {endpoint}: {exc}")
+              if not third_saved:
+                  third_saved = try_pdf_candidates(
+                      candidates,
+                      '03_安信证券_2014-10-15_国内磷酸龙头矿电磷一体化成本优势显著.pdf',
+                      fx_meta,
+                      f'https://www.fxbaogao.com/view?id={report_id}',
+                  )
+
+          if len(records) < 2:
+              raise RuntimeError(f'Only {len(records)} verified PDFs were obtained; need at least 2')
+
+          # Build a human-readable manifest.
+          lines = [
+              '澄星股份（600078）券商研究报告文件清单',
+              '生成日期：2026-10-28',
+              f'已验证PDF数量：{len(records)}',
+              '',
+              '说明：所有文件均经过PDF签名、可解析页数和首末页文本抽样检查。',
+              '',
+          ]
+          for idx, record in enumerate(records, 1):
+              lines.extend([
+                  f'{idx}. {record["title"]}',
+                  f'   机构：{record["broker"]}',
+                  f'   日期：{record["date"]}',
+                  f'   作者：{record.get("authors") or "未注明"}',
+                  f'   页数：{record["pages"]}',
+                  f'   文件：{record["filename"]}',
+                  f'   原始来源：{record.get("source_url", "")}',
+                  f'   实际下载地址：{record.get("resolved_url", "")}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+          manifest = '\n'.join(lines)
+          (REPORT_DIR / '文件清单与来源.txt').write_text(manifest, encoding='utf-8')
+          (DEBUG_DIR / 'run.log').write_text('\n'.join(debug_lines), encoding='utf-8')
+          (DEBUG_DIR / 'records.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_name = f'澄星股份_600078_券商研究报告_{len(records)}份_截至20261028.zip'
+          zip_path = ROOT / zip_name
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for path in sorted(REPORT_DIR.iterdir()):
+                  zf.write(path, arcname=path.name)
+          log(f'CREATED {zip_path} {zip_path.stat().st_size} bytes')
+          print(json.dumps({'zip': str(zip_path), 'count': len(records), 'records': records}, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload deliverable
+        uses: actions/upload-artifact@v4
+        with:
+          name: chengxing-600078-broker-reports-20261028
+          path: deliverable/
+          if-no-files-found: error
+          retention-days: 7
