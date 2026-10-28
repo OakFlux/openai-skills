@@ -1,0 +1,435 @@
+name: Package Intellifusion 688343 all filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/yuntianlifei-688343-all-filings-20261028.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          STOCK_CODE = '688343'
+          COMPANY_SHORT = '云天励飞'
+          COMPANY_FULL = '深圳云天励飞技术股份有限公司'
+          AS_OF = '2026-10-28'
+          PACKAGE_CN = '云天励飞_688343.SH_全部年报_招股说明书_最新季报'
+          PACKAGE_EN = 'Intellifusion_688343_All_Annual_Reports_Prospectus_Latest_Quarter'
+          PROSPECTUS_URL = 'https://static.cninfo.com.cn/finalpage/2023-03-30/1216260511.PDF'
+
+          ROOT = Path(PACKAGE_CN)
+          VERIFY = Path('verify')
+          OUTPUT = Path('artifact_out')
+          for directory in (ROOT, VERIFY, OUTPUT):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(
+              total=7, connect=7, read=7, status=7,
+              backoff_factor=1.0,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'], raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8))
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+          all_rows: list[dict[str, Any]] = []
+          search_pages: list[dict[str, Any]] = []
+          for page in range(1, 61):
+              params = {
+                  'sr':'-1', 'page_size':'100', 'page_index':str(page),
+                  'ann_type':'A', 'client_source':'web', 'stock_list':STOCK_CODE,
+                  'f_node':'0', 's_node':'0',
+              }
+              payload = None
+              last: Any = None
+              for attempt in range(8):
+                  try:
+                      response = session.get(api, params=params, timeout=(25, 150))
+                      last = {'status':response.status_code,'text':response.text[:300]}
+                      if response.status_code == 200:
+                          payload = response.json()
+                          break
+                  except Exception as exc:
+                      last = {'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              if payload is None:
+                  raise RuntimeError(f'Announcement API failed page {page}: {last}')
+              rows = ((payload.get('data') or {}).get('list') or [])
+              search_pages.append({'page':page,'count':len(rows)})
+              if not rows:
+                  break
+              all_rows.extend(rows)
+              time.sleep(0.08)
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', '', text or '')
+
+          def art_code(row: dict[str, Any]) -> str:
+              return str(row.get('art_code') or row.get('artCode') or '')
+
+          def date_value(row: dict[str, Any]) -> str:
+              return str(row.get('display_time') or row.get('notice_date') or '')
+
+          exclusions = [
+              '摘要','英文版','取消','问询','回复','审计报告','董事会','监事会',
+              '更正公告','提示性公告','社会责任报告','环境、社会及管治报告',
+              '可持续发展报告','独立董事述职报告','内部控制评价报告','财务决算报告',
+              '年度报告说明会','年度报告网上说明会','募集资金','会计师事务所',
+              '前期会计差错更正后的财务报表','财务报表及相关附注','财务报告',
+          ]
+
+          def choose_report(variants: list[str], period: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+              candidates: list[tuple[int, str, dict[str, Any], str]] = []
+              for row in all_rows:
+                  raw_title = str(row.get('title') or '')
+                  title = compact(raw_title)
+                  matched = next((variant for variant in variants if compact(variant) in title), None)
+                  if not matched or any(compact(term) in title for term in exclusions):
+                      continue
+                  score = 50
+                  key = compact(matched)
+                  if COMPANY_SHORT in raw_title or COMPANY_FULL in raw_title:
+                      score += 20
+                  if title.endswith(key):
+                      score += 35
+                  if title == key:
+                      score += 20
+                  if any(term in title for term in ['更正后','修订版','更新后','修订稿']):
+                      score += 120
+                  if any(term in title for term in ['取消版','已取消']):
+                      score -= 200
+                  candidates.append((score, date_value(row), row, matched))
+              candidates.sort(key=lambda item:(item[0], item[1]), reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'Missing report for {period}: {variants}')
+              log = [
+                  {'period':period,'matched_variant':matched,'score':score,'date':date,'title':row.get('title'),'art_code':art_code(row)}
+                  for score,date,row,matched in candidates[:20]
+              ]
+              return candidates[0][2], log
+
+          def choose_latest_quarter() -> tuple[dict[str, Any], str, str, list[dict[str, Any]]]:
+              desired = [
+                  (['2026年第三季度报告','2026年三季度报告'], '2026Q3', '2026年第三季度报告'),
+                  (['2026年第一季度报告','2026年一季度报告'], '2026Q1', '2026年第一季度报告'),
+                  (['2025年第三季度报告','2025年三季度报告'], '2025Q3', '2025年第三季度报告'),
+                  (['2025年第一季度报告','2025年一季度报告'], '2025Q1', '2025年第一季度报告'),
+              ]
+              combined: list[dict[str, Any]] = []
+              for variants, period, label in desired:
+                  try:
+                      row, log = choose_report(variants, period)
+                      combined.extend(log)
+                      return row, period, label, combined
+                  except RuntimeError:
+                      continue
+              raise RuntimeError('Missing latest quarterly report')
+
+          candidate_logs: dict[str, Any] = {}
+          annual_selected: list[dict[str, Any]] = []
+          for year in range(2020, 2026):
+              variants = [f'{year}年年度报告']
+              try:
+                  row, log = choose_report(variants, str(year))
+              except RuntimeError:
+                  candidate_logs[f'{year}年年度报告'] = []
+                  continue
+              candidate_logs[f'{year}年年度报告'] = log
+              annual_selected.append({
+                  'period':str(year),
+                  'min_pages':80,
+                  'row':row,
+              })
+
+          annual_years = [item['period'] for item in annual_selected]
+          expected_annual_years = ['2022', '2023', '2024', '2025']
+          if annual_years != expected_annual_years:
+              raise RuntimeError(f'Unexpected annual-report range: found {annual_years}, expected {expected_annual_years}')
+
+          quarter_row, quarter_period, quarter_label, quarter_log = choose_latest_quarter()
+          candidate_logs['最新季报'] = quarter_log
+
+          def fetch_pdf_from_art(art: str, referer: str) -> tuple[bytes, dict[str, Any], str]:
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H4_{art}_1.pdf',
+              ]
+              last: dict[str, Any] = {}
+              for url in urls:
+                  for attempt in range(5):
+                      try:
+                          response = session.get(
+                              url, timeout=(30, 420), allow_redirects=True,
+                              headers={
+                                  'User-Agent':session.headers['User-Agent'],
+                                  'Referer':referer,
+                                  'Accept':'application/pdf,*/*;q=0.8',
+                              },
+                          )
+                          last = {
+                              'url':url,'status':response.status_code,'final_url':response.url,
+                              'content_type':response.headers.get('content-type',''),'bytes':len(response.content),
+                          }
+                          if response.status_code == 200 and response.content[:5] == b'%PDF-' and len(response.content) > 30_000:
+                              return response.content, last, url
+                      except Exception as exc:
+                          last = {'url':url,'error':repr(exc)}
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f'PDF download failed {art}: {last}')
+
+          def fetch_direct_pdf(url: str, referer: str) -> tuple[bytes, dict[str, Any]]:
+              last: dict[str, Any] = {}
+              for attempt in range(8):
+                  try:
+                      response = session.get(
+                          url, timeout=(30, 480), allow_redirects=True,
+                          headers={
+                              'User-Agent':session.headers['User-Agent'],
+                              'Referer':referer,
+                              'Accept':'application/pdf,*/*;q=0.8',
+                          },
+                      )
+                      last = {
+                          'url':url,'status':response.status_code,'final_url':response.url,
+                          'content_type':response.headers.get('content-type',''),'bytes':len(response.content),
+                      }
+                      if response.status_code == 200 and response.content[:5] == b'%PDF-' and len(response.content) > 100_000:
+                          return response.content, last
+                  except Exception as exc:
+                      last = {'url':url,'error':repr(exc)}
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f'Direct PDF download failed: {last}')
+
+          def validate_pdf(path: Path, min_pages: int, required_any: list[str]) -> tuple[int, str, bool]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'Too few pages {path.name}: {pages} < {min_pages}')
+              extracted = ''
+              for page in reader.pages[:min(25, pages)]:
+                  try:
+                      extracted += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact_text = compact(extracted)
+              identity_ok = any(term in compact_text for term in [COMPANY_SHORT, COMPANY_FULL, STOCK_CODE])
+              if not identity_ok:
+                  raise RuntimeError(f'Issuer identity check failed: {path.name}')
+              if required_any and not any(compact(term) in compact_text for term in required_any):
+                  raise RuntimeError(f'Required text missing in {path.name}: none of {required_any}')
+              subprocess.run(
+                  ['qpdf','--warning-exit-0','--check',str(path)],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              for page_number, suffix in ((1, 'first'), (pages, 'last')):
+                  prefix = VERIFY / f'{path.stem}_{suffix}'
+                  subprocess.run([
+                      'pdftoppm','-f',str(page_number),'-l',str(page_number),
+                      '-png','-r','100','-singlefile',str(path),str(prefix)
+                  ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                  preview = Path(str(prefix) + '.png')
+                  if not preview.exists() or preview.stat().st_size < 8_000:
+                      raise RuntimeError(f'Page render failed: {path.name}, page {page_number}')
+              data = path.read_bytes()
+              return pages, hashlib.sha256(data).hexdigest(), identity_ok
+
+          manifest: list[dict[str, Any]] = []
+
+          # Formal IPO prospectus.
+          prospectus_filename = '01_云天励飞_首次公开发行股票并在科创板上市招股说明书.pdf'
+          prospectus_path = ROOT / prospectus_filename
+          prospectus_bytes, prospectus_download_meta = fetch_direct_pdf(PROSPECTUS_URL, 'https://www.cninfo.com.cn/')
+          prospectus_path.write_bytes(prospectus_bytes)
+          prospectus_pages, prospectus_sha, prospectus_identity = validate_pdf(
+              prospectus_path,
+              300,
+              ['首次公开发行股票并在科创板上市招股说明书','招股说明书'],
+          )
+          manifest.append({
+              'period':'2023IPO',
+              'filename':prospectus_filename,
+              'doc_type':'正式招股说明书',
+              'announcement_title':'首次公开发行股票并在科创板上市招股说明书',
+              'announcement_date':'2023-03-30',
+              'source_url':PROSPECTUS_URL,
+              'actual_pages':prospectus_pages,
+              'bytes':len(prospectus_bytes),
+              'sha256':prospectus_sha,
+              'identity_text_check':prospectus_identity,
+              'download_meta':prospectus_download_meta,
+              'validation':['PDF header','formal prospectus title','issuer identity','minimum page count','qpdf structure','first-page render','last-page render'],
+          })
+
+          # All full annual reports disclosed by the listed company.
+          for index, spec in enumerate(annual_selected, start=2):
+              row = spec['row']
+              art = art_code(row)
+              if not art:
+                  raise RuntimeError(f'No art code for annual report {spec["period"]}')
+              detail_page = f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{art}.html'
+              pdf_bytes, download_meta, mirror_pdf = fetch_pdf_from_art(art, detail_page)
+              filename = f'{index:02d}_云天励飞_{spec["period"]}年年度报告.pdf'
+              destination = ROOT / filename
+              destination.write_bytes(pdf_bytes)
+              pages, sha256, identity_ok = validate_pdf(destination, spec['min_pages'], [f'{spec["period"]}年年度报告'])
+              manifest.append({
+                  'period':spec['period'],
+                  'filename':filename,
+                  'doc_type':'年度报告',
+                  'announcement_title':row.get('title'),
+                  'announcement_date':date_value(row),
+                  'art_code':art,
+                  'announcement_detail_page':detail_page,
+                  'source_url':mirror_pdf,
+                  'official_cninfo_index':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK_CODE}',
+                  'official_sse_profile':f'https://www.sse.com.cn/assortment/stock/list/info/company/index.shtml?COMPANY_CODE={STOCK_CODE}',
+                  'actual_pages':pages,
+                  'bytes':len(pdf_bytes),
+                  'sha256':sha256,
+                  'identity_text_check':identity_ok,
+                  'download_meta':download_meta,
+                  'validation':['PDF header','announcement-title match','issuer identity','report-period text','minimum page count','qpdf structure','first-page render','last-page render'],
+              })
+
+          # Latest independent quarterly report as of the packaging date.
+          quarter_art = art_code(quarter_row)
+          if not quarter_art:
+              raise RuntimeError('No art code for latest quarter')
+          quarter_detail = f'https://data.eastmoney.com/notices/detail/{STOCK_CODE}/{quarter_art}.html'
+          quarter_bytes, quarter_download_meta, quarter_mirror = fetch_pdf_from_art(quarter_art, quarter_detail)
+          quarter_filename = f'{len(manifest)+1:02d}_云天励飞_{quarter_label}.pdf'
+          quarter_path = ROOT / quarter_filename
+          quarter_path.write_bytes(quarter_bytes)
+          quarter_required = ['2026年第三季度报告','2026年三季度报告'] if quarter_period == '2026Q3' else ['2026年第一季度报告','2026年一季度报告']
+          quarter_pages, quarter_sha, quarter_identity = validate_pdf(quarter_path, 5, quarter_required)
+          manifest.append({
+              'period':quarter_period,
+              'filename':quarter_filename,
+              'doc_type':'最新季报',
+              'announcement_title':quarter_row.get('title'),
+              'announcement_date':date_value(quarter_row),
+              'art_code':quarter_art,
+              'announcement_detail_page':quarter_detail,
+              'source_url':quarter_mirror,
+              'official_cninfo_index':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK_CODE}',
+              'official_sse_profile':f'https://www.sse.com.cn/assortment/stock/list/info/company/index.shtml?COMPANY_CODE={STOCK_CODE}',
+              'actual_pages':quarter_pages,
+              'bytes':len(quarter_bytes),
+              'sha256':quarter_sha,
+              'identity_text_check':quarter_identity,
+              'download_meta':quarter_download_meta,
+              'validation':['PDF header','announcement-title match','issuer identity','report-period text','minimum page count','qpdf structure','first-page render','last-page render'],
+          })
+
+          if len(manifest) != 6:
+              raise RuntimeError(f'Unexpected packaged document count: {len(manifest)}')
+
+          latest = manifest[-1]
+          readme = [
+              '深圳云天励飞技术股份有限公司（688343.SH）全部年度报告、正式招股说明书及最新季度报告资料包',
+              f'整理日期：{AS_OF}',
+              '',
+              '收录口径：',
+              '1. 正式发行版《首次公开发行股票并在科创板上市招股说明书》，披露日期为2023年3月30日。',
+              '2. 公司已披露的全部完整年度报告：2022年、2023年、2024年、2025年。',
+              f'3. 截至整理日最新独立季度报告：{latest["announcement_title"]}，公告日期：{latest["announcement_date"]}。',
+              '未收录招股说明书申报稿、注册稿、招股意向书、年度报告摘要、半年报、审计附件和提示性公告。',
+              '',
+              '文件清单：',
+          ]
+          for index, item in enumerate(manifest, start=1):
+              readme.extend([
+                  f'{index}. {item["filename"]}',
+                  f'   类型：{item["doc_type"]}；报告期：{item["period"]}',
+                  f'   公告/披露日期：{item["announcement_date"]}；实际页数：{item["actual_pages"]}',
+                  f'   来源：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ])
+          readme.extend([
+              '来源说明：PDF均为公开披露文件原件，未合并、重排或转换。',
+              '核验项目：PDF文件头、公司名称/证券代码、报告期或招股说明书标题、实际页数、qpdf结构、首末页渲染、ZIP CRC和SHA-256。',
+          ])
+
+          (ROOT / '00_文件清单与说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'candidate_selection_log.json').write_text(json.dumps(candidate_logs, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'announcement_search_log.json').write_text(
+              json.dumps({'pages':search_pages,'rows_scanned':len(all_rows)}, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['filename']}\n" for item in manifest), encoding='utf-8'
+          )
+
+          cn_zip = OUTPUT / f'{PACKAGE_CN}.zip'
+          with zipfile.ZipFile(cn_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{PACKAGE_CN}/{path.relative_to(ROOT)}')
+          with zipfile.ZipFile(cn_zip, 'r') as archive:
+              bad = archive.testzip()
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              if len(pdfs) != 6:
+                  raise RuntimeError(f'PDF count mismatch: zip={len(pdfs)}, expected=6')
+
+          en_zip = OUTPUT / f'{PACKAGE_EN}.zip'
+          shutil.copy2(cn_zip, en_zip)
+          print('FINAL_ZIP', cn_zip, cn_zip.stat().st_size, hashlib.sha256(cn_zip.read_bytes()).hexdigest(), flush=True)
+          print('BACKUP_ZIP', en_zip, en_zip.stat().st_size, hashlib.sha256(en_zip.read_bytes()).hexdigest(), flush=True)
+          print('LATEST_QUARTER', quarter_period, latest['announcement_title'], latest['announcement_date'], flush=True)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuntianlifei-688343-all-filings-final
+          path: artifact_out/*.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
