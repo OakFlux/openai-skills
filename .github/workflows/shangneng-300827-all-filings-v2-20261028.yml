@@ -1,0 +1,197 @@
+name: Build Shangneng 300827 all filings v2 20261028
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/shangneng-300827-all-filings-v2-20261028.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4 lxml
+
+      - name: Build verified package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, html, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CODE='300827'; SHORT='上能电气'; FULL='上能电气股份有限公司'
+          PACKAGE='上能电气_300827_全部年报_招股说明书_最新季报'
+          ROOT=Path(PACKAGE); PDFDIR=ROOT/'原始PDF'; PREV=ROOT/'首页预览'
+          for d in (ROOT,PDFDIR,PREV): d.mkdir(parents=True,exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8','Referer':'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=300827','Origin':'https://www.cninfo.com.cn','X-Requested-With':'XMLHttpRequest'})
+          request_log=[]
+
+          def clean(v):
+            return re.sub(r'\s+','',BeautifulSoup(html.unescape(str(v or '')),'lxml').get_text(' ',strip=True))
+          def title(row): return clean(row.get('announcementTitle') or row.get('title') or '')
+          def adjunct(row): return str(row.get('adjunctUrl') or row.get('url') or '').strip()
+          def atime(row):
+            try:return int(row.get('announcementTime') or row.get('announcementDate') or 0)
+            except:return int((re.sub(r'\D','',str(row.get('announcementTime') or 0))[:14] or '0'))
+          def issuer_ok(row):
+            code=str(row.get('secCode') or row.get('stockCode') or '')
+            name=clean(row.get('secName') or row.get('stockName') or '')
+            return code in ('',CODE) and (not name or SHORT in name or FULL in name or SHORT in title(row))
+          def query(stock,category,se_date,searchkey=''):
+            endpoint='https://www.cninfo.com.cn/new/hisAnnouncement/query'; out=[]; seen=set()
+            for page in range(1,6):
+              data={'pageNum':str(page),'pageSize':'100','column':'szse','tabName':'fulltext','plate':'sz','stock':stock,'searchkey':searchkey,'secid':'','category':category,'trade':'','seDate':se_date,'sortName':'time','sortType':'desc','isHLtitle':'true'}
+              payload=None; last={}
+              for attempt in range(7):
+                try:
+                  r=s.post(endpoint,data=data,timeout=(20,120)); last={'status':r.status_code,'bytes':len(r.content),'data':data}; request_log.append(last)
+                  if r.status_code==200: payload=r.json(); break
+                except Exception as e: last={'data':data,'attempt':attempt+1,'error':repr(e)}; request_log.append(last)
+                time.sleep(1+attempt)
+              if payload is None: raise RuntimeError(f'CNInfo query failed: {last}')
+              rows=payload.get('announcements') or payload.get('announcementList') or []
+              if not isinstance(rows,list): rows=[]
+              added=0
+              for row in rows:
+                key=str(row.get('announcementId') or '')+'|'+str(row.get('adjunctUrl') or '')
+                if key not in seen: seen.add(key); out.append(row); added+=1
+              total=int(payload.get('totalpages') or payload.get('totalPages') or 0); more=bool(payload.get('hasMore'))
+              print('QUERY',category,se_date,searchkey,page,len(rows),total,more)
+              if not rows or (total and page>=total) or (not total and not more) or added==0: break
+            return out
+
+          mapping=s.get('https://www.cninfo.com.cn/new/data/szse_stock.json',timeout=(20,120)).json()
+          org=''
+          def walk(obj):
+            global org
+            if isinstance(obj,dict):
+              vals=[str(obj.get(k) or '') for k in ('code','secCode','stockCode','zqdm','symbol')]
+              if CODE in vals:
+                for k in ('orgId','orgid','organizationId','companyId'):
+                  if obj.get(k): org=str(obj[k]); return
+              for v in obj.values():
+                if not org: walk(v)
+            elif isinstance(obj,list):
+              for v in obj:
+                if not org: walk(v)
+          walk(mapping)
+          if not org: raise RuntimeError('CNInfo orgId not found')
+          stock=f'{CODE},{org}'; print('STOCK',stock)
+
+          selections=[]; annual_log={}; excluded=['摘要','审计报告','内部控制','董事会工作报告','监事会工作报告','问询','回复','说明会','提示性公告','取消']
+          for year in range(2020,2026):
+            window=f'{year+1}-01-01~{year+1}-07-31'; rows=query(stock,'category_ndbg_szsh',window)
+            if not rows: rows=query(stock,'',window,f'{year}年年度报告')
+            candidates=[]; logged=[]; target=f'{year}年年度报告'
+            for row in rows:
+              if not issuer_ok(row): continue
+              t=title(row); logged.append({'title':t,'time':atime(row),'url':adjunct(row)})
+              if target not in t or any(w in t for w in excluded) or '更正公告' in t or ('关于' in t and target in t): continue
+              score=100
+              if re.search(rf'(^|[:：]){year}年年度报告(全文)?$',t): score+=100
+              if any(w in t for w in ['更新后','修订版','更正后']): score+=40
+              if '全文' in t: score+=10
+              candidates.append((score,atime(row),row))
+            annual_log[str(year)]=logged
+            if not candidates: raise RuntimeError(f'Missing annual report {year}: {logged}')
+            candidates.sort(key=lambda x:(x[0],x[1]),reverse=True)
+            selections.append((f'{year}年年度报告',candidates[0][2]))
+
+          prospectus={'announcementTitle':'首次公开发行股票并在创业板上市招股说明书','announcementTime':1585267200000,'adjunctUrl':'https://disc.static.szse.cn/disc/disk02/finalpage/2020-03-27/7076d41c-9e07-41dd-aede-2b0ddb437d1e.PDF','secCode':CODE,'secName':SHORT}
+          selections.append(('首次公开发行股票并在创业板上市招股说明书',prospectus))
+
+          qrows=query(stock,'category_sjdbg_szsh','2026-09-01~2026-10-28')
+          if not qrows: qrows=query(stock,'','2026-09-01~2026-10-28','2026年三季度报告')
+          qc=[]; qlog=[]
+          for row in qrows:
+            if not issuer_ok(row): continue
+            t=title(row); qlog.append({'title':t,'time':atime(row),'url':adjunct(row)})
+            if not any(x in t for x in ['2026年三季度报告','2026年第三季度报告']): continue
+            if any(x in t for x in ['摘要','更正公告','关于']): continue
+            qc.append((100,atime(row),row))
+          if not qc: raise RuntimeError(f'Missing 2026 Q3 report: {qlog}')
+          qc.sort(key=lambda x:(x[0],x[1]),reverse=True)
+          selections.append(('2026年第三季度报告',qc[0][2]))
+          if len(selections)!=8: raise RuntimeError(f'Unexpected selection count {len(selections)}')
+
+          def safe(x): return re.sub(r'[\\/:*?"<>|]+','_',re.sub(r'\s+','',x))[:120]
+          manifest=[]; total_pages=0
+          for idx,(label,row) in enumerate(selections,1):
+            a=adjunct(row)
+            if a.startswith('//'): url='https:'+a
+            elif a.startswith('http://') or a.startswith('https://'): url=a.replace('http://','https://',1)
+            else: url='https://static.cninfo.com.cn/'+a.lstrip('/')
+            data=None; attempts=[]
+            for attempt in range(7):
+              try:
+                r=s.get(url,headers={'User-Agent':s.headers['User-Agent'],'Referer':'https://www.cninfo.com.cn/','Accept':'application/pdf,*/*;q=0.8'},timeout=(30,360),allow_redirects=True)
+                attempts.append({'status':r.status_code,'bytes':len(r.content),'content_type':r.headers.get('content-type',''),'final_url':r.url})
+                if r.status_code==200 and r.content[:5]==b'%PDF-' and len(r.content)>50000: data=r.content; break
+              except Exception as e: attempts.append({'attempt':attempt+1,'error':repr(e)})
+              time.sleep(1+attempt)
+            if data is None: raise RuntimeError(f'Download failed {label}: {attempts}')
+            fn=f'{idx:02d}_{safe(label)}.pdf'; dest=PDFDIR/fn; dest.write_bytes(data)
+            reader=PdfReader(str(dest),strict=False); pages=len(reader.pages)
+            minimum=200 if '招股说明书' in label else (80 if '年度报告' in label else 5)
+            if pages<minimum: raise RuntimeError(f'Unexpectedly short {fn}: {pages}')
+            text=''
+            for p in reader.pages[:min(12,pages)]:
+              try:text+='\n'+(p.extract_text() or '')
+              except:pass
+            compact=re.sub(r'\s+','',text); hits=[x for x in (SHORT,FULL,CODE) if re.sub(r'\s+','',x) in compact]
+            if len(compact)>500 and not hits: raise RuntimeError(f'Issuer mismatch {fn}')
+            subprocess.run(['qpdf','--warning-exit-0','--check',str(dest)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            prefix=PREV/dest.stem
+            subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','110','-singlefile',str(dest),str(prefix)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            preview=Path(str(prefix)+'.png')
+            if not preview.exists() or preview.stat().st_size<8000: raise RuntimeError(f'Preview failed {fn}')
+            sha=hashlib.sha256(data).hexdigest(); total_pages+=pages
+            manifest.append({'label':label,'announcement_title':title(row),'announcement_time':atime(row),'filename':str(Path('原始PDF')/fn),'source_url':url,'pages':pages,'bytes':len(data),'sha256':sha,'identity_hits':hits,'preview_file':str(Path('首页预览')/preview.name),'download_attempts':attempts,'validation':['PDF header','issuer identity','page count','qpdf structure','first-page render']})
+
+          readme=['上能电气股份有限公司（300827.SZ）定期报告与发行文件资料包','整理日期：2026-10-28','','收录范围：2020—2025年全部年度报告全文、首次公开发行股票并在创业板上市招股说明书全文，以及截至整理日最新披露的2026年第三季度报告。','如同一年度存在更新或修订后的全文，优先采用后续披露版本。','']
+          for i,x in enumerate(manifest,1): readme += [f"{i}. {x['label']}",f"   公告标题：{x['announcement_title']}",f"   页数：{x['pages']}页；文件：{x['filename']}",f"   来源：{x['source_url']}",f"   SHA-256：{x['sha256']}",'']
+          readme += [f'合计：{len(manifest)}份PDF，{total_pages}页。','全部PDF均为公开信息披露原始附件。','已核验PDF文件头、公司名称/证券代码、实际页数、文档结构、首页渲染、ZIP CRC和SHA-256。']
+          (ROOT/'00_文件清单与说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'annual_candidate_records.json').write_text(json.dumps(annual_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'quarter_candidate_records.json').write_text(json.dumps(qlog,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'request_log.json').write_text(json.dumps(request_log,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in manifest),encoding='utf-8')
+
+          zcn=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zcn,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file(): z.write(p,arcname=f'{ROOT.name}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(zcn) as z:
+            bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=8: raise RuntimeError(f'ZIP failed bad={bad} pdf_count={len(pdfs)}')
+          zen=Path('shangneng_300827_all_annual_reports_prospectus_latest_quarter.zip'); zen.write_bytes(zcn.read_bytes())
+          print('FINAL_ZIP',zcn,zcn.stat().st_size,'SHA256',hashlib.sha256(zcn.read_bytes()).hexdigest())
+          print('TOTAL_PAGES',total_pages)
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: shangneng-300827-all-filings-v2-final
+          path: |
+            上能电气_300827_全部年报_招股说明书_最新季报.zip
+            shangneng_300827_all_annual_reports_prospectus_latest_quarter.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
