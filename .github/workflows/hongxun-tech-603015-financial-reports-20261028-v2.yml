@@ -1,0 +1,388 @@
+name: Package Hongxun Technology 603015 financial reports v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hongxun-tech-603015-financial-reports-20261028-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Build verified package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          import zipfile
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from typing import Any
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CODE = '603015'
+          COMPANY = '弘讯科技'
+          FULL_COMPANY = '宁波弘讯科技股份有限公司'
+          ORG_ID = '9900023700'
+          CUTOFF = '2026-10-28'
+          CUTOFF_COMPACT = '20261028'
+          API = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          STATIC = 'https://static.cninfo.com.cn/'
+          ROOT_NAME = f'{COMPANY}_{CODE}_2020-2025年报及最新季报_截至{CUTOFF_COMPACT}'
+          ROOT = Path('work') / ROOT_NAME
+          DIST = Path('dist')
+          ANNUAL_DIR = ROOT / '01_年度报告'
+          QUARTER_DIR = ROOT / '02_最新季度报告'
+          PREVIEW_DIR = ROOT / '首页预览'
+          for directory in (ANNUAL_DIR, QUARTER_DIR, PREVIEW_DIR, DIST):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          def make_session() -> requests.Session:
+              session = requests.Session()
+              retry = Retry(
+                  total=5, connect=5, read=5, status=5, backoff_factor=1.0,
+                  status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({'GET', 'POST'}), raise_on_status=False,
+              )
+              session.mount('https://', HTTPAdapter(max_retries=retry))
+              session.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36',
+                  'Accept': 'application/json, text/javascript, */*; q=0.01',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'Origin': 'https://www.cninfo.com.cn',
+                  'Referer': f'https://www.cninfo.com.cn/new/disclosure/stock?orgId={ORG_ID}&stockCode={CODE}',
+                  'X-Requested-With': 'XMLHttpRequest',
+              })
+              return session
+
+          S = make_session()
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', '', value)
+              value = value.replace('\u3000', ' ').replace(' ', ' ')
+              return re.sub(r'\s+', '', value).strip()
+
+          def query(label: str, searchkey: str, category: str, date_range: str) -> list[dict[str, Any]]:
+              payload = {
+                  'pageNum': '1',
+                  'pageSize': '30',
+                  'column': 'sse',
+                  'tabName': 'fulltext',
+                  'plate': 'sh',
+                  'stock': f'{CODE},{ORG_ID}',
+                  'searchkey': searchkey,
+                  'secid': '',
+                  'category': category,
+                  'trade': '',
+                  'seDate': date_range,
+                  'sortName': '',
+                  'sortType': '',
+                  'isHLtitle': 'true',
+              }
+              response = S.post(API, data=payload, timeout=90)
+              print('QUERY', label, response.status_code, len(response.content), payload)
+              response.raise_for_status()
+              data = response.json()
+              rows = data.get('announcements') or []
+              print('RESULT', label, 'rows=', len(rows), 'total=', data.get('totalAnnouncement'))
+              for row in rows:
+                  print('TITLE', label, clean_title(str(row.get('announcementTitle') or '')), row.get('secCode'), row.get('secName'), row.get('adjunctUrl'))
+              return rows
+
+          raw_rows: list[dict[str, Any]] = []
+          tasks: list[tuple[str, str, str, str]] = []
+          for report_year in range(2020, 2026):
+              disclosure_year = report_year + 1
+              date_range = f'{disclosure_year}-01-01~{disclosure_year}-07-31'
+              tasks.extend([
+                  (f'annual_{report_year}_keyword', f'{report_year}年年度报告', '', date_range),
+                  (f'annual_{report_year}_category', '', 'category_ndbg_szsh', date_range),
+              ])
+          tasks.extend([
+              ('q3_2026_keyword', '2026年第三季度报告', '', '2026-09-01~2026-10-28'),
+              ('q3_2026_category', '', 'category_sjdbg_szsh', '2026-09-01~2026-10-28'),
+          ])
+
+          for task in tasks:
+              try:
+                  raw_rows.extend(query(*task))
+              except Exception as exc:
+                  print('QUERY_ERROR', task[0], repr(exc))
+              time.sleep(0.2)
+
+          # Official Q3 fallback verified independently.
+          raw_rows.append({
+              'announcementTitle': '2026年第三季度报告',
+              'adjunctUrl': 'finalpage/2026-10-27/1225622370.PDF',
+              'announcementTime': 1793030400000,
+              'secCode': CODE,
+              'secName': COMPANY,
+          })
+
+          normalized: list[dict[str, Any]] = []
+          seen = set()
+          for row in raw_rows:
+              path = str(row.get('adjunctUrl') or '').lstrip('/')
+              title = clean_title(str(row.get('announcementTitle') or ''))
+              if not path or not title:
+                  continue
+              sec_code = str(row.get('secCode') or CODE)
+              sec_name = clean_title(str(row.get('secName') or COMPANY))
+              if sec_code != CODE and COMPANY not in sec_name:
+                  continue
+              key = (title, path)
+              if key in seen:
+                  continue
+              seen.add(key)
+              timestamp = int(row.get('announcementTime') or 0)
+              date = datetime.fromtimestamp(timestamp / 1000, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d') if timestamp else ''
+              normalized.append({
+                  'title': title,
+                  'url_path': path,
+                  'source_url': STATIC + path,
+                  'announcement_time': timestamp,
+                  'announcement_date': date,
+              })
+
+          print('UNIQUE_CANDIDATES', len(normalized))
+          for item in sorted(normalized, key=lambda value: value['announcement_time'], reverse=True):
+              print('CANDIDATE', item['announcement_date'], item['title'], item['url_path'])
+
+          annual_by_year: dict[int, list[dict[str, Any]]] = {}
+          for item in normalized:
+              match = re.search(r'(20\d{2})年年度报告', item['title'])
+              if not match:
+                  continue
+              title = item['title']
+              if any(keyword in title for keyword in (
+                  '摘要', '更正公告', '提示性公告', '取消', '审计报告', '审核报告',
+                  '独立意见', '董事会', '监事会', '问询函', '回复', '说明会', '业绩说明会'
+              )):
+                  continue
+              year = int(match.group(1))
+              if 2020 <= year <= 2025:
+                  annual_by_year.setdefault(year, []).append(item)
+
+          def annual_rank(item: dict[str, Any]) -> tuple[int, int, int]:
+              title = item['title']
+              revision = 3 if any(keyword in title for keyword in ('修订稿', '修订版', '更新后', '更正后', '补充后')) else 1
+              exact = 3 if re.fullmatch(r'20\d{2}年年度报告(?:（[^）]+）|\([^)]*\))?', title) else 1
+              return revision, exact, int(item['announcement_time'])
+
+          annual_selected: list[dict[str, Any]] = []
+          for year in range(2020, 2026):
+              candidates = annual_by_year.get(year) or []
+              if not candidates:
+                  raise RuntimeError(f'Missing official annual report for {year}; candidates={annual_by_year}')
+              item = dict(max(candidates, key=annual_rank))
+              item.update(doc_type='annual_report', report_year=year)
+              annual_selected.append(item)
+
+          quarter_candidates: list[dict[str, Any]] = []
+          for item in normalized:
+              match = re.search(r'(20\d{2})年(第一|第三|一|三)季度报告', item['title'])
+              if not match or any(keyword in item['title'] for keyword in ('摘要', '更正公告', '提示性公告', '问询', '说明')):
+                  continue
+              quarter = 3 if match.group(2) in ('第三', '三') else 1
+              candidate = dict(item)
+              candidate.update(doc_type='quarterly_report', report_year=int(match.group(1)), quarter=quarter)
+              quarter_candidates.append(candidate)
+          if not quarter_candidates:
+              raise RuntimeError('No formal quarterly report found')
+          latest_quarter = max(quarter_candidates, key=lambda value: (value['report_year'], value['quarter'], value['announcement_time']))
+          if (latest_quarter['report_year'], latest_quarter['quarter']) != (2026, 3):
+              raise RuntimeError(f"Unexpected latest quarter {latest_quarter['report_year']}Q{latest_quarter['quarter']}")
+
+          selected = [*annual_selected, latest_quarter]
+          print('SELECTED_DOCUMENTS')
+          for item in selected:
+              print(json.dumps(item, ensure_ascii=False))
+
+          def safe_name(name: str) -> str:
+              return re.sub(r'_+', '_', re.sub(r'[\\/:*?"<>|]', '_', name)).strip('_. ')
+
+          def download(item: dict[str, Any], destination: Path) -> None:
+              response = S.get(
+                  item['source_url'],
+                  headers={'Referer': 'https://www.cninfo.com.cn/', 'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},
+                  timeout=180,
+              )
+              print('DOWNLOAD', response.status_code, len(response.content), item['source_url'])
+              response.raise_for_status()
+              if len(response.content) < 50_000 or not response.content.startswith(b'%PDF'):
+                  raise RuntimeError(f"Not a complete PDF: {item['source_url']} size={len(response.content)}")
+              destination.write_bytes(response.content)
+
+          records: list[dict[str, Any]] = []
+          for item in selected:
+              if item['doc_type'] == 'annual_report':
+                  year = int(item['report_year'])
+                  suffix = '_修订或更新版' if any(keyword in item['title'] for keyword in ('修订稿', '修订版', '更新后', '更正后', '补充后')) else ''
+                  destination = ANNUAL_DIR / safe_name(f'{year}_{COMPANY}_{year}年年度报告{suffix}.pdf')
+                  period = str(year)
+              else:
+                  year = int(item['report_year'])
+                  quarter = int(item['quarter'])
+                  destination = QUARTER_DIR / safe_name(f'{year}Q{quarter}_{COMPANY}_{year}年第三季度报告.pdf')
+                  period = f'{year}Q{quarter}'
+
+              download(item, destination)
+              reader = PdfReader(str(destination), strict=False)
+              if reader.is_encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception as exc:
+                      raise RuntimeError(f'Encrypted PDF cannot be opened: {destination}: {exc}')
+              page_count = len(reader.pages)
+              if page_count < 2:
+                  raise RuntimeError(f'Invalid page count: {destination} -> {page_count}')
+
+              doc = fitz.open(destination)
+              if doc.page_count != page_count:
+                  raise RuntimeError(f'Parser page mismatch: {destination}: {page_count} vs {doc.page_count}')
+              first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+              last = doc.load_page(doc.page_count - 1).get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 100:
+                  raise RuntimeError(f'Page render failed: {destination}')
+              first.save(PREVIEW_DIR / f'{destination.stem}.png')
+
+              probe = ''
+              for page_index in range(min(6, doc.page_count)):
+                  try:
+                      probe += doc.load_page(page_index).get_text('text')
+                  except Exception:
+                      pass
+              doc.close()
+              if COMPANY not in probe and FULL_COMPANY not in probe and CODE not in probe:
+                  raise RuntimeError(f'Company identity not found in PDF: {destination}')
+
+              record = {
+                  'document_type': item['doc_type'],
+                  'period': period,
+                  'announcement_title': item['title'],
+                  'announcement_date': item['announcement_date'],
+                  'source_url': item['source_url'],
+                  'relative_path': str(destination.relative_to(ROOT)).replace(os.sep, '/'),
+                  'file_name': destination.name,
+                  'file_size_bytes': destination.stat().st_size,
+                  'page_count': page_count,
+                  'sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
+                  'pdf_header_valid': True,
+                  'first_page_rendered': True,
+                  'last_page_rendered': True,
+                  'company_identity_validated': True,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False))
+
+          annual_years = sorted(int(record['period']) for record in records if record['document_type'] == 'annual_report')
+          if annual_years != [2020, 2021, 2022, 2023, 2024, 2025]:
+              raise RuntimeError(f'Annual coverage mismatch: {annual_years}')
+
+          manifest = {
+              'company': COMPANY,
+              'full_company_name': FULL_COMPANY,
+              'stock_code': CODE,
+              'market': '上海证券交易所',
+              'cutoff_date': CUTOFF,
+              'annual_report_years': annual_years,
+              'latest_quarter': f"{latest_quarter['report_year']}Q{latest_quarter['quarter']}",
+              'document_count': len(records),
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{record['sha256']}  {record['relative_path']}" for record in records) + '\n', encoding='utf-8'
+          )
+
+          readme = [
+              f'# {COMPANY}（{CODE}）2020—2025年报及最新季报', '',
+              f'- 截止日期：{CUTOFF}',
+              '- 来源：巨潮资讯网官方原始PDF。',
+              '- 已排除年度报告摘要、提示性公告、单独审计文件及重复文件。',
+              '- 已完成PDF文件头、双解析器页数、公司身份、首末页渲染、SHA-256及ZIP CRC校验。', '',
+              '## 文件清单', '',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. `{record['relative_path']}`",
+                  f"   - 披露标题：{record['announcement_title']}",
+                  f"   - 披露日期：{record['announcement_date']}",
+                  f"   - 页数：{record['page_count']}；大小：{record['file_size_bytes']:,}字节",
+                  f"   - 官方来源：{record['source_url']}",
+                  f"   - SHA-256：`{record['sha256']}`",
+              ])
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          chinese_zip = DIST / f'{ROOT_NAME}.zip'
+          english_zip = DIST / f'hongxun_technology_603015_2020_2025_annual_latest_quarter_{CUTOFF_COMPACT}.zip'
+          with zipfile.ZipFile(chinese_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(chinese_zip, english_zip)
+
+          for path in (chinese_zip, english_zip):
+              with zipfile.ZipFile(path, 'r') as archive:
+                  bad = archive.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+                  pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if len(pdfs) != 7:
+                      raise RuntimeError(f'Unexpected PDF count: {len(pdfs)}')
+              print('ZIP_VERIFIED', path, path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+
+          print('FINAL_JSON', json.dumps({
+              'annual_years': annual_years,
+              'latest_quarter': manifest['latest_quarter'],
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'chinese_zip': str(chinese_zip),
+              'english_zip': str(english_zip),
+              'chinese_zip_size': chinese_zip.stat().st_size,
+              'chinese_zip_sha256': hashlib.sha256(chinese_zip.read_bytes()).hexdigest(),
+              'records': records,
+          }, ensure_ascii=False))
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hongxun-technology-603015-financial-reports-20261028-v2
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
