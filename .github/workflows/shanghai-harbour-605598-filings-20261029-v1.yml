@@ -1,0 +1,485 @@
+name: Package Shanghai Harbour filings 20261029
+
+on:
+  push:
+    branches:
+      - tmp/shanghai-harbour-605598-filings-20261029-v1
+    paths:
+      - .github/workflows/shanghai-harbour-605598-filings-20261029-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Fetch official filings validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import json
+          import math
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "605598"
+          SHORT = "上海港湾"
+          FULL = "上海港湾基础建设（集团）股份有限公司"
+          END_DATE = "2026-10-29"
+          PACKAGE_BASENAME = "shanghai_harbour_605598_all_annual_prospectus_latest_quarter"
+          ROOT_NAME = "上海港湾_605598_所有年报_招股说明书及最新季报"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF原件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept": "application/json,text/plain,*/*",
+              "Referer": "https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
+              "Origin": "https://www.cninfo.com.cn",
+              "X-Requested-With": "XMLHttpRequest",
+          })
+
+          def request_json(method: str, urls: list[str], **kwargs):
+              last = None
+              for url in urls:
+                  for attempt in range(5):
+                      try:
+                          response = session.request(method, url, timeout=(20, 180), **kwargs)
+                          print("JSON_REQUEST", method, response.status_code, len(response.content), response.url)
+                          if response.status_code == 200:
+                              return response.json(), response.url
+                          last = RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
+                      except Exception as exc:
+                          last = exc
+                          print("JSON_ERROR", url, attempt, repr(exc))
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"JSON request failed: {last}")
+
+          stock_data, stock_source = request_json(
+              "GET",
+              [
+                  "https://www.cninfo.com.cn/new/data/szse_stock.json",
+                  "http://www.cninfo.com.cn/new/data/szse_stock.json",
+              ],
+          )
+          stock_rows = stock_data.get("stockList") or []
+          matched_stocks = [x for x in stock_rows if str(x.get("code") or "") == CODE]
+          if not matched_stocks:
+              raise RuntimeError(f"Could not resolve CNINFO orgId for {CODE}")
+          org_id = str(matched_stocks[0].get("orgId") or "")
+          if not org_id:
+              raise RuntimeError("Resolved stock row has no orgId")
+          stock_item = f"{CODE},{org_id}"
+          print("STOCK_RESOLVED", CODE, org_id, stock_source)
+
+          query_urls = [
+              "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+              "http://www.cninfo.com.cn/new/hisAnnouncement/query",
+          ]
+
+          def fetch_category(category: str, begin_date: str, end_date: str = END_DATE) -> list[dict]:
+              base_payload = {
+                  "pageNum": "1",
+                  "pageSize": "30",
+                  "column": "szse",
+                  "tabName": "fulltext",
+                  "plate": "",
+                  "stock": stock_item,
+                  "searchkey": "",
+                  "secid": "",
+                  "category": category,
+                  "trade": "",
+                  "seDate": f"{begin_date}~{end_date}",
+                  "sortName": "",
+                  "sortType": "",
+                  "isHLtitle": "true",
+              }
+              first, _ = request_json("POST", query_urls, data=base_payload)
+              total = int(first.get("totalAnnouncement") or 0)
+              pages = max(1, math.ceil(total / 30))
+              records = list(first.get("announcements") or [])
+              print("CATEGORY", category, "TOTAL", total, "PAGES", pages, "PAGE1", len(records))
+              for page in range(2, pages + 1):
+                  payload = dict(base_payload)
+                  payload["pageNum"] = str(page)
+                  data, _ = request_json("POST", query_urls, data=payload)
+                  batch = data.get("announcements") or []
+                  records.extend(batch)
+                  print("CATEGORY_PAGE", category, page, len(batch))
+                  time.sleep(0.25)
+              by_id = {}
+              for row in records:
+                  key = str(row.get("announcementId") or row.get("adjunctUrl") or "")
+                  if key:
+                      by_id[key] = row
+              return list(by_id.values())
+
+          annual_rows = fetch_category("category_ndbg_szsh", "2018-01-01")
+          prospectus_rows = fetch_category("category_sf_szsh", "2018-01-01", "2022-12-31")
+          q1_rows = fetch_category("category_yjdbg_szsh", "2025-01-01")
+          q3_rows = fetch_category("category_sjdbg_szsh", "2025-01-01")
+          all_raw = {
+              "annual": annual_rows,
+              "prospectus": prospectus_rows,
+              "q1": q1_rows,
+              "q3": q3_rows,
+          }
+          (ROOT / "cninfo_raw_records.json").write_text(
+              json.dumps(all_raw, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+
+          def clean_title(value) -> str:
+              text = html.unescape(str(value or ""))
+              text = re.sub(r"<[^>]+>", "", text)
+              return re.sub(r"\s+", " ", text).strip()
+
+          def announcement_dt(row: dict) -> datetime:
+              value = row.get("announcementTime")
+              try:
+                  return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc).astimezone(timezone(timedelta(hours=8)))
+              except Exception:
+                  return datetime(1900, 1, 1, tzinfo=timezone(timedelta(hours=8)))
+
+          def full_source_url(row: dict) -> str:
+              path = str(row.get("adjunctUrl") or "").strip()
+              if path.startswith("http://") or path.startswith("https://"):
+                  return path
+              return urljoin("https://static.cninfo.com.cn/", path.lstrip("/"))
+
+          annual_by_year: dict[int, list[dict]] = {}
+          annual_excluded = [
+              "摘要", "英文", "审计", "问询", "回复", "说明", "提示性公告",
+              "关于", "社会责任", "环境、社会", "内部控制", "董事会工作报告",
+          ]
+          for row in annual_rows:
+              title = clean_title(row.get("announcementTitle"))
+              match = re.search(r"(20\d{2})年?年度报告", title)
+              if not match or any(word in title for word in annual_excluded):
+                  continue
+              year = int(match.group(1))
+              candidate = dict(row)
+              candidate["_title"] = title
+              candidate["_date"] = announcement_dt(row)
+              candidate["_revision_score"] = sum(word in title for word in ["修订", "更新", "更正后", "修正版"])
+              annual_by_year.setdefault(year, []).append(candidate)
+
+          annual_selected = []
+          for year in sorted(annual_by_year):
+              candidates = sorted(
+                  annual_by_year[year],
+                  key=lambda x: (x["_revision_score"], x["_date"]),
+                  reverse=True,
+              )
+              print("ANNUAL_CANDIDATES", year, [(x["_title"], x["_date"].isoformat(), x["_revision_score"]) for x in candidates])
+              annual_selected.append({
+                  "kind": "annual",
+                  "period": f"{year}年年度报告",
+                  "year": year,
+                  "quarter_rank": 0,
+                  "row": candidates[0],
+              })
+
+          if not annual_selected:
+              raise RuntimeError("No full annual reports found")
+
+          prospectus_candidates = []
+          for row in prospectus_rows:
+              title = clean_title(row.get("announcementTitle"))
+              if "招股说明书" not in title:
+                  continue
+              if any(word in title for word in ["摘要", "申报稿", "预披露", "反馈", "更新稿", "审核问询"]):
+                  continue
+              score = 0
+              if "首次公开发行股票招股说明书" in title:
+                  score += 100
+              if "首次公开发行股票并上市招股说明书" in title:
+                  score += 120
+              if "发行公告" in title or "上市公告书" in title:
+                  score -= 100
+              candidate = dict(row)
+              candidate["_title"] = title
+              candidate["_date"] = announcement_dt(row)
+              candidate["_score"] = score
+              prospectus_candidates.append(candidate)
+
+          prospectus_candidates.sort(key=lambda x: (x["_score"], x["_date"]), reverse=True)
+          print("PROSPECTUS_CANDIDATES", [(x["_title"], x["_date"].isoformat(), x["_score"]) for x in prospectus_candidates])
+          if not prospectus_candidates:
+              raise RuntimeError("No final prospectus found")
+          prospectus_selected = {
+              "kind": "prospectus",
+              "period": "首次公开发行股票招股说明书",
+              "year": 2021,
+              "quarter_rank": 0,
+              "row": prospectus_candidates[0],
+          }
+
+          quarter_candidates = []
+          for rank, label, rows in [
+              (1, "第一季度报告", q1_rows),
+              (3, "第三季度报告", q3_rows),
+          ]:
+              for row in rows:
+                  title = clean_title(row.get("announcementTitle"))
+                  match = re.search(r"(20\d{2})年(第一|第三)季度报告", title)
+                  if not match:
+                      continue
+                  if any(word in title for word in ["摘要", "英文", "关于", "更正公告", "取消"]):
+                      continue
+                  year = int(match.group(1))
+                  quarter_candidates.append({
+                      "kind": "quarter",
+                      "period": f"{year}年{label}",
+                      "year": year,
+                      "quarter_rank": rank,
+                      "row": {**row, "_title": title, "_date": announcement_dt(row)},
+                  })
+
+          quarter_candidates.sort(
+              key=lambda x: (x["year"], x["quarter_rank"], x["row"]["_date"]), reverse=True
+          )
+          print("QUARTER_CANDIDATES", [(x["period"], x["row"]["_title"], x["row"]["_date"].isoformat()) for x in quarter_candidates])
+          if not quarter_candidates:
+              raise RuntimeError("No quarterly report found")
+          latest_quarter = quarter_candidates[0]
+
+          selected = [prospectus_selected] + annual_selected + [latest_quarter]
+
+          def safe_filename(text: str) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text)
+              return re.sub(r"\s+", " ", text).strip(" ._")[:150]
+
+          manifest = []
+          for index, item in enumerate(selected, 1):
+              row = item["row"]
+              title = row.get("_title") or clean_title(row.get("announcementTitle"))
+              disclosed = (row.get("_date") or announcement_dt(row)).strftime("%Y-%m-%d")
+              source_url = full_source_url(row)
+              candidate_urls = [source_url]
+              if source_url.startswith("https://"):
+                  candidate_urls.append("http://" + source_url[len("https://"):])
+              content = None
+              used_url = None
+              attempts = []
+              for url in candidate_urls:
+                  for attempt in range(5):
+                      try:
+                          response = session.get(
+                              url,
+                              timeout=(30, 420),
+                              allow_redirects=True,
+                              headers={
+                                  "User-Agent": session.headers["User-Agent"],
+                                  "Referer": "https://www.cninfo.com.cn/",
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                              },
+                          )
+                          rec = {
+                              "url": url,
+                              "status": response.status_code,
+                              "bytes": len(response.content),
+                              "content_type": response.headers.get("content-type", ""),
+                              "magic": response.content[:8].hex(),
+                              "final_url": response.url,
+                          }
+                          attempts.append(rec)
+                          print("PDF_REQUEST", json.dumps(rec, ensure_ascii=False))
+                          if response.status_code == 200 and response.content.startswith(b"%PDF-") and len(response.content) > 50_000:
+                              content = response.content
+                              used_url = response.url
+                              break
+                      except Exception as exc:
+                          attempts.append({"url": url, "error": repr(exc)})
+                          print("PDF_ERROR", url, attempt, repr(exc))
+                      time.sleep(1 + attempt)
+                  if content is not None:
+                      break
+              if content is None:
+                  raise RuntimeError(f"Could not download PDF for {title}: {attempts}")
+
+              filename = safe_filename(f"{index:02d}_{SHORT}_{item['period']}.pdf")
+              pdf_path = PDF_DIR / filename
+              pdf_path.write_bytes(content)
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              pages = len(reader.pages)
+              if pages <= 0:
+                  raise RuntimeError(f"Invalid page count for {filename}")
+              sample_parts = []
+              for page in reader.pages[: min(20, pages)]:
+                  try:
+                      sample_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample_text = "\n".join(sample_parts)
+              issuer_ok = SHORT in sample_text or FULL in sample_text or CODE in sample_text
+              if not issuer_ok:
+                  raise RuntimeError(f"Issuer validation failed for {filename}")
+
+              if item["kind"] == "annual":
+                  period_tokens = [str(item["year"]), "年度报告"]
+              elif item["kind"] == "quarter":
+                  period_tokens = [str(item["year"]), "季度报告"]
+              else:
+                  period_tokens = ["招股说明书"]
+              if not all(token in sample_text for token in period_tokens):
+                  print("WARN_PERIOD_TEXT_NOT_FOUND", filename, period_tokens)
+
+              qpdf = subprocess.run(
+                  ["qpdf", "--warning-exit-0", "--check", str(pdf_path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f"qpdf failed for {filename}: {qpdf.stdout}")
+
+              preview_prefix = PREVIEW_DIR / pdf_path.stem
+              render = subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "120", "-singlefile", str(pdf_path), str(preview_prefix)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              preview_path = Path(str(preview_prefix) + ".png")
+              if render.returncode != 0 or not preview_path.exists() or preview_path.stat().st_size < 5_000:
+                  raise RuntimeError(f"First-page rendering failed for {filename}: {render.stdout}")
+
+              digest = hashlib.sha256(content).hexdigest()
+              manifest.append({
+                  "filename": filename,
+                  "kind": item["kind"],
+                  "period": item["period"],
+                  "announcement_title": title,
+                  "disclosure_date": disclosed,
+                  "source_url": used_url or source_url,
+                  "cninfo_announcement_id": str(row.get("announcementId") or ""),
+                  "pages": pages,
+                  "bytes": len(content),
+                  "sha256": digest,
+                  "preview_file": str(Path("首页预览") / preview_path.name),
+                  "download_attempts": attempts,
+              })
+
+          annual_count = sum(1 for item in manifest if item["kind"] == "annual")
+          if annual_count < 4:
+              raise RuntimeError(f"Unexpectedly few annual reports: {annual_count}")
+          if not any(item["kind"] == "prospectus" for item in manifest):
+              raise RuntimeError("Prospectus missing from final manifest")
+          if not any(item["kind"] == "quarter" for item in manifest):
+              raise RuntimeError("Quarterly report missing from final manifest")
+
+          manifest_path = ROOT / "manifest.json"
+          manifest_path.write_text(
+              json.dumps({
+                  "company": SHORT,
+                  "full_company_name": FULL,
+                  "stock_code": CODE,
+                  "prepared_on": END_DATE,
+                  "annual_report_count": annual_count,
+                  "latest_quarter": latest_quarter["period"],
+                  "source_platform": "巨潮资讯网（法定信息披露平台）",
+                  "files": manifest,
+              }, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["文件名", "文件类型", "报告期间", "公告标题", "公告日期", "页数", "字节数", "SHA-256", "官方PDF来源"])
+              for item in manifest:
+                  writer.writerow([
+                      item["filename"], item["kind"], item["period"], item["announcement_title"],
+                      item["disclosure_date"], item["pages"], item["bytes"], item["sha256"], item["source_url"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF原件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          readme = [
+              f"{SHORT}（{CODE}.SH）所有年度报告、招股说明书及最新季度报告资料包",
+              f"整理日期：{END_DATE}",
+              "来源：巨潮资讯网法定信息披露文件原始PDF",
+              "",
+              f"本包共收录 {len(manifest)} 份PDF：招股说明书1份、上市后全部年度报告{annual_count}份，以及{latest_quarter['period']}1份。",
+              "",
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme.extend([
+                  f"{i}. {item['filename']}",
+                  f"   公告标题：{item['announcement_title']}",
+                  f"   公告日期：{item['disclosure_date']}；实际页数：{item['pages']}页；大小：{item['bytes']}字节",
+                  f"   官方PDF：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme.extend([
+              "核验项目：PDF文件头、公司名称/证券代码、报告期间、实际页数、qpdf结构检查、首页渲染、逐文件SHA-256、ZIP CRC。",
+              "说明：年度报告按巨潮资讯网可检索到的上市后完整年度报告收录；同一年度如存在修订版，优先选择修订或公告时间较晚的完整版本。",
+          ])
+          (ROOT / "README_文件清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          zip_path = Path(PACKAGE_BASENAME + ".zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT_NAME) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed: {bad}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "file_count": len(manifest),
+              "annual_report_count": annual_count,
+              "latest_quarter": latest_quarter["period"],
+              "files": [{k: item[k] for k in ["filename", "kind", "period", "announcement_title", "disclosure_date", "pages", "bytes", "sha256", "source_url"]} for item in manifest],
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-harbour-605598-filings-20261029
+          path: |
+            shanghai_harbour_605598_all_annual_prospectus_latest_quarter.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
