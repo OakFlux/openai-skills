@@ -1,0 +1,332 @@
+name: Build Hytera 002583 annual reports and latest quarter 20261029
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/hytera-002583-all-filings-20261029.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import math
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '002583'
+          ORG_ID = '9900019838'
+          SHORT = '海能达'
+          FULL = '海能达通信股份有限公司'
+          PACKAGE = '海能达_002583_2020-2025年报及最新季报'
+          ROOT = Path(PACKAGE)
+          PDFDIR = ROOT / '原始PDF'
+          PREV = ROOT / '首页预览'
+          for d in (ROOT, PDFDIR, PREV):
+              d.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155 Safari/537.36'
+          common_headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', '', value)
+              value = re.sub(r'\s+', '', value)
+              return value
+
+          def query_cninfo(start: str, end: str) -> list[dict]:
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              headers = {
+                  **common_headers,
+                  'Referer': f'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search&code={CODE}',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'Accept': 'application/json, text/javascript, */*; q=0.01',
+              }
+              try:
+                  session.get('https://www.cninfo.com.cn/new/index', headers=common_headers, timeout=(20, 60))
+              except Exception:
+                  pass
+
+              rows: list[dict] = []
+              page = 1
+              while True:
+                  data = {
+                      'pageNum': str(page),
+                      'pageSize': '100',
+                      'column': 'szse',
+                      'tabName': 'fulltext',
+                      'plate': 'sz',
+                      'stock': f'{CODE},{ORG_ID}',
+                      'searchkey': '',
+                      'secid': '',
+                      'category': '',
+                      'trade': '',
+                      'seDate': f'{start}~{end}',
+                      'sortName': '',
+                      'sortType': '',
+                      'isHLtitle': 'true',
+                  }
+                  r = session.post(endpoint, headers=headers, data=data, timeout=(30, 120))
+                  print('CNINFO_QUERY', start, end, page, r.status_code, len(r.content), r.headers.get('content-type', ''))
+                  r.raise_for_status()
+                  obj = r.json()
+                  anns = obj.get('announcements') or []
+                  rows.extend(anns)
+                  total = int(obj.get('totalAnnouncement') or len(rows))
+                  if not anns or len(rows) >= total or page >= max(1, math.ceil(total / 100)):
+                      break
+                  page += 1
+              return rows
+
+          def choose_annual(year: int, announcements: list[dict]) -> dict:
+              exact_re = re.compile(rf'^{year}年年度报告(?:（(?:更新后|修订版|更正后)）)?$')
+              candidates = []
+              for a in announcements:
+                  title = clean_title(a.get('announcementTitle', ''))
+                  if exact_re.match(title) and '摘要' not in title:
+                      score = 0
+                      if '更新后' in title or '修订版' in title or '更正后' in title:
+                          score += 100
+                      candidates.append((score, int(a.get('announcementTime') or 0), a, title))
+              if not candidates:
+                  available = [clean_title(a.get('announcementTitle', '')) for a in announcements]
+                  raise RuntimeError(f'No annual report found for {year}. Available sample: {available[:30]}')
+              candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+              chosen = candidates[0][2]
+              chosen['_clean_title'] = candidates[0][3]
+              return chosen
+
+          def choose_latest_quarter(announcements: list[dict]) -> dict:
+              candidates = []
+              for a in announcements:
+                  title = clean_title(a.get('announcementTitle', ''))
+                  if re.match(r'^2026年(?:三季度|第三季度)报告$', title):
+                      candidates.append((int(a.get('announcementTime') or 0), a, title))
+              if not candidates:
+                  available = [clean_title(a.get('announcementTitle', '')) for a in announcements]
+                  raise RuntimeError(f'No 2026 Q3 report found. Available sample: {available[:40]}')
+              candidates.sort(key=lambda x: x[0], reverse=True)
+              chosen = candidates[0][1]
+              chosen['_clean_title'] = candidates[0][2]
+              return chosen
+
+          date_ranges = {
+              2020: ('2021-04-01', '2021-06-30'),
+              2021: ('2022-03-01', '2022-05-31'),
+              2022: ('2023-03-01', '2023-05-31'),
+              2023: ('2024-03-01', '2024-05-31'),
+              2024: ('2025-03-01', '2025-05-31'),
+              2025: ('2026-03-01', '2026-05-31'),
+          }
+
+          selected: list[dict] = []
+          for year, (start, end) in date_ranges.items():
+              anns = query_cninfo(start, end)
+              chosen = choose_annual(year, anns)
+              selected.append({
+                  'label': f'{year}年年度报告' + ('（更新后）' if year == 2020 and '更新后' in chosen['_clean_title'] else ''),
+                  'year': year,
+                  'kind': 'annual',
+                  'announcement': chosen,
+              })
+
+          q3_anns = query_cninfo('2026-10-28', '2026-10-29')
+          q3 = choose_latest_quarter(q3_anns)
+          selected.append({
+              'label': '2026年第三季度报告',
+              'year': 2026,
+              'kind': 'quarter',
+              'announcement': q3,
+          })
+
+          (ROOT / 'cninfo_selected_announcements.json').write_text(
+              json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          manifest = []
+          for index, item in enumerate(selected, 1):
+              a = item['announcement']
+              adjunct = (a.get('adjunctUrl') or '').lstrip('/')
+              if not adjunct:
+                  raise RuntimeError(f'Missing adjunctUrl for {item["label"]}: {a}')
+              url = f'https://static.cninfo.com.cn/{adjunct}'
+              attempts = []
+              data = None
+              for attempt in range(5):
+                  try:
+                      r = session.get(
+                          url,
+                          headers={
+                              **common_headers,
+                              'Referer': 'https://www.cninfo.com.cn/',
+                              'Accept': 'application/pdf,*/*;q=0.8',
+                          },
+                          timeout=(30, 360),
+                          allow_redirects=True,
+                      )
+                      attempts.append({
+                          'attempt': attempt + 1,
+                          'url': url,
+                          'status': r.status_code,
+                          'bytes': len(r.content),
+                          'content_type': r.headers.get('content-type', ''),
+                          'final_url': r.url,
+                      })
+                      if r.status_code == 200 and r.content[:5] == b'%PDF-' and len(r.content) > 50000:
+                          data = r.content
+                          break
+                  except Exception as exc:
+                      attempts.append({'attempt': attempt + 1, 'url': url, 'error': repr(exc)})
+                  time.sleep(1 + attempt)
+              if data is None:
+                  raise RuntimeError(f'Download failed for {item["label"]}: {attempts}')
+
+              filename = f'{index:02d}_海能达_{item["label"]}.pdf'
+              dest = PDFDIR / filename
+              dest.write_bytes(data)
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              minimum_pages = 100 if item['kind'] == 'annual' else 5
+              if pages < minimum_pages:
+                  raise RuntimeError(f'Unexpectedly short PDF {filename}: {pages} pages')
+
+              text = ''
+              for page in reader.pages[:min(35, pages)]:
+                  try:
+                      text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', text)
+              identity_hits = [x for x in (SHORT, FULL, CODE) if re.sub(r'\s+', '', x) in compact]
+              if len(compact) > 500 and not identity_hits:
+                  raise RuntimeError(f'Issuer mismatch: {filename}')
+
+              subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(dest)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              prefix = PREV / dest.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(dest), str(prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 8000:
+                  raise RuntimeError(f'Preview failed: {filename}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  'label': item['label'],
+                  'report_year': item['year'],
+                  'report_kind': item['kind'],
+                  'announcement_title': a.get('_clean_title') or clean_title(a.get('announcementTitle', '')),
+                  'announcement_time': a.get('announcementTime'),
+                  'announcement_id': a.get('announcementId'),
+                  'source_url': url,
+                  'filename': str(Path('原始PDF') / filename),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'identity_hits': identity_hits,
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'download_attempts': attempts,
+                  'validation': [
+                      'PDF header', 'issuer identity', 'page count',
+                      'qpdf structure', 'first-page render'
+                  ],
+              })
+              print('VERIFIED', item['label'], pages, len(data), sha, url)
+
+          total_pages = sum(x['pages'] for x in manifest)
+          readme = [
+              '海能达通信股份有限公司（002583.SZ）年度报告及最新季度报告资料包',
+              '整理日期：2026-10-29',
+              '',
+              '收录范围：2020—2025年年度报告全文，以及截至整理日最新披露的2026年第三季度报告。',
+              '2020年年度报告采用后续披露的更新后版本；不收录年度报告摘要、董事会工作报告或单独审计附件。',
+              '',
+          ]
+          for i, x in enumerate(manifest, 1):
+              readme += [
+                  f'{i}. {x["label"]}',
+                  f'   页数：{x["pages"]}页；文件：{x["filename"]}',
+                  f'   官方来源：{x["source_url"]}',
+                  f'   SHA-256：{x["sha256"]}',
+                  '',
+              ]
+          readme += [
+              f'合计：{len(manifest)}份PDF，{total_pages}页。',
+              '核验项目：PDF文件头、公司名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (ROOT / '00_文件清单与来源.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest),
+              encoding='utf-8',
+          )
+
+          chinese_zip = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(chinese_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{ROOT.name}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(chinese_zip) as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs) != len(manifest):
+                  raise RuntimeError(f'ZIP validation failed bad={bad} pdf_count={len(pdfs)} manifest={len(manifest)}')
+
+          english_zip = Path('hytera_002583_2020_2025_annual_reports_latest_quarter.zip')
+          english_zip.write_bytes(chinese_zip.read_bytes())
+          print('FINAL_ZIP', chinese_zip, chinese_zip.stat().st_size, hashlib.sha256(chinese_zip.read_bytes()).hexdigest())
+          print('TOTAL_PAGES', total_pages)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: hytera-002583-all-filings-final
+          path: |
+            海能达_002583_2020-2025年报及最新季报.zip
+            hytera_002583_2020_2025_annual_reports_latest_quarter.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
