@@ -1,0 +1,405 @@
+name: Package Guangzhou Port broker deep reports
+
+on:
+  push:
+    branches:
+      - tmp/guangzhou-port-broker-reports-20261029-v1
+    paths:
+      - .github/workflows/guangzhou-port-broker-reports-20261029-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "601228"
+          SHORT = "广州港"
+          FULL = "广州港股份有限公司"
+          PREPARED = "2026-10-29"
+          ROOT_NAME = "广州港_601228_券商深度研究报告"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF原件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept": "application/json,text/plain,*/*",
+          })
+
+          def get_json(url: str) -> Any:
+              last = None
+              for attempt in range(5):
+                  try:
+                      response = session.get(url, timeout=(25, 240), allow_redirects=True)
+                      print("JSON_REQUEST", response.status_code, len(response.content), response.url)
+                      if response.status_code == 200:
+                          return response.json()
+                      last = RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+                  except Exception as exc:
+                      last = exc
+                      print("JSON_ERROR", url, attempt, repr(exc))
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f"Unable to fetch JSON {url}: {last}")
+
+          # Discover all company-report metadata from the public Eastmoney metadata mirror.
+          matches: list[dict[str, Any]] = []
+          seen_ids: set[str] = set()
+          for year in range(2017, 2027):
+              url = f"https://raw.githubusercontent.com/metatools2023/reportlists/main/site/data/index-{year}.json"
+              data = get_json(url)
+              for row in data.get("reports", []):
+                  info_code = str(row.get("i") or "").strip()
+                  title = str(row.get("t") or "").strip()
+                  stock = str(row.get("s") or "").strip()
+                  qtype = row.get("q")
+                  if not info_code or info_code in seen_ids or qtype != 0:
+                      continue
+                  if stock != SHORT and SHORT not in title and CODE not in title:
+                      continue
+                  seen_ids.add(info_code)
+                  matches.append({
+                      "info_code": info_code,
+                      "publish_date": str(row.get("d") or "")[:10],
+                      "title": title,
+                      "org": str(row.get("o") or "").strip(),
+                      "industry": str(row.get("n") or "").strip(),
+                      "rating": str(row.get("r") or "").strip(),
+                      "researcher": str(row.get("a") or "").strip(),
+                      "stock": stock,
+                      "qtype": qtype,
+                  })
+
+          if not matches:
+              raise RuntimeError("No Guangzhou Port company reports found in metadata index")
+
+          # Enrich candidates with page count and full fields from monthly shards.
+          shard_cache: dict[str, list[dict[str, Any]]] = {}
+          for item in matches:
+              ym = item["publish_date"][:7]
+              if not re.fullmatch(r"20\d{2}-\d{2}", ym):
+                  continue
+              if ym not in shard_cache:
+                  shard_url = f"https://raw.githubusercontent.com/metatools2023/reportlists/main/site/data/reports-{ym}.json"
+                  try:
+                      shard_cache[ym] = get_json(shard_url)
+                  except Exception as exc:
+                      print("SHARD_ERROR", ym, repr(exc))
+                      shard_cache[ym] = []
+              full_row = next((x for x in shard_cache[ym] if str(x.get("infoCode") or "") == item["info_code"]), None)
+              if full_row:
+                  item["pages_meta"] = int(full_row.get("attachPages") or 0)
+                  item["attach_size_kb"] = int(full_row.get("attachSize") or 0)
+                  item["stock_code"] = str(full_row.get("stockCode") or "")
+                  item["org_full"] = str(full_row.get("orgName") or "")
+                  item["encode_url"] = str(full_row.get("encodeUrl") or "")
+              else:
+                  item["pages_meta"] = 0
+                  item["attach_size_kb"] = 0
+                  item["stock_code"] = ""
+                  item["org_full"] = ""
+                  item["encode_url"] = ""
+
+          deep_words = [
+              "深度", "首次覆盖", "首次评级", "公司首次覆盖", "公司深度",
+              "公司研究报告", "公司专题", "投资价值", "价值分析", "首次推荐",
+          ]
+          commentary_words = [
+              "点评", "季报", "年报", "中报", "半年报", "业绩预告", "业绩快报",
+              "月报", "周报", "公告", "跟踪", "调研", "事件点评",
+          ]
+          exclude_words = ["行业", "港口行业", "交通运输行业", "策略", "债券", "信用"]
+
+          def parse_date(value: str) -> datetime:
+              try:
+                  return datetime.strptime(value[:10], "%Y-%m-%d")
+              except Exception:
+                  return datetime(1900, 1, 1)
+
+          for item in matches:
+              compact = re.sub(r"\s+", "", item["title"])
+              item["is_deep"] = any(word in compact for word in deep_words)
+              item["is_commentary"] = any(word in compact for word in commentary_words)
+              item["excluded_title"] = any(word in compact for word in exclude_words) and item["stock"] != SHORT
+              dt = parse_date(item["publish_date"])
+              score = int(item.get("pages_meta") or 0) * 5
+              if item["is_deep"]:
+                  score += 350
+              if "首次" in compact:
+                  score += 90
+              if item["is_commentary"] and not item["is_deep"]:
+                  score -= 120
+              if dt.year >= 2023:
+                  score += 40
+              elif dt.year >= 2020:
+                  score += 20
+              item["score"] = score
+              item["date_obj"] = dt
+
+          ranked = sorted(
+              [x for x in matches if not x["excluded_title"]],
+              key=lambda x: (x["score"], int(x.get("pages_meta") or 0), x["date_obj"]),
+              reverse=True,
+          )
+          print("CANDIDATE_COUNT", len(ranked))
+          for item in ranked:
+              print("CANDIDATE", json.dumps({k: item.get(k) for k in ["publish_date","org","researcher","title","pages_meta","rating","is_deep","is_commentary","score","info_code"]}, ensure_ascii=False))
+
+          def safe_filename(text: str, limit: int = 120) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text)
+              text = re.sub(r"\s+", " ", text).strip(" ._")
+              return text[:limit]
+
+          def download_pdf(info_code: str) -> tuple[bytes, str, list[dict[str, Any]]]:
+              urls = [
+                  f"https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H1_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H4_{info_code}_1.pdf",
+              ]
+              attempts: list[dict[str, Any]] = []
+              for url in urls:
+                  for attempt in range(4):
+                      try:
+                          response = session.get(
+                              url,
+                              timeout=(30, 420),
+                              allow_redirects=True,
+                              headers={
+                                  "User-Agent": session.headers["User-Agent"],
+                                  "Referer": "https://data.eastmoney.com/report/",
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                              },
+                          )
+                          rec = {
+                              "url": url,
+                              "status": response.status_code,
+                              "bytes": len(response.content),
+                              "content_type": response.headers.get("content-type", ""),
+                              "magic": response.content[:8].hex(),
+                              "final_url": response.url,
+                          }
+                          attempts.append(rec)
+                          if response.status_code == 200 and response.content.startswith(b"%PDF-") and len(response.content) > 50_000:
+                              return response.content, response.url, attempts
+                      except Exception as exc:
+                          attempts.append({"url": url, "error": repr(exc)})
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"Could not download {info_code}: {attempts}")
+
+          selected: list[dict[str, Any]] = []
+          rejected: list[dict[str, Any]] = []
+          used_orgs: set[str] = set()
+
+          def try_pool(pool: list[dict[str, Any]], min_pages: int, distinct_org: bool) -> None:
+              for candidate in pool:
+                  if len(selected) >= 3:
+                      return
+                  if any(x["info_code"] == candidate["info_code"] for x in selected):
+                      continue
+                  if distinct_org and candidate["org"] in used_orgs:
+                      continue
+                  temp = ROOT / f"_candidate_{candidate['info_code']}.pdf"
+                  try:
+                      content, used_url, attempts = download_pdf(candidate["info_code"])
+                      temp.write_bytes(content)
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      sample_parts = []
+                      for page in reader.pages[: min(15, pages)]:
+                          try:
+                              sample_parts.append(page.extract_text() or "")
+                          except Exception:
+                              pass
+                      sample_text = "\n".join(sample_parts)
+                      issuer_ok = SHORT in sample_text or FULL in sample_text or CODE in sample_text
+                      if pages < min_pages or not issuer_ok:
+                          rejected.append({
+                              "info_code": candidate["info_code"],
+                              "title": candidate["title"],
+                              "org": candidate["org"],
+                              "pages": pages,
+                              "reason": "too_short" if pages < min_pages else "issuer_validation_failed",
+                          })
+                          temp.unlink(missing_ok=True)
+                          continue
+
+                      check = subprocess.run(
+                          ["qpdf", "--warning-exit-0", "--check", str(temp)],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                          text=True,
+                      )
+                      if check.returncode != 0:
+                          raise RuntimeError(check.stdout)
+
+                      number = len(selected) + 1
+                      date_prefix = candidate["publish_date"].replace("-", "") or "unknown"
+                      filename = safe_filename(f"{number:02d}_{date_prefix}_{candidate['org']}_{candidate['title']}.pdf")
+                      final_pdf = PDF_DIR / filename
+                      temp.replace(final_pdf)
+
+                      preview_prefix = PREVIEW_DIR / final_pdf.stem
+                      render = subprocess.run(
+                          ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "120", "-singlefile", str(final_pdf), str(preview_prefix)],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                          text=True,
+                      )
+                      preview_path = Path(str(preview_prefix) + ".png")
+                      if render.returncode != 0 or not preview_path.exists() or preview_path.stat().st_size < 5_000:
+                          raise RuntimeError(f"preview failed: {render.stdout}")
+
+                      selected.append({
+                          **{k: v for k, v in candidate.items() if k != "date_obj"},
+                          "filename": filename,
+                          "actual_pages": pages,
+                          "bytes": len(content),
+                          "sha256": hashlib.sha256(content).hexdigest(),
+                          "pdf_url": used_url,
+                          "detail_url": f"https://data.eastmoney.com/report/info/{candidate['info_code']}.html",
+                          "download_attempts": attempts,
+                          "preview_file": str(Path("首页预览") / preview_path.name),
+                      })
+                      used_orgs.add(candidate["org"])
+                  except Exception as exc:
+                      rejected.append({
+                          "info_code": candidate["info_code"],
+                          "title": candidate["title"],
+                          "org": candidate["org"],
+                          "reason": repr(exc),
+                      })
+                      temp.unlink(missing_ok=True)
+
+          deep_pool = [x for x in ranked if x["is_deep"]]
+          substantive_pool = [x for x in ranked if not x["is_commentary"] or int(x.get("pages_meta") or 0) >= 12]
+          try_pool(deep_pool, 12, True)
+          if len(selected) < 3:
+              try_pool(deep_pool, 10, False)
+          if len(selected) < 3:
+              try_pool(substantive_pool, 12, True)
+          if len(selected) < 3:
+              try_pool(ranked, 8, False)
+
+          if len(selected) < 2:
+              raise RuntimeError(f"Only {len(selected)} suitable original PDFs found. Rejected: {rejected[:30]}")
+
+          count = len(selected)
+          package_basename = f"guangzhou_port_601228_broker_deep_reports_{count}"
+          readme = [
+              f"广州港（{CODE}.SH）券商公司研究报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              f"本包收录 {count} 份公开可下载的券商原始PDF，优先选择公司深度、首次覆盖或篇幅较完整的公司研究报告。",
+              "报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。",
+              "",
+          ]
+          for index, item in enumerate(selected, 1):
+              readme.extend([
+                  f"{index}. {item['filename']}",
+                  f"   券商：{item['org']}；研究员：{item['researcher'] or '未标注'}；发布日期：{item['publish_date'] or '未标注'}",
+                  f"   标题：{item['title']}",
+                  f"   评级：{item['rating'] or '未标注'}；实际页数：{item['actual_pages']}页；大小：{item['bytes']}字节",
+                  f"   来源页面：{item['detail_url']}",
+                  f"   原始PDF：{item['pdf_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme.extend([
+              "核验项目：PDF文件头、广州港/证券代码匹配、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "元数据来源：东方财富研报中心公开元数据及其原始PDF外链。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          manifest_payload = {
+              "company": SHORT,
+              "full_company_name": FULL,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "report_count": count,
+              "files": selected,
+              "rejected_candidates": rejected,
+              "all_candidates": [{k: v for k, v in x.items() if k != "date_obj"} for x in ranked],
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["文件名", "券商", "研究员", "发布日期", "标题", "评级", "页数", "字节数", "SHA-256", "来源页面", "PDF地址"])
+              for item in selected:
+                  writer.writerow([
+                      item["filename"], item["org"], item["researcher"], item["publish_date"], item["title"],
+                      item["rating"], item["actual_pages"], item["bytes"], item["sha256"], item["detail_url"], item["pdf_url"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF原件/{item['filename']}" for item in selected) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path(package_basename + ".zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT_NAME) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed: {bad}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "report_count": count,
+              "files": [{k: item[k] for k in ["filename", "org", "researcher", "publish_date", "title", "rating", "actual_pages", "bytes", "sha256", "detail_url", "pdf_url"]} for item in selected],
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guangzhou-port-601228-broker-deep-reports-20261029
+          path: |
+            guangzhou_port_601228_broker_deep_reports_*.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
