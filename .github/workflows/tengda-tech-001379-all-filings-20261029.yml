@@ -1,0 +1,432 @@
+name: Build Tengda Tech 001379 all filings 20261029
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tengda-tech-001379-all-filings-20261029.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CODE = '001379'
+          SHORT = '腾达科技'
+          FULL = '山东腾达紧固科技股份有限公司'
+          PACKAGE = '腾达科技_001379_全部年报_招股说明书_最新季报'
+          ROOT = Path(PACKAGE)
+          PDFDIR = ROOT / '原始PDF'
+          PREV = ROOT / '首页预览'
+          for d in (ROOT, PDFDIR, PREV):
+              d.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155 Safari/537.36'
+          common_headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', '', value)
+              return re.sub(r'\s+', '', value)
+
+          discovery_log: dict[str, object] = {}
+
+          def discover_cninfo_q3() -> list[str]:
+              candidates: list[str] = []
+              try:
+                  session.get('https://www.cninfo.com.cn/new/index', headers=common_headers, timeout=(20, 60))
+              except Exception as exc:
+                  discovery_log['cninfo_preflight_error'] = repr(exc)
+
+              org_ids: list[str] = []
+              for keyword in (CODE, SHORT, FULL):
+                  try:
+                      r = session.get(
+                          'https://www.cninfo.com.cn/new/information/topSearch/query',
+                          params={'keyWord': keyword, 'maxNum': '20'},
+                          headers={**common_headers, 'Referer': 'https://www.cninfo.com.cn/'},
+                          timeout=(20, 90),
+                      )
+                      entry = {'keyword': keyword, 'status': r.status_code, 'bytes': len(r.content), 'content_type': r.headers.get('content-type', '')}
+                      try:
+                          obj = r.json()
+                          entry['json'] = obj
+                          rows = obj if isinstance(obj, list) else (obj.get('data') or obj.get('records') or obj.get('keyBoardList') or [])
+                          for row in rows:
+                              row_code = str(row.get('code') or row.get('stockCode') or row.get('secCode') or '')
+                              org_id = row.get('orgId') or row.get('orgid') or row.get('org_id')
+                              if row_code == CODE and org_id and str(org_id) not in org_ids:
+                                  org_ids.append(str(org_id))
+                      except Exception as exc:
+                          entry['json_error'] = repr(exc)
+                          entry['text_prefix'] = r.text[:1000]
+                      discovery_log.setdefault('cninfo_top_search', []).append(entry)
+                  except Exception as exc:
+                      discovery_log.setdefault('cninfo_top_search_errors', []).append({'keyword': keyword, 'error': repr(exc)})
+
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              headers = {
+                  **common_headers,
+                  'Referer': f'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search&code={CODE}',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'Accept': 'application/json, text/javascript, */*; q=0.01',
+              }
+              stocks = [f'{CODE},{org_id}' for org_id in org_ids]
+              stocks.extend([CODE, ''])
+              seen_stocks = []
+              for stock in stocks:
+                  if stock in seen_stocks:
+                      continue
+                  seen_stocks.append(stock)
+                  for searchkey in ('', '腾达科技', '2026年三季度报告', '2026年第三季度报告'):
+                      payload = {
+                          'pageNum': '1', 'pageSize': '100', 'column': 'szse',
+                          'tabName': 'fulltext', 'plate': 'sz', 'stock': stock,
+                          'searchkey': searchkey, 'secid': '', 'category': '', 'trade': '',
+                          'seDate': '2026-10-26~2026-10-29', 'sortName': '', 'sortType': '',
+                          'isHLtitle': 'true',
+                      }
+                      try:
+                          r = session.post(endpoint, headers=headers, data=payload, timeout=(30, 120))
+                          entry = {'stock': stock, 'searchkey': searchkey, 'status': r.status_code, 'bytes': len(r.content), 'content_type': r.headers.get('content-type', '')}
+                          try:
+                              obj = r.json()
+                              anns = obj.get('announcements') or []
+                              entry['total'] = obj.get('totalAnnouncement')
+                              entry['titles'] = [clean_title(a.get('announcementTitle', '')) for a in anns]
+                              for a in anns:
+                                  title = clean_title(a.get('announcementTitle', ''))
+                                  sec_code = str(a.get('secCode') or '')
+                                  if sec_code and sec_code != CODE:
+                                      continue
+                                  if ('2026年三季度报告' in title or '2026年第三季度报告' in title) and '摘要' not in title:
+                                      adjunct = (a.get('adjunctUrl') or '').lstrip('/')
+                                      if adjunct:
+                                          url = 'https://static.cninfo.com.cn/' + adjunct
+                                          if url not in candidates:
+                                              candidates.append(url)
+                                          discovery_log['cninfo_selected_q3'] = a
+                          except Exception as exc:
+                              entry['json_error'] = repr(exc)
+                              entry['text_prefix'] = r.text[:1000]
+                          discovery_log.setdefault('cninfo_query', []).append(entry)
+                      except Exception as exc:
+                          discovery_log.setdefault('cninfo_query_errors', []).append({'stock': stock, 'searchkey': searchkey, 'error': repr(exc)})
+                      if candidates:
+                          return candidates
+              return candidates
+
+          def discover_sina_q3() -> list[str]:
+              urls: list[str] = []
+              pages = [
+                  f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{CODE}/page_type/sjdbg.phtml',
+                  f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{CODE}.phtml',
+                  f'https://money.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{CODE}.phtml',
+              ]
+              ids: list[str] = []
+              for page_url in pages:
+                  try:
+                      r = session.get(page_url, headers={**common_headers, 'Referer': 'https://finance.sina.com.cn/'}, timeout=(30, 120))
+                      r.encoding = r.apparent_encoding or 'gb18030'
+                      text = r.text
+                      entry = {'url': page_url, 'status': r.status_code, 'bytes': len(r.content), 'encoding': r.encoding, 'title_found': '2026年三季度报告' in text or '2026年第三季度报告' in text}
+                      for match in re.finditer(r'vCB_AllBulletinDetail\.php\?id=(\d+)&stockid=001379', text):
+                          start = max(0, match.start() - 500)
+                          end = min(len(text), match.end() + 500)
+                          context = clean_title(text[start:end])
+                          if '2026年三季度报告' in context or '2026年第三季度报告' in context:
+                              bid = match.group(1)
+                              if bid not in ids:
+                                  ids.append(bid)
+                      entry['ids'] = ids.copy()
+                      discovery_log.setdefault('sina_pages', []).append(entry)
+                  except Exception as exc:
+                      discovery_log.setdefault('sina_page_errors', []).append({'url': page_url, 'error': repr(exc)})
+              for bid in ids:
+                  for day in ('2026-10-28', '2026-10-27', '2026-10-29'):
+                      url = f'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2026/2026-10/{day}/{bid}.PDF'
+                      if url not in urls:
+                          urls.append(url)
+              return urls
+
+          def discover_cfi_q3() -> list[str]:
+              urls: list[str] = []
+              pages = [
+                  'https://www.cfi.net.cn/p20261027005167.html',
+                  'https://data.cfi.cn/quote.aspx?client=phone&contenttype=cbgg&stockid=171412',
+              ]
+              for page_url in pages:
+                  try:
+                      r = session.get(page_url, headers={**common_headers, 'Referer': 'https://www.cfi.net.cn/'}, timeout=(30, 120))
+                      r.encoding = r.apparent_encoding or 'utf-8'
+                      soup = BeautifulSoup(r.text, 'html.parser')
+                      found = []
+                      for a in soup.find_all('a', href=True):
+                          href = urljoin(r.url, a.get('href'))
+                          text = clean_title(a.get_text(' ', strip=True))
+                          if '.pdf' in href.lower() or 'pdf' in text.lower() or '原文' in text:
+                              found.append({'text': text, 'href': href})
+                              if '.pdf' in href.lower() and href not in urls:
+                                  urls.append(href)
+                      discovery_log.setdefault('cfi_pages', []).append({'url': page_url, 'status': r.status_code, 'bytes': len(r.content), 'found': found[:50]})
+                  except Exception as exc:
+                      discovery_log.setdefault('cfi_page_errors', []).append({'url': page_url, 'error': repr(exc)})
+              return urls
+
+          q3_candidates = []
+          for candidate in discover_cninfo_q3() + discover_sina_q3() + discover_cfi_q3():
+              if candidate not in q3_candidates:
+                  q3_candidates.append(candidate)
+          discovery_log['q3_candidates'] = q3_candidates
+          (ROOT / '00_最新季报来源发现记录.json').write_text(json.dumps(discovery_log, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          items = [
+              {
+                  'label': '2023年年度报告',
+                  'kind': 'annual',
+                  'min_pages': 100,
+                  'urls': [
+                      'https://notice.10jqka.com.cn/api/pdf/1d7e4b420953461c.pdf',
+                      'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2024/2024-4/2024-04-19/9997575.PDF',
+                  ],
+              },
+              {
+                  'label': '2024年年度报告',
+                  'kind': 'annual',
+                  'min_pages': 100,
+                  'urls': [
+                      'https://disc.static.szse.cn/disc/disk03/finalpage/2025-04-25/2fbd4af2-b446-4847-948b-eda8f99916b2.PDF',
+                      'https://notice.10jqka.com.cn/api/pdf/50fd50caf97a554.pdf',
+                      'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2025/2025-4/2025-04-25/10967754.PDF',
+                  ],
+              },
+              {
+                  'label': '2025年年度报告',
+                  'kind': 'annual',
+                  'min_pages': 100,
+                  'urls': [
+                      'https://static.cninfo.com.cn/finalpage/2026-04-24/1225158577.PDF',
+                      'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2026/2026-4/2026-04-24/12158721.PDF',
+                  ],
+              },
+              {
+                  'label': '首次公开发行股票并在主板上市招股说明书',
+                  'kind': 'prospectus',
+                  'min_pages': 300,
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H2_AN202401141617484327_1.pdf',
+                      'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2024/2024-1/2024-01-15/9782108.PDF',
+                  ],
+              },
+              {
+                  'label': '2026年第三季度报告',
+                  'kind': 'quarter',
+                  'min_pages': 5,
+                  'urls': q3_candidates,
+              },
+          ]
+
+          manifest = []
+          for idx, item in enumerate(items, 1):
+              if not item['urls']:
+                  raise RuntimeError(f'No candidate URLs discovered for {item["label"]}')
+              data = None
+              source_url = ''
+              attempts = []
+              for url in item['urls']:
+                  for attempt in range(5):
+                      try:
+                          if 'sina.com.cn' in url:
+                              referer = 'https://vip.stock.finance.sina.com.cn/'
+                          elif 'cninfo.com.cn' in url:
+                              referer = 'https://www.cninfo.com.cn/'
+                          elif 'szse.cn' in url:
+                              referer = 'https://www.szse.cn/'
+                          elif '10jqka.com.cn' in url:
+                              referer = 'https://notice.10jqka.com.cn/'
+                          elif 'dfcfw.com' in url:
+                              referer = 'https://data.eastmoney.com/'
+                          else:
+                              referer = 'https://www.cfi.net.cn/'
+                          r = session.get(
+                              url,
+                              headers={
+                                  **common_headers,
+                                  'Referer': referer,
+                                  'Accept': 'application/pdf,*/*;q=0.8',
+                              },
+                              timeout=(30, 360),
+                              allow_redirects=True,
+                          )
+                          attempts.append({
+                              'url': url,
+                              'attempt': attempt + 1,
+                              'status': r.status_code,
+                              'bytes': len(r.content),
+                              'content_type': r.headers.get('content-type', ''),
+                              'final_url': r.url,
+                          })
+                          if r.status_code == 200 and r.content[:5] == b'%PDF-' and len(r.content) > 50000:
+                              data = r.content
+                              source_url = url
+                              break
+                          if r.status_code in (400, 401, 403, 404, 410):
+                              break
+                      except Exception as exc:
+                          attempts.append({'url': url, 'attempt': attempt + 1, 'error': repr(exc)})
+                      time.sleep(1 + attempt)
+                  if data is not None:
+                      break
+              if data is None:
+                  raise RuntimeError(f'Download failed {item["label"]}: {attempts}')
+
+              filename = f'{idx:02d}_腾达科技_{item["label"]}.pdf'
+              dest = PDFDIR / filename
+              dest.write_bytes(data)
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f'Unexpectedly short PDF {filename}: {pages} pages')
+
+              text = ''
+              for page in reader.pages[:min(45, pages)]:
+                  try:
+                      text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', text)
+              identity_terms = (SHORT, FULL, '腾达紧固', CODE)
+              identity_hits = [x for x in identity_terms if re.sub(r'\s+', '', x) in compact]
+              if len(compact) > 500 and not identity_hits:
+                  raise RuntimeError(f'Issuer mismatch {filename}')
+
+              subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(dest)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              prefix = PREV / dest.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125', '-singlefile', str(dest), str(prefix)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              preview = Path(str(prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 8000:
+                  raise RuntimeError(f'Preview failed {filename}')
+
+              sha = hashlib.sha256(data).hexdigest()
+              manifest.append({
+                  'label': item['label'],
+                  'kind': item['kind'],
+                  'candidate_urls': item['urls'],
+                  'source_url': source_url,
+                  'filename': str(Path('原始PDF') / filename),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'identity_hits': identity_hits,
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'download_attempts': attempts,
+                  'validation': [
+                      'PDF header', 'issuer identity', 'page count',
+                      'qpdf structure', 'first-page render'
+                  ],
+              })
+              print('VERIFIED', item['label'], pages, len(data), sha, source_url)
+
+          total_pages = sum(x['pages'] for x in manifest)
+          readme = [
+              '山东腾达紧固科技股份有限公司（001379.SZ）公开披露文件资料包',
+              '整理日期：2026-10-29',
+              '',
+              '收录范围：公司上市后已披露的全部年度报告全文（2023—2025年）、首次公开发行股票并在主板上市招股说明书最终发行版，以及截至整理日最新披露的2026年第三季度报告。',
+              '不收录年度报告摘要、招股意向书、申报稿或普通公告页面。',
+              '',
+          ]
+          for i, x in enumerate(manifest, 1):
+              readme += [
+                  f'{i}. {x["label"]}',
+                  f'   页数：{x["pages"]}页；文件：{x["filename"]}',
+                  f'   来源：{x["source_url"]}',
+                  f'   SHA-256：{x["sha256"]}',
+                  '',
+              ]
+          readme += [
+              f'合计：{len(manifest)}份PDF，{total_pages}页。',
+              '核验项目：PDF文件头、公司名称/证券代码、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (ROOT / '00_文件清单与来源.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest),
+              encoding='utf-8',
+          )
+
+          chinese_zip = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(chinese_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=f'{ROOT.name}/{p.relative_to(ROOT)}')
+          with zipfile.ZipFile(chinese_zip) as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if bad or len(pdfs) != len(manifest):
+                  raise RuntimeError(f'ZIP validation failed bad={bad} pdf_count={len(pdfs)} manifest={len(manifest)}')
+
+          english_zip = Path('tengda_tech_001379_all_annual_reports_prospectus_latest_quarter.zip')
+          english_zip.write_bytes(chinese_zip.read_bytes())
+          print('FINAL_ZIP', chinese_zip, chinese_zip.stat().st_size, 'SHA256', hashlib.sha256(chinese_zip.read_bytes()).hexdigest())
+          print('TOTAL_PAGES', total_pages)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: tengda-tech-001379-all-filings-final
+          path: |
+            腾达科技_001379_全部年报_招股说明书_最新季报.zip
+            tengda_tech_001379_all_annual_reports_prospectus_latest_quarter.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
