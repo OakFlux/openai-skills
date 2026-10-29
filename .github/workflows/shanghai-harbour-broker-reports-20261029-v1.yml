@@ -1,0 +1,274 @@
+name: Package Shanghai Harbour broker deep reports
+
+on:
+  push:
+    branches:
+      - tmp/shanghai-harbour-broker-reports-20261029-v1
+    paths:
+      - .github/workflows/shanghai-harbour-broker-reports-20261029-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "605598"
+          SHORT = "上海港湾"
+          FULL = "上海港湾基础建设（集团）股份有限公司"
+          PREPARED = "2026-10-29"
+          ROOT_NAME = "上海港湾_605598_券商深度报告_3份"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF原件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  "date": "2025-01-07",
+                  "broker": "国金证券",
+                  "analyst": "李阳、赵铭",
+                  "rating": "增持（首次评级）",
+                  "title": "掘金印尼沙特，基建龙头加速出海",
+                  "info_code": "AP202501081641850806",
+                  "url": "https://pdf.dfcfw.com/pdf/H3_AP202501081641850806_1.pdf",
+                  "expected_pages": 16,
+              },
+              {
+                  "date": "2024-07-12",
+                  "broker": "华源证券",
+                  "analyst": "戴铭余、刘晓宁",
+                  "rating": "增持（首次覆盖）",
+                  "title": "软土地基出海先锋，被低估的“新质生产力”",
+                  "info_code": "AP202407121637824789",
+                  "url": "https://pdf.dfcfw.com/pdf/H3_AP202407121637824789_1.pdf",
+                  "expected_pages": 32,
+              },
+              {
+                  "date": "2024-01-28",
+                  "broker": "东吴证券",
+                  "analyst": "黄诗涛、房大磊、石峰源；研究助理：杨晓曦",
+                  "rating": "增持（首次）",
+                  "title": "软土地基处理龙头，加速拓展一带一路市场",
+                  "info_code": "AP202401281619244059",
+                  "url": "https://pdf.dfcfw.com/pdf/H3_AP202401281619244059_1.pdf",
+                  "expected_pages": 35,
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Referer": "https://data.eastmoney.com/report/605598.html",
+              "Accept": "application/pdf,*/*;q=0.8",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def safe_filename(text: str) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text)
+              return re.sub(r"\s+", " ", text).strip(" ._")[:160]
+
+          manifest = []
+          for index, spec in enumerate(reports, 1):
+              content = None
+              used_url = None
+              attempts = []
+              candidate_urls = [
+                  spec["url"],
+                  spec["url"].replace("/H3_", "/H2_"),
+                  spec["url"].replace("/H3_", "/H1_"),
+              ]
+              for url in candidate_urls:
+                  for attempt in range(5):
+                      try:
+                          response = session.get(url, timeout=(30, 420), allow_redirects=True)
+                          rec = {
+                              "url": url,
+                              "status": response.status_code,
+                              "bytes": len(response.content),
+                              "content_type": response.headers.get("content-type", ""),
+                              "magic": response.content[:8].hex(),
+                              "final_url": response.url,
+                          }
+                          attempts.append(rec)
+                          print("PDF_REQUEST", json.dumps(rec, ensure_ascii=False))
+                          if response.status_code == 200 and response.content.startswith(b"%PDF-") and len(response.content) > 50_000:
+                              content = response.content
+                              used_url = response.url
+                              break
+                      except Exception as exc:
+                          attempts.append({"url": url, "error": repr(exc)})
+                      time.sleep(1 + attempt)
+                  if content is not None:
+                      break
+              if content is None:
+                  raise RuntimeError(f"Could not download {spec['title']}: {attempts}")
+
+              filename = safe_filename(
+                  f"{index:02d}_{spec['date'].replace('-', '')}_{spec['broker']}_{spec['title']}.pdf"
+              )
+              pdf_path = PDF_DIR / filename
+              pdf_path.write_bytes(content)
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              pages = len(reader.pages)
+              if pages != spec["expected_pages"]:
+                  raise RuntimeError(
+                      f"Unexpected page count for {filename}: {pages}, expected {spec['expected_pages']}"
+                  )
+
+              text_parts = []
+              for page in reader.pages[: min(12, pages)]:
+                  try:
+                      text_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample_text = "\n".join(text_parts)
+              if not any(token in sample_text for token in [SHORT, FULL, CODE]):
+                  raise RuntimeError(f"Issuer validation failed for {filename}")
+              title_tokens = [token for token in re.split(r"[，、：“”\s]+", spec["title"]) if len(token) >= 3]
+              if title_tokens and not any(token in sample_text for token in title_tokens[:5]):
+                  raise RuntimeError(f"Title validation failed for {filename}")
+
+              check = subprocess.run(
+                  ["qpdf", "--warning-exit-0", "--check", str(pdf_path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              if check.returncode != 0:
+                  raise RuntimeError(f"qpdf failed for {filename}: {check.stdout}")
+
+              preview_prefix = PREVIEW_DIR / pdf_path.stem
+              render = subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "140", "-singlefile", str(pdf_path), str(preview_prefix)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              preview_path = Path(str(preview_prefix) + ".png")
+              if render.returncode != 0 or not preview_path.exists() or preview_path.stat().st_size < 5_000:
+                  raise RuntimeError(f"Preview failed for {filename}: {render.stdout}")
+
+              manifest.append({
+                  **spec,
+                  "filename": filename,
+                  "actual_pages": pages,
+                  "bytes": len(content),
+                  "sha256": hashlib.sha256(content).hexdigest(),
+                  "pdf_url": used_url,
+                  "detail_url": f"https://data.eastmoney.com/report/info/{spec['info_code']}.html",
+                  "preview_file": str(Path("首页预览") / preview_path.name),
+                  "download_attempts": attempts,
+              })
+
+          readme = [
+              f"上海港湾（{CODE}.SH）券商深度研究报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              "本包收录3份公开可下载的券商原始PDF，均为公司深度或首次覆盖报告。",
+              "报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。",
+              "",
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme.extend([
+                  f"{i}. {item['filename']}",
+                  f"   券商：{item['broker']}；研究员：{item['analyst']}；发布日期：{item['date']}",
+                  f"   标题：{item['title']}",
+                  f"   评级：{item['rating']}；实际页数：{item['actual_pages']}页；文件大小：{item['bytes']}字节",
+                  f"   来源页面：{item['detail_url']}",
+                  f"   原始PDF：{item['pdf_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme.extend([
+              "核验项目：PDF文件头、上海港湾/证券代码、报告标题、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "元数据与PDF来源：东方财富研报中心公开页面及原始PDF外链。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          payload = {
+              "company": SHORT,
+              "full_company_name": FULL,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "report_count": len(manifest),
+              "files": manifest,
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["文件名", "券商", "研究员", "发布日期", "标题", "评级", "页数", "字节数", "SHA-256", "来源页面", "PDF地址"])
+              for item in manifest:
+                  writer.writerow([
+                      item["filename"], item["broker"], item["analyst"], item["date"], item["title"], item["rating"],
+                      item["actual_pages"], item["bytes"], item["sha256"], item["detail_url"], item["pdf_url"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF原件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("shanghai_harbour_605598_broker_deep_reports_3.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT_NAME) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed: {bad}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "report_count": len(manifest),
+              "files": [{k: item[k] for k in ["filename", "broker", "analyst", "date", "title", "rating", "actual_pages", "bytes", "sha256", "detail_url", "pdf_url"]} for item in manifest],
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-harbour-605598-broker-deep-reports-3-20261029
+          path: |
+            shanghai_harbour_605598_broker_deep_reports_3.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
