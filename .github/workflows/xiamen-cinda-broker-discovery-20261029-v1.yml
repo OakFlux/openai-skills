@@ -1,0 +1,387 @@
+name: Discover and package Xiamen Cinda broker reports
+
+on:
+  push:
+    branches:
+      - tmp/xiamen-cinda-broker-reports-20261029-v1
+    paths:
+      - .github/workflows/xiamen-cinda-broker-discovery-20261029-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "000701"
+          SHORT = "厦门信达"
+          FULL = "厦门信达股份有限公司"
+          PREPARED = "2026-10-29"
+          ROOT_NAME = "厦门信达_000701_券商深度研究报告"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF原件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept": "application/json,text/plain,*/*",
+              "Referer": "https://data.eastmoney.com/report/000701.html",
+          })
+
+          api = "https://reportapi.eastmoney.com/report/list"
+          records: list[dict[str, Any]] = []
+          query_log: list[dict[str, Any]] = []
+          for page in range(1, 21):
+              params = {
+                  "industryCode": "*",
+                  "pageSize": "100",
+                  "industry": "*",
+                  "rating": "*",
+                  "ratingChange": "*",
+                  "beginTime": "2000-01-01",
+                  "endTime": "2030-12-31",
+                  "pageNo": str(page),
+                  "fields": "",
+                  "qType": "0",
+                  "orgCode": "",
+                  "code": CODE,
+                  "rcode": "",
+                  "p": str(page),
+                  "pageNum": str(page),
+                  "pageNumber": str(page),
+              }
+              data = None
+              last = None
+              for attempt in range(6):
+                  try:
+                      response = session.get(api, params=params, timeout=(20, 180))
+                      last = {"status": response.status_code, "text": response.text[:300], "url": response.url}
+                      print("API", page, attempt, response.status_code, len(response.content), response.url)
+                      if response.status_code == 200:
+                          data = response.json()
+                          break
+                  except Exception as exc:
+                      last = {"error": repr(exc)}
+                  time.sleep(1 + attempt)
+              if data is None:
+                  print("API_PAGE_FAILED", page, json.dumps(last, ensure_ascii=False))
+                  break
+              batch = data.get("data") or []
+              if isinstance(batch, dict):
+                  batch = batch.get("list") or batch.get("data") or []
+              if not isinstance(batch, list):
+                  print("UNEXPECTED_API_SHAPE", type(batch).__name__)
+                  break
+              query_log.append({"page": page, "count": len(batch), "hits": data.get("hits")})
+              records.extend(x for x in batch if isinstance(x, dict))
+              if len(batch) < 100:
+                  break
+              time.sleep(0.2)
+
+          def first(row: dict[str, Any], *keys: str, default: Any = "") -> Any:
+              for key in keys:
+                  value = row.get(key)
+                  if value not in (None, ""):
+                      return value
+              return default
+
+          def clean(value: Any) -> str:
+              return re.sub(r"\s+", " ", str(value or "")).strip()
+
+          def to_int(value: Any) -> int:
+              try:
+                  return int(float(str(value).strip()))
+              except Exception:
+                  return 0
+
+          def parse_date(value: Any) -> datetime:
+              text = str(value or "").strip()
+              for fmt, length in (("%Y-%m-%d", 10), ("%Y/%m/%d", 10), ("%Y%m%d", 8)):
+                  try:
+                      return datetime.strptime(text[:length], fmt)
+                  except Exception:
+                      pass
+              return datetime(1900, 1, 1)
+
+          candidates: list[dict[str, Any]] = []
+          seen: set[str] = set()
+          for row in records:
+              info_code = clean(first(row, "infoCode", "info_code", "reportId", "report_id"))
+              title = clean(first(row, "title", "reportTitle", "report_title"))
+              stock_code = clean(first(row, "stockCode", "stock_code", "code"))
+              if not info_code or not title or info_code in seen:
+                  continue
+              if stock_code and CODE not in stock_code:
+                  continue
+              seen.add(info_code)
+              candidates.append({
+                  "info_code": info_code,
+                  "title": title,
+                  "org": clean(first(row, "orgSName", "orgName", "org_name", "organization")),
+                  "researcher": clean(first(row, "researcher", "researcherName", "author", "authors")),
+                  "publish_date": clean(first(row, "publishDate", "publish_date", "pubDate", "pub_date"))[:10],
+                  "pages_meta": to_int(first(row, "attachPages", "attach_pages", "pageCount", "pages")),
+                  "rating": clean(first(row, "emRatingName", "ratingName", "rating", "rating_name")),
+                  "stock_name": clean(first(row, "stockName", "stock_name")),
+              })
+
+          # Ensure the known public Ping An Securities deep report is included even if the API omits old records.
+          if "AP201509180010830659" not in seen:
+              candidates.append({
+                  "info_code": "AP201509180010830659",
+                  "title": "定增助力电子信息业务，转型试水供应链金融",
+                  "org": "平安证券",
+                  "researcher": "缴文超、陈雯；研究助理：罗晓娟",
+                  "publish_date": "2015-09-18",
+                  "pages_meta": 18,
+                  "rating": "推荐（首次）",
+                  "stock_name": SHORT,
+              })
+
+          deep_words = ["深度", "首次覆盖", "首次评级", "首次推荐", "布局供应链金融", "类金融", "产融结合", "互联网金融"]
+          commentary_words = ["点评", "季报", "年报", "中报", "业绩预告", "调研纪要", "纪要"]
+          exclude_words = ["行业", "策略", "周报", "月报", "评级表"]
+
+          for item in candidates:
+              compact = re.sub(r"\s+", "", item["title"])
+              dt = parse_date(item["publish_date"])
+              item["is_deep"] = any(word in compact for word in deep_words)
+              item["is_commentary"] = any(word in compact for word in commentary_words)
+              item["excluded"] = any(word in compact for word in exclude_words) and SHORT not in compact
+              score = item["pages_meta"] * 6
+              if item["is_deep"]:
+                  score += 300
+              if "首次" in compact:
+                  score += 80
+              if item["is_commentary"] and not item["is_deep"]:
+                  score -= 120
+              if dt.year >= 2015:
+                  score += 20
+              item["score"] = score
+              item["date_obj"] = dt
+
+          ranked = sorted(
+              [x for x in candidates if not x["excluded"]],
+              key=lambda x: (x["score"], x["pages_meta"], x["date_obj"]),
+              reverse=True,
+          )
+          print("QUERY_LOG", json.dumps(query_log, ensure_ascii=False))
+          print("RAW_RECORD_COUNT", len(records))
+          print("CANDIDATE_COUNT", len(ranked))
+          for x in ranked:
+              print("CANDIDATE", json.dumps({k: x.get(k) for k in ["publish_date","org","researcher","title","pages_meta","rating","is_deep","is_commentary","score","info_code"]}, ensure_ascii=False))
+
+          def safe_name(text: str, limit: int = 145) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text)
+              return re.sub(r"\s+", " ", text).strip(" ._")[:limit]
+
+          def download_pdf(info_code: str):
+              urls = [
+                  f"https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H1_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H4_{info_code}_1.pdf",
+              ]
+              attempts = []
+              for url in urls:
+                  for attempt in range(5):
+                      try:
+                          r = session.get(url, timeout=(30, 420), allow_redirects=True, headers={
+                              "User-Agent": session.headers["User-Agent"],
+                              "Referer": "https://data.eastmoney.com/report/",
+                              "Accept": "application/pdf,*/*;q=0.8",
+                          })
+                          rec = {"url": url, "status": r.status_code, "bytes": len(r.content), "content_type": r.headers.get("content-type", ""), "magic": r.content[:8].hex(), "final_url": r.url}
+                          attempts.append(rec)
+                          print("PDF_PROBE", json.dumps(rec, ensure_ascii=False))
+                          if r.status_code == 200 and r.content.startswith(b"%PDF-") and len(r.content) > 50_000:
+                              return r.content, r.url, attempts
+                      except Exception as exc:
+                          attempts.append({"url": url, "error": repr(exc)})
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"Download failed {info_code}: {attempts}")
+
+          selected: list[dict[str, Any]] = []
+          rejected: list[dict[str, Any]] = []
+          used_orgs: set[str] = set()
+
+          pools = [
+              [x for x in ranked if x["is_deep"]],
+              [x for x in ranked if not x["is_commentary"] and x["pages_meta"] >= 10],
+              ranked,
+          ]
+          thresholds = [12, 10, 8]
+          for pool, min_pages in zip(pools, thresholds):
+              for candidate in pool:
+                  if len(selected) >= 3:
+                      break
+                  if any(x["info_code"] == candidate["info_code"] for x in selected):
+                      continue
+                  # Prefer distinct broker sources for the first two reports.
+                  if len(selected) < 2 and candidate["org"] in used_orgs:
+                      continue
+                  temp = ROOT / f"_candidate_{candidate['info_code']}.pdf"
+                  try:
+                      data, used_url, attempts = download_pdf(candidate["info_code"])
+                      temp.write_bytes(data)
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      text = ""
+                      for page in reader.pages[:min(20, pages)]:
+                          try:
+                              text += "\n" + (page.extract_text() or "")
+                          except Exception:
+                              pass
+                      issuer_ok = SHORT in text or FULL in text or CODE in text
+                      if pages < min_pages or not issuer_ok:
+                          rejected.append({"info_code": candidate["info_code"], "title": candidate["title"], "org": candidate["org"], "pages": pages, "reason": "too_short" if pages < min_pages else "issuer_validation_failed"})
+                          temp.unlink(missing_ok=True)
+                          continue
+                      check = subprocess.run(["qpdf", "--warning-exit-0", "--check", str(temp)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                      if check.returncode != 0:
+                          raise RuntimeError(check.stdout)
+                      number = len(selected) + 1
+                      filename = safe_name(f"{number:02d}_{candidate['publish_date'].replace('-','')}_{candidate['org']}_{candidate['title']}.pdf")
+                      final_pdf = PDF_DIR / filename
+                      temp.replace(final_pdf)
+                      preview_prefix = PREVIEW_DIR / final_pdf.stem
+                      render = subprocess.run(["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "130", "-singlefile", str(final_pdf), str(preview_prefix)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                      preview_path = Path(str(preview_prefix) + ".png")
+                      if render.returncode != 0 or not preview_path.exists() or preview_path.stat().st_size < 5_000:
+                          raise RuntimeError(f"preview failed: {render.stdout}")
+                      selected.append({
+                          **{k: v for k, v in candidate.items() if k != "date_obj"},
+                          "filename": filename,
+                          "actual_pages": pages,
+                          "bytes": len(data),
+                          "sha256": hashlib.sha256(data).hexdigest(),
+                          "pdf_url": used_url,
+                          "detail_url": f"https://data.eastmoney.com/report/info/{candidate['info_code']}.html",
+                          "preview_file": str(Path("首页预览") / preview_path.name),
+                          "download_attempts": attempts,
+                      })
+                      used_orgs.add(candidate["org"])
+                  except Exception as exc:
+                      rejected.append({"info_code": candidate["info_code"], "title": candidate["title"], "org": candidate["org"], "reason": repr(exc)})
+                      temp.unlink(missing_ok=True)
+              if len(selected) >= 3:
+                  break
+
+          if len(selected) < 2:
+              Path("discovery_result.json").write_text(json.dumps({"query_log": query_log, "ranked": [{k: v for k, v in x.items() if k != "date_obj"} for x in ranked], "rejected": rejected}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+              raise RuntimeError(f"Only {len(selected)} suitable original PDFs found; rejected={rejected[:30]}")
+
+          count = len(selected)
+          package_basename = f"xiamen_cinda_000701_broker_deep_reports_{count}"
+          readme = [
+              f"厦门信达（{CODE}.SZ）券商深度研究报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              f"本包收录{count}份公开可直接下载的券商原始PDF，优先选择公司深度、首次覆盖或篇幅较完整的公司研究报告。",
+              "报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。",
+              "",
+          ]
+          for i, item in enumerate(selected, 1):
+              readme += [
+                  f"{i}. {item['filename']}",
+                  f"   券商：{item['org'] or '未标注'}；研究员：{item['researcher'] or '未标注'}；发布日期：{item['publish_date'] or '未标注'}",
+                  f"   标题：{item['title']}",
+                  f"   评级：{item['rating'] or '未标注'}；实际页数：{item['actual_pages']}页；文件大小：{item['bytes']}字节",
+                  f"   来源页面：{item['detail_url']}",
+                  f"   原始PDF：{item['pdf_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ]
+          readme += [
+              "核验项目：PDF文件头、厦门信达/证券代码匹配、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "未绕过任何登录、会员或付费限制；未使用网页摘要替代券商原始PDF。",
+          ]
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          manifest_payload = {
+              "company": SHORT,
+              "full_company_name": FULL,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "report_count": count,
+              "files": selected,
+              "rejected_candidates": rejected,
+              "query_log": query_log,
+              "all_candidates": [{k: v for k, v in x.items() if k != "date_obj"} for x in ranked],
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as f:
+              w = csv.writer(f)
+              w.writerow(["文件名","券商","研究员","发布日期","标题","评级","页数","字节数","SHA-256","来源页面","PDF地址"])
+              for x in selected:
+                  w.writerow([x["filename"],x["org"],x["researcher"],x["publish_date"],x["title"],x["rating"],x["actual_pages"],x["bytes"],x["sha256"],x["detail_url"],x["pdf_url"]])
+          (ROOT / "SHA256SUMS.txt").write_text("\n".join(f"{x['sha256']}  PDF原件/{x['filename']}" for x in selected) + "\n", encoding="utf-8")
+
+          zip_path = Path(package_basename + ".zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, arcname=str(Path(ROOT_NAME) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, "r") as z:
+              bad = z.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed: {bad}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "report_count": count,
+              "files": [{k: x[k] for k in ["filename","org","researcher","publish_date","title","rating","actual_pages","bytes","sha256","detail_url","pdf_url"]} for x in selected],
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiamen-cinda-000701-broker-reports-20261029
+          path: |
+            xiamen_cinda_000701_broker_deep_reports_*.zip
+            result.json
+            discovery_result.json
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
