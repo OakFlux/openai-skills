@@ -1,0 +1,259 @@
+name: Build final Shaanxi Jinye broker report package
+
+on:
+  push:
+    branches:
+      - tmp-shaanxi-jinye-broker-reports-20261029
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF and image tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+          python3 -m pip install --quiet --disable-pip-version-check requests beautifulsoup4 pillow img2pdf pypdf
+
+      - name: Download, reconstruct, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import concurrent.futures, hashlib, html, io, json, re, shutil, subprocess, sys, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import img2pdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          package=Path('陕西金叶_000812_券商研究报告_3份')
+          if package.exists(): shutil.rmtree(package)
+          package.mkdir(parents=True)
+          work=Path('/tmp/shaanxi_jinye_work')
+          if work.exists(): shutil.rmtree(work)
+          work.mkdir(parents=True)
+
+          s=requests.Session(); s.trust_env=False
+          retry=Retry(total=6,connect=6,read=6,status=6,backoff_factor=.8,status_forcelist=[429,500,502,503,504],allowed_methods=['GET'],raise_on_status=False)
+          s.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=24,pool_maxsize=24))
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def sha256(path:Path)->str:
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
+              return h.hexdigest()
+
+          def pdf_pages(path:Path)->int:
+              return len(PdfReader(str(path),strict=False).pages)
+
+          records=[]
+
+          # 1) Direct original PDF from a public research-report page.
+          original={
+              'broker':'中银国际',
+              'title':'春风吹渭水，金叶满长安',
+              'report_date':'2011-05-03',
+              'type':'公司深度研究报告',
+              'detail_url':'https://www.p5w.net/stock/lzft/gsyj/201105/t3592653.htm',
+              'source_url':'https://www.p5w.net/stock/lzft/gsyj/201105/P020110504525137822745.pdf',
+              'filename':'01_中银国际_春风吹渭水金叶满长安_2011-05-03_原始PDF.pdf',
+              'source_format':'券商原始PDF（公开页面直接下载）',
+          }
+          r=s.get(original['source_url'],headers={'Referer':original['detail_url'],'Accept':'application/pdf,*/*;q=0.8'},timeout=(30,300),allow_redirects=True)
+          data=r.content
+          if r.status_code!=200 or not data.startswith(b'%PDF-') or len(data)<100000:
+              raise RuntimeError(f"original PDF failed HTTP={r.status_code} bytes={len(data)} type={r.headers.get('content-type')}")
+          opath=package/original['filename']; opath.write_bytes(data)
+          pages=pdf_pages(opath)
+          if pages<8: raise RuntimeError(f'original pages={pages}')
+          text=''.join((p.extract_text() or '') for p in PdfReader(str(opath),strict=False).pages)
+          compact=re.sub(r'\s+','',text)
+          if '陕西金叶' not in compact and '000812' not in compact: raise RuntimeError('original company mismatch')
+          records.append({**original,'pages':pages,'bytes':opath.stat().st_size,'sha256':sha256(opath),'resolved_source_url':r.url})
+          print('ORIGINAL_OK',opath.name,pages,opath.stat().st_size,r.url)
+
+          reconstructed_specs=[
+              {
+                  'id':'70124','broker':'安信证券','title':'烟标整合有望加速，大健康布局值得期待','report_date':'2016-04-25',
+                  'type':'公司研究报告','detail_url':'https://www.fxbaogao.com/detail/70124',
+                  'filename':'02_安信证券_烟标整合有望加速大健康布局值得期待_2016-04-25_公开阅读页还原.pdf',
+              },
+              {
+                  'id':'80303','broker':'安信证券','title':'主业仍处困难期，积极推进烟标整合及大健康转型','report_date':'2016-08-26',
+                  'type':'公司研究报告','detail_url':'https://www.fxbaogao.com/detail/80303',
+                  'filename':'03_安信证券_主业仍处困难期积极推进烟标整合及大健康转型_2016-08-26_公开阅读页还原.pdf',
+              },
+          ]
+
+          def extract_first_image(detail_url:str,doc_id:str)->str:
+              x=s.get(detail_url,timeout=(25,180),allow_redirects=True)
+              x.raise_for_status()
+              decoded=html.unescape(x.text).replace('\\/','/')
+              pats=[
+                  rf'https?://[^\s"\'<>]+/report-image/[^\s"\'<>]*{re.escape(doc_id)}-1\.(?:png|jpg|jpeg|webp)(?:\?[^\s"\'<>]*)?',
+                  rf'https?://[^\s"\'<>]+/report-image/[^\s"\'<>]+?-1\.(?:png|jpg|jpeg|webp)(?:\?[^\s"\'<>]*)?',
+              ]
+              for pat in pats:
+                  hits=re.findall(pat,decoded,flags=re.I)
+                  if hits: return hits[0].split('?')[0]
+              raise RuntimeError(f'cannot find first image for {doc_id}')
+
+          def reconstruct(spec:dict)->dict:
+              first=extract_first_image(spec['detail_url'],spec['id'])
+              m=re.match(r'(.+)-1\.(png|jpg|jpeg|webp)$',first,flags=re.I)
+              if not m: raise RuntimeError(f'bad first image URL {first}')
+              base,ext=m.group(1),m.group(2)
+              report_dir=work/spec['id']; report_dir.mkdir(parents=True,exist_ok=True)
+
+              def fetch_page(n:int):
+                  url=f'{base}-{n}.{ext}'
+                  try:
+                      x=s.get(url,headers={'Referer':spec['detail_url'],'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'},timeout=(15,90),allow_redirects=True)
+                      content=x.content
+                      ctype=x.headers.get('content-type','')
+                      if x.status_code==200 and len(content)>5000 and (ctype.startswith('image/') or content[:4] in (b'\x89PNG',b'\xff\xd8\xff\xe0',b'RIFF')):
+                          try:
+                              im=Image.open(io.BytesIO(content)); im.load()
+                              return n,url,content,im.size,im.format
+                          except Exception:
+                              return None
+                  except Exception:
+                      return None
+                  return None
+
+              found={}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+                  futs={ex.submit(fetch_page,n):n for n in range(1,81)}
+                  for fut in concurrent.futures.as_completed(futs):
+                      item=fut.result()
+                      if item: found[item[0]]=item
+              contiguous=[]
+              for n in range(1,81):
+                  if n in found: contiguous.append(found[n])
+                  else: break
+              if len(contiguous)<4:
+                  raise RuntimeError(f"{spec['id']} only {len(contiguous)} contiguous pages; found={sorted(found)} first={first}")
+              # Reject non-contiguous extra pages, which would indicate a transient gap.
+              extras=[n for n in found if n>len(contiguous)]
+              if extras: raise RuntimeError(f"{spec['id']} gap before pages {sorted(extras)[:10]}")
+
+              jpgs=[]; sources=[]
+              for n,url,content,size,fmt in contiguous:
+                  im=Image.open(io.BytesIO(content)); im.load()
+                  if im.mode not in ('RGB','L'): im=im.convert('RGB')
+                  elif im.mode=='L': im=im.convert('RGB')
+                  jp=report_dir/f'{n:03d}.jpg'
+                  im.save(jp,'JPEG',quality=94,optimize=True,progressive=False)
+                  jpgs.append(jp); sources.append(url)
+              pdf=package/spec['filename']
+              pdf.write_bytes(img2pdf.convert([str(p) for p in jpgs],rotation=img2pdf.Rotation.ifvalid))
+              pages=pdf_pages(pdf)
+              if pages!=len(jpgs): raise RuntimeError(f'{spec["id"]} PDF pages {pages}!={len(jpgs)}')
+              return {
+                  **spec,
+                  'source_format':'由公开完整阅读页逐页无删减还原为PDF（非券商原始PDF字节）',
+                  'first_page_source':sources[0],
+                  'last_page_source':sources[-1],
+                  'page_image_base':base,
+                  'pages':pages,'bytes':pdf.stat().st_size,'sha256':sha256(pdf),
+                  'first_image_dimensions':list(contiguous[0][3]),
+                  'last_image_dimensions':list(contiguous[-1][3]),
+              }
+
+          for spec in reconstructed_specs:
+              rec=reconstruct(spec); records.append(rec)
+              print('RECONSTRUCTED_OK',rec['id'],rec['pages'],rec['bytes'],rec['first_page_source'],rec['last_page_source'])
+
+          if len(records)!=3: raise RuntimeError(f'record count={len(records)}')
+          if len({r['sha256'] for r in records})!=3: raise RuntimeError('duplicate files')
+
+          lines=[
+              '陕西金叶（000812）券商研究报告资料包',
+              '整理日期：2026-10-29',
+              '',
+              '文件说明：',
+              '1. 本包共3份报告。第1份为公开页面直接下载的券商原始PDF。',
+              '2. 第2、3份来自公开完整报告阅读页，按原页顺序逐页下载并合成为PDF；内容页未删减，但不是券商原始PDF字节，文件名已明确标注“公开阅读页还原”。',
+              '3. 每份PDF均已检查文件结构、页数、首末页可渲染性，并生成SHA-256校验值。',
+              '4. 资料仅供研究参考，不构成投资建议。',
+              '',
+              '文件清单：',
+          ]
+          sums=[]; total_pages=0; total_bytes=0
+          for i,rec in enumerate(records,1):
+              total_pages+=rec['pages']; total_bytes+=rec['bytes']
+              lines += [
+                  f'{i}. {rec["broker"]}｜{rec["title"]}',
+                  f'   报告日期：{rec["report_date"]}',
+                  f'   类型：{rec["type"]}',
+                  f'   页数：{rec["pages"]}页',
+                  f'   来源格式：{rec["source_format"]}',
+                  f'   文件：{rec["filename"]}',
+                  f'   信息页：{rec["detail_url"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  '',
+              ]
+              sums.append(f'{rec["sha256"]}  {rec["filename"]}')
+          lines += [f'合计：3份PDF，{total_pages}页，{total_bytes}字节。']
+          (package/'00_文件清单与来源说明.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          (package/'SHA256SUMS.txt').write_text('\n'.join(sums)+'\n',encoding='utf-8')
+          (package/'metadata.json').write_text(json.dumps(records,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          print('\n'.join(lines))
+          PY
+
+          PACKAGE='陕西金叶_000812_券商研究报告_3份'
+          RENDER='/tmp/shaanxi_jinye_render'
+          rm -rf "$RENDER" && mkdir -p "$RENDER"
+          test "$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)" -eq 3
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            test "$(stat -c%s "$pdf")" -gt 100000
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then cat "$pdf.qpdf" >&2; exit "$rc"; fi
+            rm -f "$pdf.qpdf"
+            pages=$(pdfinfo "$pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 4
+            stem="$RENDER/$(basename "$pdf" .pdf)"
+            pdftoppm -f 1 -l 1 -singlefile -png -r 120 "$pdf" "$stem.first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 120 "$pdf" "$stem.last" >/dev/null 2>&1
+            test -s "$stem.first.png" && test -s "$stem.last.png"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+          ZIP='陕西金叶_000812_券商研究报告_3份_2026-10-29.zip'
+          rm -f "$ZIP"
+          zip -q -r -6 "$ZIP" "$PACKAGE"
+          unzip -t "$ZIP" >/dev/null
+          test "$(unzip -Z1 "$ZIP" | grep -c '\.pdf$')" -eq 3
+          ls -lh "$ZIP" "$PACKAGE"/*
+
+      - name: Upload final ZIP and individual reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shaanxi-Jinye-000812-broker-research-reports-final
+          path: |
+            陕西金叶_000812_券商研究报告_3份_2026-10-29.zip
+            陕西金叶_000812_券商研究报告_3份/*.pdf
+            陕西金叶_000812_券商研究报告_3份/00_文件清单与来源说明.txt
+            陕西金叶_000812_券商研究报告_3份/SHA256SUMS.txt
+            陕西金叶_000812_券商研究报告_3份/metadata.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
