@@ -1,0 +1,248 @@
+name: Package Shenda 600626 broker research reports v3
+
+on:
+  push:
+    branches:
+      - tmp/shenda-600626-broker-reports-20261103-v1
+    paths:
+      - .github/workflows/shenda-600626-broker-reports-20261103-v3.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "600626"
+          COMPANY = "申达股份"
+          FULL = "上海申达股份有限公司"
+          PREPARED = "2026-11-03"
+          ROOT_NAME = "申达股份_600626_券商研究报告"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF原件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          DISCOVERY_DIR = ROOT / "检索记录"
+          for d in [PDF_DIR, PREVIEW_DIR, DISCOVERY_DIR]:
+              d.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def get(url, *, params=None, referer=None, timeout=(20, 180)):
+              headers = {"Referer": referer} if referer else {}
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = s.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
+                      print("GET", r.status_code, len(r.content), r.url)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                  except Exception as exc:
+                      last = exc
+                      print("GET_ERROR", url, attempt, repr(exc))
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f"GET failed {url}: {last}")
+
+          rows = []
+          raw = []
+          for begin, end in [("2017-01-01", "2020-12-31"), ("2021-01-01", "2026-11-03")]:
+              for page in range(1, 11):
+                  params = {
+                      "industryCode": "*",
+                      "pageSize": "100",
+                      "industry": "*",
+                      "rating": "*",
+                      "ratingChange": "*",
+                      "beginTime": begin,
+                      "endTime": end,
+                      "pageNo": str(page),
+                      "fields": "",
+                      "qType": "0",
+                      "orgCode": "",
+                      "code": CODE,
+                      "rcode": "",
+                      "p": str(page),
+                      "pageNum": str(page),
+                      "pageNumber": str(page),
+                      "_": str(int(time.time() * 1000)),
+                  }
+                  try:
+                      r = get("https://reportapi.eastmoney.com/report/list", params=params, referer="https://data.eastmoney.com/")
+                      obj = r.json()
+                      raw.append({"url": r.url, "payload": obj})
+                      batch = obj.get("data") or []
+                      print("REPORT_PAGE", begin, end, page, len(batch), "hits", obj.get("hits"), "size", obj.get("size"))
+                      rows.extend(batch)
+                      total_pages = int(obj.get("TotalPage") or obj.get("totalPage") or 1)
+                      if not batch or page >= total_pages or len(batch) < 100:
+                          break
+                  except Exception as exc:
+                      print("REPORT_API_FAILED", begin, end, page, repr(exc))
+                      break
+
+          (DISCOVERY_DIR / "reportapi_raw.json").write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          normalized = []
+          seen = set()
+          for row in rows:
+              info = str(row.get("infoCode") or row.get("INFO_CODE") or "").strip()
+              if not info or info in seen:
+                  continue
+              seen.add(info)
+              normalized.append({
+                  "info_code": info,
+                  "title": str(row.get("title") or "").strip(),
+                  "broker": str(row.get("orgSName") or row.get("orgName") or "").strip(),
+                  "researcher": str(row.get("researcher") or "").strip(),
+                  "publish_date": str(row.get("publishDate") or "").strip(),
+                  "rating": str(row.get("emRatingName") or "").strip(),
+                  "raw": row,
+              })
+          (DISCOVERY_DIR / "normalized_metadata.json").write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("NORMALIZED_COUNT", len(normalized))
+          for x in normalized:
+              print("META", json.dumps({k:x[k] for k in ["info_code","publish_date","broker","title","rating"]}, ensure_ascii=False))
+
+          def safe(text, limit=180):
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text)
+              return re.sub(r"\s+", " ", text).strip(" ._")[:limit] or "report"
+
+          candidates = []
+          temp_dir = Path("candidate_pdfs")
+          temp_dir.mkdir(exist_ok=True)
+          for meta in normalized:
+              info = meta["info_code"]
+              data = None
+              used = None
+              for url in [f"https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf", f"https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf", f"https://pdf.dfcfw.com/pdf/H1_{info}_1.pdf"]:
+                  try:
+                      r = get(url, referer=f"https://data.eastmoney.com/report/info/{info}.html", timeout=(25,300))
+                      print("PDF_PROBE", r.status_code, len(r.content), r.url)
+                      if r.content.startswith(b"%PDF-") and len(r.content) > 50000:
+                          data, used = r.content, r.url
+                          break
+                  except Exception as exc:
+                      print("PDF_FAILED", info, url, repr(exc))
+              if data is None:
+                  continue
+              path = temp_dir / f"{info}.pdf"
+              path.write_bytes(data)
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  pages = len(reader.pages)
+                  text = ""
+                  for page in reader.pages[:min(20,pages)]:
+                      try:
+                          text += "\n" + (page.extract_text() or "")
+                      except Exception:
+                          pass
+              except Exception as exc:
+                  print("PARSE_FAILED", info, repr(exc))
+                  continue
+              if pages < 4 or not (COMPANY in text or FULL in text or CODE in text):
+                  continue
+              title = meta["title"] or re.sub(r"\s+"," ",text[:160]).strip()
+              score = min(pages,60)*2 + (30 if pages>=20 else 15 if pages>=12 else 0)
+              for term in ["深度","首次覆盖","首次评级","首次","公司研究","投资价值","专题","调研","价值分析"]:
+                  if term in title:
+                      score += 25
+              ym = re.search(r"20\d{2}", meta["publish_date"])
+              if ym:
+                  score += max(0,int(ym.group())-2010)
+              candidates.append({**meta,"title":title,"pages":pages,"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest(),"pdf_url":used,"detail_url":f"https://data.eastmoney.com/report/info/{info}.html","temp_path":str(path),"score":score})
+
+          candidates.sort(key=lambda x:(x["score"],x["pages"],x["publish_date"]), reverse=True)
+          (DISCOVERY_DIR / "validated_candidates.json").write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("VALIDATED_COUNT", len(candidates))
+          for x in candidates:
+              print("VALID",x["score"],x["pages"],x["publish_date"],x["broker"],x["title"],x["info_code"])
+
+          selected=[]
+          seen_titles=set()
+          for x in candidates:
+              key=re.sub(r"\W+","",x["title"])
+              if key in seen_titles:
+                  continue
+              seen_titles.add(key)
+              selected.append(x)
+              if len(selected)==3:
+                  break
+          if len(selected)<2:
+              raise RuntimeError(f"Only {len(selected)} valid original broker PDFs found; normalized={normalized}; candidates={candidates}")
+
+          manifest=[]
+          for i,x in enumerate(selected,1):
+              date=x["publish_date"] or "未知日期"
+              date_slug=re.sub(r"[^0-9]","",date)[:8] or "unknown"
+              broker=x["broker"] or "未知券商"
+              title=x["title"] or x["info_code"]
+              filename=safe(f"{i:02d}_{date_slug}_{broker}_{title}.pdf")
+              dst=PDF_DIR/filename
+              dst.write_bytes(Path(x["temp_path"]).read_bytes())
+              q=subprocess.run(["qpdf","--warning-exit-0","--check",str(dst)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+              if q.returncode!=0:
+                  raise RuntimeError(q.stdout)
+              prefix=PREVIEW_DIR/dst.stem
+              rr=subprocess.run(["pdftoppm","-f","1","-l","1","-png","-r","140","-singlefile",str(dst),str(prefix)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+              preview=Path(str(prefix)+".png")
+              if rr.returncode!=0 or not preview.exists() or preview.stat().st_size<5000:
+                  raise RuntimeError(f"preview failed {filename}: {rr.stdout}")
+              manifest.append({"filename":filename,"date":date,"broker":broker,"researcher":x["researcher"],"rating":x["rating"],"title":title,"report_type":"券商公司研究报告","info_code":x["info_code"],"actual_pages":x["pages"],"bytes":x["bytes"],"sha256":x["sha256"],"detail_url":x["detail_url"],"pdf_url":x["pdf_url"],"preview_file":str(Path("首页预览")/preview.name)})
+
+          readme=[f"申达股份（{CODE}.SH）券商研究报告资料包",f"整理日期：{PREPARED}","",f"本包收录{len(manifest)}份公开可直接下载并完成结构核验的券商原始PDF。","报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。",""]
+          for i,x in enumerate(manifest,1):
+              readme += [f"{i}. {x['filename']}",f"   券商：{x['broker']}；研究员：{x['researcher'] or '公开元数据未标注'}；发布日期：{x['date'] or '未标注'}",f"   标题：{x['title']}",f"   评级：{x['rating'] or '公开元数据未标注'}；实际页数：{x['actual_pages']}页；文件大小：{x['bytes']}字节",f"   来源页面：{x['detail_url']}",f"   原始PDF：{x['pdf_url']}",f"   SHA-256：{x['sha256']}",""]
+          readme += ["核验项目：PDF文件头、发行人名称/证券代码、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。","未使用网页摘要或自行重排文件替代券商原始PDF。"]
+          (ROOT/"README_报告清单与核验说明.txt").write_text("\n".join(readme),encoding="utf-8")
+          (ROOT/"manifest.json").write_text(json.dumps({"company":COMPANY,"full_company_name":FULL,"stock_code":CODE,"prepared_on":PREPARED,"report_count":len(manifest),"all_files_are_original_broker_pdfs":True,"files":manifest},ensure_ascii=False,indent=2),encoding="utf-8")
+          with (ROOT/"manifest.csv").open("w",newline="",encoding="utf-8-sig") as f:
+              w=csv.writer(f); w.writerow(["文件名","券商","研究员","发布日期","标题","评级","页数","字节数","SHA-256","来源页面","PDF地址"])
+              for x in manifest: w.writerow([x["filename"],x["broker"],x["researcher"],x["date"],x["title"],x["rating"],x["actual_pages"],x["bytes"],x["sha256"],x["detail_url"],x["pdf_url"]])
+          (ROOT/"SHA256SUMS.txt").write_text("\n".join(f"{x['sha256']}  PDF原件/{x['filename']}" for x in manifest)+"\n",encoding="utf-8")
+
+          zip_path=Path("shenda_600626_broker_reports.zip")
+          with zipfile.ZipFile(zip_path,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for p in sorted(ROOT.rglob("*")):
+                  if p.is_file(): z.write(p,arcname=str(Path(ROOT_NAME)/p.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path,"r") as z:
+              bad=z.testzip()
+              if bad is not None: raise RuntimeError(f"ZIP CRC failed: {bad}")
+          result={"package":zip_path.name,"zip_bytes":zip_path.stat().st_size,"zip_sha256":hashlib.sha256(zip_path.read_bytes()).hexdigest(),"report_count":len(manifest),"files":manifest}
+          Path("result.json").write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding="utf-8")
+          print("PACKAGE_RESULT",json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenda-600626-broker-reports-20261103-v3
+          path: |
+            shenda_600626_broker_reports.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
