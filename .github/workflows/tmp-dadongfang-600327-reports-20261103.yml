@@ -1,0 +1,314 @@
+name: Build Dadongfang 600327 reports package
+
+on:
+  push:
+    branches:
+      - tmp-dadongfang-600327-reports-20261103
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+          python3 -m pip install --quiet --disable-pip-version-check requests pypdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='大东方_600327_2020-2025年报及最新季报'
+          rm -rf "$PACKAGE"
+          mkdir -p "$PACKAGE" /tmp/dadongfang_render
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import concurrent.futures
+          import hashlib
+          import json
+          import re
+          import time
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('大东方_600327_2020-2025年报及最新季报')
+          API = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+
+          fallback = {
+              2020: ('2021-04-15', '7043854'),
+              2021: ('2022-04-20', '8012347'),
+              2022: ('2023-04-20', '9013670'),
+              2023: ('2024-04-20', '10005488'),
+              2024: ('2025-04-18', '10890937'),
+              2025: ('2026-04-18', '12108080'),
+              'q3': ('2026-10-28', '12665289'),
+          }
+
+          def new_session() -> requests.Session:
+              s = requests.Session()
+              s.trust_env = False
+              s.mount('https://', HTTPAdapter(max_retries=Retry(
+                  total=5, connect=5, read=5, status=5,
+                  backoff_factor=0.8,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=['GET'], raise_on_status=False,
+              )))
+              s.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+              })
+              return s
+
+          session = new_session()
+          rows: list[dict] = []
+          for page in range(1, 11):
+              r = session.get(
+                  API,
+                  params={
+                      'sr': '-1', 'page_size': '100', 'page_index': str(page),
+                      'ann_type': 'A', 'client_source': 'web', 'stock_list': '600327',
+                  },
+                  headers={'Referer': 'https://data.eastmoney.com/'},
+                  timeout=(20, 120),
+              )
+              r.raise_for_status()
+              page_rows = ((r.json().get('data') or {}).get('list') or [])
+              if not page_rows:
+                  break
+              rows.extend(page_rows)
+              print('ANNOUNCEMENT_PAGE', page, 'ROWS', len(page_rows))
+              if len(page_rows) < 100:
+                  break
+
+          def title_of(row: dict) -> str:
+              return re.sub(r'\s+', '', str(row.get('title') or row.get('title_ch') or ''))
+
+          docs: list[dict] = []
+          for order, year in enumerate(range(2020, 2026), start=1):
+              key = f'{year}年年度报告'
+              candidates = [
+                  row for row in rows
+                  if key in title_of(row)
+                  and '摘要' not in title_of(row)
+                  and '英文版' not in title_of(row)
+                  and '一张图' not in title_of(row)
+                  and '提示性公告' not in title_of(row)
+              ]
+              candidates.sort(key=lambda row: str(row.get('display_time') or row.get('notice_date') or ''), reverse=True)
+              selected = candidates[0] if candidates else {}
+              art_code = str(selected.get('art_code') or '')
+              display_time = str(selected.get('display_time') or selected.get('notice_date') or '')
+              date = display_time[:10] or fallback[year][0]
+              docs.append({
+                  'order': order,
+                  'kind': 'annual',
+                  'year': year,
+                  'title': f'{year}年年度报告',
+                  'date': date,
+                  'filename': f'{order:02d}_大东方_{year}年年度报告.pdf',
+                  'min_pages': 80,
+                  'art_code': art_code,
+                  'fallback_date': fallback[year][0],
+                  'fallback_id': fallback[year][1],
+              })
+              print('SELECT_ANNUAL', year, art_code, title_of(selected), date)
+
+          q3_candidates = [
+              row for row in rows
+              if ('2026年第三季度报告' in title_of(row) or '2026年三季度报告' in title_of(row))
+              and '一张图' not in title_of(row)
+              and '提示性公告' not in title_of(row)
+          ]
+          q3_candidates.sort(key=lambda row: str(row.get('display_time') or row.get('notice_date') or ''), reverse=True)
+          q3 = q3_candidates[0] if q3_candidates else {}
+          q3_art = str(q3.get('art_code') or '')
+          q3_date = str(q3.get('display_time') or q3.get('notice_date') or '')[:10] or fallback['q3'][0]
+          docs.append({
+              'order': 7,
+              'kind': 'quarter',
+              'year': 2026,
+              'title': '2026年第三季度报告',
+              'date': q3_date,
+              'filename': '07_大东方_2026年第三季度报告.pdf',
+              'min_pages': 5,
+              'art_code': q3_art,
+              'fallback_date': fallback['q3'][0],
+              'fallback_id': fallback['q3'][1],
+          })
+          print('SELECT_Q3', q3_art, title_of(q3), q3_date)
+
+          def sina_url(date: str, announcement_id: str) -> str:
+              year = date[:4]
+              month = str(int(date[5:7]))
+              return (
+                  'https://file.finance.sina.com.cn/211.154.219.97%3A9494/'
+                  f'MRGG/CNSESH_STOCK/{year}/{year}-{month}/{date}/{announcement_id}.PDF'
+              )
+
+          def sample_text(reader: PdfReader) -> str:
+              pages = len(reader.pages)
+              indexes = list(range(min(20, pages)))
+              if pages > 20:
+                  indexes.append(pages - 1)
+              chunks: list[str] = []
+              for idx in dict.fromkeys(indexes):
+                  try:
+                      chunks.append(reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(chunks))
+
+          def validate_pdf(path: Path, doc: dict) -> int:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < int(doc['min_pages']):
+                  raise RuntimeError(f'page count below minimum: {pages}')
+              compact = sample_text(reader)
+              if '大东方' not in compact and '无锡商业大厦大东方股份有限公司' not in compact:
+                  raise RuntimeError('company name mismatch')
+              if doc['kind'] == 'annual':
+                  year = str(doc['year'])
+                  if f'{year}年年度报告' not in compact and f'{year}年度报告' not in compact:
+                      raise RuntimeError('annual report title mismatch')
+                  if '年度报告摘要' in compact[:1200]:
+                      raise RuntimeError('summary received instead of full annual report')
+              else:
+                  if ('第三季度报告' not in compact and '三季度报告' not in compact) or '2026' not in compact:
+                      raise RuntimeError('quarter report title mismatch')
+              return pages
+
+          def download_one(doc: dict) -> dict:
+              s = new_session()
+              urls: list[str] = []
+              if doc['art_code']:
+                  urls.extend([
+                      f"https://pdf.dfcfw.com/pdf/H2_{doc['art_code']}_1.pdf",
+                      f"https://pdf.dfcfw.com/pdf/H3_{doc['art_code']}_1.pdf",
+                  ])
+              urls.append(sina_url(doc['fallback_date'], doc['fallback_id']))
+              urls = list(dict.fromkeys(urls))
+              destination = OUT / doc['filename']
+              last = None
+              for url in urls:
+                  for attempt in range(3):
+                      try:
+                          r = s.get(
+                              url,
+                              headers={
+                                  'Referer': 'https://data.eastmoney.com/',
+                                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                              },
+                              timeout=(25, 240),
+                              allow_redirects=True,
+                          )
+                          data = r.content
+                          if r.status_code != 200 or not data.startswith(b'%PDF-') or len(data) < 80_000:
+                              raise RuntimeError(f'HTTP={r.status_code}, bytes={len(data)}, type={r.headers.get("content-type")}')
+                          destination.write_bytes(data)
+                          pages = validate_pdf(destination, doc)
+                          sha = hashlib.sha256(data).hexdigest()
+                          print('DOWNLOADED', doc['title'], 'pages=', pages, 'bytes=', len(data), 'source=', r.url, 'sha256=', sha)
+                          return {**doc, 'pages': pages, 'bytes': len(data), 'source': r.url, 'sha256': sha}
+                      except Exception as exc:
+                          last = exc
+                          destination.unlink(missing_ok=True)
+                          print('FAILED', doc['title'], url, repr(exc))
+                          time.sleep(1 + attempt)
+              raise RuntimeError(f"Could not download {doc['title']}: {last!r}")
+
+          records: list[dict] = []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+              futures = [executor.submit(download_one, doc) for doc in docs]
+              for future in concurrent.futures.as_completed(futures):
+                  records.append(future.result())
+          records.sort(key=lambda item: item['order'])
+
+          lines = [
+              '大东方（600327）2020-2025年年度报告及最新季报资料包',
+              '整理日期：2026-11-03',
+              '',
+              '收录范围：',
+              '1. 2020-2025年度报告全文，共6份，不含年度报告摘要。',
+              '2. 最新季报为2026年10月28日披露的2026年第三季度报告。',
+              '3. 文件均为公开披露PDF原件，已核验公司名称、报告期、页数和文档结构。',
+              '',
+              '文件清单：',
+          ]
+          sums: list[str] = []
+          total_pages = 0
+          total_bytes = 0
+          for item in records:
+              total_pages += item['pages']
+              total_bytes += item['bytes']
+              lines += [
+                  f"{item['order']}. {item['filename']}",
+                  f"   文档：{item['title']}",
+                  f"   披露日期：{item['date']}",
+                  f"   页数：{item['pages']}页",
+                  f"   公告编号：{item['art_code'] or item['fallback_id']}",
+                  f"   原始PDF：{item['source']}",
+                  f"   SHA-256：{item['sha256']}",
+                  '',
+              ]
+              sums.append(f"{item['sha256']}  {item['filename']}")
+          lines += [
+              f'合计：7份PDF，{total_pages}页，{total_bytes}字节。',
+              '全部文件已完成PDF结构、实际页数、公司名称、报告标题及首末页渲染检查。',
+          ]
+          (OUT / '00_文件清单与来源说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          (OUT / '_metadata.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('\n'.join(lines))
+          PY
+
+          test "$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)" -eq 7
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            test "$(stat -c%s "$pdf")" -gt 80000
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf.txt" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+              cat "$pdf.qpdf.txt" >&2
+              exit "$rc"
+            fi
+            rm -f "$pdf.qpdf.txt"
+            pages=$(pdfinfo "$pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 5
+            pdftotext "$pdf" "$pdf.txt" 2>/dev/null || true
+            grep -Eq '大东方|无锡商业大厦大东方股份有限公司' "$pdf.txt"
+            rm -f "$pdf.txt"
+            stem="/tmp/dadongfang_render/$(basename "$pdf" .pdf)"
+            pdftoppm -f 1 -l 1 -singlefile -png -r 100 "$pdf" "$stem.first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 100 "$pdf" "$stem.last" >/dev/null 2>&1
+            test -s "$stem.first.png" && test -s "$stem.last.png"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+
+          rm -f "$PACKAGE/_metadata.json"
+          zip -q -r -6 /tmp/dadongfang_test.zip "$PACKAGE"
+          unzip -t /tmp/dadongfang_test.zip >/dev/null
+          test "$(unzip -Z1 /tmp/dadongfang_test.zip | grep -c '\.pdf$')" -eq 7
+          rm -f /tmp/dadongfang_test.zip
+          ls -lh "$PACKAGE"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dadongfang-600327-2020-2025-annual-reports-latest-quarter
+          path: 大东方_600327_2020-2025年报及最新季报/
+          retention-days: 3
+          compression-level: 6
+          if-no-files-found: error
