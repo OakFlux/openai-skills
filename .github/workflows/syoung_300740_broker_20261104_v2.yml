@@ -1,0 +1,116 @@
+name: package-syoung-300740-broker-reports-v2
+
+on:
+  push:
+    branches:
+      - tmp/syoung-300740-broker-20261104-v1
+
+permissions:
+  contents: read
+
+jobs:
+  package-v2:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pillow
+
+      - name: Query download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY="水羊股份"; FULL_NAME="水羊集团股份有限公司"; CODE="300740"; PREPARED="2026-11-04"
+          ROOT_NAME="水羊股份_300740_券商深度研究报告_3份"; ROOT=Path(ROOT_NAME); PDF_DIR=ROOT/"PDF文件"; PREVIEW_DIR=ROOT/"首页预览"
+          PDF_DIR.mkdir(parents=True,exist_ok=True); PREVIEW_DIR.mkdir(parents=True,exist_ok=True)
+
+          desired=[
+            {"sequence":1,"title_key":"从美妆平台到高奢品牌集团，高端化转型开启成长新周期","filename":"01_20260814_东吴证券_从美妆平台到高奢品牌集团_公司深度研究.pdf","report_type":"公司深度研究/首次覆盖"},
+            {"sequence":2,"title_key":"高端转型效果渐显，高奢新星冉冉升起","filename":"02_20250916_浙商证券_高端转型效果渐显高奢新星冉冉升起_公司深度.pdf","report_type":"公司深度报告"},
+            {"sequence":3,"title_key":"双轮驱动的领先美妆集团，品牌升级迎经营拐点","filename":"03_20230707_开源证券_双轮驱动的领先美妆集团_首次覆盖报告.pdf","report_type":"公司首次覆盖报告"},
+          ]
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36","Accept-Language":"zh-CN,zh;q=0.9,en;q=0.8","Referer":f"https://data.eastmoney.com/report/{CODE}.html"})
+          params={"industryCode":"*","pageSize":"100","industry":"*","rating":"*","ratingChange":"*","beginTime":"2023-01-01","endTime":PREPARED,"pageNo":"1","fields":"","qType":"0","orgCode":"","code":CODE,"rcode":"","cb":"callback123"}
+          r=s.get("https://reportapi.eastmoney.com/report/list",params=params,timeout=(30,180)); print("METADATA",r.status_code,len(r.content),r.url); r.raise_for_status()
+          m=re.search(r"^[^(]*\((.*)\)\s*;?\s*$",r.text.strip(),re.S); payload=json.loads(m.group(1) if m else r.text); rows=payload.get("data") or []
+          print("METADATA_ROWS",len(rows))
+          for row in rows: print("REPORT",row.get("publishDate"),row.get("orgSName"),row.get("title"),row.get("infoCode"),row.get("attachPages"))
+
+          selected=[]
+          for spec in desired:
+            candidates=[row for row in rows if spec["title_key"] in str(row.get("title") or "")]
+            if len(candidates)!=1: raise RuntimeError(f"Expected one match for {spec['title_key']}, got {len(candidates)}")
+            selected.append({**spec,**candidates[0]})
+
+          def download(url):
+            last=None
+            for attempt in range(5):
+              try:
+                rr=s.get(url,timeout=(30,360),allow_redirects=True,headers={"Accept":"application/pdf,*/*;q=0.8","Referer":"https://data.eastmoney.com/"})
+                print("DOWNLOAD",rr.status_code,len(rr.content),rr.url,rr.headers.get("content-type")); rr.raise_for_status()
+                if rr.content.startswith(b"%PDF-") and len(rr.content)>100000: return rr.content,rr.url,rr.headers.get("content-type","")
+                last=RuntimeError(f"Not PDF: {rr.content[:40]!r}")
+              except Exception as e:
+                last=e; print("DOWNLOAD_ERROR",attempt,url,repr(e)); time.sleep(attempt+1)
+            raise RuntimeError(f"Download failed {url}: {last}")
+
+          manifest=[]; accepted=[CODE,COMPANY,FULL_NAME,"御家汇"]
+          for item in selected:
+            pdf_url=f"https://pdf.dfcfw.com/pdf/H3_{item['infoCode']}_1.pdf"
+            data,final_url,ctype=download(pdf_url); out=PDF_DIR/item["filename"]; out.write_bytes(data)
+            reader=PdfReader(str(out),strict=False); pages=len(reader.pages); expected=int(item.get("attachPages") or 0)
+            if expected and pages!=expected: raise RuntimeError(f"Page mismatch {out.name}: {pages}!={expected}")
+            if pages<15: raise RuntimeError(f"Too short {out.name}: {pages}")
+            text="\n".join((p.extract_text() or "") for p in reader.pages[:min(10,pages)]); compact=re.sub(r"\s+","",text)
+            if not any(name in compact for name in accepted): raise RuntimeError(f"Issuer validation failed {out.name}")
+            chk=subprocess.run(["qpdf","--warning-exit-0","--check",str(out)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+            if chk.returncode!=0: raise RuntimeError(f"qpdf failed {out.name}: {chk.stdout}")
+            prefix=PREVIEW_DIR/out.stem; rnd=subprocess.run(["pdftoppm","-f","1","-l","1","-png","-r","150","-singlefile",str(out),str(prefix)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True); preview=Path(str(prefix)+".png")
+            if rnd.returncode!=0 or not preview.exists() or preview.stat().st_size<8000: raise RuntimeError(f"Preview failed {out.name}: {rnd.stdout}")
+            authors=item.get("researcher") or ",".join(str(v).split(".",1)[-1] for v in (item.get("author") or [])); rating=item.get("sRatingName") or item.get("emRatingName") or "未标注"; pub=str(item.get("publishDate") or "").split(" ",1)[0]
+            rec={"sequence":item["sequence"],"broker":item.get("orgSName") or item.get("orgName") or "","date":pub,"analyst":authors,"rating":rating,"report_type":item["report_type"],"title":item.get("title") or item["title_key"],"info_code":item["infoCode"],"filename":item["filename"],"pages":pages,"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest(),"source_url":final_url,"content_type":ctype,"preview_file":str(Path("首页预览")/preview.name)}
+            manifest.append(rec); print("VALIDATED",rec["broker"],rec["date"],pages,rec["sha256"],rec["title"])
+
+          lines=[f"{FULL_NAME}（{CODE}.SZ）券商深度研究报告资料包",f"整理日期：{PREPARED}","","本包收录3份可直接公开下载并验证的券商原始PDF，均为公司深度或首次覆盖研究。",""]
+          for x in manifest:
+            lines += [f"{x['sequence']}. {x['filename']}",f"   券商：{x['broker']}；研究员：{x['analyst']}",f"   日期：{x['date']}；评级：{x['rating']}",f"   类型：{x['report_type']}",f"   标题：{x['title']}",f"   页数：{x['pages']}；文件大小：{x['bytes']}字节",f"   公开来源：{x['source_url']}",f"   SHA-256：{x['sha256']}",""]
+          lines += ["核验项目：PDF文件头、公司名称或证券代码、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。","报告版权归原券商及作者所有，仅供研究与存档，不构成投资建议。"]
+          (ROOT/"README_报告清单与核验说明.txt").write_text("\n".join(lines),encoding="utf-8")
+          payload={"company":FULL_NAME,"stock_code":CODE,"prepared_on":PREPARED,"report_count":len(manifest),"original_pdf_count":len(manifest),"files":manifest}
+          (ROOT/"manifest.json").write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
+          with (ROOT/"manifest.csv").open("w",newline="",encoding="utf-8-sig") as f:
+            w=csv.writer(f); w.writerow(["序号","券商","日期","研究员","评级","类型","标题","文件名","页数","字节数","SHA-256","公开来源","首页预览"])
+            for x in manifest: w.writerow([x["sequence"],x["broker"],x["date"],x["analyst"],x["rating"],x["report_type"],x["title"],x["filename"],x["pages"],x["bytes"],x["sha256"],x["source_url"],x["preview_file"]])
+          (ROOT/"SHA256SUMS.txt").write_text("\n".join(f"{x['sha256']}  PDF文件/{x['filename']}" for x in manifest)+"\n",encoding="utf-8")
+          zip_path=Path("syoung_300740_broker_deep_reports_3.zip")
+          with zipfile.ZipFile(zip_path,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(ROOT.rglob("*")):
+              if p.is_file(): z.write(p,arcname=str(Path(ROOT_NAME)/p.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path) as z:
+            bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith(".pdf")]
+            if bad or len(pdfs)!=3: raise RuntimeError(f"ZIP validation failed bad={bad} pdfs={len(pdfs)}")
+          result={"package":zip_path.name,"zip_bytes":zip_path.stat().st_size,"zip_sha256":hashlib.sha256(zip_path.read_bytes()).hexdigest(),"report_count":len(manifest),"original_pdf_count":len(manifest),"files":[{k:x[k] for k in ["broker","date","analyst","rating","report_type","title","pages","bytes","sha256","source_url"]} for x in manifest]}
+          Path("result.json").write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding="utf-8"); print("PACKAGE_RESULT",json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: syoung-300740-broker-deep-reports-3-v2-20261104
+          path: |
+            syoung_300740_broker_deep_reports_3.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
