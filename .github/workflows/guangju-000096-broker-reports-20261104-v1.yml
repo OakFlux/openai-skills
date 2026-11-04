@@ -1,0 +1,351 @@
+name: Package Guangju Energy 000096 broker reports
+
+on:
+  push:
+    branches:
+      - tmp/guangju-000096-broker-reports-20261104-v1
+    paths:
+      - .github/workflows/guangju-000096-broker-reports-20261104-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "000096"
+          COMPANY = "广聚能源"
+          FULL = "深圳市广聚能源股份有限公司"
+          PREPARED = "2026-11-04"
+          ROOT_NAME = "广聚能源_000096_券商深度研究报告_2份"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF原件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          DISCOVERY_DIR = ROOT / "检索记录"
+          for d in (PDF_DIR, PREVIEW_DIR, DISCOVERY_DIR):
+              d.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def get(url: str, *, referer: str | None = None, timeout=(25, 300)):
+              headers = {}
+              if referer:
+                  headers["Referer"] = referer
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      print("GET", r.status_code, len(r.content), r.url)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                  except Exception as exc:
+                      last = exc
+                      print("GET_ERROR", url, attempt, repr(exc))
+                  time.sleep(1 + attempt)
+              raise RuntimeError(f"GET failed {url}: {last}")
+
+          index_rows = []
+          index_sources = []
+          for year in (2017, 2025):
+              urls = [
+                  f"https://raw.githubusercontent.com/metatools2023/reportlists/main/site/data/index-{year}.json",
+                  f"https://reportlists.pages.dev/data/index-{year}.json",
+              ]
+              obj = None
+              used = None
+              for url in urls:
+                  try:
+                      r = get(url, referer="https://reportlists.pages.dev/")
+                      obj = r.json()
+                      used = r.url
+                      break
+                  except Exception as exc:
+                      print("INDEX_FAILED", year, url, repr(exc))
+              if not isinstance(obj, dict):
+                  raise RuntimeError(f"Could not load index for {year}")
+              rows = obj.get("reports") or []
+              print("INDEX", year, "ROWS", len(rows), "SOURCE", used)
+              index_sources.append({"year": year, "source": used, "count": len(rows)})
+              index_rows.extend(rows)
+
+          (DISCOVERY_DIR / "index_sources.json").write_text(
+              json.dumps(index_sources, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+
+          matches = []
+          for row in index_rows:
+              if not isinstance(row, dict):
+                  continue
+              title = str(row.get("t") or "")
+              stock = str(row.get("s") or "")
+              blob = f"{title} {stock} {row.get('i') or ''}"
+              if (
+                  COMPANY in blob
+                  or CODE in blob
+                  or "综合能源供应商" in title
+                  or "受益于成品油定价机制" in title
+              ):
+                  matches.append(row)
+
+          (DISCOVERY_DIR / "matched_index_rows.json").write_text(
+              json.dumps(matches, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print("MATCH_COUNT", len(matches))
+          for row in matches:
+              print("MATCH", json.dumps(row, ensure_ascii=False))
+
+          wanted = [
+              {
+                  "label": "2025华西证券深度报告",
+                  "match_terms": ["综合能源供应商", "外延内生踏上新征途"],
+                  "expected_broker": "华西证券",
+                  "report_type": "公司深度研究/首次覆盖",
+                  "priority": 2,
+              },
+              {
+                  "label": "2017海通证券首次覆盖",
+                  "match_terms": ["受益于成品油定价机制", "成品油盈利大幅提高"],
+                  "expected_broker": "海通证券",
+                  "report_type": "公司调研简报/首次覆盖",
+                  "priority": 1,
+              },
+          ]
+
+          chosen = []
+          for spec in wanted:
+              candidates = []
+              for row in matches:
+                  title = str(row.get("t") or "")
+                  if all(term in title for term in spec["match_terms"]):
+                      candidates.append(row)
+              if not candidates:
+                  raise RuntimeError(f"No index row matched {spec['label']}; matches={matches}")
+              candidates.sort(key=lambda x: (str(x.get("d") or ""), str(x.get("i") or "")), reverse=True)
+              row = candidates[0]
+              chosen.append({**spec, "row": row})
+
+          manifest = []
+          for index, selected in enumerate(chosen, 1):
+              row = selected["row"]
+              info = str(row.get("i") or "").strip()
+              if not re.fullmatch(r"AP\d+", info):
+                  raise RuntimeError(f"Invalid infoCode for {selected['label']}: {info!r}")
+
+              candidate_urls = [
+                  f"https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H1_{info}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H4_{info}_1.pdf",
+              ]
+              content = None
+              used_url = None
+              attempts = []
+              for url in candidate_urls:
+                  try:
+                      r = get(
+                          url,
+                          referer=f"https://data.eastmoney.com/report/info/{info}.html",
+                      )
+                      rec = {
+                          "url": url,
+                          "status": r.status_code,
+                          "bytes": len(r.content),
+                          "content_type": r.headers.get("content-type", ""),
+                          "magic": r.content[:8].hex(),
+                          "final_url": r.url,
+                      }
+                      attempts.append(rec)
+                      print("PDF_PROBE", json.dumps(rec, ensure_ascii=False))
+                      if r.content.startswith(b"%PDF-") and len(r.content) > 50_000:
+                          content = r.content
+                          used_url = r.url
+                          break
+                  except Exception as exc:
+                      attempts.append({"url": url, "error": repr(exc)})
+              if content is None:
+                  raise RuntimeError(f"Could not download PDF for {selected['label']}: {attempts}")
+
+              date = str(row.get("d") or "")[:10]
+              broker = str(row.get("o") or selected["expected_broker"])
+              analyst = str(row.get("a") or "")
+              rating = str(row.get("r") or "")
+              title = str(row.get("t") or "")
+              date_slug = re.sub(r"[^0-9]", "", date)[:8] or "unknown"
+              safe_title = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", title)
+              safe_title = re.sub(r"\s+", " ", safe_title).strip(" ._")[:100]
+              filename = f"{index:02d}_{date_slug}_{broker}_{safe_title}.pdf"
+              path = PDF_DIR / filename
+              path.write_bytes(content)
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              text_parts = []
+              for page in reader.pages[:min(20, pages)]:
+                  try:
+                      text_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              text = "\n".join(text_parts)
+              if pages < 4:
+                  raise RuntimeError(f"Report too short: {filename}, pages={pages}")
+              if not (COMPANY in text or FULL in text or CODE in text):
+                  raise RuntimeError(f"Issuer validation failed: {filename}")
+              if selected["expected_broker"] not in text and selected["expected_broker"] not in broker:
+                  raise RuntimeError(f"Broker validation failed: {filename}")
+              if not any(term in text or term in title for term in selected["match_terms"]):
+                  raise RuntimeError(f"Title validation failed: {filename}")
+
+              check = subprocess.run(
+                  ["qpdf", "--warning-exit-0", "--check", str(path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              if check.returncode != 0:
+                  raise RuntimeError(f"qpdf failed for {filename}: {check.stdout}")
+
+              preview_prefix = PREVIEW_DIR / path.stem
+              render = subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "140", "-singlefile", str(path), str(preview_prefix)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              preview = Path(str(preview_prefix) + ".png")
+              if render.returncode != 0 or not preview.exists() or preview.stat().st_size < 5_000:
+                  raise RuntimeError(f"Preview failed for {filename}: {render.stdout}")
+
+              manifest.append({
+                  "filename": filename,
+                  "date": date,
+                  "broker": broker,
+                  "analyst": analyst,
+                  "rating": rating,
+                  "title": title,
+                  "report_type": selected["report_type"],
+                  "info_code": info,
+                  "actual_pages": pages,
+                  "bytes": len(content),
+                  "sha256": hashlib.sha256(content).hexdigest(),
+                  "detail_url": f"https://data.eastmoney.com/report/info/{info}.html",
+                  "pdf_url": used_url,
+                  "preview_file": str(Path("首页预览") / preview.name),
+                  "download_attempts": attempts,
+              })
+
+          if len(manifest) != 2:
+              raise RuntimeError(f"Expected two reports, got {len(manifest)}")
+
+          readme = [
+              f"广聚能源（{CODE}.SZ）券商深度研究报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              "本包收录2份公开可直接下载并完成结构核验的券商原始PDF。",
+              "其中2025年报告为公司深度研究/首次覆盖，2017年报告为首次覆盖型公司调研简报。",
+              "报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。",
+              "",
+          ]
+          for i, item in enumerate(manifest, 1):
+              readme.extend([
+                  f"{i}. {item['filename']}",
+                  f"   券商：{item['broker']}；类型：{item['report_type']}；研究员：{item['analyst'] or '公开元数据未标注'}；发布日期：{item['date']}",
+                  f"   标题：{item['title']}",
+                  f"   评级：{item['rating'] or '公开元数据未标注'}；实际页数：{item['actual_pages']}页；文件大小：{item['bytes']}字节",
+                  f"   来源页面：{item['detail_url']}",
+                  f"   原始PDF：{item['pdf_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme.extend([
+              "核验项目：PDF文件头、发行人名称/证券代码、券商与标题、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "未使用付费预览、网页摘要或自行重排文件替代券商原始PDF。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          payload = {
+              "company": COMPANY,
+              "full_company_name": FULL,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "report_count": len(manifest),
+              "all_files_are_original_broker_pdfs": True,
+              "files": manifest,
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["文件名", "报告类型", "券商", "研究员", "发布日期", "标题", "评级", "页数", "字节数", "SHA-256", "来源页面", "PDF地址"])
+              for item in manifest:
+                  writer.writerow([
+                      item["filename"], item["report_type"], item["broker"], item["analyst"], item["date"], item["title"], item["rating"], item["actual_pages"], item["bytes"], item["sha256"], item["detail_url"], item["pdf_url"],
+                  ])
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF原件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("guangju_energy_000096_broker_deep_reports_2.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT_NAME) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed: {bad}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "report_count": len(manifest),
+              "files": manifest,
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guangju-energy-000096-broker-deep-reports-2-20261104
+          path: |
+            guangju_energy_000096_broker_deep_reports_2.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
