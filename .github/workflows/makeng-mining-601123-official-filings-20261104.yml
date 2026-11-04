@@ -1,0 +1,495 @@
+name: Package Makeng Mining 601123 official filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/makeng-mining-601123-official-filings-20261104.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install validation dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Discover, download, verify and package official PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CODE = '601123'
+          COMPANY = '马矿股份'
+          FULL_COMPANY = '福建马坑矿业股份有限公司'
+          LISTING_DATE = '2026-09-01'
+          CUTOFF = '2026-11-04'
+          CUTOFF_COMPACT = '20261104'
+          ROOT_NAME = f'{COMPANY}_{CODE}_上市以来全部年报_招股说明书及最新季报_附IPO审计报告_截至{CUTOFF_COMPACT}'
+          ROOT = Path('work') / ROOT_NAME
+          NOTE_DIR = ROOT / '00_年报情况说明'
+          PROSPECTUS_DIR = ROOT / '01_招股说明书'
+          AUDIT_DIR = ROOT / '02_IPO财务报告及审计报告'
+          QUARTER_DIR = ROOT / '03_最新季度报告'
+          PREVIEW_DIR = ROOT / '首页预览'
+          DIST = Path('dist')
+          for directory in (NOTE_DIR, PROSPECTUS_DIR, AUDIT_DIR, QUARTER_DIR, PREVIEW_DIR, DIST):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          def make_session() -> requests.Session:
+              session = requests.Session()
+              retry = Retry(
+                  total=6,
+                  connect=6,
+                  read=6,
+                  status=6,
+                  backoff_factor=1.0,
+                  status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({'GET', 'POST'}),
+                  raise_on_status=False,
+              )
+              session.mount('https://', HTTPAdapter(max_retries=retry))
+              session.mount('http://', HTTPAdapter(max_retries=retry))
+              session.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              })
+              return session
+
+          S = make_session()
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', '', value)
+              value = value.replace('\u3000', ' ').replace(' ', ' ')
+              return re.sub(r'\s+', '', value).strip()
+
+          def normalize_sse_url(value: str) -> str:
+              value = html.unescape((value or '').strip())
+              if not value:
+                  return ''
+              if value.startswith('//'):
+                  return 'https:' + value
+              if value.startswith('http://') or value.startswith('https://'):
+                  return value
+              if value.startswith('/disclosure/'):
+                  return 'https://static.sse.com.cn' + value
+              if value.startswith('disclosure/'):
+                  return 'https://static.sse.com.cn/' + value
+              return urljoin('https://www.sse.com.cn/', value)
+
+          def discover_sse_announcements() -> list[dict[str, Any]]:
+              endpoint = 'https://query.sse.com.cn/security/stock/queryCompanyBulletin.do'
+              params = {
+                  'isPagination': 'true',
+                  'productId': CODE,
+                  'keyWord': '',
+                  'securityType': '0101,120100,020100,020200,120200',
+                  'reportType2': '',
+                  'reportType': 'ALL',
+                  'beginDate': '2026-08-01',
+                  'endDate': CUTOFF,
+                  'pageHelp.pageSize': '100',
+                  'pageHelp.pageNo': '1',
+                  'pageHelp.beginPage': '1',
+                  'pageHelp.cacheSize': '1',
+                  'pageHelp.endPage': '5',
+                  '_': str(int(time.time() * 1000)),
+              }
+              headers = {
+                  'Referer': f'https://www.sse.com.cn/assortment/stock/list/info/announcement/index.shtml?productId={CODE}',
+                  'Accept': 'application/json, text/javascript, */*; q=0.01',
+                  'X-Requested-With': 'XMLHttpRequest',
+              }
+              response = S.get(endpoint, params=params, headers=headers, timeout=90)
+              print('SSE_QUERY', response.status_code, len(response.content), response.url)
+              response.raise_for_status()
+              text = response.text.strip()
+              if text.startswith('jsonp') or text.startswith('callback'):
+                  text = text[text.find('(') + 1:text.rfind(')')]
+              data = json.loads(text)
+              rows = data.get('result') or data.get('data') or []
+              result: list[dict[str, Any]] = []
+              for row in rows:
+                  if not isinstance(row, dict):
+                      continue
+                  title = clean_title(str(row.get('TITLE') or row.get('title') or row.get('BULLETIN_TITLE') or ''))
+                  url = normalize_sse_url(str(row.get('URL') or row.get('url') or row.get('BULLETIN_URL') or ''))
+                  date = str(row.get('SSEDATE') or row.get('date') or row.get('BULLETIN_DATE') or '')
+                  if title and url:
+                      result.append({'title': title, 'source_url': url, 'date': date, 'raw': row})
+                      print('SSE_ROW', date, title, url)
+              return result
+
+          def resolve_cninfo_org_id() -> str:
+              for keyword in (CODE, FULL_COMPANY, COMPANY):
+                  url = 'https://www.cninfo.com.cn/new/information/topSearch/query'
+                  try:
+                      response = S.get(
+                          url,
+                          params={'keyWord': keyword, 'maxNum': '20'},
+                          headers={
+                              'Referer': 'https://www.cninfo.com.cn/',
+                              'Accept': 'application/json, text/plain, */*',
+                              'X-Requested-With': 'XMLHttpRequest',
+                          },
+                          timeout=60,
+                      )
+                      print('CNINFO_TOPSEARCH', keyword, response.status_code, len(response.content))
+                      response.raise_for_status()
+                      data = response.json()
+                      rows = data if isinstance(data, list) else data.get('data') or data.get('result') or []
+                      for row in rows:
+                          code = str(row.get('code') or row.get('stockCode') or row.get('secCode') or '')
+                          name = str(row.get('zwjc') or row.get('name') or row.get('secName') or '')
+                          org_id = str(row.get('orgId') or row.get('orgid') or '')
+                          if (code == CODE or COMPANY in name or FULL_COMPANY in name) and org_id:
+                              print('CNINFO_ORG', org_id, row)
+                              return org_id
+                  except Exception as exc:
+                      print('CNINFO_TOPSEARCH_ERROR', keyword, repr(exc))
+              return ''
+
+          def discover_cninfo_announcements() -> list[dict[str, Any]]:
+              org_id = resolve_cninfo_org_id()
+              stock_values = [f'{CODE},{org_id}'] if org_id else []
+              stock_values.append(CODE)
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              all_rows: list[dict[str, Any]] = []
+              for stock_value in stock_values:
+                  payload = {
+                      'pageNum': '1',
+                      'pageSize': '100',
+                      'column': 'sse',
+                      'tabName': 'fulltext',
+                      'plate': 'sh',
+                      'stock': stock_value,
+                      'searchkey': '',
+                      'secid': '',
+                      'category': '',
+                      'trade': '',
+                      'seDate': f'2026-08-01~{CUTOFF}',
+                      'sortName': 'time',
+                      'sortType': 'desc',
+                      'isHLtitle': 'true',
+                  }
+                  try:
+                      response = S.post(
+                          endpoint,
+                          data=payload,
+                          headers={
+                              'Origin': 'https://www.cninfo.com.cn',
+                              'Referer': f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={CODE}',
+                              'Accept': 'application/json, text/plain, */*',
+                              'X-Requested-With': 'XMLHttpRequest',
+                          },
+                          timeout=90,
+                      )
+                      print('CNINFO_QUERY', stock_value, response.status_code, len(response.content))
+                      response.raise_for_status()
+                      data = response.json()
+                      rows = data.get('announcements') or []
+                      if rows:
+                          all_rows = rows
+                          break
+                  except Exception as exc:
+                      print('CNINFO_QUERY_ERROR', stock_value, repr(exc))
+              result: list[dict[str, Any]] = []
+              for row in all_rows:
+                  title = clean_title(str(row.get('announcementTitle') or ''))
+                  path = str(row.get('adjunctUrl') or '').lstrip('/')
+                  if title and path:
+                      url = 'https://static.cninfo.com.cn/' + path
+                      timestamp = int(row.get('announcementTime') or 0)
+                      date = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).strftime('%Y-%m-%d') if timestamp else ''
+                      result.append({'title': title, 'source_url': url, 'date': date, 'raw': row})
+                      print('CNINFO_ROW', date, title, url)
+              return result
+
+          sse_rows: list[dict[str, Any]] = []
+          cninfo_rows: list[dict[str, Any]] = []
+          try:
+              sse_rows = discover_sse_announcements()
+          except Exception as exc:
+              print('SSE_DISCOVERY_ERROR', repr(exc))
+          try:
+              cninfo_rows = discover_cninfo_announcements()
+          except Exception as exc:
+              print('CNINFO_DISCOVERY_ERROR', repr(exc))
+          announcements = sse_rows + cninfo_rows
+
+          def select_announcement(kind: str) -> dict[str, Any] | None:
+              candidates: list[dict[str, Any]] = []
+              for item in announcements:
+                  title = item['title']
+                  if kind == 'prospectus':
+                      if '首次公开发行股票并在主板上市招股说明书' not in title:
+                          continue
+                      if any(word in title for word in ('提示性公告', '意向书', '申报稿', '注册稿', '上会稿', '摘要')):
+                          continue
+                  elif kind == 'quarter':
+                      if not any(phrase in title for phrase in ('2026年第三季度报告', '2026年三季度报告')):
+                          continue
+                      if any(word in title for word in ('董事会', '提示性公告', '决议公告', '摘要', '关于')):
+                          continue
+                  candidates.append(item)
+              if not candidates:
+                  return None
+              return max(candidates, key=lambda item: (item.get('date') or '', len(item.get('source_url') or '')))
+
+          prospectus_item = select_announcement('prospectus')
+          quarter_item = select_announcement('quarter')
+
+          if prospectus_item is None:
+              prospectus_item = {
+                  'title': '首次公开发行股票并在主板上市招股说明书',
+                  'date': '2026-08-27',
+                  'source_url': 'http://pdffile.qianlong.com.cn:21380/NoticeFile/SH/Stock/2026-08-27/601123_20260827_KVSF.pdf',
+                  'source_note': '公开信息披露镜像；内容为正式发行版招股说明书',
+              }
+          if quarter_item is None:
+              raise RuntimeError('未能从上交所或巨潮资讯发现2026年第三季度报告原始PDF。')
+
+          audit_item = {
+              'title': '发行人最近三年的财务报告和审计报告（2023—2025年度）',
+              'date': '2026-05-29',
+              'source_url': 'https://static.sse.com.cn/stock/disclosure/announcement/c/202605/002132_20260529_OB7W.pdf',
+              'source_note': '上交所IPO注册稿配套审计报告',
+          }
+
+          print('SELECTED_PROSPECTUS', json.dumps(prospectus_item, ensure_ascii=False))
+          print('SELECTED_AUDIT', json.dumps(audit_item, ensure_ascii=False))
+          print('SELECTED_QUARTER', json.dumps(quarter_item, ensure_ascii=False))
+
+          items = [
+              {
+                  **prospectus_item,
+                  'document_type': 'prospectus',
+                  'destination': PROSPECTUS_DIR / '2026_马矿股份_首次公开发行股票并在主板上市招股说明书.pdf',
+                  'min_pages': 250,
+                  'required_terms': ('招股说明书',),
+              },
+              {
+                  **audit_item,
+                  'document_type': 'ipo_audit_report',
+                  'destination': AUDIT_DIR / '2023-2025_马矿股份_财务报告及审计报告.pdf',
+                  'min_pages': 100,
+                  'required_terms': ('审计报告', '财务报表'),
+              },
+              {
+                  **quarter_item,
+                  'document_type': 'quarterly_report',
+                  'destination': QUARTER_DIR / '2026Q3_马矿股份_2026年第三季度报告.pdf',
+                  'min_pages': 5,
+                  'required_terms': ('第三季度报告',),
+              },
+          ]
+
+          def safe_name(name: str) -> str:
+              return re.sub(r'_+', '_', re.sub(r'[\\/:*?"<>|]', '_', name)).strip('_. ')
+
+          def download_pdf(item: dict[str, Any]) -> requests.Response:
+              url = item['source_url']
+              headers = {
+                  'Referer': 'https://www.sse.com.cn/',
+                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              }
+              response = S.get(url, headers=headers, timeout=300, allow_redirects=True)
+              print('DOWNLOAD', item['document_type'], response.status_code, len(response.content), url, '->', response.url)
+              response.raise_for_status()
+              if len(response.content) < 50_000 or not response.content.startswith(b'%PDF'):
+                  raise RuntimeError(f'下载内容不是完整PDF: {url}; size={len(response.content)}; head={response.content[:20]!r}')
+              return response
+
+          records: list[dict[str, Any]] = []
+          for item in items:
+              destination = Path(item['destination'])
+              destination = destination.with_name(safe_name(destination.name))
+              response = download_pdf(item)
+              destination.write_bytes(response.content)
+
+              reader = PdfReader(str(destination), strict=False)
+              if reader.is_encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception as exc:
+                      raise RuntimeError(f'PDF加密且无法打开: {destination}: {exc}')
+              page_count = len(reader.pages)
+              if page_count < int(item['min_pages']):
+                  raise RuntimeError(f'PDF页数异常: {destination}: {page_count} < {item["min_pages"]}')
+
+              doc = fitz.open(destination)
+              if doc.page_count != page_count:
+                  raise RuntimeError(f'双解析器页数不一致: {destination}: pypdf={page_count}, fitz={doc.page_count}')
+              first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+              last = doc.load_page(doc.page_count - 1).get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 100:
+                  raise RuntimeError(f'PDF首末页渲染异常: {destination}')
+              first.save(PREVIEW_DIR / f'{destination.stem}.png')
+
+              probe = ''
+              probe_pages = list(range(min(15, doc.page_count)))
+              if doc.page_count > 15:
+                  probe_pages.extend(range(max(15, doc.page_count - 5), doc.page_count))
+              for page_index in sorted(set(probe_pages)):
+                  try:
+                      probe += doc.load_page(page_index).get_text('text')
+                  except Exception:
+                      pass
+              doc.close()
+              compact = re.sub(r'\s+', '', probe)
+              if CODE not in compact and COMPANY not in compact and FULL_COMPANY not in compact:
+                  raise RuntimeError(f'PDF中未识别到公司名称或代码: {destination}')
+              for term in item['required_terms']:
+                  if re.sub(r'\s+', '', term) not in compact:
+                      raise RuntimeError(f'PDF中未识别到文档类型关键词“{term}”: {destination}')
+
+              record = {
+                  'document_type': item['document_type'],
+                  'title': item['title'],
+                  'date': item.get('date', ''),
+                  'source_url': item['source_url'],
+                  'resolved_url': response.url,
+                  'source_note': item.get('source_note', ''),
+                  'relative_path': str(destination.relative_to(ROOT)).replace(os.sep, '/'),
+                  'file_name': destination.name,
+                  'file_size_bytes': destination.stat().st_size,
+                  'page_count': page_count,
+                  'sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
+                  'pdf_header_valid': True,
+                  'first_page_rendered': True,
+                  'last_page_rendered': True,
+                  'company_identity_validated': True,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False))
+
+          annual_note = f'''# 马矿股份（601123）年度报告情况说明
+
+- 公司于 **{LISTING_DATE}** 在上海证券交易所主板上市。
+- 截至 **{CUTOFF}**，公司上市后尚未到首个年度报告披露期，因此不存在已公开披露的上市公司年度报告全文。
+- 为便于查阅历史年度财务信息，本压缩包补充收录了上交所IPO注册稿配套的《发行人最近三年的财务报告和审计报告》，覆盖 **2023—2025年度**，但该文件不等同于上市公司定期年度报告。
+- 本包另收录正式发行版招股说明书和截至截止日最新的2026年第三季度报告。
+'''
+          (NOTE_DIR / '年报情况说明.md').write_text(annual_note, encoding='utf-8')
+
+          manifest = {
+              'company': COMPANY,
+              'full_company_name': FULL_COMPANY,
+              'stock_code': CODE,
+              'market': '上海证券交易所主板',
+              'listing_date': LISTING_DATE,
+              'cutoff_date': CUTOFF,
+              'listed_company_annual_report_count': 0,
+              'annual_report_status': '截至截止日尚无上市公司年度报告；附IPO审计报告覆盖2023—2025年度。',
+              'document_count': len(records),
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f"{record['sha256']}  {record['relative_path']}" for record in records) + '\n',
+              encoding='utf-8',
+          )
+
+          readme = [
+              f'# {COMPANY}（{CODE}）官方披露文件包',
+              '',
+              f'- 截止日期：{CUTOFF}',
+              f'- 上市日期：{LISTING_DATE}',
+              '- 上市以来年度报告：0份（尚未进入首个年报披露期）。',
+              '- 正式发行版招股说明书：1份。',
+              '- IPO财务报告及审计报告：1份，覆盖2023—2025年度，作为历史年度财务资料补充。',
+              '- 最新季度报告：2026年第三季度报告。',
+              '- 已完成PDF文件头、双解析器页数、公司与文档类型身份、首末页渲染、SHA-256及ZIP CRC校验。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. `{record['relative_path']}`",
+                  f"   - 标题：{record['title']}",
+                  f"   - 日期：{record['date']}",
+                  f"   - 页数：{record['page_count']}；大小：{record['file_size_bytes']:,}字节",
+                  f"   - 来源：{record['source_url']}",
+                  f"   - SHA-256：`{record['sha256']}`",
+              ])
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          chinese_zip = DIST / f'{ROOT_NAME}.zip'
+          english_zip = DIST / f'makeng_mining_601123_prospectus_audited_financials_latest_quarter_{CUTOFF_COMPACT}.zip'
+          for path in (chinese_zip, english_zip):
+              if path.exists():
+                  path.unlink()
+
+          with zipfile.ZipFile(chinese_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(chinese_zip, english_zip)
+
+          for path in (chinese_zip, english_zip):
+              with zipfile.ZipFile(path, 'r') as archive:
+                  bad = archive.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC校验失败: {path}: {bad}')
+                  pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if len(pdfs) != 3:
+                      raise RuntimeError(f'ZIP内PDF数量异常: {path}: {len(pdfs)}')
+              print('ZIP_VERIFIED', path, path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+
+          print('FINAL_JSON', json.dumps({
+              'listed_company_annual_report_count': 0,
+              'supplementary_audited_years': [2023, 2024, 2025],
+              'latest_quarter': '2026Q3',
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'chinese_zip': str(chinese_zip),
+              'english_zip': str(english_zip),
+              'chinese_zip_size': chinese_zip.stat().st_size,
+              'chinese_zip_sha256': hashlib.sha256(chinese_zip.read_bytes()).hexdigest(),
+              'records': records,
+          }, ensure_ascii=False))
+          PY
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: makeng-mining-601123-official-filings-20261104
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
