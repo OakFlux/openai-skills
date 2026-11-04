@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check requests pypdf pymupdf
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
       - name: Download, validate, and package official filings
         shell: bash
         run: |
@@ -31,12 +31,11 @@ jobs:
           import json
           import os
           import re
-          import time
           import zipfile
           from datetime import datetime, timezone
           from pathlib import Path
 
-          import pymupdf
+          import fitz
           import requests
           from pypdf import PdfReader
           from requests.adapters import HTTPAdapter
@@ -47,7 +46,13 @@ jobs:
           STOCK_CODE = '688190'
           ORG_ID = '9900041682'
           CUTOFF_DATE = '2026-11-04'
-          EXPECTED_ANNUAL_YEARS = [2021, 2022, 2023, 2024, 2025]
+          ANNUAL_DATES = {
+              2021: '2022-04-15',
+              2022: '2023-03-31',
+              2023: '2024-03-30',
+              2024: '2025-03-29',
+              2025: '2026-03-31',
+          }
           ROOT_NAME = f'{COMPANY}_{STOCK_CODE}_年报_招股说明书_最新季报_截至20261104'
           ROOT = Path('work') / ROOT_NAME
           REPORT_DIR = ROOT / 'PDF文件'
@@ -84,101 +89,69 @@ jobs:
                       h.update(chunk)
               return h.hexdigest()
 
-          def query_all_announcements() -> list[dict]:
+          def query_cninfo(searchkey: str, date: str) -> list[dict]:
               endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
-              all_rows: list[dict] = []
-              page = 1
-              total = None
-              while True:
-                  payload = {
-                      'pageNum': str(page),
-                      'pageSize': '100',
-                      'column': 'sse',
-                      'tabName': 'fulltext',
-                      'plate': 'sh',
-                      'stock': f'{STOCK_CODE},{ORG_ID}',
-                      'searchkey': '',
-                      'secid': '',
-                      'category': '',
-                      'trade': '',
-                      'seDate': '2021-01-01~2026-11-04',
-                      'sortName': 'time',
-                      'sortType': 'desc',
-                      'isHLtitle': 'true',
-                  }
-                  response = session.post(endpoint, data=payload, timeout=90)
-                  print('QUERY', page, response.status_code, len(response.content), flush=True)
-                  response.raise_for_status()
-                  data = response.json()
-                  rows = data.get('announcements') or []
-                  if total is None:
-                      total = int(data.get('totalAnnouncement') or data.get('totalRecordNum') or 0)
-                      print('TOTAL_ANNOUNCEMENTS', total, flush=True)
-                  all_rows.extend(rows)
-                  if not rows or len(all_rows) >= total:
-                      break
-                  page += 1
-                  if page > 30:
-                      raise RuntimeError('公告分页异常：超过30页')
-                  time.sleep(0.15)
-              return all_rows
-
-          announcements = query_all_announcements()
-          for row in announcements:
-              row['_title'] = clean_title(str(row.get('announcementTitle') or ''))
-              row['_time'] = int(row.get('announcementTime') or 0)
-
-          # Select one effective full annual report for each fiscal year. If a revision exists,
-          # the latest announcement for that year is selected.
-          annual_by_year: dict[int, dict] = {}
-          for row in announcements:
-              title = row['_title']
-              if '年度报告' not in title:
-                  continue
-              if any(x in title for x in ('摘要', '英文版', '审计报告', '问询', '回复')):
-                  continue
-              match = re.search(r'(20\d{2})年年度报告', title)
-              if not match:
-                  continue
-              year = int(match.group(1))
-              if year not in EXPECTED_ANNUAL_YEARS:
-                  continue
-              current = annual_by_year.get(year)
-              if current is None or row['_time'] > current['_time']:
-                  annual_by_year[year] = row
-
-          missing = [y for y in EXPECTED_ANNUAL_YEARS if y not in annual_by_year]
-          if missing:
-              print('AVAILABLE_ANNUALS', [(r['_title'], r.get('adjunctUrl')) for r in announcements if '年度报告' in r['_title']], flush=True)
-              raise RuntimeError(f'缺少年报年份: {missing}')
-
-          prospectus_candidates = []
-          for row in announcements:
-              title = row['_title']
-              if '招股说明书' in title and '招股意向书' not in title and '附录' not in title and '摘要' not in title:
-                  prospectus_candidates.append(row)
-          if not prospectus_candidates:
-              raise RuntimeError('未找到最终版招股说明书')
-          prospectus_candidates.sort(key=lambda x: (x['_time'], len(x['_title'])), reverse=True)
-          prospectus = prospectus_candidates[0]
-
-          quarterly_candidates = []
-          for row in announcements:
-              title = row['_title']
-              if '季度报告' in title and '摘要' not in title:
-                  quarterly_candidates.append(row)
-          if not quarterly_candidates:
-              raise RuntimeError('未找到季度报告')
-          quarterly_candidates.sort(key=lambda x: x['_time'], reverse=True)
-          latest_quarterly = quarterly_candidates[0]
-          if '2026年第三季度报告' not in latest_quarterly['_title']:
-              raise RuntimeError(f'最新季报识别异常: {latest_quarterly["_title"]}')
+              payload = {
+                  'pageNum': 1,
+                  'pageSize': 30,
+                  'column': 'sse',
+                  'tabName': 'fulltext',
+                  'plate': '',
+                  'stock': f'{STOCK_CODE},{ORG_ID}',
+                  'searchkey': searchkey,
+                  'secid': '',
+                  'category': '',
+                  'trade': '',
+                  'seDate': f'{date}~{date}',
+                  'sortName': '',
+                  'sortType': '',
+                  'isHLtitle': 'true',
+              }
+              response = session.post(endpoint, data=payload, timeout=90)
+              print('QUERY', searchkey, date, response.status_code, len(response.content), flush=True)
+              response.raise_for_status()
+              data = response.json()
+              rows = data.get('announcements') or []
+              for row in rows:
+                  row['_title'] = clean_title(str(row.get('announcementTitle') or ''))
+                  row['_time'] = int(row.get('announcementTime') or 0)
+              print('QUERY_ROWS', json.dumps([
+                  {'title': r['_title'], 'url': r.get('adjunctUrl'), 'time': r.get('_time')}
+                  for r in rows
+              ], ensure_ascii=False), flush=True)
+              return rows
 
           selected: list[tuple[str, dict, str]] = []
-          for index, year in enumerate(EXPECTED_ANNUAL_YEARS, start=1):
-              selected.append((f'{index:02d}_{year}年年度报告.pdf', annual_by_year[year], '年度报告'))
-          selected.append(('06_首次公开发行股票并在科创板上市招股说明书.pdf', prospectus, '招股说明书'))
-          selected.append(('07_2026年第三季度报告.pdf', latest_quarterly, '最新季度报告'))
+
+          for index, (year, date) in enumerate(ANNUAL_DATES.items(), start=1):
+              rows = query_cninfo(f'{year}年年度报告', date)
+              candidates = [
+                  r for r in rows
+                  if f'{year}年年度报告' in r['_title']
+                  and all(x not in r['_title'] for x in ('摘要', '英文版', '审计报告', '问询', '回复'))
+              ]
+              if not candidates:
+                  raise RuntimeError(f'未找到{year}年年度报告')
+              candidates.sort(key=lambda x: x['_time'], reverse=True)
+              selected.append((f'{index:02d}_{year}年年度报告.pdf', candidates[0], '年度报告'))
+
+          rows = query_cninfo('招股说明书', '2021-11-22')
+          candidates = [
+              r for r in rows
+              if '招股说明书' in r['_title']
+              and all(x not in r['_title'] for x in ('招股意向书', '附录', '摘要'))
+          ]
+          if not candidates:
+              raise RuntimeError('未找到最终版招股说明书')
+          candidates.sort(key=lambda x: (x['_time'], len(x['_title'])), reverse=True)
+          selected.append(('06_首次公开发行股票并在科创板上市招股说明书.pdf', candidates[0], '招股说明书'))
+
+          rows = query_cninfo('2026年第三季度报告', '2026-10-31')
+          candidates = [r for r in rows if '2026年第三季度报告' in r['_title'] and '摘要' not in r['_title']]
+          if not candidates:
+              raise RuntimeError('未找到2026年第三季度报告')
+          candidates.sort(key=lambda x: x['_time'], reverse=True)
+          selected.append(('07_2026年第三季度报告.pdf', candidates[0], '最新季度报告'))
 
           print('SELECTED_DOCUMENTS', json.dumps([
               {'file': name, 'title': row['_title'], 'url': row.get('adjunctUrl'), 'type': doc_type}
@@ -191,7 +164,7 @@ jobs:
               if not adjunct:
                   raise RuntimeError(f'公告缺少PDF路径: {row["_title"]}')
               source_url = f'https://static.cninfo.com.cn/{adjunct}'
-              response = session.get(source_url, timeout=240, allow_redirects=True)
+              response = session.get(source_url, timeout=300, allow_redirects=True)
               print('DOWNLOAD', filename, response.status_code, len(response.content), response.url, flush=True)
               response.raise_for_status()
               if not response.content.startswith(b'%PDF') or len(response.content) < 20_000:
@@ -223,12 +196,11 @@ jobs:
               if doc_type == '最新季度报告' and '2026年第三季度报告' not in compact:
                   raise RuntimeError('最新季报文本校验失败')
 
-              # Render the first and last pages to verify that the PDFs are visually readable.
-              doc = pymupdf.open(path)
+              doc = fitz.open(path)
               if doc.page_count != page_count:
                   raise RuntimeError(f'双解析器页数不一致: {filename}')
               for label, page_index in (('first', 0), ('last', doc.page_count - 1)):
-                  pix = doc.load_page(page_index).get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False)
+                  pix = doc.load_page(page_index).get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
                   if pix.width < 500 or pix.height < 500:
                       raise RuntimeError(f'页面渲染异常: {filename} {label}')
                   pix.save(VERIFY_DIR / f'{Path(filename).stem}_{label}.png')
@@ -294,8 +266,7 @@ jobs:
           with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
               for path in sorted(ROOT.rglob('*')):
                   if path.is_file():
-                      arcname = str(path.relative_to(ROOT.parent)).replace(os.sep, '/')
-                      archive.write(path, arcname)
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep, '/'))
 
           with zipfile.ZipFile(final_zip) as archive:
               bad = archive.testzip()
