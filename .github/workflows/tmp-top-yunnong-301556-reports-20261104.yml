@@ -1,0 +1,385 @@
+name: Build Top Yunnong 301556 disclosure package
+
+on:
+  push:
+    branches:
+      - tmp-top-yunnong-301556-reports-20261104
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+          python3 -m pip install --quiet --disable-pip-version-check requests pypdf beautifulsoup4
+
+      - name: Download validate and package disclosures
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE='托普云农_301556_全部年报_招股说明书_最新季报'
+          rm -rf "$PACKAGE" /tmp/top_yunnong_render
+          mkdir -p "$PACKAGE" /tmp/top_yunnong_render
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT = Path('托普云农_301556_全部年报_招股说明书_最新季报')
+          TODAY = '2026-11-04'
+          CODE = '301556'
+          COMPANY = '浙江托普云农科技股份有限公司'
+
+          def make_session() -> requests.Session:
+              s = requests.Session()
+              s.trust_env = False
+              retry = Retry(
+                  total=7, connect=7, read=7, status=7, backoff_factor=1.0,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=['GET', 'POST'], raise_on_status=False,
+              )
+              adapter = HTTPAdapter(max_retries=retry)
+              s.mount('https://', adapter)
+              s.mount('http://', adapter)
+              s.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.5',
+              })
+              return s
+
+          def clean_text(value: str) -> str:
+              value = html.unescape(value or '')
+              value = BeautifulSoup(value, 'html.parser').get_text('', strip=True)
+              return re.sub(r'\s+', '', value)
+
+          def disclosure_date(row: dict[str, Any]) -> str:
+              adjunct = str(row.get('adjunctUrl') or '')
+              match = re.search(r'finalpage/(\d{4}-\d{2}-\d{2})/', adjunct)
+              return match.group(1) if match else ''
+
+          def get_org_id() -> str:
+              s = make_session()
+              r = s.get(
+                  'https://www.cninfo.com.cn/new/information/topSearch/query',
+                  params={'keyWord': CODE, 'maxSecNum': '20'},
+                  headers={'Referer': 'https://www.cninfo.com.cn/'},
+                  timeout=(30, 120),
+              )
+              print('TOP_SEARCH', r.status_code, len(r.content), r.headers.get('content-type'))
+              r.raise_for_status()
+              payload = r.json()
+              rows = payload if isinstance(payload, list) else (payload.get('keyBoardList') or payload.get('data') or payload.get('list') or [])
+              for row in rows:
+                  code = str(row.get('code') or row.get('secCode') or row.get('zwjc') or '')
+                  name = str(row.get('zwjc') or row.get('secName') or row.get('name') or '')
+                  org = str(row.get('orgId') or row.get('orgid') or '')
+                  print('TOP_ROW', code, name, org)
+                  if code == CODE and org:
+                      return org
+              raise RuntimeError(f'Could not resolve CNINFO orgId for {CODE}')
+
+          def query_announcements(org_id: str) -> list[dict[str, Any]]:
+              s = make_session()
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              headers = {
+                  'Referer': 'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search',
+                  'Origin': 'https://www.cninfo.com.cn',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'Accept': 'application/json, text/javascript, */*; q=0.01',
+              }
+              all_rows: list[dict[str, Any]] = []
+              for page in range(1, 21):
+                  data = {
+                      'pageNum': str(page), 'pageSize': '30',
+                      'column': 'szse', 'tabName': 'fulltext', 'plate': 'sz',
+                      'stock': f'{CODE},{org_id}', 'searchkey': '', 'secid': '',
+                      'category': '', 'trade': '', 'seDate': f'2024-01-01~{TODAY}',
+                      'sortName': '', 'sortType': '', 'isHLtitle': 'true',
+                  }
+                  r = s.post(endpoint, data=data, headers=headers, timeout=(30, 150))
+                  print('ANNOUNCEMENT_PAGE', page, r.status_code, len(r.content), r.headers.get('content-type'))
+                  r.raise_for_status()
+                  obj = r.json()
+                  batch = obj.get('announcements') or []
+                  print('ANNOUNCEMENT_BATCH', len(batch), 'TOTAL', obj.get('totalAnnouncement'), 'HAS_MORE', obj.get('hasMore'))
+                  all_rows.extend(batch)
+                  if not batch or not obj.get('hasMore'):
+                      break
+              dedup: dict[str, dict[str, Any]] = {}
+              for row in all_rows:
+                  key = str(row.get('announcementId') or row.get('adjunctUrl') or '')
+                  if key:
+                      dedup[key] = row
+              rows = list(dedup.values())
+              rows.sort(key=lambda x: int(x.get('announcementTime') or 0), reverse=True)
+              print('ANNOUNCEMENT_UNIQUE', len(rows))
+              for row in rows:
+                  title = clean_text(str(row.get('announcementTitle') or ''))
+                  if any(token in title for token in ['年度报告', '季度报告', '招股说明书']):
+                      print('RELEVANT', row.get('announcementId'), disclosure_date(row), title, row.get('adjunctUrl'))
+              return rows
+
+          def select_documents(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+              annuals = []
+              for row in rows:
+                  title = clean_text(str(row.get('announcementTitle') or ''))
+                  adjunct = str(row.get('adjunctUrl') or '')
+                  match = re.search(r'(20\d{2})年年度报告', title)
+                  if not match or not adjunct.lower().endswith('.pdf'):
+                      continue
+                  if any(x in title for x in ['摘要', '英文版', '提示性公告', '更正公告', '问询函', '回复公告']):
+                      continue
+                  annuals.append((int(match.group(1)), row))
+              by_year: dict[int, list[dict[str, Any]]] = {}
+              for year, row in annuals:
+                  by_year.setdefault(year, []).append(row)
+              annual_docs = []
+              for year in sorted(by_year):
+                  candidates = by_year[year]
+                  candidates.sort(
+                      key=lambda row: (
+                          1 if '修订' in clean_text(str(row.get('announcementTitle') or '')) else 0,
+                          int(row.get('announcementTime') or 0),
+                      ),
+                      reverse=True,
+                  )
+                  chosen = candidates[0]
+                  annual_docs.append({
+                      'order_group': 2,
+                      'kind': 'annual',
+                      'year': year,
+                      'period': f'{year}年年度报告',
+                      'filename': f'托普云农_301556_{year}年年度报告_全文.pdf',
+                      'row': chosen,
+                  })
+                  print('SELECT_ANNUAL', year, clean_text(str(chosen.get('announcementTitle') or '')), chosen.get('adjunctUrl'))
+              if not annual_docs:
+                  raise RuntimeError('No full annual reports found')
+
+              prospectus_candidates = []
+              excluded = ['招股意向书', '申报稿', '注册稿', '上会稿', '问询回复', '审核中心意见落实函', '提示性公告', '摘要']
+              for row in rows:
+                  title = clean_text(str(row.get('announcementTitle') or ''))
+                  adjunct = str(row.get('adjunctUrl') or '')
+                  if '首次公开发行股票并在创业板上市招股说明书' not in title:
+                      continue
+                  if any(x in title for x in excluded) or not adjunct.lower().endswith('.pdf'):
+                      continue
+                  prospectus_candidates.append(row)
+              if not prospectus_candidates:
+                  raise RuntimeError('Formal IPO prospectus not found')
+              prospectus_candidates.sort(key=lambda row: int(row.get('announcementTime') or 0), reverse=True)
+              prospectus = prospectus_candidates[0]
+              prospectus_doc = {
+                  'order_group': 1,
+                  'kind': 'prospectus',
+                  'year': 2024,
+                  'period': '首次公开发行股票并在创业板上市招股说明书',
+                  'filename': '托普云农_301556_首次公开发行股票并在创业板上市招股说明书_正式版.pdf',
+                  'row': prospectus,
+              }
+              print('SELECT_PROSPECTUS', clean_text(str(prospectus.get('announcementTitle') or '')), prospectus.get('adjunctUrl'))
+
+              quarter_candidates = []
+              for row in rows:
+                  title = clean_text(str(row.get('announcementTitle') or ''))
+                  adjunct = str(row.get('adjunctUrl') or '')
+                  match = re.search(r'(20\d{2})年(第一|第三)季度报告', title)
+                  if not match or not adjunct.lower().endswith('.pdf'):
+                      continue
+                  if any(x in title for x in ['摘要', '提示性公告', '更正公告', '取消']):
+                      continue
+                  quarter_candidates.append((int(row.get('announcementTime') or 0), row, match.group(0)))
+              if not quarter_candidates:
+                  raise RuntimeError('No formal quarterly report found')
+              quarter_candidates.sort(key=lambda item: item[0], reverse=True)
+              _, qrow, period = quarter_candidates[0]
+              quarter_doc = {
+                  'order_group': 3,
+                  'kind': 'quarter',
+                  'year': int(period[:4]),
+                  'period': period,
+                  'filename': f'托普云农_301556_{period}_全文.pdf',
+                  'row': qrow,
+              }
+              print('SELECT_QUARTER', period, clean_text(str(qrow.get('announcementTitle') or '')), qrow.get('adjunctUrl'))
+              return [prospectus_doc, *annual_docs, quarter_doc]
+
+          def download_validate(item: dict[str, Any]) -> dict[str, Any]:
+              row = item['row']
+              adjunct = str(row.get('adjunctUrl') or '').lstrip('/')
+              urls = [
+                  f'https://static.cninfo.com.cn/{adjunct}',
+                  f'http://static.cninfo.com.cn/{adjunct}',
+              ]
+              s = make_session()
+              response = None
+              data = b''
+              failures = []
+              for url in urls:
+                  try:
+                      r = s.get(url, headers={'Referer': 'https://www.cninfo.com.cn/'}, timeout=(30, 300), allow_redirects=True)
+                      print('DOWNLOAD', item['period'], r.status_code, len(r.content), r.headers.get('content-type'), r.url)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 100_000:
+                          response, data = r, r.content
+                          break
+                      failures.append(f'{url}: HTTP {r.status_code}, bytes={len(r.content)}')
+                  except Exception as exc:
+                      failures.append(f'{url}: {exc!r}')
+              if response is None:
+                  raise RuntimeError(f"Unable to download {item['period']}: {'; '.join(failures)}")
+
+              path = OUT / item['filename']
+              path.write_bytes(data)
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              minimum = {'prospectus': 250, 'annual': 60, 'quarter': 5}[item['kind']]
+              if pages < minimum:
+                  raise RuntimeError(f'{path.name}: only {pages} pages, expected at least {minimum}')
+
+              sample_indexes = list(range(min(15, pages)))
+              if pages > 15:
+                  sample_indexes.extend(range(max(15, pages - 3), pages))
+              sample = ''.join((reader.pages[index].extract_text() or '') for index in sample_indexes)
+              compact = re.sub(r'\s+', '', sample)
+              if '托普云农' not in compact and COMPANY not in compact:
+                  raise RuntimeError(f'{path.name}: company name not found')
+              if CODE not in compact:
+                  raise RuntimeError(f'{path.name}: stock code not found')
+
+              first_page = re.sub(r'\s+', '', reader.pages[0].extract_text() or '')
+              if item['kind'] == 'prospectus':
+                  if '首次公开发行股票并在创业板上市招股说明书' not in compact:
+                      raise RuntimeError(f'{path.name}: formal prospectus title not found')
+                  if any(x in first_page for x in ['招股意向书', '申报稿', '注册稿', '上会稿']):
+                      raise RuntimeError(f'{path.name}: non-final prospectus version detected')
+              elif item['kind'] == 'annual':
+                  if item['period'] not in compact:
+                      raise RuntimeError(f"{path.name}: period '{item['period']}' not found")
+                  if '摘要' in first_page:
+                      raise RuntimeError(f'{path.name}: annual report summary detected')
+              else:
+                  if item['period'] not in compact:
+                      raise RuntimeError(f"{path.name}: period '{item['period']}' not found")
+
+              sha = hashlib.sha256(data).hexdigest()
+              return {
+                  'filename': path.name,
+                  'kind': item['kind'],
+                  'period': item['period'],
+                  'title': clean_text(str(row.get('announcementTitle') or '')),
+                  'disclosure_date': disclosure_date(row),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'source_url': response.url,
+                  'announcement_id': str(row.get('announcementId') or ''),
+                  'sha256': sha,
+                  'order_group': item['order_group'],
+              }
+
+          org_id = get_org_id()
+          print('RESOLVED_ORG_ID', org_id)
+          rows = query_announcements(org_id)
+          documents = select_documents(rows)
+          records = [download_validate(item) for item in documents]
+          records.sort(key=lambda item: (item['order_group'], item['period']))
+
+          annual_count = sum(1 for item in records if item['kind'] == 'annual')
+          prospectus_count = sum(1 for item in records if item['kind'] == 'prospectus')
+          quarter_count = sum(1 for item in records if item['kind'] == 'quarter')
+          if prospectus_count != 1 or quarter_count != 1 or annual_count < 1:
+              raise RuntimeError(f'Unexpected package composition: prospectus={prospectus_count}, annual={annual_count}, quarter={quarter_count}')
+
+          lines = [
+              '托普云农（301556）全部年度报告、招股说明书及最新季度报告资料包',
+              f'整理日期：{TODAY}', '',
+              '收录口径：',
+              '1. 公司于2024年10月17日在深交所创业板上市；本包收录上市后公开披露的全部年度报告全文。',
+              '2. 招股说明书采用首次公开发行股票并在创业板上市的正式发行版本，不以招股意向书、申报稿、注册稿或上会稿替代。',
+              '3. 最新季度报告按照截至整理日的正式公告披露时间确定。',
+              '4. 全部PDF均来自巨潮资讯正式公告附件，并完成公司名称、证券代码、报告期、页数、PDF结构及首末页渲染检查。',
+              '', '文件清单：',
+          ]
+          sums = []
+          for index, item in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {item['filename']}",
+                  f"   公告标题：{item['title']}",
+                  f"   披露日期：{item['disclosure_date']}",
+                  f"   页数：{item['pages']}页",
+                  f"   文件大小：{item['bytes']}字节",
+                  f"   来源：{item['source_url']}",
+                  f"   公告ID：{item['announcement_id']}",
+                  f"   SHA-256：{item['sha256']}", '',
+              ])
+              sums.append(f"{item['sha256']}  {item['filename']}")
+          lines.extend([
+              f"合计：{len(records)}份PDF，其中招股说明书{prospectus_count}份、年度报告{annual_count}份、最新季度报告{quarter_count}份；共{sum(x['pages'] for x in records)}页，{sum(x['bytes'] for x in records)}字节。",
+              '资料仅用于信息查阅，不构成投资建议。',
+          ])
+          (OUT / '00_文件清单与来源说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+          (OUT / '_metadata.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('\n'.join(lines))
+          PY
+
+          pdf_count=$(find "$PACKAGE" -maxdepth 1 -name '*.pdf' | wc -l)
+          test "$pdf_count" -ge 3
+          for pdf in "$PACKAGE"/*.pdf; do
+            test "$(head -c 5 "$pdf")" = '%PDF-'
+            test "$(stat -c%s "$pdf")" -gt 100000
+            set +e
+            qpdf --check "$pdf" >"$pdf.qpdf.txt" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+              cat "$pdf.qpdf.txt" >&2
+              exit "$rc"
+            fi
+            rm -f "$pdf.qpdf.txt"
+            pages=$(pdfinfo "$pdf" | awk -F: '/^Pages:/{gsub(/ /,"",$2);print $2}')
+            test -n "$pages" && test "$pages" -ge 5
+            pdftotext -f 1 -l 15 "$pdf" "$pdf.txt" 2>/dev/null || true
+            grep -Eq '托普云农|浙江托普云农科技股份有限公司' "$pdf.txt"
+            grep -q '301556' "$pdf.txt"
+            rm -f "$pdf.txt"
+            stem="/tmp/top_yunnong_render/$(basename "$pdf" .pdf)"
+            pdftoppm -f 1 -l 1 -singlefile -png -r 90 "$pdf" "$stem.first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -l "$pages" -singlefile -png -r 90 "$pdf" "$stem.last" >/dev/null 2>&1
+            test -s "$stem.first.png" && test -s "$stem.last.png"
+            echo "VALIDATED $(basename "$pdf") pages=$pages bytes=$(stat -c%s "$pdf")"
+          done
+
+          rm -f "$PACKAGE/_metadata.json"
+          zip -q -r -6 /tmp/top_yunnong_test.zip "$PACKAGE"
+          unzip -t /tmp/top_yunnong_test.zip >/dev/null
+          test "$(unzip -Z1 /tmp/top_yunnong_test.zip | grep -c '\.pdf$')" -eq "$pdf_count"
+          rm -f /tmp/top_yunnong_test.zip
+          ls -lh "$PACKAGE"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Top-Yunnong-301556-all-annual-reports-prospectus-latest-quarter
+          path: 托普云农_301556_全部年报_招股说明书_最新季报/
+          retention-days: 3
+          compression-level: 6
+          if-no-files-found: error
