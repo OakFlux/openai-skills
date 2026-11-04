@@ -1,0 +1,243 @@
+name: Package two verified Yunlu broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/yunlu-688190-broker-deep-reports-2-20261104.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Download, verify, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY = '云路股份'
+          CODE = '688190'
+          CUTOFF = '2026-11-04'
+          COMPACT = '20261104'
+          ROOT_NAME = f'{COMPANY}_{CODE}_券商深度报告_精选2份_截至{COMPACT}'
+          ROOT = Path('work') / ROOT_NAME
+          REPORT_DIR = ROOT / '报告PDF'
+          PREVIEW_DIR = ROOT / '首页与末页预览'
+          DIST = Path('dist')
+          for path in (REPORT_DIR, PREVIEW_DIR, DIST):
+              path.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '光大证券',
+                  'date': '2025-02-25',
+                  'title': '投资价值分析报告：节能变压器和高效电机的双重受益者',
+                  'info_code': 'AP202502251643475281',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP202502251643475281_1.pdf',
+              },
+              {
+                  'broker': '华源证券',
+                  'date': '2024-07-29',
+                  'title': '非晶合金龙头，乘风配电变压器景气度及电机新应用',
+                  'info_code': 'AP202407291638444272',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP202407291638444272_1.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          retry = Retry(
+              total=6, connect=6, read=6, status=6,
+              backoff_factor=0.8,
+              status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+              allowed_methods=frozenset({'GET'}),
+              raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/report/',
+          })
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          records = []
+          for index, item in enumerate(reports, 1):
+              response = session.get(
+                  item['url'],
+                  headers={'Referer': f"https://data.eastmoney.com/report/info/{item['info_code']}.html"},
+                  timeout=180,
+                  allow_redirects=True,
+              )
+              print('DOWNLOAD', item['url'], response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+              response.raise_for_status()
+              data = response.content
+              if not data.startswith(b'%PDF') or len(data) < 100_000:
+                  raise RuntimeError(f"PDF content invalid: {item['title']}")
+
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              if reader.is_encrypted:
+                  reader.decrypt('')
+              page_count = len(reader.pages)
+              if page_count < 15:
+                  raise RuntimeError(f"Not a sufficiently complete deep report: {item['title']}, pages={page_count}")
+
+              text_parts = []
+              for page_index in range(min(4, page_count)):
+                  try:
+                      text_parts.append(reader.pages[page_index].extract_text() or '')
+                  except Exception:
+                      pass
+              try:
+                  text_parts.append(reader.pages[page_count - 1].extract_text() or '')
+              except Exception:
+                  pass
+              sample_text = re.sub(r'\s+', ' ', '\n'.join(text_parts)).strip()
+              compact = re.sub(r'\s+', '', sample_text)
+              if COMPANY not in compact and CODE not in compact:
+                  raise RuntimeError(f"Company identity validation failed: {item['title']}")
+              print('TEXT_SAMPLE', item['broker'], sample_text[:1800], flush=True)
+
+              safe_title = re.sub(r'[\\/:*?"<>|]+', '_', item['title'])
+              filename = f"{index:02d}_{item['broker']}_{item['date']}_{safe_title}.pdf"
+              path = REPORT_DIR / filename
+              path.write_bytes(data)
+
+              doc = fitz.open(path)
+              if doc.page_count != page_count:
+                  raise RuntimeError(f'Dual-parser page mismatch: {filename}')
+              first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+              last = doc.load_page(doc.page_count - 1).get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 400:
+                  raise RuntimeError(f'Render validation failed: {filename}')
+              first.save(PREVIEW_DIR / f'{Path(filename).stem}_首页.png')
+              last.save(PREVIEW_DIR / f'{Path(filename).stem}_末页.png')
+              doc.close()
+
+              record = {
+                  **item,
+                  'file_name': filename,
+                  'page_count': page_count,
+                  'file_size_bytes': path.stat().st_size,
+                  'sha256': sha256_file(path),
+                  'report_page_url': f"https://data.eastmoney.com/report/info/{item['info_code']}.html",
+                  'pdf_header_valid': True,
+                  'company_identity_validated': True,
+                  'dual_parser_page_count_validated': True,
+                  'first_and_last_pages_rendered': True,
+                  'first_page_text_sample': sample_text[:600],
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          manifest = {
+              'company': COMPANY,
+              'stock_code': CODE,
+              'cutoff_date': CUTOFF,
+              'selection_note': '公开渠道中优先选择完整原始PDF的投资价值分析和首次覆盖深度报告；未收录短篇业绩点评。',
+              'document_count': len(records),
+              'total_pages': sum(r['page_count'] for r in records),
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{r['sha256']}  报告PDF/{r['file_name']}\n" for r in records),
+              encoding='utf-8',
+          )
+
+          readme = [
+              f'# {COMPANY}（{CODE}）券商深度报告精选',
+              '',
+              f'- 截止日期：{CUTOFF}',
+              f'- 完整原始PDF：{len(records)}份；合计页数：{sum(r["page_count"] for r in records)}页。',
+              '- 选择口径：投资价值分析或首次覆盖深度报告；排除短篇点评。',
+              '- 校验：PDF文件头、公司身份、双解析器页数、首末页渲染、SHA-256及ZIP CRC。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for i, r in enumerate(records, 1):
+              readme += [
+                  f'{i}. `{r["file_name"]}`',
+                  f'   - 机构：{r["broker"]}；日期：{r["date"]}',
+                  f'   - 标题：{r["title"]}',
+                  f'   - 页数：{r["page_count"]}',
+                  f'   - 原始PDF：{r["url"]}',
+                  f'   - SHA-256：`{r["sha256"]}`',
+              ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          cn_zip = DIST / f'{ROOT_NAME}.zip'
+          en_zip = DIST / f'yunlu_688190_broker_deep_reports_2_{COMPACT}.zip'
+          with zipfile.ZipFile(cn_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(cn_zip, en_zip)
+
+          for zip_path in (cn_zip, en_zip):
+              with zipfile.ZipFile(zip_path) as archive:
+                  bad = archive.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failure: {bad}')
+                  pdfs = [n for n in archive.namelist() if n.lower().endswith('.pdf')]
+                  if len(pdfs) != 2:
+                      raise RuntimeError(f'Expected two PDFs, found {len(pdfs)}')
+              print('ZIP_VERIFIED', zip_path, zip_path.stat().st_size, sha256_file(zip_path), flush=True)
+
+          print('FINAL_SUMMARY', json.dumps({
+              'chinese_zip': str(cn_zip),
+              'english_zip': str(en_zip),
+              'zip_size_bytes': cn_zip.stat().st_size,
+              'zip_sha256': sha256_file(cn_zip),
+              'document_count': len(records),
+              'total_pages': sum(r['page_count'] for r in records),
+              'records': records,
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: yunlu-688190-broker-deep-reports-2-final-20261104
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
