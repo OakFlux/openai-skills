@@ -1,0 +1,459 @@
+name: Build Yueyang Xingchang 000819 annual reports 20261104
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/yueyang-xingchang-000819-annual-reports-20261104.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import io
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import parse_qs, urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CODE = '000819'
+          SHORT = '岳阳兴长'
+          FULL = '岳阳兴长石化股份有限公司'
+          PACKAGE = '岳阳兴长_000819_2020-2025年报及最新季报'
+          ROOT = Path(PACKAGE)
+          PDFDIR = ROOT / '原始PDF'
+          PREV = ROOT / '首页预览'
+          for directory in (ROOT, PDFDIR, PREV):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'
+          base_headers = {
+              'User-Agent': user_agent,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+
+          def normalize(value: str) -> str:
+              return re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]+', '', value or '').lower()
+
+          def decode_html(response: requests.Response) -> str:
+              raw = response.content
+              for encoding in (response.encoding, response.apparent_encoding, 'gb18030', 'gbk', 'utf-8'):
+                  if not encoding:
+                      continue
+                  try:
+                      text = raw.decode(encoding, errors='strict')
+                      if '年度报告' in text or '下载公告' in text or SHORT in text:
+                          return text
+                  except Exception:
+                      pass
+              return raw.decode('gb18030', errors='replace')
+
+          def normalize_pdf_url(url: str) -> str:
+              url = html.unescape((url or '').strip())
+              if url.startswith('//'):
+                  url = 'https:' + url
+              if url.startswith('http://file.finance.sina.com.cn/211.154.219.97:9494/'):
+                  url = url.replace(
+                      'http://file.finance.sina.com.cn/211.154.219.97:9494/',
+                      'https://file.finance.sina.com.cn/211.154.219.97%3A9494/',
+                  )
+              return url
+
+          list_urls = [
+              f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{CODE}/page_type/ndbg.phtml',
+              f'https://money.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{CODE}.phtml?ftype=ndbg',
+          ]
+          candidates: dict[int, list[dict]] = {year: [] for year in range(2020, 2026)}
+          list_traces = []
+
+          for list_url in list_urls:
+              response = session.get(list_url, headers=base_headers, timeout=(30, 180))
+              list_traces.append({
+                  'url': list_url,
+                  'status': response.status_code,
+                  'bytes': len(response.content),
+                  'content_type': response.headers.get('content-type', ''),
+              })
+              print('LIST_PAGE', response.status_code, len(response.content), list_url)
+              if response.status_code != 200:
+                  continue
+              text = decode_html(response)
+              soup = BeautifulSoup(text, 'html.parser')
+              for anchor in soup.find_all('a', href=True):
+                  title = re.sub(r'\s+', '', (anchor.get_text(' ', strip=True) or '') + ' ' + (anchor.get('title') or ''))
+                  href = html.unescape(anchor.get('href') or '')
+                  absolute = urljoin(list_url, href)
+                  if 'vCB_AllBulletinDetail.php' not in absolute:
+                      continue
+                  query = parse_qs(urlparse(absolute).query)
+                  announcement_id = (query.get('id') or [None])[0]
+                  if not announcement_id:
+                      continue
+                  for year in candidates:
+                      phrase = f'{year}年年度报告'
+                      if phrase in title and '摘要' not in title:
+                          score = 0
+                          if any(token in title for token in ('二次修订版', '修订版', '修订后', '更新后', '更正后', '更正版')):
+                              score += 300
+                          if title.endswith(phrase) or title.endswith(phrase + '全文'):
+                              score += 50
+                          candidates[year].append({
+                              'id': str(announcement_id),
+                              'title': title,
+                              'score': score,
+                              'list_url': list_url,
+                          })
+
+          fallback_ids = {
+              2025: '12122828',
+          }
+
+          selected_annuals = []
+          for year in range(2020, 2026):
+              rows = candidates[year]
+              if rows:
+                  unique = {}
+                  for row in rows:
+                      existing = unique.get(row['id'])
+                      if existing is None or row['score'] > existing['score']:
+                          unique[row['id']] = row
+                  rows = list(unique.values())
+                  rows.sort(key=lambda item: (item['score'], int(item['id'])), reverse=True)
+                  chosen = rows[0]
+              elif year in fallback_ids:
+                  chosen = {
+                      'id': fallback_ids[year],
+                      'title': f'{year}年年度报告（备用公告ID）',
+                      'score': -1,
+                      'list_url': '',
+                  }
+              else:
+                  raise RuntimeError(f'Annual report discovery failed for {year}: {candidates}')
+              selected_annuals.append({'year': year, **chosen})
+              print('SELECTED_ANNUAL', year, chosen)
+
+          def detail_metadata(announcement_id: str) -> dict:
+              detail_urls = [
+                  f'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id={announcement_id}&stockid={CODE}',
+                  f'https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id={announcement_id}&stockid={CODE}',
+              ]
+              found_urls = []
+              title = ''
+              date = ''
+              traces = []
+              for detail_url in detail_urls:
+                  try:
+                      response = session.get(detail_url, headers=base_headers, timeout=(30, 180))
+                      traces.append({
+                          'detail_url': detail_url,
+                          'status': response.status_code,
+                          'bytes': len(response.content),
+                          'content_type': response.headers.get('content-type', ''),
+                      })
+                      if response.status_code != 200:
+                          continue
+                      text = decode_html(response)
+                      compact_html = re.sub(r'\s+', '', text)
+                      date_match = re.search(r'公告日期[:：](\d{4}-\d{2}-\d{2})', compact_html)
+                      if date_match:
+                          date = date_match.group(1)
+                      soup = BeautifulSoup(text, 'html.parser')
+                      heading = soup.find(['h1', 'h2'])
+                      if heading:
+                          title = heading.get_text(' ', strip=True)
+                      for anchor in soup.find_all('a', href=True):
+                          href = normalize_pdf_url(urljoin(detail_url, anchor.get('href') or ''))
+                          label = re.sub(r'\s+', '', anchor.get_text(' ', strip=True))
+                          if ('下载公告' in label or href.lower().split('?')[0].endswith('.pdf')) and (
+                              'file.finance.sina.com.cn' in href or href.lower().split('?')[0].endswith('.pdf')
+                          ):
+                              found_urls.append(href)
+                      for match in re.findall(r'https?://[^\"\'<>\s]+?\.PDF(?:\?[^\"\'<>\s]*)?', text, flags=re.I):
+                          found_urls.append(normalize_pdf_url(match))
+                  except Exception as exc:
+                      traces.append({'detail_url': detail_url, 'error': repr(exc)})
+              return {
+                  'title': title,
+                  'date': date,
+                  'pdf_urls': list(dict.fromkeys(url for url in found_urls if url)),
+                  'detail_traces': traces,
+              }
+
+          items = []
+          for row in selected_annuals:
+              metadata = detail_metadata(row['id'])
+              urls = list(metadata['pdf_urls'])
+              if metadata['date']:
+                  year_text, month_text, _ = metadata['date'].split('-')
+                  urls.append(
+                      f'https://file.finance.sina.com.cn/211.154.219.97%3A9494/'
+                      f'MRGG/CNSESH_STOCK/{year_text}/{year_text}-{int(month_text)}/'
+                      f'{metadata["date"]}/{row["id"]}.PDF'
+                  )
+              urls = list(dict.fromkeys(normalize_pdf_url(url) for url in urls if url))
+              items.append({
+                  'label': f'{row["year"]}年年度报告',
+                  'kind': 'annual',
+                  'year': row['year'],
+                  'announcement_id': row['id'],
+                  'announcement_title': row['title'],
+                  'announcement_date': metadata['date'],
+                  'required_tokens': [f'{row["year"]}年年度报告'],
+                  'candidate_urls': urls,
+                  'detail_traces': metadata['detail_traces'],
+                  'min_pages': 100,
+              })
+
+          q3_id = '12675870'
+          q3_metadata = detail_metadata(q3_id)
+          q3_urls = list(q3_metadata['pdf_urls']) + [
+              'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2026/2026-10/2026-10-30/12675870.PDF',
+          ]
+          items.append({
+              'label': '2026年第三季度报告',
+              'kind': 'quarter',
+              'year': 2026,
+              'announcement_id': q3_id,
+              'announcement_title': '岳阳兴长：2026年三季度报告',
+              'announcement_date': q3_metadata['date'] or '2026-10-30',
+              'required_tokens': ['2026年第三季度报告', '2026年三季度报告'],
+              'candidate_urls': list(dict.fromkeys(normalize_pdf_url(url) for url in q3_urls if url)),
+              'detail_traces': q3_metadata['detail_traces'],
+              'min_pages': 5,
+          })
+
+          discovery = {
+              'list_traces': list_traces,
+              'raw_candidates': candidates,
+              'selected_annuals': selected_annuals,
+              'selected_items': items,
+          }
+          (ROOT / 'source_discovery.json').write_text(
+              json.dumps(discovery, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          identities = (SHORT, FULL, CODE, '岳阳兴长石化', 'YUEYANG XINGCHANG')
+          manifest = []
+
+          for index, item in enumerate(items, 1):
+              accepted = None
+              attempts = []
+              for candidate_url in item['candidate_urls']:
+                  candidate_url = normalize_pdf_url(candidate_url)
+                  for attempt in range(5):
+                      try:
+                          if 'sina.com.cn' in candidate_url:
+                              referer = 'https://vip.stock.finance.sina.com.cn/'
+                          elif 'dfcfw.com' in candidate_url:
+                              referer = 'https://data.eastmoney.com/'
+                          else:
+                              referer = 'https://www.szse.cn/'
+                          response = session.get(
+                              candidate_url,
+                              headers={
+                                  **base_headers,
+                                  'Referer': referer,
+                                  'Accept': 'application/pdf,*/*;q=0.8',
+                              },
+                              timeout=(30, 420),
+                              allow_redirects=True,
+                          )
+                          attempt_record = {
+                              'url': candidate_url,
+                              'attempt': attempt + 1,
+                              'status': response.status_code,
+                              'bytes': len(response.content),
+                              'content_type': response.headers.get('content-type', ''),
+                              'final_url': response.url,
+                          }
+                          attempts.append(attempt_record)
+                          if response.status_code != 200 or response.content[:5] != b'%PDF-' or len(response.content) < 50000:
+                              if response.status_code in (400, 401, 403, 404, 410):
+                                  break
+                              time.sleep(1 + attempt)
+                              continue
+
+                          reader = PdfReader(io.BytesIO(response.content), strict=False)
+                          pages = len(reader.pages)
+                          if pages < item['min_pages']:
+                              attempt_record['validation_error'] = f'only {pages} pages'
+                              break
+
+                          extracted = ''
+                          for page in reader.pages[:min(80, pages)]:
+                              try:
+                                  extracted += '\n' + (page.extract_text() or '')
+                              except Exception:
+                                  pass
+                          compact = normalize(extracted)
+                          identity_hits = [token for token in identities if normalize(token) in compact]
+                          title_hits = [token for token in item['required_tokens'] if normalize(token) in compact]
+                          if len(compact) > 500 and not identity_hits:
+                              attempt_record['validation_error'] = 'issuer mismatch'
+                              break
+                          if len(compact) > 500 and not title_hits:
+                              attempt_record['validation_error'] = 'report title mismatch'
+                              break
+
+                          accepted = {
+                              'data': response.content,
+                              'source_url': candidate_url,
+                              'pages': pages,
+                              'identity_hits': identity_hits,
+                              'title_hits': title_hits,
+                          }
+                          break
+                      except Exception as exc:
+                          attempts.append({
+                              'url': candidate_url,
+                              'attempt': attempt + 1,
+                              'error': repr(exc),
+                          })
+                          time.sleep(1 + attempt)
+                  if accepted is not None:
+                      break
+
+              if accepted is None:
+                  raise RuntimeError(f'Download/validation failed for {item["label"]}: {attempts}')
+
+              filename = f'{index:02d}_岳阳兴长_{item["label"]}.pdf'
+              destination = PDFDIR / filename
+              destination.write_bytes(accepted['data'])
+
+              subprocess.run(
+                  ['qpdf', '--warning-exit-0', '--check', str(destination)],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              preview_prefix = PREV / destination.stem
+              subprocess.run(
+                  [
+                      'pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '125',
+                      '-singlefile', str(destination), str(preview_prefix),
+                  ],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              preview = Path(str(preview_prefix) + '.png')
+              if not preview.exists() or preview.stat().st_size < 8000:
+                  raise RuntimeError(f'First-page render failed for {filename}')
+
+              sha256 = hashlib.sha256(accepted['data']).hexdigest()
+              record = {
+                  'label': item['label'],
+                  'kind': item['kind'],
+                  'report_year': item['year'],
+                  'announcement_id': item['announcement_id'],
+                  'announcement_title': item['announcement_title'],
+                  'announcement_date': item['announcement_date'],
+                  'source_url': accepted['source_url'],
+                  'candidate_urls': item['candidate_urls'],
+                  'filename': str(Path('原始PDF') / filename),
+                  'pages': accepted['pages'],
+                  'bytes': len(accepted['data']),
+                  'sha256': sha256,
+                  'identity_hits': accepted['identity_hits'],
+                  'title_hits': accepted['title_hits'],
+                  'preview_file': str(Path('首页预览') / preview.name),
+                  'download_attempts': attempts,
+                  'validation': [
+                      'PDF header', 'issuer identity', 'report title', 'page count',
+                      'qpdf structure', 'first-page render',
+                  ],
+              }
+              manifest.append(record)
+              print('VERIFIED', record['label'], record['pages'], record['bytes'], record['sha256'], record['source_url'])
+
+          total_pages = sum(item['pages'] for item in manifest)
+          readme = [
+              '岳阳兴长石化股份有限公司（000819.SZ）年度报告及最新季度报告资料包',
+              '整理日期：2026-11-04', '',
+              '收录范围：2020—2025年年度报告全文，以及截至整理日最新披露的2026年第三季度报告。',
+              '不收录年度报告摘要、半年度报告、单独审计附件或普通公告页面。', '',
+          ]
+          for position, item in enumerate(manifest, 1):
+              readme += [
+                  f'{position}. {item["label"]}',
+                  f'   页数：{item["pages"]}页；文件：{item["filename"]}',
+                  f'   披露日期：{item["announcement_date"]}；公告ID：{item["announcement_id"]}',
+                  f'   来源：{item["source_url"]}',
+                  f'   SHA-256：{item["sha256"]}', '',
+              ]
+          readme += [
+              f'合计：{len(manifest)}份PDF，{total_pages}页。',
+              '核验项目：PDF文件头、公司名称/证券代码、报告标题、实际页数、qpdf结构、首页渲染、ZIP CRC及SHA-256。',
+          ]
+          (ROOT / '00_文件清单与来源.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in manifest),
+              encoding='utf-8',
+          )
+
+          chinese_zip = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(
+              chinese_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True
+          ) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{ROOT.name}/{path.relative_to(ROOT)}')
+
+          with zipfile.ZipFile(chinese_zip, 'r') as archive:
+              bad_member = archive.testzip()
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if bad_member or len(pdf_members) != len(manifest):
+                  raise RuntimeError(
+                      f'ZIP validation failed: bad={bad_member}, pdf_count={len(pdf_members)}, manifest={len(manifest)}'
+                  )
+
+          english_zip = Path('yueyang_xingchang_000819_2020_2025_annual_reports_latest_quarter.zip')
+          english_zip.write_bytes(chinese_zip.read_bytes())
+          final_sha = hashlib.sha256(chinese_zip.read_bytes()).hexdigest()
+          print('FINAL_ZIP', chinese_zip, chinese_zip.stat().st_size, 'SHA256', final_sha)
+          print('TOTAL_PAGES', total_pages)
+          print('MANIFEST', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: yueyang-xingchang-000819-filings-final
+          path: |
+            岳阳兴长_000819_2020-2025年报及最新季报.zip
+            yueyang_xingchang_000819_2020_2025_annual_reports_latest_quarter.zip
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
