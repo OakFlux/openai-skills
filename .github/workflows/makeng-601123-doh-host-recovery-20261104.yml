@@ -1,0 +1,168 @@
+name: Recover Makeng report via legacy hosts
+
+on:
+  push:
+    paths:
+      - '.github/workflows/makeng-601123-doh-host-recovery-20261104.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+      - name: Resolve legacy hosts and retrieve report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python - <<'PY'
+          import io, json, re, socket, ssl, requests, urllib3
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin, urlparse, quote
+          from pypdf import PdfReader
+          urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+          session=requests.Session()
+          session.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Connection':'close'})
+
+          hosts=['www3.nxny.com','www.nxny.com','vip.nxny.com','download.51pdf.com.cn','www.51pdf.cn']
+          resolvers=[
+            ('cloudflare','https://cloudflare-dns.com/dns-query',{'accept':'application/dns-json'}),
+            ('google','https://dns.google/resolve',{}),
+            ('alidns','https://dns.alidns.com/resolve',{}),
+            ('dnspod','https://doh.pub/resolve',{}),
+          ]
+          host_ips={h:[] for h in hosts}
+          for host in hosts:
+            try:
+              print('SYSTEM_DNS',host,socket.getaddrinfo(host,None),flush=True)
+            except Exception as e: print('SYSTEM_DNS_ERROR',host,repr(e),flush=True)
+            for name,endpoint,headers in resolvers:
+              try:
+                r=session.get(endpoint,params={'name':host,'type':'A'},headers=headers,timeout=30,verify=False)
+                print('DOH',name,host,r.status_code,len(r.content),r.url,r.text[:800],flush=True)
+                if r.status_code==200:
+                  data=r.json()
+                  for ans in data.get('Answer') or []:
+                    val=str(ans.get('data') or '')
+                    if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}',val): host_ips[host].append(val)
+              except Exception as e: print('DOH_ERROR',name,host,repr(e),flush=True)
+            host_ips[host]=list(dict.fromkeys(host_ips[host]))
+          print('HOST_IPS',json.dumps(host_ips,ensure_ascii=False),flush=True)
+
+          # Try normal host and IP+Host routes for the Nxny detail and list pages.
+          targets=[
+            ('www3.nxny.com','/report/view_6451804.html'),
+            ('www3.nxny.com','/stype_xg_p6/'),
+            ('www.nxny.com','/report/view_6451804.html'),
+            ('www.nxny.com','/stype_1025_p64/'),
+          ]
+          pages=[]
+          def fetch_variant(host,path):
+            variants=[f'http://{host}{path}',f'https://{host}{path}']
+            for ip in host_ips.get(host,[]):
+              variants += [f'http://{ip}{path}',f'https://{ip}{path}']
+            for url in variants:
+              headers={'Host':host,'Referer':f'https://{host}/'} if re.match(r'https?://\d',url) else {'Referer':f'https://{host}/'}
+              try:
+                r=session.get(url,headers=headers,timeout=45,allow_redirects=True,verify=False)
+                print('FETCH',host,path,url,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+                name=re.sub(r'[^A-Za-z0-9._-]+','_',host+path+'_'+url.split(':',1)[0]+'_'+(urlparse(url).hostname or ''))
+                Path('out',name+'.bin').write_bytes(r.content)
+                text=r.content.decode(r.apparent_encoding or 'utf-8',errors='replace')
+                if r.status_code==200 and len(text)>1000:
+                  pages.append((host,path,r.url,text,r.cookies.get_dict(),headers,url))
+              except Exception as e: print('FETCH_ERROR',host,path,url,repr(e),flush=True)
+          for h,p in targets: fetch_variant(h,p)
+
+          tokens=[]; file_candidates=[]
+          for idx,(host,path,base,text,cookies,headers,requested) in enumerate(pages):
+            soup=BeautifulSoup(text,'html.parser')
+            title=soup.title.get_text(' ',strip=True) if soup.title else ''
+            print('PARSE_PAGE',idx,host,path,'TITLE',title,'COOKIES',cookies,flush=True)
+            raw=text.replace('\\/','/')
+            for tag in soup.find_all(['a','button','input','script','iframe','embed','object','form']):
+              attrs={k:tag.get(k) for k in ('href','src','data','action','onclick','value','name','id','class','type') if tag.get(k) is not None}
+              label=' '.join(tag.get_text(' ',strip=True).split())[:300]
+              for k in ('href','src','data','action'):
+                if attrs.get(k): attrs[k]=urljoin(base,attrs[k])
+              dump=json.dumps(attrs,ensure_ascii=False)
+              if any(q in (label+' '+dump).lower() for q in ('downfile','download.aspx','rnd=','.pdf','6451804','5953271')):
+                print('TAG',idx,tag.name,dump,label,flush=True)
+              for val in attrs.values():
+                if not isinstance(val,str): continue
+                for m in re.finditer(r'''downfile\s*\(\s*["']([^"']+)["']''',val,re.I): tokens.append((m.group(1),host,base,cookies))
+                if any(q in val.lower() for q in ('.pdf','download.aspx','rnd=')): file_candidates.append((urljoin(base,val),host,base,cookies))
+            for pat in [
+              r'''downfile\s*\(\s*["']([^"']+)["']''',
+              r'''(?:rnd|fileid|reportid|docid)\s*[:=]\s*["']([^"']+)["']''',
+              r'''DownLoad\.aspx\?rnd=([^"'&<\s]+)''',
+            ]:
+              for m in re.finditer(pat,raw,re.I):
+                print('TOKEN',idx,pat,m.group(1),flush=True); tokens.append((m.group(1),host,base,cookies))
+            for m in re.finditer(r'''(?:https?:)?//[^\s"'<>]+|/[A-Za-z0-9_./?=&%+,:;-]+''',raw,re.I):
+              val=m.group(0).rstrip('),;]}')
+              if val.startswith('//'): val='https:'+val
+              full=urljoin(base,val)
+              if any(q in full.lower() for q in ('.pdf','download.aspx','downfile','rnd=')): file_candidates.append((full,host,base,cookies))
+
+          # Include likely token values derived from report IDs and page IDs.
+          for tok in ('6451804','5953271','5612427'):
+            tokens.append((tok,'www3.nxny.com','https://www3.nxny.com/report/view_6451804.html',{}))
+          tokens=list(dict.fromkeys((t,h,b,json.dumps(c,sort_keys=True)) for t,h,b,c in tokens))
+          print('TOKENS',tokens,flush=True)
+
+          for tok,source_host,base,cookies_json in tokens:
+            cookies=json.loads(cookies_json)
+            endpoints=[]
+            for host in ('vip.nxny.com','download.51pdf.com.cn'):
+              endpoints += [f'http://{host}/DownLoad/DownLoad.aspx?rnd={quote(tok)}',f'https://{host}/DownLoad/DownLoad.aspx?rnd={quote(tok)}']
+              for ip in host_ips.get(host,[]):
+                endpoints += [f'http://{ip}/DownLoad/DownLoad.aspx?rnd={quote(tok)}',f'https://{ip}/DownLoad/DownLoad.aspx?rnd={quote(tok)}']
+            for url in endpoints:
+              host=urlparse(url).hostname or ''
+              logical='vip.nxny.com' if 'nxny' in url or host in host_ips.get('vip.nxny.com',[]) else 'download.51pdf.com.cn'
+              headers={'Referer':base,'Host':logical} if re.match(r'https?://\d',url) else {'Referer':base}
+              try:
+                r=session.get(url,headers=headers,cookies=cookies,timeout=60,allow_redirects=True,verify=False)
+                print('DOWNLOAD_TRY',tok,url,r.status_code,len(r.content),r.url,r.headers.get('content-type'),repr(r.content[:30]),flush=True)
+                if r.content.startswith(b'%PDF'):
+                  rd=PdfReader(io.BytesIO(r.content),strict=False); pages_n=len(rd.pages)
+                  text=''
+                  for j in range(min(4,pages_n)):
+                    try:text+=rd.pages[j].extract_text() or ''
+                    except Exception:pass
+                  print('PDF_OK',json.dumps({'token':tok,'url':url,'resolved':r.url,'pages':pages_n,'bytes':len(r.content),'text':re.sub(r'\s+',' ',text)[:800]},ensure_ascii=False),flush=True)
+                  Path('out','recovered_report.pdf').write_bytes(r.content)
+                  raise SystemExit(0)
+              except SystemExit: raise
+              except Exception as e: print('DOWNLOAD_ERROR',tok,url,repr(e),flush=True)
+
+          # Test direct candidates from parsed pages.
+          for full,host,base,cookies in file_candidates:
+            try:
+              r=session.get(full,headers={'Referer':base},cookies=cookies,timeout=60,allow_redirects=True,verify=False)
+              print('FILE_TRY',full,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              if r.content.startswith(b'%PDF'):
+                rd=PdfReader(io.BytesIO(r.content),strict=False)
+                print('FILE_PDF_OK',full,len(rd.pages),flush=True)
+                Path('out','recovered_report.pdf').write_bytes(r.content); raise SystemExit(0)
+            except SystemExit: raise
+            except Exception as e: print('FILE_ERROR',full,repr(e),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: makeng-601123-doh-host-recovery-20261104
+          path: out/
+          if-no-files-found: warn
+          retention-days: 7
