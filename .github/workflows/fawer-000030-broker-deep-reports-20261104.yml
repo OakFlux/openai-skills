@@ -1,0 +1,252 @@
+name: Package Fawer 000030 broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fawer-000030-broker-deep-reports-20261104.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Download, verify, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY = '富奥股份'
+          FULL_NAME = '富奥汽车零部件股份有限公司'
+          CODE = '000030'
+          CUTOFF = '2026-11-04'
+          COMPACT = '20261104'
+          ROOT_NAME = f'{COMPANY}_{CODE}_券商深度报告_精选2份_截至{COMPACT}'
+          ROOT = Path('work') / ROOT_NAME
+          PDF_DIR = ROOT / '报告PDF'
+          PREVIEW_DIR = ROOT / '首页与末页预览'
+          DIST = Path('dist')
+          for directory in (PDF_DIR, PREVIEW_DIR, DIST):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '东北证券',
+                  'date': '2024-02-13',
+                  'title': '一汽集团零部件核心战略资源，市场结构逐步完善',
+                  'rating': '买入（首次覆盖）',
+                  'authors': '胡易琛',
+                  'url': 'https://www.nesc.cn/timerfiles/upload/report/2024/02/19/15813870.pdf',
+                  'source_page': 'https://www.nesc.cn/timerfiles/upload/report/2024/02/19/15813870.pdf',
+              },
+              {
+                  'broker': '国信证券',
+                  'date': '2020-05-14',
+                  'title': '2019年报暨2020一季报点评：业绩逆势求进，“轻量化+电动化+智能化”打开新增长空间',
+                  'rating': '增持（首次覆盖）',
+                  'authors': '梁超；联系人：周俊宏',
+                  'url': 'https://stock.tianyancha.com/ResearchReport/eastmoney/c57a6c1e2696dc1b0f6b74cf4056bb58.pdf',
+                  'source_page': 'https://stock.tianyancha.com/ResearchReport/eastmoney/c57a6c1e2696dc1b0f6b74cf4056bb58.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          retry = Retry(
+              total=6,
+              connect=6,
+              read=6,
+              status=6,
+              backoff_factor=0.8,
+              status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+              allowed_methods=frozenset({'GET'}),
+              raise_on_status=False,
+          )
+          adapter = HTTPAdapter(max_retries=retry)
+          session.mount('https://', adapter)
+          session.mount('http://', adapter)
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'application/pdf,*/*;q=0.8',
+          })
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          records = []
+          for index, item in enumerate(reports, start=1):
+              headers = {'Referer': item['source_page']}
+              response = session.get(item['url'], headers=headers, timeout=240, allow_redirects=True)
+              print('DOWNLOAD', item['broker'], response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+              response.raise_for_status()
+              data = response.content
+              if not data.startswith(b'%PDF') or len(data) < 100_000:
+                  raise RuntimeError(f"PDF内容异常: {item['broker']} {item['title']}, bytes={len(data)}")
+
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              if reader.is_encrypted:
+                  reader.decrypt('')
+              page_count = len(reader.pages)
+              if page_count < 5:
+                  raise RuntimeError(f"报告页数过少: {item['title']}, pages={page_count}")
+
+              text_parts = []
+              probe_indices = sorted(set([0, min(1, page_count - 1), min(2, page_count - 1), page_count - 1]))
+              for page_index in probe_indices:
+                  try:
+                      text_parts.append(reader.pages[page_index].extract_text() or '')
+                  except Exception:
+                      pass
+              sample_text = re.sub(r'\s+', ' ', '\n'.join(text_parts)).strip()
+              compact_text = re.sub(r'\s+', '', sample_text)
+              if COMPANY not in compact_text and FULL_NAME not in compact_text and CODE not in compact_text:
+                  raise RuntimeError(f"公司身份校验失败: {item['title']}")
+              broker_key = item['broker'].replace('证券', '')
+              if broker_key not in compact_text and item['broker'] not in compact_text:
+                  raise RuntimeError(f"券商身份校验失败: {item['title']}")
+
+              safe_title = re.sub(r'[\\/:*?"<>|]+', '_', item['title']).strip(' ._')
+              filename = f"{index:02d}_{item['broker']}_{item['date']}_{safe_title}.pdf"
+              path = PDF_DIR / filename
+              path.write_bytes(data)
+
+              document = fitz.open(path)
+              if document.page_count != page_count:
+                  raise RuntimeError(f'双解析器页数不一致: {filename}')
+              first = document.load_page(0).get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+              last = document.load_page(document.page_count - 1).get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 400:
+                  raise RuntimeError(f'页面渲染异常: {filename}')
+              first.save(PREVIEW_DIR / f'{Path(filename).stem}_首页.png')
+              last.save(PREVIEW_DIR / f'{Path(filename).stem}_末页.png')
+              document.close()
+
+              record = {
+                  **item,
+                  'file_name': filename,
+                  'page_count': page_count,
+                  'file_size_bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'resolved_url': response.url,
+                  'pdf_header_valid': True,
+                  'company_identity_validated': True,
+                  'broker_identity_validated': True,
+                  'dual_parser_page_count_validated': True,
+                  'first_and_last_pages_rendered': True,
+                  'text_sample': sample_text[:800],
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          manifest = {
+              'company_short_name': COMPANY,
+              'company_full_name': FULL_NAME,
+              'stock_code': CODE,
+              'cutoff_date': CUTOFF,
+              'selection_note': '优先选择可公开取得的原始完整PDF，包括公司首次覆盖和较完整的公司研究报告；未混入付费站预览版或摘要整理版。',
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  报告PDF/{record['file_name']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          readme = [
+              f'# {COMPANY}（{CODE}）券商深度报告精选',
+              '',
+              f'- 截止日期：{CUTOFF}',
+              f'- 原始完整PDF：{len(records)}份；合计页数：{sum(record["page_count"] for record in records)}页。',
+              '- 选择口径：公司首次覆盖或相对完整的公司研究报告；排除短篇事件点评、付费站预览版和摘要整理版。',
+              '- 校验：PDF文件头、公司与券商身份、双解析器页数、首末页渲染、SHA-256及ZIP CRC。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for number, record in enumerate(records, start=1):
+              readme += [
+                  f'{number}. `{record["file_name"]}`',
+                  f'   - 机构：{record["broker"]}；日期：{record["date"]}',
+                  f'   - 标题：{record["title"]}',
+                  f'   - 评级：{record["rating"]}',
+                  f'   - 研究人员：{record["authors"]}',
+                  f'   - 页数：{record["page_count"]}',
+                  f'   - 来源：{record["resolved_url"]}',
+                  f'   - SHA-256：`{record["sha256"]}`',
+              ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          cn_zip = DIST / f'{ROOT_NAME}.zip'
+          en_zip = DIST / f'fawer_000030_broker_deep_reports_2_{COMPACT}.zip'
+          with zipfile.ZipFile(cn_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(cn_zip, en_zip)
+
+          for zip_path in (cn_zip, en_zip):
+              with zipfile.ZipFile(zip_path) as archive:
+                  bad_member = archive.testzip()
+                  if bad_member:
+                      raise RuntimeError(f'ZIP CRC校验失败: {bad_member}')
+                  pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if len(pdf_names) != 2:
+                      raise RuntimeError(f'ZIP内PDF数量异常: {len(pdf_names)}')
+              print('ZIP_VERIFIED', zip_path, zip_path.stat().st_size, sha256(zip_path), flush=True)
+
+          print('FINAL_SUMMARY', json.dumps({
+              'chinese_zip': str(cn_zip),
+              'english_zip': str(en_zip),
+              'zip_size_bytes': cn_zip.stat().st_size,
+              'zip_sha256': sha256(cn_zip),
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'records': records,
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: fawer-000030-broker-deep-reports-final-20261104
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
