@@ -1,0 +1,408 @@
+name: package-600877-financial-reports
+
+on:
+  push:
+    branches:
+      - tmp/electric-chip-600877-reports-20261104-v1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK_CODE = "600877"
+          ORG_ID = "gssh0600877"
+          CURRENT_NAME = "电科芯片"
+          FULL_CURRENT_NAME = "中电科芯片技术股份有限公司"
+          PREPARED_ON = "2026-11-04"
+          ROOT_NAME = "电科芯片_600877_2020-2025年报及2026年三季报"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF文件"
+          CHECK_DIR = Path("_checks")
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          CHECK_DIR.mkdir(parents=True, exist_ok=True)
+
+          API_URL = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept": "application/json, text/javascript, */*; q=0.01",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Origin": "https://www.cninfo.com.cn",
+              "Referer": f"https://www.cninfo.com.cn/new/disclosure/stock?orgId={ORG_ID}&stockCode={STOCK_CODE}",
+              "X-Requested-With": "XMLHttpRequest",
+          })
+
+          TARGETS = [
+              {
+                  "kind": "年度报告",
+                  "year": 2020,
+                  "query": "2020年年度报告",
+                  "date_range": "2021-01-01~2021-12-31",
+                  "filename": "01_电科芯片_600877_2020年年度报告.pdf",
+              },
+              {
+                  "kind": "年度报告",
+                  "year": 2021,
+                  "query": "2021年年度报告",
+                  "date_range": "2022-01-01~2022-12-31",
+                  "filename": "02_电科芯片_600877_2021年年度报告.pdf",
+              },
+              {
+                  "kind": "年度报告",
+                  "year": 2022,
+                  "query": "2022年年度报告",
+                  "date_range": "2023-01-01~2023-12-31",
+                  "filename": "03_电科芯片_600877_2022年年度报告.pdf",
+              },
+              {
+                  "kind": "年度报告",
+                  "year": 2023,
+                  "query": "2023年年度报告",
+                  "date_range": "2024-01-01~2024-12-31",
+                  "filename": "04_电科芯片_600877_2023年年度报告.pdf",
+              },
+              {
+                  "kind": "年度报告",
+                  "year": 2024,
+                  "query": "2024年年度报告",
+                  "date_range": "2025-01-01~2025-12-31",
+                  "filename": "05_电科芯片_600877_2024年年度报告.pdf",
+              },
+              {
+                  "kind": "年度报告",
+                  "year": 2025,
+                  "query": "2025年年度报告",
+                  "date_range": "2026-01-01~2026-11-04",
+                  "filename": "06_电科芯片_600877_2025年年度报告.pdf",
+              },
+              {
+                  "kind": "第三季度报告",
+                  "year": 2026,
+                  "query": "2026年第三季度报告",
+                  "date_range": "2026-09-01~2026-11-04",
+                  "filename": "07_电科芯片_600877_2026年第三季度报告_最新季报.pdf",
+              },
+          ]
+
+          EXCLUDE_WORDS = (
+              "摘要", "英文版", "修订说明", "更正公告", "问询函", "回复", "核查意见",
+              "专项说明", "独立意见", "董事会工作报告", "内部控制", "审计报告",
+              "社会责任", "环境、社会及管治", "ESG", "提示性公告",
+          )
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(value or "")
+              value = re.sub(r"<[^>]+>", "", value)
+              return re.sub(r"\s+", "", value)
+
+          def query_announcements(target: dict) -> list[dict]:
+              attempts = [
+                  (target["query"], target["date_range"]),
+                  (str(target["year"]), target["date_range"]),
+                  (target["query"], "2020-01-01~2026-11-04"),
+              ]
+              collected: list[dict] = []
+              seen: set[str] = set()
+              for search_key, date_range in attempts:
+                  payload = {
+                      "pageNum": "1",
+                      "pageSize": "100",
+                      "column": "sse",
+                      "tabName": "fulltext",
+                      "plate": "sh",
+                      "stock": f"{STOCK_CODE},{ORG_ID}",
+                      "searchkey": search_key,
+                      "secid": "",
+                      "category": "",
+                      "trade": "",
+                      "seDate": date_range,
+                      "sortName": "",
+                      "sortType": "",
+                      "isHLtitle": "true",
+                  }
+                  response = session.post(API_URL, data=payload, timeout=(30, 180))
+                  print("QUERY", target["query"], search_key, date_range, response.status_code, len(response.content))
+                  response.raise_for_status()
+                  data = response.json()
+                  for item in data.get("announcements") or []:
+                      key = str(item.get("announcementId") or item.get("adjunctUrl") or "")
+                      if key and key not in seen:
+                          seen.add(key)
+                          collected.append(item)
+                  if collected:
+                      break
+                  time.sleep(0.8)
+              return collected
+
+          def score_candidate(item: dict, target: dict) -> tuple[int, str]:
+              title = clean_title(item.get("announcementTitle") or "")
+              score = 0
+              year = str(target["year"])
+              if year in title:
+                  score += 30
+              if target["kind"] == "年度报告":
+                  if "年度报告" in title:
+                      score += 30
+                  if f"{year}年年度报告" in title or f"{year}年度报告" in title:
+                      score += 35
+              else:
+                  if "第三季度报告" in title:
+                      score += 35
+                  if f"{year}年第三季度报告" in title:
+                      score += 40
+              if STOCK_CODE in title:
+                  score += 2
+              if any(word in title for word in EXCLUDE_WORDS):
+                  score -= 100
+              adjunct = str(item.get("adjunctUrl") or "")
+              if adjunct.lower().endswith(".pdf"):
+                  score += 5
+              return score, title
+
+          def choose_candidate(items: list[dict], target: dict) -> dict:
+              ranked = sorted(
+                  ((score_candidate(item, target), item) for item in items),
+                  key=lambda pair: (pair[0][0], pair[0][1]),
+                  reverse=True,
+              )
+              print("CANDIDATES", target["query"])
+              for (score, title), item in ranked[:15]:
+                  print("  ", score, title, item.get("adjunctUrl"), item.get("announcementTime"))
+              if not ranked or ranked[0][0][0] < 50:
+                  raise RuntimeError(f"No valid announcement found for {target['query']}")
+              return ranked[0][1]
+
+          def build_urls(adjunct_url: str) -> list[str]:
+              adjunct_url = (adjunct_url or "").lstrip("/")
+              return [
+                  f"https://static.cninfo.com.cn/{adjunct_url}",
+                  f"http://static.cninfo.com.cn/{adjunct_url}",
+              ]
+
+          def download_pdf(urls: list[str]) -> tuple[bytes, str]:
+              errors: list[str] = []
+              for url in urls:
+                  for attempt in range(4):
+                      try:
+                          response = session.get(
+                              url,
+                              timeout=(30, 420),
+                              allow_redirects=True,
+                              headers={
+                                  "Referer": "https://www.cninfo.com.cn/",
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                              },
+                          )
+                          print("DOWNLOAD", response.status_code, len(response.content), response.url, response.headers.get("content-type"))
+                          if response.status_code == 200 and response.content.startswith(b"%PDF-") and len(response.content) > 50_000:
+                              return response.content, response.url
+                          errors.append(f"{url}: status={response.status_code}, bytes={len(response.content)}, type={response.headers.get('content-type')}")
+                      except Exception as exc:
+                          errors.append(f"{url}: {exc!r}")
+                      time.sleep(1.0 + attempt)
+              raise RuntimeError("PDF download failed: " + " | ".join(errors[-8:]))
+
+          def extract_first_pages_text(path: Path, max_pages: int = 8) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              page_count = len(reader.pages)
+              text_parts = []
+              for page in reader.pages[: min(max_pages, page_count)]:
+                  try:
+                      text_parts.append(page.extract_text() or "")
+                  except Exception as exc:
+                      text_parts.append(f"[extract-error:{exc!r}]")
+              return page_count, "\n".join(text_parts)
+
+          def validate_pdf(path: Path, target: dict) -> tuple[int, str]:
+              if not path.read_bytes().startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF header: {path.name}")
+              page_count, text = extract_first_pages_text(path)
+              compact = re.sub(r"\s+", "", text)
+              if page_count < 5:
+                  raise RuntimeError(f"Unexpectedly short PDF ({page_count} pages): {path.name}")
+              if STOCK_CODE not in compact:
+                  raise RuntimeError(f"Stock code validation failed: {path.name}")
+              if str(target["year"]) not in compact:
+                  raise RuntimeError(f"Report year validation failed: {path.name}")
+              if target["kind"] == "年度报告" and "年度报告" not in compact:
+                  raise RuntimeError(f"Annual report title validation failed: {path.name}")
+              if target["kind"] == "第三季度报告" and "第三季度报告" not in compact:
+                  raise RuntimeError(f"Quarterly report title validation failed: {path.name}")
+              qpdf = subprocess.run(
+                  ["qpdf", "--warning-exit-0", "--check", str(path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f"qpdf validation failed for {path.name}: {qpdf.stdout}")
+              prefix = CHECK_DIR / path.stem
+              render = subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "120", "-singlefile", str(path), str(prefix)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              png = Path(str(prefix) + ".png")
+              if render.returncode != 0 or not png.exists() or png.stat().st_size < 5_000:
+                  raise RuntimeError(f"First-page render failed for {path.name}: {render.stdout}")
+              return page_count, compact[:1500]
+
+          manifest: list[dict] = []
+          for target in TARGETS:
+              items = query_announcements(target)
+              chosen = choose_candidate(items, target)
+              title = clean_title(chosen.get("announcementTitle") or "")
+              adjunct_url = str(chosen.get("adjunctUrl") or "")
+              data, final_url = download_pdf(build_urls(adjunct_url))
+              output_path = PDF_DIR / target["filename"]
+              output_path.write_bytes(data)
+              page_count, _ = validate_pdf(output_path, target)
+              announcement_time = chosen.get("announcementTime")
+              if isinstance(announcement_time, (int, float)):
+                  disclosed_at = datetime.fromtimestamp(announcement_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+              else:
+                  disclosed_at = str(announcement_time or "")
+              item = {
+                  "sequence": len(manifest) + 1,
+                  "stock_code": STOCK_CODE,
+                  "report_year": target["year"],
+                  "report_kind": target["kind"],
+                  "announcement_title": title,
+                  "disclosure_date": disclosed_at,
+                  "filename": target["filename"],
+                  "pages": page_count,
+                  "bytes": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "official_source_url": final_url,
+                  "cninfo_adjunct_url": adjunct_url,
+                  "announcement_id": str(chosen.get("announcementId") or ""),
+              }
+              manifest.append(item)
+              print("SELECTED", json.dumps(item, ensure_ascii=False))
+
+          expected = {(x["year"], x["kind"]) for x in TARGETS}
+          actual = {(x["report_year"], x["report_kind"]) for x in manifest}
+          if expected != actual or len(manifest) != 7:
+              raise RuntimeError(f"Manifest completeness failed: expected={expected}, actual={actual}")
+
+          readme_lines = [
+              f"{FULL_CURRENT_NAME}（{STOCK_CODE}.SH）定期报告资料包",
+              f"整理日期：{PREPARED_ON}",
+              "",
+              "收录范围：2020年至2025年年度报告全文，共6份；截至整理日期最新季度报告为2026年第三季度报告，共1份。",
+              "全部文件均为巨潮资讯网披露的正式PDF全文，未收录年度报告摘要、问询函回复、审计专项说明或其他附件。",
+              "历史简称提示：2020年报告期公司简称为ST电能；2021年报告披露时公司简称为声光电科；此后使用电科芯片。证券代码始终为600877。",
+              "",
+              "文件清单：",
+          ]
+          for item in manifest:
+              readme_lines.extend([
+                  f"{item['sequence']}. {item['filename']}",
+                  f"   公告标题：{item['announcement_title']}",
+                  f"   披露日期：{item['disclosure_date']}；页数：{item['pages']}；大小：{item['bytes']}字节",
+                  f"   正式来源：{item['official_source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme_lines.extend([
+              "核验项目：PDF文件头、证券代码、报告年度与报告类型、页数、qpdf结构检查、首页渲染检查、逐文件SHA-256、ZIP CRC。",
+              "资料仅供研究与存档，报告版权归上市公司及信息披露平台相关权利人所有。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme_lines), encoding="utf-8")
+          (ROOT / "manifest.json").write_text(json.dumps({
+              "company": FULL_CURRENT_NAME,
+              "stock_code": STOCK_CODE,
+              "prepared_on": PREPARED_ON,
+              "annual_report_range": "2020-2025",
+              "latest_quarterly_report": "2026年第三季度报告",
+              "file_count": len(manifest),
+              "files": manifest,
+          }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["序号", "证券代码", "报告年度", "报告类型", "公告标题", "披露日期", "文件名", "页数", "字节数", "SHA-256", "正式来源"])
+              for item in manifest:
+                  writer.writerow([
+                      item["sequence"], item["stock_code"], item["report_year"], item["report_kind"],
+                      item["announcement_title"], item["disclosure_date"], item["filename"], item["pages"],
+                      item["bytes"], item["sha256"], item["official_source_url"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF文件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("electric_chip_600877_2020_2025_annual_and_2026_q3_reports.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT_NAME) / path.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC validation failed at {bad}")
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f"ZIP contains {len(pdf_names)} PDFs instead of 7")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "file_count": len(manifest),
+              "annual_report_count": 6,
+              "quarterly_report_count": 1,
+              "latest_quarterly_report": "2026年第三季度报告",
+              "files": manifest,
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: electric-chip-600877-financial-reports-20261104
+          path: |
+            electric_chip_600877_2020_2025_annual_and_2026_q3_reports.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
