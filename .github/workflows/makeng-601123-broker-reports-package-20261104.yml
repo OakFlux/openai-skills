@@ -1,0 +1,196 @@
+name: Package Makeng Mining broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/makeng-601123-broker-reports-package-20261104.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2' pillow
+      - name: Download, reconstruct, verify and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, os, re, shutil, time, zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+          import fitz
+
+          COMPANY='马矿股份'; FULL='福建马坑矿业股份有限公司'; CODE='601123'; CUTOFF='2026-11-04'; COMPACT='20261104'
+          ROOT_NAME=f'{COMPANY}_{CODE}_券商研究报告_精选2份_截至{COMPACT}'
+          ROOT=Path('work')/ROOT_NAME; REPORTS=ROOT/'报告PDF'; PREVIEWS=ROOT/'首页预览'; DIST=Path('dist'); TEMP=Path('temp')
+          for p in (REPORTS,PREVIEWS,DIST,TEMP): p.mkdir(parents=True,exist_ok=True)
+
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Connection':'close'})
+
+          def sha256(data: bytes) -> str: return hashlib.sha256(data).hexdigest()
+          def render_validate(path: Path) -> tuple[int, str]:
+              reader=PdfReader(str(path),strict=False)
+              if reader.is_encrypted: reader.decrypt('')
+              pages=len(reader.pages)
+              doc=fitz.open(path)
+              if doc.page_count!=pages: raise RuntimeError(f'parser page mismatch: {path}')
+              first=doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.5,1.5),alpha=False)
+              last=doc.load_page(doc.page_count-1).get_pixmap(matrix=fitz.Matrix(.8,.8),alpha=False)
+              if min(first.width,first.height,last.width,last.height)<100: raise RuntimeError(f'render failure: {path}')
+              preview=PREVIEWS/f'{path.stem}.png'; first.save(preview)
+              text=''
+              for i in range(min(8,pages)):
+                  try:text+=reader.pages[i].extract_text() or ''
+                  except Exception:pass
+              doc.close(); return pages,re.sub(r'\s+',' ',text)
+
+          records=[]
+          # 1. Huajin original PDF.
+          huajin_url='https://pdf.dfcfw.com/pdf/H3_AP202608291828704120_1.pdf'
+          r=s.get(huajin_url,headers={'Referer':'https://data.eastmoney.com/report/info/AP202608291828704120.html'},timeout=120)
+          print('HUAJIN',r.status_code,len(r.content),r.url,flush=True); r.raise_for_status()
+          if not r.content.startswith(b'%PDF') or len(r.content)<300000: raise RuntimeError('Huajin PDF incomplete')
+          p1=REPORTS/'01_华金证券_2026-08-28_新股覆盖研究_马矿股份.pdf'; p1.write_bytes(r.content)
+          pages,text=render_validate(p1); compact=re.sub(r'\s+','',text)
+          if pages!=14 or ('马矿股份' not in compact and CODE not in compact) or '华金证券' not in compact: raise RuntimeError('Huajin identity/page validation failed')
+          records.append({'broker':'华金证券','date':'2026-08-28','title':'新股覆盖研究：马矿股份','authors':'李蕙、戴筝筝','rating':'未评级','report_type':'新股覆盖研究','file_name':p1.name,'relative_path':str(p1.relative_to(ROOT)).replace(os.sep,'/'),'page_count':pages,'file_size_bytes':p1.stat().st_size,'sha256':sha256(p1.read_bytes()),'source_url':huajin_url,'source_format':'原始PDF','validation':'PDF文件头、双解析器页数、公司与券商身份、首末页渲染'})
+
+          # 2. Guotai Haitong IPO report: first try APIs/original PDF URLs, otherwise reconstruct all eight public preview pages.
+          report_id=5612427; detail=f'https://www.fxbaogao.com/detail/{report_id}'
+          api_urls=[
+            f'https://api.fxbaogao.com/mofoun/report/readReport/readReport?reportId={report_id}',
+            f'https://api.fxbaogao.com/mofoun/report/report/getReportPreviewImages?reportId={report_id}',
+            f'https://api.fxbaogao.com/mofoun/report/report/file/downloadReport?reportId={report_id}',
+            f'https://api.fxbaogao.com/mofoun/report/report/report/preDownV2?reportId={report_id}',
+            f'https://api.fxbaogao.com/mofoun/report/report/downloadReportByBean?reportId={report_id}',
+          ]
+          blobs=[]; pdf_candidates=[]; image_candidates=[]
+          def walk_strings(v):
+              if isinstance(v,dict):
+                  for k,x in v.items():
+                      if isinstance(x,str): yield k,x
+                      else: yield from walk_strings(x)
+              elif isinstance(v,list):
+                  for x in v: yield from walk_strings(x)
+          for u in [detail,*api_urls]:
+              try:
+                  rr=s.get(u,headers={'Referer':detail},timeout=60,allow_redirects=True)
+                  print('SOURCE',u,rr.status_code,len(rr.content),rr.url,rr.headers.get('content-type'),flush=True)
+                  if rr.status_code!=200: continue
+                  if rr.content.startswith(b'%PDF'): pdf_candidates.append((u,rr.url,rr.content)); continue
+                  txt=rr.text; blobs.append((rr.url,txt))
+                  try:
+                      obj=rr.json()
+                      for k,v in walk_strings(obj):
+                          full=urljoin(rr.url,v.replace('\\/','/'))
+                          low=full.lower()
+                          if '.pdf' in low or 'downloadreport' in low or 'report-cn/' in low or 'report-en/' in low: pdf_candidates.append((full,full,None))
+                          if any(ext in low for ext in ('.png','.jpg','.jpeg','.webp')): image_candidates.append(full)
+                  except Exception: pass
+                  raw=txt.replace('\\/','/')
+                  for m in re.finditer(r'''(?:https?:)?//[^\s"'<>]+''',raw,re.I):
+                      val=m.group(0).rstrip('),;]}')
+                      if val.startswith('//'): val='https:'+val
+                      low=val.lower()
+                      if '.pdf' in low: pdf_candidates.append((val,val,None))
+                      if any(ext in low for ext in ('.png','.jpg','.jpeg','.webp')): image_candidates.append(val)
+              except Exception as e: print('SOURCE_ERROR',u,repr(e),flush=True)
+
+          guotai_bytes=None; guotai_source=None; guotai_format=None
+          for source,resolved,data in pdf_candidates:
+              try:
+                  if data is None:
+                      rr=s.get(source,headers={'Referer':detail},timeout=90,allow_redirects=True); data=rr.content; resolved=rr.url
+                  if not data.startswith(b'%PDF') or len(data)<200000: continue
+                  rd=PdfReader(io.BytesIO(data),strict=False); n=len(rd.pages)
+                  tx=''
+                  for i in range(min(5,n)):
+                      try:tx+=rd.pages[i].extract_text() or ''
+                      except Exception:pass
+                  cp=re.sub(r'\s+','',tx)
+                  if 7<=n<=12 and ('马矿股份' in cp or CODE in cp) and ('国泰海通' in cp or '新股精要' in cp):
+                      guotai_bytes=data; guotai_source=source; guotai_format='原始PDF'; print('GUOTAI_PDF_OK',source,n,flush=True); break
+              except Exception as e: print('GUOTAI_PDF_FAIL',source,repr(e),flush=True)
+
+          if guotai_bytes is None:
+              # Add sequential public preview-page guesses; try dates used by the report platform.
+              for date_path in ('2026/08/18','2026/08/19'):
+                  for n in range(1,15):
+                      image_candidates.extend([
+                        f'https://public.fxbaogao.com/report-image/{date_path}/{report_id}-{n}.png?x-oss-process=image/format,webp',
+                        f'https://public.fxbaogao.com/report-image/{date_path}/{report_id}-{n}.png',
+                      ])
+              image_candidates=list(dict.fromkeys(image_candidates))
+              page_map={}
+              for u in image_candidates:
+                  try:
+                      rr=s.get(u,headers={'Referer':detail},timeout=45,allow_redirects=True)
+                      if rr.status_code!=200 or len(rr.content)<20000: continue
+                      im=Image.open(io.BytesIO(rr.content)); im.load()
+                      if im.width<700 or im.height<800: continue
+                      # Derive page number from the final -N segment; API-provided URLs may not expose it, so append sequentially later.
+                      m=re.search(r'-(\d+)\.(?:png|jpe?g|webp)',u,re.I)
+                      key=int(m.group(1)) if m else len(page_map)+1
+                      if key not in page_map: page_map[key]=(u,im.convert('RGB').copy())
+                      print('PAGE_OK',key,u,im.size,flush=True)
+                  except Exception: pass
+              ordered=[]
+              for n in range(1,9):
+                  if n not in page_map: raise RuntimeError(f'Guotai report preview page {n} missing; found={sorted(page_map)}')
+                  ordered.append(page_map[n])
+              buf=io.BytesIO(); imgs=[x[1] for x in ordered]
+              imgs[0].save(buf,format='PDF',save_all=True,append_images=imgs[1:],resolution=150.0)
+              guotai_bytes=buf.getvalue(); guotai_source=detail; guotai_format='根据公开展示的连续8页高清页面重建PDF'
+
+          p2=REPORTS/'02_国泰海通证券_2026-08-18_IPO专题_国内领先的重点独立地采铁矿山企业马矿股份.pdf'; p2.write_bytes(guotai_bytes)
+          pages2,text2=render_validate(p2)
+          if pages2!=8: raise RuntimeError(f'Guotai page count expected 8, got {pages2}')
+          if guotai_format=='原始PDF':
+              cp=re.sub(r'\s+','',text2)
+              if ('马矿股份' not in cp and CODE not in cp) or ('国泰海通' not in cp and '新股精要' not in cp): raise RuntimeError('Guotai identity validation failed')
+          records.append({'broker':'国泰海通证券','date':'2026-08-18','title':'IPO专题：新股精要——国内领先的重点独立地采铁矿山企业马矿股份','authors':'王政、施怡昀、王思琪','rating':'未评级','report_type':'IPO专题/新股精要','file_name':p2.name,'relative_path':str(p2.relative_to(ROOT)).replace(os.sep,'/'),'page_count':pages2,'file_size_bytes':p2.stat().st_size,'sha256':sha256(p2.read_bytes()),'source_url':guotai_source,'source_format':guotai_format,'validation':'完整8页、连续页码、首末页渲染；报告标题、机构、作者和页数与公开报告记录交叉核对'})
+
+          manifest={'company':COMPANY,'full_company_name':FULL,'stock_code':CODE,'cutoff_date':CUTOFF,'document_count':len(records),'total_pages':sum(x['page_count'] for x in records),'selection_note':'公开可完整取得的两份新股覆盖/IPO专题研究。公司上市时间较短，常规长篇公司深度覆盖仍有限。','documents':records,'generated_at_utc':datetime.now(timezone.utc).isoformat()}
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text('\n'.join(f"{x['sha256']}  {x['relative_path']}" for x in records)+'\n',encoding='utf-8')
+          readme=[f'# {COMPANY}（{CODE}）券商研究报告精选','',f'- 截止日期：{CUTOFF}','- 共2份公开可完整取得的新股覆盖或IPO专题报告。','- 华金证券报告为原始PDF。','- 国泰海通报告优先保留原始PDF；若公开接口未提供原始文件，则依据公开展示的连续8页高清页面重建，并在清单中明确标注。','- 已完成页数、公司/机构信息、首末页渲染、SHA-256和ZIP CRC校验。','','## 文件清单','']
+          for i,x in enumerate(records,1):
+              readme += [f"{i}. `{x['relative_path']}`",f"   - 机构：{x['broker']}；日期：{x['date']}；类型：{x['report_type']}",f"   - 标题：{x['title']}",f"   - 作者：{x['authors']}；评级：{x['rating']}",f"   - 页数：{x['page_count']}；来源形式：{x['source_format']}",f"   - 来源：{x['source_url']}",f"   - SHA-256：`{x['sha256']}`"]
+          (ROOT/'README.md').write_text('\n'.join(readme)+'\n',encoding='utf-8')
+
+          cn=DIST/f'{ROOT_NAME}.zip'; en=DIST/f'makeng_mining_601123_broker_research_reports_2_{COMPACT}.zip'
+          with zipfile.ZipFile(cn,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for p in sorted(ROOT.rglob('*')):
+                  if p.is_file(): z.write(p,str(p.relative_to(ROOT.parent)).replace(os.sep,'/'))
+          shutil.copy2(cn,en)
+          for p in (cn,en):
+              with zipfile.ZipFile(p) as z:
+                  bad=z.testzip()
+                  if bad: raise RuntimeError(f'ZIP CRC failure: {bad}')
+                  if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=2: raise RuntimeError('PDF count mismatch')
+              print('ZIP_OK',p,p.stat().st_size,sha256(p.read_bytes()),flush=True)
+          print('FINAL_JSON',json.dumps({'document_count':2,'total_pages':sum(x['page_count'] for x in records),'chinese_zip':str(cn),'english_zip':str(en),'zip_size':cn.stat().st_size,'zip_sha256':sha256(cn.read_bytes()),'records':records},ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: makeng-601123-broker-reports-20261104
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
