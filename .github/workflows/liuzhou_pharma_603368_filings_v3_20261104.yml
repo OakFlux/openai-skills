@@ -1,0 +1,202 @@
+name: package-liuzhou-pharma-603368-filings-v3
+
+on:
+  push:
+    branches:
+      - tmp/liuzhou-pharma-603368-filings-20261104-v3
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4 lxml
+
+      - name: Build package from official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, html, json, re, subprocess, time, zipfile
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CODE='603368'; ORG='gssh0603368'; COMPANY='柳药集团'; FULL='广西柳药集团股份有限公司'; PREPARED='2026-11-04'
+          HIST=['柳药股份','广西柳州医药股份有限公司']
+          ROOT_NAME='柳药集团_603368_2020-2025年报及最新季报'; ROOT=Path(ROOT_NAME)
+          PDF_DIR=ROOT/'PDF文件'; PREVIEW_DIR=ROOT/'首页预览'; PDF_DIR.mkdir(parents=True,exist_ok=True); PREVIEW_DIR.mkdir(parents=True,exist_ok=True)
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+            'Accept':'application/json, text/javascript, */*; q=0.01',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+            'Origin':'https://www.cninfo.com.cn',
+            'Referer':f'https://www.cninfo.com.cn/new/disclosure/stock?orgId={ORG}&stockCode={CODE}',
+            'X-Requested-With':'XMLHttpRequest',
+          })
+
+          def clean(v):
+            v=html.unescape(str(v or ''))
+            return re.sub(r'\s+',' ',BeautifulSoup(v,'lxml').get_text(' ',strip=True)).strip()
+
+          def ann_date(value):
+            try:
+              if isinstance(value,(int,float)) or str(value).isdigit():
+                n=int(value)
+                if n>10_000_000_000: n//=1000
+                return datetime.fromtimestamp(n,tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d')
+            except Exception: pass
+            m=re.search(r'(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})',str(value or ''))
+            return f'{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}' if m else '1900-01-01'
+
+          endpoint='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          base={
+            'pageSize':'30','column':'sse','tabName':'fulltext','plate':'sh','stock':f'{CODE},{ORG}',
+            'secid':'','trade':'','seDate':f'2021-01-01~{PREPARED}','sortName':'','sortType':'','isHLtitle':'true'
+          }
+          searches=[
+            {'category':'category_ndbg_szsh;category_bndbg_szsh;category_sjdbg_szsh;category_yjdbg_szsh','searchkey':''},
+            {'category':'','searchkey':'年度报告'},
+            {'category':'','searchkey':'季度报告'},
+          ]
+          announcements=[]; seen=set()
+          for spec in searches:
+            for page in range(1,11):
+              data={**base,**spec,'pageNum':str(page)}
+              last=None
+              for attempt in range(4):
+                try:
+                  r=s.post(endpoint,data=data,timeout=(30,180)); print('CNINFO_QUERY',spec,page,r.status_code,len(r.content),r.headers.get('content-type')); r.raise_for_status(); payload=r.json(); break
+                except Exception as e:
+                  last=e; print('CNINFO_QUERY_ERROR',spec,page,attempt,repr(e)); time.sleep(attempt+1)
+              else: raise RuntimeError(f'CNINFO query failed: {last}')
+              rows=payload.get('announcements') or []
+              if not rows: break
+              for row in rows:
+                url=row.get('adjunctUrl') or row.get('announcementUrl') or ''
+                if not url or url in seen: continue
+                seen.add(url)
+                announcements.append({
+                  'title':clean(row.get('announcementTitle') or row.get('title')),
+                  'date':ann_date(row.get('announcementTime') or row.get('announcementDate')),
+                  'url':url,
+                  'id':str(row.get('announcementId') or ''),
+                  'secCode':str(row.get('secCode') or ''),
+                  'secName':clean(row.get('secName') or ''),
+                })
+              total=int(payload.get('totalpages') or payload.get('totalPages') or 0)
+              if total and page>=total: break
+
+          print('ANNOUNCEMENTS',len(announcements))
+          relevant=[]
+          for x in announcements:
+            n=re.sub(r'\s+','',x['title'])
+            if '年度报告' in n or '季度报告' in n or '一季度报告' in n:
+              relevant.append(x); print('RECORD',x['date'],x['title'],x['url'])
+          if not relevant: raise RuntimeError('No relevant filings returned by CNINFO')
+
+          excluded=['摘要','英文','更正公告','补充公告','问询','回复','说明会','董事会','监事会','独立董事','审计报告','社会责任','ESG','披露提示性公告','取消','延期']
+          def norm(t): return re.sub(r'\s+','',t).replace('（','(').replace('）',')')
+          selected=[]
+          for year in range(2020,2026):
+            token=f'{year}年年度报告'; cand=[]
+            for x in relevant:
+              n=norm(x['title'])
+              if token in n and not any(e in n for e in excluded):
+                score=(20 if re.sub(r'^.*?[：:]','',n)==token else 0)+(5 if '修订' in n else 0)+(3 if n.endswith('年度报告') or n.endswith('年度报告(修订版)') else 0)
+                cand.append((x['date'],score,x))
+            if not cand: raise RuntimeError(f'Missing {year} annual report; titles={[x["title"] for x in relevant]}')
+            cand.sort(key=lambda z:(z[0],z[1]),reverse=True); x=cand[0][2]
+            selected.append({'period':token,'kind':'annual',**x}); print('SELECT',token,x['date'],x['title'],x['url'])
+
+          qcand=[]
+          for x in relevant:
+            n=norm(x['title'])
+            if ('季度报告' in n or '一季度报告' in n) and not any(e in n for e in excluded):
+              qrank=3 if '第三季度报告' in n else (1 if '第一季度报告' in n or '一季度报告' in n else 0)
+              ym=re.search(r'(20\d{2})年',n); y=int(ym.group(1)) if ym else 0
+              qcand.append((x['date'],y,qrank,10 if n.endswith('季度报告') or n.endswith('一季度报告') else 0,x))
+          if not qcand: raise RuntimeError('No quarterly report found')
+          qcand.sort(key=lambda z:(z[0],z[1],z[2],z[3]),reverse=True); x=qcand[0][4]; n=norm(x['title'])
+          pm=re.search(r'(20\d{2}年(?:第一|第三)季度报告)',n)
+          if not pm: pm=re.search(r'(20\d{2}年一季度报告)',n)
+          period=pm.group(1) if pm else n
+          selected.append({'period':period,'kind':'quarter',**x}); print('SELECT',period,x['date'],x['title'],x['url'])
+
+          def source_urls(raw):
+            if raw.startswith('http://') or raw.startswith('https://'): return [raw]
+            raw=raw.lstrip('/')
+            return ['https://static.cninfo.com.cn/'+raw,'http://static.cninfo.com.cn/'+raw]
+
+          def download(raw):
+            last=None
+            for u in source_urls(raw):
+              for attempt in range(5):
+                try:
+                  r=s.get(u,headers={'Referer':'https://www.cninfo.com.cn/','Accept':'application/pdf,*/*;q=0.8'},timeout=(30,360)); print('DOWNLOAD',r.status_code,len(r.content),r.url,r.headers.get('content-type')); r.raise_for_status()
+                  if r.content.startswith(b'%PDF-') and len(r.content)>50000: return r.content,r.url,r.headers.get('content-type','')
+                  last=RuntimeError(f'not PDF, first bytes={r.content[:20]!r}')
+                except Exception as e:
+                  last=e; print('DOWNLOAD_ERROR',u,attempt,repr(e)); time.sleep(attempt+1)
+            raise RuntimeError(f'Cannot download {raw}: {last}')
+
+          manifest=[]; accepted=[CODE,COMPANY,FULL,*HIST]
+          for i,item in enumerate(selected,1):
+            data,final_url,ctype=download(item['url']); filename=f'{i:02d}_{item["period"]}.pdf'; path=PDF_DIR/filename; path.write_bytes(data)
+            reader=PdfReader(str(path),strict=False); pages=len(reader.pages); sample=''.join((p.extract_text() or '') for p in reader.pages[:min(10,pages)]); compact=re.sub(r'\s+','',sample)
+            if not any(a.replace(' ','') in compact for a in accepted): raise RuntimeError(f'Issuer validation failed: {filename}')
+            if item['kind']=='annual' and pages<50: raise RuntimeError(f'Annual report too short: {filename}, {pages}')
+            if item['kind']=='quarter' and pages<5: raise RuntimeError(f'Quarter report too short: {filename}, {pages}')
+            chk=subprocess.run(['qpdf','--warning-exit-0','--check',str(path)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+            if chk.returncode!=0: raise RuntimeError(f'qpdf failed {filename}: {chk.stdout}')
+            prefix=PREVIEW_DIR/path.stem; rnd=subprocess.run(['pdftoppm','-f','1','-l','1','-png','-r','120','-singlefile',str(path),str(prefix)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True); preview=Path(str(prefix)+'.png')
+            if rnd.returncode!=0 or not preview.exists() or preview.stat().st_size<5000: raise RuntimeError(f'preview failed {filename}: {rnd.stdout}')
+            rec={'sequence':i,'period':item['period'],'kind':item['kind'],'announcement_title':item['title'],'announcement_date':item['date'],'source_url':final_url,'announcement_id':item['id'],'filename':filename,'pages':pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'content_type':ctype,'preview_file':str(Path('首页预览')/preview.name)}
+            manifest.append(rec); print('VALIDATED',rec['period'],pages,len(data),rec['sha256'])
+
+          if len(manifest)!=7: raise RuntimeError(f'Expected 7 reports, got {len(manifest)}')
+          latest=manifest[-1]['period']
+          lines=[f'{FULL}（{CODE}.SH）2020—2025年年度报告及最新季度报告资料包',f'整理日期：{PREPARED}','','文件构成：2020—2025年年度报告全文6份，以及截至整理日已披露的最新独立季度报告1份。',f'最新季度报告：{latest}。','所有PDF均来自巨潮资讯网法定信息披露镜像，已排除摘要、说明会公告及其他附件。','']
+          for x in manifest:
+            lines += [f'{x["sequence"]}. {x["filename"]}',f'   公告标题：{x["announcement_title"]}',f'   公告日期：{x["announcement_date"]}',f'   页数：{x["pages"]}；字节数：{x["bytes"]}',f'   官方来源：{x["source_url"]}',f'   SHA-256：{x["sha256"]}','']
+          lines += ['核验项目：公司名称或证券代码、报告期间、PDF文件头、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。']
+          (ROOT/'README_报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          payload={'company':FULL,'stock_code':CODE,'prepared_on':PREPARED,'file_count':7,'annual_report_count':6,'latest_quarter':latest,'files':manifest}
+          (ROOT/'manifest.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
+          with (ROOT/'manifest.csv').open('w',newline='',encoding='utf-8-sig') as f:
+            w=csv.writer(f); w.writerow(['序号','报告期间','类型','公告标题','公告日期','文件名','页数','字节数','SHA-256','官方来源','首页预览'])
+            for x in manifest: w.writerow([x['sequence'],x['period'],x['kind'],x['announcement_title'],x['announcement_date'],x['filename'],x['pages'],x['bytes'],x['sha256'],x['source_url'],x['preview_file']])
+          (ROOT/'SHA256SUMS.txt').write_text('\n'.join(f'{x["sha256"]}  PDF文件/{x["filename"]}' for x in manifest)+'\n',encoding='utf-8')
+
+          zip_path=Path('liuzhou_pharma_603368_2020_2025_annual_latest_quarter.zip')
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file(): z.write(p,arcname=str(Path(ROOT_NAME)/p.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path) as z:
+            bad=z.testzip(); pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=7: raise RuntimeError(f'ZIP validation failed bad={bad} pdfs={len(pdfs)}')
+          result={'package':zip_path.name,'zip_bytes':zip_path.stat().st_size,'zip_sha256':hashlib.sha256(zip_path.read_bytes()).hexdigest(),'file_count':7,'annual_report_count':6,'latest_quarter':latest,'files':[{k:x[k] for k in ['period','announcement_date','pages','bytes','sha256','source_url']} for x in manifest]}
+          Path('result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8'); print('PACKAGE_RESULT',json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: liuzhou-pharma-603368-filings-v3-20261104
+          path: |
+            liuzhou_pharma_603368_2020_2025_annual_latest_quarter.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
