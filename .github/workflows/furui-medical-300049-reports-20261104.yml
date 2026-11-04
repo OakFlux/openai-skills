@@ -1,0 +1,220 @@
+name: Package Furui Medical 300049 reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/furui-medical-300049-reports-20261104.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          CURRENT = '福瑞医科'
+          OLD = '福瑞股份'
+          FULL = '内蒙古福瑞医疗科技股份有限公司'
+          CODE = '300049'
+          CUTOFF = '2026-11-04'
+          COMPACT = '20261104'
+          ROOT_NAME = f'{CURRENT}_{CODE}_2020-2025年报及最新季报_截至{COMPACT}'
+          ROOT = Path('work') / ROOT_NAME
+          PDF_DIR = ROOT / 'PDF文件'
+          PREVIEW_DIR = ROOT / '首页与末页预览'
+          DIST = Path('dist')
+          for directory in (PDF_DIR, PREVIEW_DIR, DIST):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          documents = [
+              {'file_name':'01_2020年年度报告.pdf','type':'年度报告','year':2020,'date':'2021-04-28','url':'https://static.cninfo.com.cn/finalpage/2021-04-28/1209830704.PDF'},
+              {'file_name':'02_2021年年度报告.pdf','type':'年度报告','year':2021,'date':'2022-04-28','url':'https://static.cninfo.com.cn/finalpage/2022-04-28/1213160393.PDF'},
+              {'file_name':'03_2022年年度报告.pdf','type':'年度报告','year':2022,'date':'2023-04-27','url':'https://static.cninfo.com.cn/finalpage/2023-04-27/1216614685.PDF'},
+              {'file_name':'04_2023年年度报告.pdf','type':'年度报告','year':2023,'date':'2024-04-29','url':'https://static.cninfo.com.cn/finalpage/2024-04-29/1219866709.PDF'},
+              {'file_name':'05_2024年年度报告.pdf','type':'年度报告','year':2024,'date':'2025-04-22','url':'https://static.cninfo.com.cn/finalpage/2025-04-22/1223187199.PDF'},
+              {'file_name':'06_2025年年度报告.pdf','type':'年度报告','year':2025,'date':'2026-03-25','url':'https://static.cninfo.com.cn/finalpage/2026-03-25/1225027182.PDF'},
+              {'file_name':'07_2026年第三季度报告.pdf','type':'最新季度报告','year':2026,'date':'2026-10-30','url':'https://static.cninfo.com.cn/finalpage/2026-10-30/1225638772.PDF'},
+          ]
+
+          session = requests.Session()
+          retry = Retry(total=6, connect=6, read=6, status=6, backoff_factor=0.8,
+                        status_forcelist=(403,408,429,500,502,503,504),
+                        allowed_methods=frozenset({'GET'}), raise_on_status=False)
+          adapter = HTTPAdapter(max_retries=retry)
+          session.mount('https://', adapter)
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer':'https://www.cninfo.com.cn/',
+              'Accept':'application/pdf,*/*;q=0.8',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', '', text or '')
+
+          records = []
+          for item in documents:
+              response = session.get(item['url'], timeout=300, allow_redirects=True)
+              print('DOWNLOAD', item['file_name'], response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+              response.raise_for_status()
+              data = response.content
+              if not data.startswith(b'%PDF') or len(data) < 20000:
+                  raise RuntimeError(f"PDF内容异常: {item['file_name']}, bytes={len(data)}")
+
+              path = PDF_DIR / item['file_name']
+              path.write_bytes(data)
+              reader = PdfReader(str(path), strict=False)
+              if reader.is_encrypted:
+                  reader.decrypt('')
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f"PDF页数异常: {item['file_name']}, pages={pages}")
+
+              sample = ''
+              for idx in sorted(set([0, min(1,pages-1), min(2,pages-1), pages-1])):
+                  try:
+                      sample += reader.pages[idx].extract_text() or ''
+                  except Exception:
+                      pass
+              text = compact(sample)
+              if FULL not in text and CURRENT not in text and OLD not in text and CODE not in text:
+                  raise RuntimeError(f"公司身份校验失败: {item['file_name']}")
+              if item['type'] == '年度报告' and f"{item['year']}年年度报告" not in text:
+                  raise RuntimeError(f"报告年份校验失败: {item['file_name']}")
+              if item['type'] == '最新季度报告' and '2026年第三季度报告' not in text and '2026年三季度报告' not in text:
+                  raise RuntimeError('最新季度报告文本校验失败')
+
+              doc = fitz.open(path)
+              if doc.page_count != pages:
+                  raise RuntimeError(f"双解析器页数不一致: {item['file_name']}")
+              first = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(1.25,1.25), alpha=False)
+              last = doc.load_page(doc.page_count-1).get_pixmap(matrix=fitz.Matrix(1.0,1.0), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 400:
+                  raise RuntimeError(f"页面渲染异常: {item['file_name']}")
+              first.save(PREVIEW_DIR / f"{path.stem}_首页.png")
+              last.save(PREVIEW_DIR / f"{path.stem}_末页.png")
+              doc.close()
+
+              record = {
+                  **item,
+                  'page_count': pages,
+                  'file_size_bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'resolved_url': response.url,
+                  'pdf_header_valid': True,
+                  'company_identity_validated': True,
+                  'dual_parser_page_count_validated': True,
+                  'first_and_last_pages_rendered': True,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          manifest = {
+              'company_short_name': CURRENT,
+              'previous_short_name': OLD,
+              'company_full_name': FULL,
+              'stock_code': CODE,
+              'cutoff_date': CUTOFF,
+              'scope': '2020-2025年完整年度报告及截至截止日最新季度报告（2026年第三季度报告）',
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  PDF文件/{r['file_name']}\n" for r in records), encoding='utf-8')
+
+          readme = [
+              f'# {CURRENT}（{CODE}）2020-2025年报及最新季报','',
+              f'- 公司全称：{FULL}', f'- 截止日期：{CUTOFF}',
+              '- 证券简称说明：2020-2024年年报披露时简称为“福瑞股份”；2025年年报及2026年季报简称为“福瑞医科”。',
+              '- 文件范围：2020-2025年完整年度报告、2026年第三季度报告。',
+              f'- PDF数量：{len(records)}份；合计页数：{sum(r["page_count"] for r in records)}页。',
+              '- 来源：巨潮资讯网法定信息披露PDF。',
+              '- 校验：PDF文件头、公司与报告身份、双解析器页数、首末页渲染、SHA-256和ZIP CRC。','',
+              '## 文件清单',''
+          ]
+          for number, record in enumerate(records, 1):
+              readme += [
+                  f'{number}. `{record["file_name"]}`',
+                  f'   - 类型：{record["type"]}；公告日期：{record["date"]}',
+                  f'   - 页数：{record["page_count"]}',
+                  f'   - 来源：{record["resolved_url"]}',
+                  f'   - SHA-256：`{record["sha256"]}`',
+              ]
+          (ROOT/'README.md').write_text('\n'.join(readme)+'\n', encoding='utf-8')
+
+          cn_zip = DIST / f'{ROOT_NAME}.zip'
+          en_zip = DIST / f'furui_medical_300049_2020_2025_annual_latest_quarter_{COMPACT}.zip'
+          with zipfile.ZipFile(cn_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep,'/'))
+          shutil.copy2(cn_zip, en_zip)
+
+          for zip_path in (cn_zip, en_zip):
+              with zipfile.ZipFile(zip_path) as archive:
+                  bad = archive.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC校验失败: {bad}')
+                  pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if len(pdfs) != 7:
+                      raise RuntimeError(f'ZIP内PDF数量异常: {len(pdfs)}')
+              print('ZIP_VERIFIED', zip_path, zip_path.stat().st_size, sha256(zip_path), flush=True)
+
+          print('FINAL_SUMMARY', json.dumps({
+              'chinese_zip': str(cn_zip),
+              'english_zip': str(en_zip),
+              'zip_size_bytes': cn_zip.stat().st_size,
+              'zip_sha256': sha256(cn_zip),
+              'document_count': len(records),
+              'total_pages': sum(r['page_count'] for r in records),
+              'records': records,
+          }, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload final ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: furui-medical-300049-reports-final-20261104
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
