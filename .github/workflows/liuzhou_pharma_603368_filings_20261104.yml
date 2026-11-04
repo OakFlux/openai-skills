@@ -1,0 +1,418 @@
+name: package-liuzhou-pharma-603368-filings
+
+on:
+  push:
+    branches:
+      - tmp/liuzhou-pharma-603368-filings-20261104-v1
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "603368"
+          COMPANY = "柳药集团"
+          FULL_NAME = "广西柳药集团股份有限公司"
+          HISTORICAL_NAMES = ["柳药股份", "广西柳州医药股份有限公司"]
+          PREPARED = "2026-11-04"
+          ROOT_NAME = "柳药集团_603368_2020-2025年报及最新季报"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF文件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Referer": "https://www.sse.com.cn/",
+          })
+
+          def parse_json_or_jsonp(text: str):
+              text = text.strip()
+              try:
+                  return json.loads(text)
+              except json.JSONDecodeError:
+                  match = re.search(r"^[^(]*\((.*)\)\s*;?\s*$", text, re.S)
+                  if match:
+                      return json.loads(match.group(1))
+                  raise
+
+          def recursive_records(obj):
+              if isinstance(obj, dict):
+                  keys_upper = {str(k).upper(): k for k in obj}
+                  title_key = next((keys_upper[k] for k in ["BULLETIN_TITLE", "TITLE", "ANNOUNCEMENTTITLE", "SECNAME"] if k in keys_upper), None)
+                  url_key = next((keys_upper[k] for k in ["URL", "BULLETIN_URL", "ANNOUNCEMENTURL", "ADJUNCTURL"] if k in keys_upper), None)
+                  if title_key is not None and url_key is not None:
+                      yield obj
+                  for value in obj.values():
+                      yield from recursive_records(value)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      yield from recursive_records(value)
+
+          def get_field(record, names):
+              upper = {str(k).upper(): v for k, v in record.items()}
+              for name in names:
+                  if name.upper() in upper and upper[name.upper()] not in (None, ""):
+                      return str(upper[name.upper()])
+              return ""
+
+          endpoint = "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do"
+          common = {
+              "isPagination": "true",
+              "productId": CODE,
+              "keyWord": "",
+              "beginDate": "2021-01-01",
+              "endDate": PREPARED,
+              "pageHelp.pageSize": "100",
+              "pageHelp.pageCount": "50",
+              "pageHelp.pageNo": "1",
+              "pageHelp.beginPage": "1",
+              "pageHelp.cacheSize": "1",
+          }
+          variants = [
+              {**common, "reportType2": "DQBG", "securityType": "0101,120100,020100,020200,120200"},
+              {**common, "securityType": "0101,120100,020100,020200,120200"},
+              common,
+          ]
+
+          raw_records = []
+          for index, params in enumerate(variants, 1):
+              try:
+                  response = session.get(endpoint, params=params, timeout=(20, 120))
+                  print("SSE_QUERY", index, response.status_code, len(response.content), response.url, response.headers.get("content-type"))
+                  response.raise_for_status()
+                  payload = parse_json_or_jsonp(response.text)
+                  found = list(recursive_records(payload))
+                  print("SSE_RECORDS", index, len(found))
+                  raw_records.extend(found)
+              except Exception as exc:
+                  print("SSE_QUERY_ERROR", index, repr(exc))
+
+          records = []
+          seen_urls = set()
+          for rec in raw_records:
+              title = get_field(rec, ["BULLETIN_TITLE", "TITLE", "ANNOUNCEMENTTITLE"])
+              url = get_field(rec, ["URL", "BULLETIN_URL", "ANNOUNCEMENTURL", "ADJUNCTURL"])
+              date = get_field(rec, ["BULLETIN_DATE", "DATE", "ANNOUNCEMENTTIME", "SSEDATE"])
+              if not title or not url:
+                  continue
+              if url in seen_urls:
+                  continue
+              seen_urls.add(url)
+              records.append({"title": title, "url": url, "date": date, "raw": rec})
+
+          print("UNIQUE_RECORDS", len(records))
+          for item in sorted(records, key=lambda x: x["date"]):
+              norm = re.sub(r"\s+", "", item["title"])
+              if any(token in norm for token in ["年度报告", "季度报告"]):
+                  print("CANDIDATE", item["date"], item["title"], item["url"])
+
+          if not records:
+              raise RuntimeError("No Shanghai Stock Exchange announcement records were discovered")
+
+          excluded = [
+              "摘要", "英文", "更正公告", "补充公告", "问询", "回复", "说明会",
+              "董事会", "监事会", "独立董事", "审计报告", "社会责任", "ESG",
+              "披露提示性公告", "取消", "延期",
+          ]
+
+          def normalized_title(title: str) -> str:
+              return re.sub(r"\s+", "", title).replace("（", "(").replace("）", ")")
+
+          def parse_date(value: str) -> datetime:
+              candidates = re.findall(r"20\d{2}[-/.年]\d{1,2}(?:[-/.月]\d{1,2})?", value or "")
+              for candidate in candidates:
+                  clean = candidate.replace("年", "-").replace("月", "-").replace("日", "").replace("/", ".").replace(".", "-")
+                  parts = [p for p in clean.split("-") if p]
+                  try:
+                      if len(parts) >= 3:
+                          return datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+                      if len(parts) == 2:
+                          return datetime(int(parts[0]), int(parts[1]), 1)
+                  except Exception:
+                      pass
+              return datetime(1900, 1, 1)
+
+          selections = []
+          for year in range(2020, 2026):
+              token = f"{year}年年度报告"
+              candidates = []
+              for item in records:
+                  norm = normalized_title(item["title"])
+                  if token not in norm:
+                      continue
+                  if any(x in norm for x in excluded):
+                      continue
+                  score = 0
+                  stripped = re.sub(r"^.*?[：:]", "", norm)
+                  if stripped == token:
+                      score += 20
+                  if "修订" in norm:
+                      score += 5
+                  if norm.endswith("年度报告") or norm.endswith("年度报告(修订版)"):
+                      score += 3
+                  candidates.append((parse_date(item["date"]), score, item))
+              if not candidates:
+                  raise RuntimeError(f"Missing full annual report for {year}")
+              candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+              chosen = candidates[0][2]
+              selections.append({"period": f"{year}年年度报告", "kind": "annual", "year": year, **chosen})
+              print("SELECTED_ANNUAL", year, chosen["date"], chosen["title"], chosen["url"])
+
+          quarter_candidates = []
+          for item in records:
+              norm = normalized_title(item["title"])
+              if "季度报告" not in norm:
+                  continue
+              if any(x in norm for x in excluded):
+                  continue
+              quarter_rank = 0
+              if "第三季度报告" in norm:
+                  quarter_rank = 3
+              elif "第一季度报告" in norm:
+                  quarter_rank = 1
+              year_match = re.search(r"(20\d{2})年", norm)
+              year_value = int(year_match.group(1)) if year_match else 0
+              score = 10 if norm.endswith("季度报告") else 0
+              quarter_candidates.append((parse_date(item["date"]), year_value, quarter_rank, score, item))
+
+          if not quarter_candidates:
+              raise RuntimeError("No quarterly report was discovered")
+          quarter_candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+          qdate, qyear, qrank, _, quarter = quarter_candidates[0]
+          qnorm = normalized_title(quarter["title"])
+          qperiod_match = re.search(r"(20\d{2}年(?:第一|第三)季度报告)", qnorm)
+          qperiod = qperiod_match.group(1) if qperiod_match else qnorm
+          selections.append({"period": qperiod, "kind": "quarter", "year": qyear, **quarter})
+          print("SELECTED_QUARTER", quarter["date"], quarter["title"], quarter["url"])
+
+          def possible_urls(raw_url: str):
+              urls = []
+              if raw_url.startswith("http://") or raw_url.startswith("https://"):
+                  urls.append(raw_url)
+              elif raw_url.startswith("//"):
+                  urls.append("https:" + raw_url)
+              elif raw_url.startswith("/"):
+                  urls.extend([
+                      "https://static.sse.com.cn" + raw_url,
+                      "https://www.sse.com.cn" + raw_url,
+                  ])
+              else:
+                  urls.extend([
+                      urljoin("https://static.sse.com.cn/", raw_url),
+                      urljoin("https://www.sse.com.cn/", raw_url),
+                  ])
+              return list(dict.fromkeys(urls))
+
+          def download_pdf(raw_url: str):
+              last = None
+              for candidate in possible_urls(raw_url):
+                  for attempt in range(4):
+                      try:
+                          response = session.get(candidate, timeout=(30, 300), headers={
+                              "Referer": "https://www.sse.com.cn/",
+                              "Accept": "application/pdf,*/*;q=0.8",
+                          })
+                          print("DOWNLOAD", response.status_code, len(response.content), response.url, response.headers.get("content-type"))
+                          response.raise_for_status()
+                          if response.content.startswith(b"%PDF-") and len(response.content) > 50_000:
+                              return response.content, response.url, response.headers.get("content-type", "")
+                          last = RuntimeError(f"Not a valid PDF response from {candidate}")
+                      except Exception as exc:
+                          last = exc
+                          print("DOWNLOAD_ERROR", candidate, attempt, repr(exc))
+                          time.sleep(attempt + 1)
+              raise RuntimeError(f"Unable to download PDF for {raw_url}: {last}")
+
+          manifest = []
+          accepted_names = [COMPANY, FULL_NAME, CODE, *HISTORICAL_NAMES]
+          for index, item in enumerate(selections, 1):
+              data, final_url, content_type = download_pdf(item["url"])
+              safe_period = re.sub(r"[\\/:*?\"<>|]", "_", item["period"])
+              filename = f"{index:02d}_{safe_period}.pdf"
+              output = PDF_DIR / filename
+              output.write_bytes(data)
+
+              reader = PdfReader(str(output), strict=False)
+              page_count = len(reader.pages)
+              sample_text = "\n".join((page.extract_text() or "") for page in reader.pages[: min(8, page_count)])
+              compact = re.sub(r"\s+", "", sample_text)
+              if not any(name.replace(" ", "") in compact for name in accepted_names):
+                  raise RuntimeError(f"Issuer validation failed for {filename}")
+              if item["kind"] == "annual" and page_count < 80:
+                  raise RuntimeError(f"Annual report unexpectedly short: {filename} has {page_count} pages")
+              if item["kind"] == "quarter" and page_count < 5:
+                  raise RuntimeError(f"Quarterly report unexpectedly short: {filename} has {page_count} pages")
+
+              check = subprocess.run(
+                  ["qpdf", "--warning-exit-0", "--check", str(output)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              if check.returncode != 0:
+                  raise RuntimeError(f"qpdf failed for {filename}: {check.stdout}")
+
+              prefix = PREVIEW_DIR / output.stem
+              render = subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "120", "-singlefile", str(output), str(prefix)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              preview = Path(str(prefix) + ".png")
+              if render.returncode != 0 or not preview.exists() or preview.stat().st_size < 5_000:
+                  raise RuntimeError(f"Preview rendering failed for {filename}: {render.stdout}")
+
+              record = {
+                  "sequence": index,
+                  "period": item["period"],
+                  "kind": item["kind"],
+                  "announcement_title": item["title"],
+                  "announcement_date": item["date"],
+                  "source_url": final_url,
+                  "filename": filename,
+                  "pages": page_count,
+                  "bytes": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "content_type": content_type,
+                  "preview_file": str(Path("首页预览") / preview.name),
+              }
+              manifest.append(record)
+              print("VALIDATED", item["period"], page_count, len(data), record["sha256"])
+
+          if len(manifest) != 7:
+              raise RuntimeError(f"Expected 7 reports, got {len(manifest)}")
+
+          latest_quarter = manifest[-1]["period"]
+          readme = [
+              f"{FULL_NAME}（{CODE}.SH）2020—2025年年度报告及最新季度报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              "文件构成：",
+              "- 2020—2025年年度报告全文，共6份。",
+              f"- 截至整理日已披露的最新独立季度报告：{latest_quarter}，共1份。",
+              "",
+              "所有PDF均来源于上海证券交易所法定信息披露页面，已排除年度报告摘要、说明会公告、审计附件及其他非正文文件。",
+              "",
+          ]
+          for item in manifest:
+              readme.extend([
+                  f"{item['sequence']}. {item['filename']}",
+                  f"   报告期间：{item['period']}",
+                  f"   公告标题：{item['announcement_title']}",
+                  f"   公告日期：{item['announcement_date']}",
+                  f"   PDF页数：{item['pages']}；文件大小：{item['bytes']}字节",
+                  f"   官方来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme.extend([
+              "核验项目：公司名称或证券代码、报告期间、PDF文件头、实际页数、qpdf结构、首页渲染、逐文件SHA-256与ZIP CRC。",
+              "文件仅供研究、教学和信息存档使用。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          payload = {
+              "company": FULL_NAME,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "file_count": len(manifest),
+              "annual_report_count": sum(x["kind"] == "annual" for x in manifest),
+              "latest_quarter": latest_quarter,
+              "files": manifest,
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["序号", "报告期间", "类型", "公告标题", "公告日期", "文件名", "页数", "字节数", "SHA-256", "官方来源", "首页预览"])
+              for item in manifest:
+                  writer.writerow([
+                      item["sequence"], item["period"], item["kind"], item["announcement_title"],
+                      item["announcement_date"], item["filename"], item["pages"], item["bytes"],
+                      item["sha256"], item["source_url"], item["preview_file"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF文件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("liuzhou_pharma_603368_2020_2025_annual_latest_quarter.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(Path(ROOT_NAME) / path.relative_to(ROOT)))
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad is not None:
+                  raise RuntimeError(f"ZIP CRC failed at {bad}")
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f"ZIP contains {len(pdf_names)} PDFs instead of 7")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "file_count": len(manifest),
+              "annual_report_count": 6,
+              "latest_quarter": latest_quarter,
+              "files": [{
+                  "period": x["period"],
+                  "announcement_date": x["announcement_date"],
+                  "pages": x["pages"],
+                  "bytes": x["bytes"],
+                  "sha256": x["sha256"],
+                  "source_url": x["source_url"],
+              } for x in manifest],
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: liuzhou-pharma-603368-filings-20261104
+          path: |
+            liuzhou_pharma_603368_2020_2025_annual_latest_quarter.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
