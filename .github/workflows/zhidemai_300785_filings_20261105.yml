@@ -1,0 +1,425 @@
+name: package-zhidemai-300785-filings
+
+on:
+  push:
+    branches:
+      - tmp/zhidemai-300785-filings-20261105-v1
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Query official disclosures, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from zoneinfo import ZoneInfo
+
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY = "北京值得买科技股份有限公司"
+          SHORT_NAME = "值得买"
+          CODE = "300785"
+          ORG_ID = "9900035077"
+          PREPARED = "2026-11-05"
+          ROOT_NAME = "值得买_300785_2020-2025年报及最新季报"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF文件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Referer": f"https://www.cninfo.com.cn/new/disclosure/stock?orgId={ORG_ID}&stockCode={CODE}",
+              "Origin": "https://www.cninfo.com.cn",
+              "X-Requested-With": "XMLHttpRequest",
+          })
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(value or "")
+              value = re.sub(r"<[^>]+>", "", value)
+              return " ".join(value.split())
+
+          def compact(value: str) -> str:
+              return re.sub(r"\s+", "", value or "")
+
+          def query_cninfo(*, category: str = "", searchkey: str = "", start: str, end: str) -> list[dict]:
+              endpoint = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+              all_rows: list[dict] = []
+              for page_num in range(1, 8):
+                  data = {
+                      "pageNum": page_num,
+                      "pageSize": 100,
+                      "column": "szse",
+                      "tabName": "fulltext",
+                      "plate": "sz",
+                      "stock": f"{CODE},{ORG_ID}",
+                      "searchkey": searchkey,
+                      "secid": "",
+                      "category": category,
+                      "trade": "",
+                      "seDate": f"{start}~{end}",
+                      "sortName": "time",
+                      "sortType": "desc",
+                      "isHLtitle": "true",
+                  }
+                  last_error: Exception | None = None
+                  payload = None
+                  for attempt in range(5):
+                      try:
+                          response = session.post(endpoint, data=data, timeout=(30, 120))
+                          print("QUERY", category or "ALL", searchkey or "-", page_num, response.status_code, len(response.content), response.headers.get("content-type"))
+                          response.raise_for_status()
+                          payload = response.json()
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          print("QUERY_ERROR", category, searchkey, page_num, attempt, repr(exc))
+                          time.sleep(1 + attempt)
+                  if payload is None:
+                      raise RuntimeError(f"CNINFO query failed: {last_error}")
+                  rows = payload.get("announcements") or []
+                  all_rows.extend(rows)
+                  total_pages = int(payload.get("totalpages") or payload.get("totalPages") or 1)
+                  if page_num >= total_pages or not rows:
+                      break
+              return all_rows
+
+          # Prime cookies before API calls.
+          try:
+              session.get("https://www.cninfo.com.cn/new/index", timeout=(20, 60))
+          except Exception as exc:
+              print("COOKIE_PRIME_WARNING", repr(exc))
+
+          annual_rows = []
+          annual_rows.extend(query_cninfo(category="category_ndbg_szsh", start="2020-01-01", end=PREPARED))
+          annual_rows.extend(query_cninfo(searchkey="年度报告", start="2020-01-01", end=PREPARED))
+
+          quarter_rows = []
+          quarter_rows.extend(query_cninfo(category="category_sjdbg_szsh", start="2026-01-01", end=PREPARED))
+          quarter_rows.extend(query_cninfo(searchkey="2026年三季度报告", start="2026-01-01", end=PREPARED))
+          quarter_rows.extend(query_cninfo(searchkey="2026年第三季度报告", start="2026-01-01", end=PREPARED))
+          quarter_rows.extend(query_cninfo(start="2026-10-01", end=PREPARED))
+
+          def dedup(rows: list[dict]) -> list[dict]:
+              result = {}
+              for row in rows:
+                  key = row.get("adjunctUrl") or row.get("announcementId") or json.dumps(row, sort_keys=True, ensure_ascii=False)
+                  result[key] = row
+              return list(result.values())
+
+          annual_rows = dedup(annual_rows)
+          quarter_rows = dedup(quarter_rows)
+
+          annual_candidates: dict[int, list[dict]] = {year: [] for year in range(2020, 2026)}
+          for row in annual_rows:
+              title = clean_title(row.get("announcementTitle", ""))
+              title_compact = compact(title)
+              if "年度报告" not in title_compact or "摘要" in title_compact:
+                  continue
+              if any(word in title_compact for word in ["审计报告", "商誉减值", "董事会", "监事会", "问询", "意见", "说明", "取消"]):
+                  continue
+              match = re.search(r"(2020|2021|2022|2023|2024|2025)年年度报告", title_compact)
+              if not match:
+                  continue
+              year = int(match.group(1))
+              copy = dict(row)
+              copy["clean_title"] = title
+              annual_candidates[year].append(copy)
+
+          def row_timestamp(row: dict) -> int:
+              value = row.get("announcementTime") or 0
+              try:
+                  return int(value)
+              except Exception:
+                  return 0
+
+          def annual_score(row: dict) -> tuple[int, int]:
+              title = compact(row.get("clean_title", ""))
+              revised = 1 if any(mark in title for mark in ["更正后", "更新后", "修订后", "修正版"]) else 0
+              return revised, row_timestamp(row)
+
+          selected_annuals = []
+          for year in range(2020, 2026):
+              candidates = annual_candidates[year]
+              print("ANNUAL_CANDIDATES", year, len(candidates))
+              for candidate in sorted(candidates, key=row_timestamp):
+                  print("ANNUAL_ROW", year, row_timestamp(candidate), candidate.get("clean_title"), candidate.get("adjunctUrl"))
+              if not candidates:
+                  raise RuntimeError(f"No full annual report found for {year}")
+              chosen = max(candidates, key=annual_score)
+              selected_annuals.append((year, chosen))
+              print("ANNUAL_PICK", year, chosen.get("clean_title"), chosen.get("adjunctUrl"))
+
+          quarter_candidates = []
+          for row in quarter_rows:
+              title = clean_title(row.get("announcementTitle", ""))
+              title_compact = compact(title)
+              if "2026年" not in title_compact:
+                  continue
+              if not ("三季度报告" in title_compact or "第三季度报告" in title_compact):
+                  continue
+              if "摘要" in title_compact:
+                  continue
+              copy = dict(row)
+              copy["clean_title"] = title
+              quarter_candidates.append(copy)
+
+          print("QUARTER_CANDIDATES", len(quarter_candidates))
+          for candidate in sorted(quarter_candidates, key=row_timestamp):
+              print("QUARTER_ROW", row_timestamp(candidate), candidate.get("clean_title"), candidate.get("adjunctUrl"))
+          if not quarter_candidates:
+              raise RuntimeError("No 2026 third-quarter report found")
+          selected_quarter = max(quarter_candidates, key=row_timestamp)
+          print("QUARTER_PICK", selected_quarter.get("clean_title"), selected_quarter.get("adjunctUrl"))
+
+          def announcement_date(row: dict) -> str:
+              value = row.get("announcementTime") or 0
+              try:
+                  milliseconds = int(value)
+                  if milliseconds > 10_000_000_000:
+                      seconds = milliseconds / 1000
+                  else:
+                      seconds = milliseconds
+                  return datetime.fromtimestamp(seconds, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+              except Exception:
+                  path = row.get("adjunctUrl", "")
+                  match = re.search(r"/(20\d{2}-\d{2}-\d{2})/", path)
+                  return match.group(1) if match else ""
+
+          documents = []
+          for sequence, (year, row) in enumerate(selected_annuals, start=1):
+              title_compact = compact(row.get("clean_title", ""))
+              revised = any(mark in title_compact for mark in ["更正后", "更新后", "修订后", "修正版"])
+              period = f"{year}年年度报告" + ("（更新版）" if revised else "")
+              documents.append({
+                  "sequence": sequence,
+                  "category": "年度报告",
+                  "period": period,
+                  "year": year,
+                  "announcement_title": row.get("clean_title", ""),
+                  "announcement_date": announcement_date(row),
+                  "filename": f"{sequence:02d}_{period}.pdf",
+                  "minimum_pages": 80,
+                  "adjunct_url": row.get("adjunctUrl", ""),
+                  "source_url": urljoin("https://static.cninfo.com.cn/", row.get("adjunctUrl", "")),
+                  "period_markers": [f"{year}年年度报告", f"{year}年度报告"],
+              })
+
+          documents.append({
+              "sequence": 7,
+              "category": "季度报告",
+              "period": "2026年第三季度报告",
+              "year": 2026,
+              "announcement_title": selected_quarter.get("clean_title", ""),
+              "announcement_date": announcement_date(selected_quarter),
+              "filename": "07_2026年第三季度报告.pdf",
+              "minimum_pages": 5,
+              "adjunct_url": selected_quarter.get("adjunctUrl", ""),
+              "source_url": urljoin("https://static.cninfo.com.cn/", selected_quarter.get("adjunctUrl", "")),
+              "period_markers": ["2026年第三季度报告", "2026年三季度报告"],
+          })
+
+          def download_pdf(document: dict) -> tuple[bytes, str, str]:
+              variants = [document["source_url"], document["source_url"] + "?download=1"]
+              last_error: Exception | None = None
+              for url in dict.fromkeys(variants):
+                  for attempt in range(5):
+                      try:
+                          response = session.get(
+                              url,
+                              timeout=(30, 480),
+                              allow_redirects=True,
+                              headers={
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                                  "Referer": f"https://www.cninfo.com.cn/new/disclosure/stock?orgId={ORG_ID}&stockCode={CODE}",
+                              },
+                          )
+                          print("DOWNLOAD", document["period"], response.status_code, len(response.content), response.url, response.headers.get("content-type"))
+                          response.raise_for_status()
+                          if response.content.startswith(b"%PDF-") and len(response.content) > 50_000:
+                              return response.content, response.url, response.headers.get("content-type", "")
+                          last_error = RuntimeError(f"Not a valid PDF response: {response.content[:60]!r}")
+                      except Exception as exc:
+                          last_error = exc
+                          print("DOWNLOAD_ERROR", document["period"], attempt, url, repr(exc))
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"Unable to download {document['period']}: {last_error}")
+
+          manifest = []
+          for document in documents:
+              data, final_url, content_type = download_pdf(document)
+              output = PDF_DIR / document["filename"]
+              output.write_bytes(data)
+
+              reader = PdfReader(str(output), strict=False)
+              pages = len(reader.pages)
+              if pages < document["minimum_pages"]:
+                  raise RuntimeError(f"Document too short: {output.name}: {pages} pages")
+
+              qpdf = subprocess.run(
+                  ["qpdf", "--warning-exit-0", "--check", str(output)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f"qpdf failed for {output.name}: {qpdf.stdout}")
+
+              text_run = subprocess.run(
+                  ["pdftotext", "-f", "1", "-l", str(min(20, pages)), str(output), "-"],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              text_compact = compact(text_run.stdout)
+              issuer_hits = [marker for marker in [COMPANY, SHORT_NAME, CODE, "北京值得买科技"] if compact(marker) in text_compact]
+              period_hits = [marker for marker in document["period_markers"] if compact(marker) in text_compact]
+              if not issuer_hits:
+                  raise RuntimeError(f"Issuer validation failed for {output.name}")
+              if not period_hits:
+                  raise RuntimeError(f"Period validation failed for {output.name}")
+
+              prefix = PREVIEW_DIR / output.stem
+              render = subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "150", "-singlefile", str(output), str(prefix)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              preview = Path(str(prefix) + ".png")
+              if render.returncode != 0 or not preview.exists() or preview.stat().st_size < 6_000:
+                  raise RuntimeError(f"Preview rendering failed for {output.name}: {render.stdout}")
+
+              item = {
+                  **document,
+                  "source_url": final_url,
+                  "content_type": content_type,
+                  "pages": pages,
+                  "bytes": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "issuer_marker_hits": issuer_hits,
+                  "period_marker_hits": period_hits,
+                  "preview_file": str(Path("首页预览") / preview.name),
+              }
+              manifest.append(item)
+              print("VALIDATED", item["period"], item["announcement_date"], pages, item["sha256"])
+
+          if len(manifest) != 7:
+              raise RuntimeError(f"Expected 7 documents, got {len(manifest)}")
+
+          readme = [
+              f"{COMPANY}（{CODE}.SZ）2020—2025年年度报告及最新季度报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              "文件构成：2020—2025年年度报告全文共6份，以及截至整理日最新独立季度报告——2026年第三季度报告1份。",
+              "年度报告若存在更新、更正或修订版本，优先采用公开披露时间较晚的完整版本。",
+              "已排除年度报告摘要、半年度报告、审计附件、商誉减值报告及其他非正文文件。",
+              "",
+          ]
+          for item in manifest:
+              readme.extend([
+                  f"{item['sequence']}. {item['filename']}",
+                  f"   类型：{item['category']}；报告：{item['period']}",
+                  f"   公告标题：{item['announcement_title']}",
+                  f"   公告日期：{item['announcement_date']}",
+                  f"   PDF页数：{item['pages']}；文件大小：{item['bytes']}字节",
+                  f"   下载来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme.extend([
+              "核验项目：PDF文件头、公司名称或证券代码、报告期间、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "文件仅供研究、教学与信息存档使用。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          payload = {
+              "company": COMPANY,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "file_count": len(manifest),
+              "annual_report_count": 6,
+              "latest_quarter": "2026年第三季度报告",
+              "files": manifest,
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["序号", "类型", "报告", "公告标题", "公告日期", "文件名", "页数", "字节数", "SHA-256", "下载来源", "首页预览"])
+              for item in manifest:
+                  writer.writerow([
+                      item["sequence"], item["category"], item["period"], item["announcement_title"],
+                      item["announcement_date"], item["filename"], item["pages"], item["bytes"],
+                      item["sha256"], item["source_url"], item["preview_file"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF文件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("zhidemai_300785_2020_2025_annual_latest_quarter.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for file_path in sorted(ROOT.rglob("*")):
+                  if file_path.is_file():
+                      archive.write(file_path, arcname=str(Path(ROOT_NAME) / file_path.relative_to(ROOT)))
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if bad is not None or len(pdf_names) != 7:
+                  raise RuntimeError(f"ZIP validation failed: bad={bad}, pdfs={len(pdf_names)}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "file_count": len(manifest),
+              "annual_report_count": 6,
+              "latest_quarter": "2026年第三季度报告",
+              "files": [{k: item[k] for k in ["period", "announcement_title", "announcement_date", "pages", "bytes", "sha256", "source_url"]} for item in manifest],
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhidemai-300785-filings-20261105
+          path: |
+            zhidemai_300785_2020_2025_annual_latest_quarter.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
