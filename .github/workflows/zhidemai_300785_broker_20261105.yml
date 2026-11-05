@@ -1,0 +1,319 @@
+name: package-zhidemai-300785-broker-reports
+
+on:
+  push:
+    branches:
+      - tmp/zhidemai-300785-broker-20261105-v1
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY = "北京值得买科技股份有限公司"
+          SHORT_NAME = "值得买"
+          CODE = "300785"
+          PREPARED = "2026-11-05"
+          ROOT_NAME = "值得买_300785_券商深度研究报告_3份"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF文件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          candidates = [
+              {
+                  "date": "2024-03-09",
+                  "broker": "国泰君安证券",
+                  "analyst": "陈筱、陈俊希",
+                  "rating": "增持（首次覆盖）",
+                  "report_type": "首次覆盖报告",
+                  "title": "乘文生视频之风，创消费内容新平台",
+                  "minimum_pages": 15,
+                  "urls": [
+                      "https://duplik-1252068037.cos.ap-beijing.myqcloud.com/duplik/447460783945158/520072899438150/b51ddf54e189414c9b11dd23c181031b447460783945158.pdf",
+                  ],
+                  "markers": ["值得买", "300785", "乘文生视频", "国泰君安"],
+              },
+              {
+                  "date": "2023-08-22",
+                  "broker": "华福证券",
+                  "analyst": "陈泽敏",
+                  "rating": "买入（首次评级）",
+                  "report_type": "公司深度研究",
+                  "title": "多元成长曲线拓展中，AI助力主站长期成长",
+                  "minimum_pages": 20,
+                  "urls": [
+                      "https://pdf.dfcfw.com/pdf/H3_AP202308221595497149_1.pdf",
+                  ],
+                  "markers": ["值得买", "300785", "多元成长曲线", "华福证券"],
+              },
+              {
+                  "date": "2022-02-05",
+                  "broker": "国盛证券",
+                  "analyst": "杜玥莹；研究助理：毕琼瑶、汪亚雯",
+                  "rating": "买入（首次覆盖）",
+                  "report_type": "首次覆盖报告",
+                  "title": "“内容+服务+数据”三轮驱动，开启新征程",
+                  "minimum_pages": 20,
+                  "urls": [
+                      "https://pdf.dfcfw.com/pdf/H3_AP202202071545436859_1.pdf",
+                  ],
+                  "markers": ["值得买", "300785", "三轮驱动", "国盛证券"],
+              },
+              {
+                  "date": "2020-09-22",
+                  "broker": "信达证券",
+                  "analyst": "王建会",
+                  "rating": "买入（首次评级）",
+                  "report_type": "公司深度研究",
+                  "title": "打造内容生态，成就内容电商第一股",
+                  "minimum_pages": 20,
+                  "urls": [
+                      "https://pdf.dfcfw.com/pdf/H3_AP202009231416391373_1.pdf",
+                  ],
+                  "markers": ["值得买", "300785", "打造内容生态", "信达证券"],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def compact(value: str) -> str:
+              return re.sub(r"\s+", "", value or "")
+
+          def safe_name(value: str) -> str:
+              return re.sub(r"[\\/:*?\"<>|＋+&]", "", value).replace("，", "").replace("“", "").replace("”", "")
+
+          def download_pdf(report: dict) -> tuple[bytes, str, str]:
+              last_error: Exception | None = None
+              variants: list[str] = []
+              for url in report["urls"]:
+                  variants.extend([url, url + ("&download=1" if "?" in url else "?download=1")])
+              for url in dict.fromkeys(variants):
+                  for attempt in range(4):
+                      try:
+                          response = session.get(
+                              url,
+                              timeout=(30, 480),
+                              allow_redirects=True,
+                              headers={
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                                  "Referer": "https://data.eastmoney.com/",
+                              },
+                          )
+                          print("DOWNLOAD", report["broker"], response.status_code, len(response.content), response.url, response.headers.get("content-type"))
+                          response.raise_for_status()
+                          if response.content.startswith(b"%PDF-") and len(response.content) > 100_000:
+                              return response.content, response.url, response.headers.get("content-type", "")
+                          last_error = RuntimeError(f"Not a valid PDF response: {response.content[:60]!r}")
+                      except Exception as exc:
+                          last_error = exc
+                          print("DOWNLOAD_ERROR", report["broker"], attempt, url, repr(exc))
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"Download failed for {report['title']}: {last_error}")
+
+          manifest: list[dict] = []
+          failures: list[dict] = []
+
+          for report in candidates:
+              if len(manifest) >= 3:
+                  break
+              try:
+                  data, final_url, content_type = download_pdf(report)
+                  temp = Path("candidate.pdf")
+                  temp.write_bytes(data)
+                  reader = PdfReader(str(temp), strict=False)
+                  pages = len(reader.pages)
+                  if pages < report["minimum_pages"]:
+                      raise RuntimeError(f"Report unexpectedly short: {pages} pages")
+
+                  qpdf = subprocess.run(
+                      ["qpdf", "--warning-exit-0", "--check", str(temp)],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  )
+                  if qpdf.returncode != 0:
+                      raise RuntimeError(f"qpdf validation failed: {qpdf.stdout}")
+
+                  text_run = subprocess.run(
+                      ["pdftotext", "-f", "1", "-l", str(min(8, pages)), str(temp), "-"],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  )
+                  text_compact = compact(text_run.stdout)
+                  marker_hits = [m for m in report["markers"] if compact(m) in text_compact]
+                  if len(marker_hits) < 2:
+                      raise RuntimeError(f"Issuer/title validation failed: hits={marker_hits}")
+
+                  sequence = len(manifest) + 1
+                  filename = (
+                      f"{sequence:02d}_{report['date'].replace('-', '')}_{report['broker']}_"
+                      f"{safe_name(report['title'])}_{report['report_type']}.pdf"
+                  )
+                  output = PDF_DIR / filename
+                  output.write_bytes(data)
+
+                  prefix = PREVIEW_DIR / output.stem
+                  render = subprocess.run(
+                      ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "150", "-singlefile", str(output), str(prefix)],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  )
+                  preview = Path(str(prefix) + ".png")
+                  if render.returncode != 0 or not preview.exists() or preview.stat().st_size < 8_000:
+                      raise RuntimeError(f"Preview rendering failed: {render.stdout}")
+
+                  record = {
+                      "sequence": sequence,
+                      "broker": report["broker"],
+                      "date": report["date"],
+                      "analyst": report["analyst"],
+                      "rating": report["rating"],
+                      "report_type": report["report_type"],
+                      "title": report["title"],
+                      "filename": filename,
+                      "pages": pages,
+                      "bytes": len(data),
+                      "sha256": hashlib.sha256(data).hexdigest(),
+                      "source_url": final_url,
+                      "content_type": content_type,
+                      "marker_hits": marker_hits,
+                      "preview_file": str(Path("首页预览") / preview.name),
+                  }
+                  manifest.append(record)
+                  print("VALIDATED", record["broker"], record["date"], pages, record["sha256"], record["title"])
+              except Exception as exc:
+                  failures.append({"broker": report["broker"], "date": report["date"], "title": report["title"], "error": repr(exc)})
+                  print("CANDIDATE_FAILED", report["broker"], report["date"], repr(exc))
+
+          if len(manifest) != 3:
+              raise RuntimeError(f"Expected 3 reports, got {len(manifest)}; failures={failures}")
+
+          readme = [
+              f"{COMPANY}（{CODE}.SZ）券商深度研究报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              "本包收录3份可公开下载并验证的券商原始PDF，均为公司深度研究或首次覆盖报告。",
+              "未使用网页摘要、索引页、短篇财报点评或重新排版文件替代原始报告。",
+              "",
+          ]
+          for item in manifest:
+              readme.extend([
+                  f"{item['sequence']}. {item['filename']}",
+                  f"   券商：{item['broker']}；研究员：{item['analyst']}",
+                  f"   日期：{item['date']}；评级：{item['rating']}",
+                  f"   类型：{item['report_type']}",
+                  f"   标题：{item['title']}",
+                  f"   页数：{item['pages']}；文件大小：{item['bytes']}字节",
+                  f"   公开来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          if failures:
+              readme.extend(["候选文件下载记录："])
+              for failure in failures:
+                  readme.append(f"   未采用：{failure['broker']} {failure['date']}《{failure['title']}》；原因：{failure['error']}")
+              readme.append("")
+          readme.extend([
+              "核验项目：PDF文件头、公司名称/证券代码、报告标题、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "报告版权归原券商及作者所有，仅供研究与存档，不构成投资建议。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          payload = {
+              "company": COMPANY,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "report_count": len(manifest),
+              "original_pdf_count": len(manifest),
+              "files": manifest,
+              "candidate_failures": failures,
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["序号", "券商", "日期", "研究员", "评级", "类型", "标题", "文件名", "页数", "字节数", "SHA-256", "公开来源", "首页预览"])
+              for item in manifest:
+                  writer.writerow([
+                      item["sequence"], item["broker"], item["date"], item["analyst"], item["rating"],
+                      item["report_type"], item["title"], item["filename"], item["pages"], item["bytes"],
+                      item["sha256"], item["source_url"], item["preview_file"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF文件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("zhidemai_300785_broker_deep_reports_3.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for file_path in sorted(ROOT.rglob("*")):
+                  if file_path.is_file():
+                      archive.write(file_path, arcname=str(Path(ROOT_NAME) / file_path.relative_to(ROOT)))
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              previews = [name for name in archive.namelist() if name.lower().endswith(".png")]
+              if bad is not None or len(pdf_names) != 3 or len(previews) != 3:
+                  raise RuntimeError(f"ZIP validation failed: bad={bad}, pdfs={len(pdf_names)}, previews={len(previews)}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "report_count": len(manifest),
+              "original_pdf_count": len(manifest),
+              "files": [{k: item[k] for k in ["broker", "date", "analyst", "rating", "report_type", "title", "pages", "bytes", "sha256", "source_url"]} for item in manifest],
+              "candidate_failures": failures,
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhidemai-300785-broker-deep-reports-3-20261105
+          path: |
+            zhidemai_300785_broker_deep_reports_3.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
