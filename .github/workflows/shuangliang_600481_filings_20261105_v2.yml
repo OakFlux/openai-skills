@@ -1,0 +1,276 @@
+name: package-shuangliang-600481-filings-v2
+
+on:
+  push:
+    branches:
+      - tmp/shuangliang-600481-filings-20261105-v1
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4 lxml
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY = "双良节能"
+          FULL_NAME = "双良节能系统股份有限公司"
+          CODE = "600481"
+          ROOT_NAME = "双良节能_600481_2020-2025年报及最新季报"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF文件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def clean(s):
+              return re.sub(r"\s+", "", s or "")
+
+          def get_html(url):
+              r = session.get(url, timeout=(30, 240), allow_redirects=True)
+              print("HTML", r.status_code, len(r.content), r.url, r.headers.get("content-type"))
+              r.raise_for_status()
+              r.encoding = r.apparent_encoding or "gbk"
+              return r.text, r.url
+
+          def annual_rows():
+              rows = []
+              urls = [
+                  "https://money.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/600481.phtml?ftype=ndbg",
+                  "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/600481/page_type/ndbg.phtml",
+              ]
+              for list_url in urls:
+                  html, final_url = get_html(list_url)
+                  soup = BeautifulSoup(html, "lxml")
+                  for a in soup.find_all("a", href=True):
+                      title = " ".join(a.get_text(" ", strip=True).split())
+                      ctitle = clean(title)
+                      if "年度报告" not in ctitle or "摘要" in ctitle:
+                          continue
+                      m = re.search(r"(2020|2021|2022|2023|2024|2025)(?:年年度报告|年度报告)", ctitle)
+                      if not m:
+                          continue
+                      href = urljoin(final_url, a["href"])
+                      if "BulletinDetail" not in href:
+                          continue
+                      im = re.search(r"[?&]id=(\d+)", href)
+                      item_id = int(im.group(1)) if im else 0
+                      rows.append({"year": int(m.group(1)), "title": title, "compact": ctitle, "url": href, "id": item_id})
+              dedup = {}
+              for row in rows:
+                  dedup[row["id"] or row["url"]] = row
+              result = list(dedup.values())
+              for row in sorted(result, key=lambda x: (x["year"], x["id"]), reverse=True):
+                  print("ANNUAL_ROW", row)
+              return result
+
+          def choose(rows, year):
+              candidates = [x for x in rows if x["year"] == year]
+              if not candidates:
+                  raise RuntimeError(f"No annual report for {year}")
+              def score(x):
+                  corrected = 2 if ("更正后" in x["compact"] or "更新后" in x["compact"]) else 0
+                  return corrected, x["id"]
+              selected = max(candidates, key=score)
+              print("ANNUAL_PICK", selected)
+              return selected
+
+          def direct_pdf(detail_url):
+              html, final_url = get_html(detail_url)
+              soup = BeautifulSoup(html, "lxml")
+              candidates = []
+              for a in soup.find_all("a", href=True):
+                  href = urljoin(final_url, a["href"])
+                  text = clean(a.get_text(" ", strip=True))
+                  if "下载公告" in text or "file.finance.sina.com.cn" in href or href.lower().endswith(".pdf"):
+                      candidates.append(href)
+              for match in re.findall(r"https?://[^\s\"'<>]+", html):
+                  match = match.replace("&amp;", "&")
+                  if "file.finance.sina.com.cn" in match or match.lower().endswith(".pdf"):
+                      candidates.append(match)
+              for candidate in dict.fromkeys(candidates):
+                  if "file.finance.sina.com.cn" in candidate or candidate.lower().endswith(".pdf"):
+                      print("DETAIL_PDF", candidate)
+                      return candidate
+              raise RuntimeError(f"No PDF on {detail_url}")
+
+          def date_from_url(url):
+              m = re.search(r"/(20\d{2}-\d{2}-\d{2})/", url)
+              return m.group(1) if m else ""
+
+          rows = annual_rows()
+          docs = []
+          for seq, year in enumerate(range(2020, 2026), 1):
+              row = choose(rows, year)
+              url = direct_pdf(row["url"])
+              corrected = "更正后" in row["compact"] or "更新后" in row["compact"]
+              period = f"{year}年年度报告（更正后）" if corrected else f"{year}年年度报告"
+              docs.append({
+                  "sequence": seq, "category": "年度报告", "year": year, "period": period,
+                  "announcement_date": date_from_url(url), "detail_url": row["url"],
+                  "filename": f"{seq:02d}_{period}.pdf", "minimum_pages": 100,
+                  "urls": [url, url.replace("http://", "https://", 1)],
+              })
+
+          docs.append({
+              "sequence": 7, "category": "季度报告", "year": 2026,
+              "period": "2026年第三季度报告", "announcement_date": "2026-10-31",
+              "detail_url": "https://www.cninfo.com.cn/new/disclosure/stock?stockCode=600481",
+              "filename": "07_2026年第三季度报告.pdf", "minimum_pages": 5,
+              "urls": ["https://static.cninfo.com.cn/finalpage/2026-10-31/1225650705.PDF"],
+          })
+
+          accepted = [CODE, COMPANY, FULL_NAME, "SHUANGLIANG", "双良节能系统"]
+
+          def pdf_text(reader):
+              n = len(reader.pages)
+              indexes = list(range(min(16, n)))
+              if n > 16:
+                  indexes += list(range(max(16, n - 3), n))
+              return clean("\n".join((reader.pages[i].extract_text() or "") for i in sorted(set(indexes))))
+
+          def obtain(doc):
+              last = None
+              for url in dict.fromkeys(doc["urls"]):
+                  for attempt in range(4):
+                      try:
+                          r = session.get(url, timeout=(30, 480), allow_redirects=True,
+                                          headers={"Accept": "application/pdf,*/*;q=0.8", "Referer": doc["detail_url"]})
+                          print("DOWNLOAD", doc["period"], r.status_code, len(r.content), r.url, r.headers.get("content-type"))
+                          r.raise_for_status()
+                          if not r.content.startswith(b"%PDF-") or len(r.content) < 50000:
+                              raise RuntimeError("Invalid PDF response")
+                          Path("candidate.pdf").write_bytes(r.content)
+                          reader = PdfReader("candidate.pdf", strict=False)
+                          pages = len(reader.pages)
+                          if pages < doc["minimum_pages"]:
+                              raise RuntimeError(f"Too short: {pages}")
+                          text = pdf_text(reader)
+                          if not any(clean(x) in text for x in accepted):
+                              raise RuntimeError("Issuer validation failed")
+                          year = doc["year"]
+                          if doc["category"] == "年度报告":
+                              ok = f"{year}年年度报告" in text or f"{year}年度报告" in text
+                          else:
+                              ok = "2026年第三季度报告" in text
+                          if not ok:
+                              raise RuntimeError("Period validation failed")
+                          return r.content, r.url, r.headers.get("content-type", ""), pages
+                      except Exception as exc:
+                          last = exc
+                          print("DOWNLOAD_ERROR", doc["period"], attempt, url, repr(exc))
+                          time.sleep(1 + attempt)
+              raise RuntimeError(f"Unable to obtain {doc['period']}: {last}")
+
+          manifest = []
+          for doc in docs:
+              data, source_url, content_type, pages = obtain(doc)
+              path = PDF_DIR / doc["filename"]
+              path.write_bytes(data)
+              check = subprocess.run(["qpdf", "--warning-exit-0", "--check", str(path)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              if check.returncode != 0:
+                  raise RuntimeError(check.stdout)
+              prefix = PREVIEW_DIR / path.stem
+              render = subprocess.run(["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "140", "-singlefile", str(path), str(prefix)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              preview = Path(str(prefix) + ".png")
+              if render.returncode != 0 or not preview.exists() or preview.stat().st_size < 6000:
+                  raise RuntimeError(f"Preview failed: {path.name}: {render.stdout}")
+              item = {
+                  "sequence": doc["sequence"], "category": doc["category"], "period": doc["period"],
+                  "announcement_date": doc["announcement_date"] or date_from_url(source_url),
+                  "filename": doc["filename"], "pages": pages, "bytes": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(), "source_url": source_url,
+                  "detail_url": doc["detail_url"], "content_type": content_type,
+                  "preview_file": str(Path("首页预览") / preview.name),
+              }
+              manifest.append(item)
+              print("VALIDATED", item["period"], item["announcement_date"], pages, item["sha256"])
+
+          if len(manifest) != 7:
+              raise RuntimeError(f"Expected 7 files, got {len(manifest)}")
+
+          lines = [
+              f"{FULL_NAME}（{CODE}.SH）2020—2025年年度报告及最新季度报告资料包",
+              "整理日期：2026-11-05", "",
+              "文件构成：2020—2025年年度报告全文共6份，以及截至整理日最新独立季度报告——2026年第三季度报告1份。",
+              "2020年年度报告采用后续披露的更正后版本；已排除年度报告摘要、半年度报告、审计附件及其他非正文文件。", "",
+          ]
+          for x in manifest:
+              lines += [
+                  f"{x['sequence']}. {x['filename']}",
+                  f"   类型：{x['category']}；报告：{x['period']}",
+                  f"   公告日期：{x['announcement_date']}",
+                  f"   PDF页数：{x['pages']}；文件大小：{x['bytes']}字节",
+                  f"   公告页面：{x['detail_url']}",
+                  f"   下载来源：{x['source_url']}",
+                  f"   SHA-256：{x['sha256']}", "",
+              ]
+          lines += [
+              "核验项目：PDF文件头、公司名称或证券代码、报告期间、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "文件仅供研究、教学与信息存档使用。",
+          ]
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(lines), encoding="utf-8")
+
+          payload = {"company": FULL_NAME, "stock_code": CODE, "prepared_on": "2026-11-05",
+                     "file_count": 7, "annual_report_count": 6, "latest_quarter": "2026年第三季度报告", "files": manifest}
+          (ROOT / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as f:
+              w = csv.writer(f)
+              w.writerow(["序号", "类型", "报告", "公告日期", "文件名", "页数", "字节数", "SHA-256", "公告页面", "下载来源", "首页预览"])
+              for x in manifest:
+                  w.writerow([x["sequence"], x["category"], x["period"], x["announcement_date"], x["filename"], x["pages"], x["bytes"], x["sha256"], x["detail_url"], x["source_url"], x["preview_file"]])
+          (ROOT / "SHA256SUMS.txt").write_text("\n".join(f"{x['sha256']}  PDF文件/{x['filename']}" for x in manifest) + "\n", encoding="utf-8")
+
+          zip_path = Path("shuangliang_600481_2020_2025_annual_latest_quarter.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for p in sorted(ROOT.rglob("*")):
+                  if p.is_file():
+                      z.write(p, arcname=str(Path(ROOT_NAME) / p.relative_to(ROOT)))
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              pdfs = [n for n in z.namelist() if n.lower().endswith(".pdf")]
+              if bad or len(pdfs) != 7:
+                  raise RuntimeError(f"ZIP validation failed bad={bad} pdfs={len(pdfs)}")
+
+          result = {"package": zip_path.name, "zip_bytes": zip_path.stat().st_size,
+                    "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+                    "file_count": 7, "annual_report_count": 6, "latest_quarter": "2026年第三季度报告",
+                    "files": [{k: x[k] for k in ["period", "announcement_date", "pages", "bytes", "sha256", "source_url"]} for x in manifest]}
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shuangliang-600481-filings-v2-20261105
+          path: |
+            shuangliang_600481_2020_2025_annual_latest_quarter.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
