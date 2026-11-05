@@ -1,0 +1,277 @@
+name: package-jimin-603222-broker-reports
+
+on:
+  push:
+    branches:
+      - tmp/jimin-603222-broker-20261105-v1
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY = "济民健康管理股份有限公司"
+          CURRENT_NAME = "济民健康"
+          HISTORICAL_NAME = "济民医疗"
+          CODE = "603222"
+          PREPARED = "2026-11-05"
+          ROOT_NAME = "济民健康_603222_券商深度研究报告_2份"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF文件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  "sequence": 1,
+                  "date": "2023-04-02",
+                  "broker": "东吴证券",
+                  "analyst": "朱国广",
+                  "rating": "买入（首次）",
+                  "report_type": "公司深度研究",
+                  "title": "高政策壁垒、新技术的博鳌医院等，高端医疗服务启动第二成长曲线",
+                  "filename": "01_20230402_东吴证券_高政策壁垒新技术的博鳌医院等高端医疗服务启动第二成长曲线_公司深度研究.pdf",
+                  "minimum_pages": 25,
+                  "urls": [
+                      "https://pdf.dfcfw.com/pdf/H3_AP202304031585032706_1.pdf?1680538011000.pdf=",
+                      "https://pdf.dfcfw.com/pdf/H3_AP202304031585032706_1.pdf",
+                  ],
+                  "markers": ["济民医疗", "603222", "高政策壁垒", "朱国广"],
+              },
+              {
+                  "sequence": 2,
+                  "date": "2022-04-23",
+                  "broker": "信达证券",
+                  "analyst": "周平",
+                  "rating": "增持（首次覆盖）",
+                  "report_type": "公司首次覆盖报告",
+                  "title": "安全注射器持续放量，博鳌国际医院扭亏为盈",
+                  "filename": "02_20220423_信达证券_安全注射器持续放量博鳌国际医院扭亏为盈_首次覆盖报告.pdf",
+                  "minimum_pages": 14,
+                  "urls": [
+                      "https://pdf.dfcfw.com/pdf/H3_AP202204231561105183_1.PDF",
+                  ],
+                  "markers": ["济民医疗", "603222", "安全注射器持续放量", "周平"],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def compact(value: str) -> str:
+              return re.sub(r"\s+", "", value or "")
+
+          def download_pdf(report: dict) -> tuple[bytes, str, str]:
+              last_error: Exception | None = None
+              variants: list[str] = []
+              for url in report["urls"]:
+                  variants.extend([url, url + ("&download=1" if "?" in url else "?download=1")])
+              for url in dict.fromkeys(variants):
+                  for attempt in range(5):
+                      try:
+                          response = session.get(
+                              url,
+                              timeout=(30, 480),
+                              allow_redirects=True,
+                              headers={
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                                  "Referer": "https://data.eastmoney.com/",
+                              },
+                          )
+                          print("DOWNLOAD", report["broker"], response.status_code, len(response.content), response.url, response.headers.get("content-type"))
+                          response.raise_for_status()
+                          if response.content.startswith(b"%PDF-") and len(response.content) > 100_000:
+                              return response.content, response.url, response.headers.get("content-type", "")
+                          last_error = RuntimeError(f"Not a valid PDF response: {response.content[:60]!r}")
+                      except Exception as exc:
+                          last_error = exc
+                          print("DOWNLOAD_ERROR", report["broker"], attempt, url, repr(exc))
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"Download failed for {report['title']}: {last_error}")
+
+          manifest: list[dict] = []
+          for report in reports:
+              data, final_url, content_type = download_pdf(report)
+              output = PDF_DIR / report["filename"]
+              output.write_bytes(data)
+
+              reader = PdfReader(str(output), strict=False)
+              pages = len(reader.pages)
+              if pages < report["minimum_pages"]:
+                  raise RuntimeError(f"Report unexpectedly short: {output.name}: {pages} pages")
+
+              qpdf = subprocess.run(
+                  ["qpdf", "--warning-exit-0", "--check", str(output)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f"qpdf failed for {output.name}: {qpdf.stdout}")
+
+              text_run = subprocess.run(
+                  ["pdftotext", "-f", "1", "-l", str(min(8, pages)), str(output), "-"],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              text_compact = compact(text_run.stdout)
+              marker_hits = [marker for marker in report["markers"] if compact(marker) in text_compact]
+              if len(marker_hits) < 2:
+                  raise RuntimeError(f"Issuer/title validation failed for {output.name}: hits={marker_hits}")
+
+              prefix = PREVIEW_DIR / output.stem
+              render = subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "150", "-singlefile", str(output), str(prefix)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              preview = Path(str(prefix) + ".png")
+              if render.returncode != 0 or not preview.exists() or preview.stat().st_size < 8_000:
+                  raise RuntimeError(f"Preview rendering failed for {output.name}: {render.stdout}")
+
+              record = {
+                  "sequence": report["sequence"],
+                  "broker": report["broker"],
+                  "date": report["date"],
+                  "analyst": report["analyst"],
+                  "rating": report["rating"],
+                  "report_type": report["report_type"],
+                  "title": report["title"],
+                  "filename": report["filename"],
+                  "pages": pages,
+                  "bytes": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "source_url": final_url,
+                  "content_type": content_type,
+                  "marker_hits": marker_hits,
+                  "preview_file": str(Path("首页预览") / preview.name),
+              }
+              manifest.append(record)
+              print("VALIDATED", record["broker"], record["date"], pages, record["sha256"], record["title"])
+
+          if len(manifest) != 2:
+              raise RuntimeError(f"Expected 2 reports, got {len(manifest)}")
+
+          readme = [
+              f"{COMPANY}（{CODE}.SH，现简称：{CURRENT_NAME}，报告期简称：{HISTORICAL_NAME}）券商深度研究报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              "本包收录2份可公开下载并验证的券商原始PDF，分别为公司深度研究和首次覆盖报告。",
+              "公开渠道可核验的其他材料主要为短篇业绩点评，或与东吴证券深度报告内容高度重复的国际版摘要，因此未用于补足第三份。",
+              "未使用网页摘要、索引页、短篇财报点评或重新排版文件替代原始报告。",
+              "",
+          ]
+          for item in manifest:
+              readme.extend([
+                  f"{item['sequence']}. {item['filename']}",
+                  f"   券商：{item['broker']}；研究员：{item['analyst']}",
+                  f"   日期：{item['date']}；评级：{item['rating']}",
+                  f"   类型：{item['report_type']}",
+                  f"   标题：{item['title']}",
+                  f"   页数：{item['pages']}；文件大小：{item['bytes']}字节",
+                  f"   公开来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme.extend([
+              "核验项目：PDF文件头、公司历史简称/证券代码、报告标题、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "报告版权归原券商及作者所有，仅供研究与存档，不构成投资建议。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          payload = {
+              "company": COMPANY,
+              "current_short_name": CURRENT_NAME,
+              "historical_short_name": HISTORICAL_NAME,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "report_count": len(manifest),
+              "original_pdf_count": len(manifest),
+              "files": manifest,
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["序号", "券商", "日期", "研究员", "评级", "类型", "标题", "文件名", "页数", "字节数", "SHA-256", "公开来源", "首页预览"])
+              for item in manifest:
+                  writer.writerow([
+                      item["sequence"], item["broker"], item["date"], item["analyst"], item["rating"],
+                      item["report_type"], item["title"], item["filename"], item["pages"], item["bytes"],
+                      item["sha256"], item["source_url"], item["preview_file"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF文件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("jimin_603222_broker_deep_reports_2.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for file_path in sorted(ROOT.rglob("*")):
+                  if file_path.is_file():
+                      archive.write(file_path, arcname=str(Path(ROOT_NAME) / file_path.relative_to(ROOT)))
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              previews = [name for name in archive.namelist() if name.lower().endswith(".png")]
+              if bad is not None or len(pdf_names) != 2 or len(previews) != 2:
+                  raise RuntimeError(f"ZIP validation failed: bad={bad}, pdfs={len(pdf_names)}, previews={len(previews)}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "report_count": len(manifest),
+              "original_pdf_count": len(manifest),
+              "files": [{k: item[k] for k in ["broker", "date", "analyst", "rating", "report_type", "title", "pages", "bytes", "sha256", "source_url"]} for item in manifest],
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jimin-603222-broker-deep-reports-2-20261105
+          path: |
+            jimin_603222_broker_deep_reports_2.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
