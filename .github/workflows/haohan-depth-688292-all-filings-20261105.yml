@@ -1,0 +1,447 @@
+name: Package Haohan Data annual reports prospectus and latest quarter
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/haohan-depth-688292-all-filings-20261105.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      TZ: Asia/Taipei
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Resolve download validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY = '浩瀚深度'
+          FULL_NAME = '北京浩瀚深度信息技术股份有限公司'
+          CODE = '688292'
+          CUTOFF = '2026-11-05'
+          COMPACT = '20261105'
+          ROOT_NAME = f'{COMPANY}_{CODE}_上市以来全部年报_招股说明书及最新季报_截至{COMPACT}'
+          ROOT = Path('work') / ROOT_NAME
+          PDF_DIR = ROOT / '报告PDF'
+          PREVIEW_DIR = ROOT / '首页与末页预览'
+          DIST = Path('dist')
+          for directory in (PDF_DIR, PREVIEW_DIR, DIST):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          retry = Retry(
+              total=5,
+              connect=5,
+              read=5,
+              status=5,
+              backoff_factor=0.8,
+              status_forcelist=(403, 408, 425, 429, 500, 502, 503, 504),
+              allowed_methods=frozenset({'GET', 'POST'}),
+              raise_on_status=False,
+          )
+          adapter = HTTPAdapter(max_retries=retry)
+          session.mount('https://', adapter)
+          session.mount('http://', adapter)
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def clean_title(value: str) -> str:
+              value = re.sub(r'<[^>]+>', '', value or '')
+              return re.sub(r'\s+', '', html.unescape(value))
+
+          def query_cninfo() -> list[dict]:
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              headers = {
+                  'Referer': f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={CODE}',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'Accept': 'application/json, text/javascript, */*; q=0.01',
+              }
+              attempts = [
+                  (CODE, 'category_ndbg_szsh;', ''),
+                  ('', 'category_ndbg_szsh;', COMPANY),
+                  ('', '', f'{COMPANY} 年度报告'),
+                  ('', '', FULL_NAME),
+              ]
+              all_rows: list[dict] = []
+              for stock_value, category, searchkey in attempts:
+                  data = {
+                      'pageNum': '1',
+                      'pageSize': '100',
+                      'column': 'sse',
+                      'tabName': 'fulltext',
+                      'plate': 'sh',
+                      'stock': stock_value,
+                      'searchkey': searchkey,
+                      'secid': '',
+                      'category': category,
+                      'trade': '',
+                      'seDate': '2022-01-01~2026-11-05',
+                      'sortName': 'time',
+                      'sortType': 'desc',
+                      'isHLtitle': 'true',
+                  }
+                  response = session.post(endpoint, headers=headers, data=data, timeout=90)
+                  print('CNINFO_QUERY', response.status_code, len(response.content), stock_value, category, searchkey, flush=True)
+                  if response.status_code != 200:
+                      continue
+                  try:
+                      payload = response.json()
+                  except Exception as exc:
+                      print('CNINFO_JSON_ERROR', repr(exc), response.text[:500], flush=True)
+                      continue
+                  rows = payload.get('announcements') or []
+                  print('CNINFO_ROWS', len(rows), flush=True)
+                  all_rows.extend(rows)
+                  matched = [row for row in rows if str(row.get('secCode', '')).strip() == CODE]
+                  if matched and sum('年度报告' in clean_title(str(row.get('announcementTitle') or '')) for row in matched) >= 4:
+                      break
+              dedup: dict[str, dict] = {}
+              for row in all_rows:
+                  if str(row.get('secCode', '')).strip() != CODE:
+                      continue
+                  key = str(row.get('announcementId') or row.get('adjunctUrl') or row.get('announcementTitle'))
+                  dedup[key] = row
+              return list(dedup.values())
+
+          def announcement_url(row: dict) -> str:
+              adjunct = str(row.get('adjunctUrl') or '').strip()
+              if adjunct.startswith(('http://', 'https://')):
+                  return adjunct
+              if not adjunct:
+                  raise ValueError('announcement has no adjunctUrl')
+              return urljoin('https://static.cninfo.com.cn/', adjunct.lstrip('/'))
+
+          def choose_annual(rows: list[dict], year: int) -> dict:
+              target = f'{year}年年度报告'
+              candidates = []
+              for row in rows:
+                  title = clean_title(str(row.get('announcementTitle') or ''))
+                  if target not in title:
+                      continue
+                  if any(blocked in title for blocked in ('摘要', '英文版', '审计报告', '财务决算报告', '更正公告', '提示性公告', 'ESG', '社会责任')):
+                      continue
+                  corrected = any(marker in title for marker in ('更正后', '修订后', '更新后', '修订版'))
+                  timestamp = int(row.get('announcementTime') or 0)
+                  exactness = int(title in (target, f'{COMPANY}：{target}', f'{COMPANY}:{target}', f'{COMPANY}{target}', f'{FULL_NAME}{target}'))
+                  candidates.append((corrected, exactness, timestamp, row, title))
+              if not candidates:
+                  raise RuntimeError(f'未检索到{year}年年度报告完整全文')
+              candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+              chosen = dict(candidates[0][3])
+              chosen['_clean_title'] = candidates[0][4]
+              chosen['_corrected'] = bool(candidates[0][0])
+              return chosen
+
+          annual_rows = query_cninfo()
+          print('CNINFO_MATCHED_ROWS', json.dumps([
+              {
+                  'title': clean_title(str(row.get('announcementTitle') or '')),
+                  'time': row.get('announcementTime'),
+                  'url': row.get('adjunctUrl'),
+              }
+              for row in annual_rows
+              if '年度报告' in clean_title(str(row.get('announcementTitle') or ''))
+          ], ensure_ascii=False, indent=2), flush=True)
+
+          def extract_sina_pdf_urls(page_url: str, announcement_id: str) -> list[str]:
+              urls: list[str] = []
+              try:
+                  response = session.get(page_url, timeout=60, allow_redirects=True)
+                  response.encoding = response.apparent_encoding or response.encoding or 'gb18030'
+                  text = html.unescape(response.text)
+                  patterns = [
+                      rf'href=[\"\']([^\"\']+{re.escape(announcement_id)}\.PDF[^\"\']*)[\"\']',
+                      rf'(https?://[^\s\"\'<>]+{re.escape(announcement_id)}\.PDF[^\s\"\'<>]*)',
+                  ]
+                  for pattern in patterns:
+                      for found in re.findall(pattern, text, flags=re.I):
+                          absolute = urljoin(response.url, found)
+                          if absolute not in urls:
+                              urls.append(absolute)
+              except Exception as exc:
+                  print('SINA_PAGE_WARNING', page_url, repr(exc), flush=True)
+              return urls
+
+          prospectus_page = 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=8412944&stockid=688292'
+          prospectus_urls = extract_sina_pdf_urls(prospectus_page, '8412944')
+          for fallback in [
+              'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2022/2022-8/2022-08-11/8412944.PDF',
+              'https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2022/2022-8/2022-08-11/8412944.PDF',
+              'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2022/2022-08/2022-08-11/8412944.PDF',
+          ]:
+              if fallback not in prospectus_urls:
+                  prospectus_urls.append(fallback)
+
+          q3_page = 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=12669601&stockid=688292'
+          q3_urls = extract_sina_pdf_urls(q3_page, '12669601')
+          for fallback in [
+              'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2026/2026-10/2026-10-29/12669601.PDF',
+              'https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2026/2026-10/2026-10-29/12669601.PDF',
+          ]:
+              if fallback not in q3_urls:
+                  q3_urls.append(fallback)
+
+          documents: list[dict] = [
+              {
+                  'report_type': '招股说明书',
+                  'period': '2022-08-11',
+                  'title': '首次公开发行股票并在科创板上市招股说明书',
+                  'label': '首次公开发行股票并在科创板上市招股说明书_最终正式版',
+                  'source': '新浪财经公开披露镜像（对应上交所最终正式发行版）',
+                  'source_page': prospectus_page,
+                  'urls': prospectus_urls,
+                  'minimum_pages': 300,
+                  'expected_tokens': ['首次公开发行股票', '招股说明书'],
+              }
+          ]
+
+          for year in range(2022, 2026):
+              selected = choose_annual(annual_rows, year)
+              title = clean_title(str(selected.get('announcementTitle') or f'{year}年年度报告'))
+              documents.append({
+                  'report_type': '年度报告',
+                  'period': f'{year}年',
+                  'year': year,
+                  'title': title,
+                  'label': f'{year}年年度报告' + ('_更正后' if selected.get('_corrected') else ''),
+                  'source': '巨潮资讯网',
+                  'source_page': announcement_url(selected),
+                  'urls': [announcement_url(selected)],
+                  'minimum_pages': 90,
+                  'expected_tokens': [f'{year}年年度报告'],
+                  'corrected': bool(selected.get('_corrected')),
+                  'announcement_time': selected.get('announcementTime'),
+              })
+
+          documents.append({
+              'report_type': '第三季度报告',
+              'period': '2026年第三季度',
+              'title': '2026年第三季度报告',
+              'label': '2026年第三季度报告',
+              'source': '上海证券交易所公告；新浪财经公开披露镜像',
+              'source_page': q3_page,
+              'urls': q3_urls,
+              'minimum_pages': 5,
+              'expected_tokens': ['2026年第三季度报告', CODE],
+          })
+
+          def download_pdf(item: dict) -> tuple[bytes, str, str]:
+              errors = []
+              for url in item['urls']:
+                  try:
+                      response = session.get(
+                          url,
+                          headers={
+                              'Referer': item.get('source_page') or 'https://www.cninfo.com.cn/',
+                              'Accept': 'application/pdf,*/*;q=0.8',
+                          },
+                          timeout=150,
+                          allow_redirects=True,
+                      )
+                      print('DOWNLOAD', item['report_type'], item['period'], response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF') and len(response.content) > 50_000:
+                          return response.content, response.url, response.headers.get('content-type') or ''
+                      errors.append(f'{url}: status={response.status_code}, bytes={len(response.content)}')
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError(f"下载失败：{item['report_type']} {item['period']}；{' | '.join(errors)}")
+
+          records = []
+          for index, item in enumerate(documents, start=1):
+              data, resolved_url, content_type = download_pdf(item)
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              if reader.is_encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception:
+                      pass
+              page_count = len(reader.pages)
+              if page_count < item['minimum_pages']:
+                  raise RuntimeError(f"页数异常：{item['title']} pages={page_count}")
+
+              probe_indices = sorted(set(list(range(min(20, page_count))) + [page_count - 1]))
+              text_parts = []
+              for page_index in probe_indices:
+                  try:
+                      text_parts.append(reader.pages[page_index].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', item['title'], page_index, repr(exc), flush=True)
+              sample_text = re.sub(r'\s+', ' ', '\n'.join(text_parts)).strip()
+              compact_text = re.sub(r'\s+', '', sample_text)
+              if FULL_NAME not in compact_text and COMPANY not in compact_text and CODE not in compact_text:
+                  raise RuntimeError(f"公司身份校验失败：{item['title']}")
+              if not all(token in compact_text for token in item['expected_tokens']):
+                  raise RuntimeError(f"报告身份校验失败：{item['title']}")
+
+              file_name = f"{index:02d}_{COMPANY}_{CODE}_{item['label']}.pdf"
+              path = PDF_DIR / file_name
+              path.write_bytes(data)
+
+              document = pymupdf.open(path)
+              if document.page_count != page_count:
+                  raise RuntimeError(f"双解析器页数不一致：{file_name} pypdf={page_count}, pymupdf={document.page_count}")
+              first = document.load_page(0).get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False)
+              last = document.load_page(document.page_count - 1).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 400:
+                  raise RuntimeError(f"页面渲染异常：{file_name}")
+              first.save(PREVIEW_DIR / f'{Path(file_name).stem}_首页.png')
+              last.save(PREVIEW_DIR / f'{Path(file_name).stem}_末页.png')
+              document.close()
+
+              record = {
+                  **{k: v for k, v in item.items() if k not in ('urls', 'minimum_pages', 'expected_tokens')},
+                  'resolved_url': resolved_url,
+                  'content_type': content_type,
+                  'file_name': file_name,
+                  'page_count': page_count,
+                  'file_size_bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'pdf_header_valid': True,
+                  'company_and_report_identity_validated': True,
+                  'dual_parser_page_count_validated': True,
+                  'first_and_last_pages_rendered': True,
+                  'text_sample': sample_text[:1200],
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 6:
+              raise RuntimeError(f'文件数量异常：{len(records)}')
+          annual_years = [record.get('year') for record in records if record['report_type'] == '年度报告']
+          if annual_years != [2022, 2023, 2024, 2025]:
+              raise RuntimeError(f'年度报告年份异常：{annual_years}')
+
+          manifest = {
+              'company_short_name': COMPANY,
+              'company_full_name': FULL_NAME,
+              'stock_code': CODE,
+              'listing_date': '2022-08-18',
+              'cutoff_date': CUTOFF,
+              'annual_report_scope': '2022-2025年度（上市以来全部年度报告）',
+              'prospectus': '2022-08-11最终正式发行版',
+              'latest_quarterly_report': '2026年第三季度报告（披露日期2026-10-29）',
+              'selection_policy': '年报采用完整全文，排除摘要、单独审计报告、财务决算报告和提示性公告；若存在后续更正或修订全文则优先采用。',
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          readme = [
+              f'# {COMPANY}（{CODE}）上市以来全部年报、招股说明书及最新季报',
+              '',
+              f'- 截止日期：{CUTOFF}',
+              '- 上市日期：2022-08-18。',
+              '- 年度报告：2022、2023、2024、2025年度，共4份。',
+              '- 招股说明书：2022-08-11最终正式发行版。',
+              '- 最新季报：2026年第三季度报告，披露日期为2026-10-29。',
+              '- 未收录年度报告摘要、单独审计报告、ESG报告、财务决算报告、提示性公告及重复文件。',
+              '- 已校验PDF文件头、公司与报告身份、双解析器页数、首末页渲染、SHA-256及ZIP CRC。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for number, record in enumerate(records, start=1):
+              readme += [
+                  f'{number}. `{record["file_name"]}`',
+                  f'   - 标题：{record["title"]}',
+                  f'   - 页数：{record["page_count"]}',
+                  f'   - 来源：{record["source"]}',
+                  f'   - 原始地址：{record["resolved_url"]}',
+                  f'   - SHA-256：`{record["sha256"]}`',
+              ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (ROOT / '文件清单.txt').write_text('\n'.join(record['file_name'] for record in records) + '\n', encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  报告PDF/{record['file_name']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          cn_zip = DIST / f'{ROOT_NAME}.zip'
+          en_zip = DIST / f'haohan_data_688292_all_annual_reports_prospectus_latest_quarter_{COMPACT}.zip'
+          with zipfile.ZipFile(cn_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(cn_zip, en_zip)
+
+          for zip_path in (cn_zip, en_zip):
+              with zipfile.ZipFile(zip_path, 'r') as archive:
+                  bad_member = archive.testzip()
+                  if bad_member:
+                      raise RuntimeError(f'ZIP CRC校验失败：{bad_member}')
+                  pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if len(pdf_names) != 6:
+                      raise RuntimeError(f'ZIP内PDF数量异常：{len(pdf_names)}')
+              print('ZIP_VERIFIED', zip_path, zip_path.stat().st_size, sha256(zip_path), flush=True)
+
+          print('FINAL_SUMMARY', json.dumps({
+              'chinese_zip': str(cn_zip),
+              'english_zip': str(en_zip),
+              'zip_size_bytes': cn_zip.stat().st_size,
+              'zip_sha256': sha256(cn_zip),
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'records': [
+                  {
+                      'file_name': record['file_name'],
+                      'title': record['title'],
+                      'page_count': record['page_count'],
+                      'resolved_url': record['resolved_url'],
+                      'sha256': record['sha256'],
+                  }
+                  for record in records
+              ],
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: haohan-depth-688292-all-filings-20261105
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
