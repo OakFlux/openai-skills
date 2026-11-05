@@ -1,0 +1,355 @@
+name: Package Sidea broker deep reports
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sidea-301629-broker-deep-reports-20261105.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Taipei
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python -m pip install --disable-pip-version-check requests pypdf 'pymupdf<2'
+
+      - name: Resolve download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          COMPANY = '矽电股份'
+          FULL_NAME = '矽电半导体设备（深圳）股份有限公司'
+          CODE = '301629'
+          CUTOFF = '2026-11-05'
+          COMPACT = '20261105'
+          ROOT_NAME = f'{COMPANY}_{CODE}_券商深度及首次覆盖报告_精选3份_截至{COMPACT}'
+          ROOT = Path('work') / ROOT_NAME
+          REPORT_DIR = ROOT / '报告PDF'
+          PREVIEW_DIR = ROOT / '首页与末页预览'
+          DIST = Path('dist')
+          for directory in (REPORT_DIR, PREVIEW_DIR, DIST):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          retry = Retry(
+              total=5,
+              connect=5,
+              read=5,
+              status=5,
+              backoff_factor=0.8,
+              status_forcelist=(403, 408, 425, 429, 500, 502, 503, 504),
+              allowed_methods=frozenset({'GET'}),
+              raise_on_status=False,
+          )
+          adapter = HTTPAdapter(max_retries=retry)
+          session.mount('https://', adapter)
+          session.mount('http://', adapter)
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          api_url = 'https://reportapi.eastmoney.com/report/list'
+          params = {
+              'industryCode': '*',
+              'pageSize': '100',
+              'industry': '*',
+              'rating': '*',
+              'ratingChange': '*',
+              'beginTime': '2025-01-01',
+              'endTime': CUTOFF,
+              'pageNo': '1',
+              'fields': '',
+              'qType': '0',
+              'orgCode': '',
+              'code': CODE,
+              'rcode': '',
+              'p': '1',
+              'pageNum': '1',
+              'pageNumber': '1',
+          }
+          api_response = session.get(
+              api_url,
+              params=params,
+              headers={'Referer': f'https://data.eastmoney.com/report/stock.jshtml?stockcode={CODE}'},
+              timeout=90,
+          )
+          print('REPORT_API', api_response.status_code, len(api_response.content), api_response.url, flush=True)
+          api_response.raise_for_status()
+          payload = api_response.json()
+          rows = payload.get('data') or []
+          print('REPORT_ROWS', json.dumps(rows, ensure_ascii=False, indent=2), flush=True)
+
+          desired = [
+              {
+                  'broker': '招商证券',
+                  'title': '国内探针台设备龙头，持续受益于国产替代和新品突破',
+                  'title_tokens': ['国内探针台设备龙头', '国产替代和新品突破'],
+                  'report_type': '公司深度报告/首次覆盖',
+                  'minimum_pages': 18,
+              },
+              {
+                  'broker': '开源证券',
+                  'title': '中小盘次新股说：国内领先的探针台设备企业',
+                  'title_tokens': ['国内领先的探针台设备企业'],
+                  'report_type': '公司研究/次新股深度',
+                  'minimum_pages': 12,
+              },
+              {
+                  'broker': '中航证券',
+                  'title': '针锋探微显华光，高端突破领成长',
+                  'title_tokens': ['针锋探微显华光', '高端突破领成长'],
+                  'report_type': '公司深度研究/首次覆盖',
+                  'minimum_pages': 12,
+              },
+          ]
+
+          def normalize(text: str) -> str:
+              return re.sub(r'[\s，。、“”‘’：:；;（）()]+', '', text or '')
+
+          selected = []
+          for target in desired:
+              matches = []
+              target_norm = normalize(target['title'])
+              broker_norm = normalize(target['broker'].replace('有限责任公司', '').replace('股份有限公司', ''))
+              for row in rows:
+                  title = str(row.get('title') or '')
+                  org = str(row.get('orgSName') or row.get('orgName') or '')
+                  title_norm = normalize(title)
+                  org_norm = normalize(org)
+                  if target_norm == title_norm and broker_norm in org_norm:
+                      matches.append(row)
+              if not matches:
+                  raise RuntimeError(f"未在东方财富研报接口中找到：{target['broker']}《{target['title']}》")
+              matches.sort(key=lambda row: str(row.get('publishDate') or ''), reverse=True)
+              row = dict(matches[0])
+              row['_target'] = target
+              selected.append(row)
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def download_report(row: dict) -> tuple[bytes, str, str]:
+              info_code = str(row.get('infoCode') or '').strip()
+              if not re.fullmatch(r'AP\d{18}', info_code):
+                  raise RuntimeError(f'无效infoCode：{info_code}')
+              candidates = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H1_{info_code}_1.pdf',
+              ]
+              errors = []
+              source_page = f'https://data.eastmoney.com/report/info/{info_code}.html'
+              for url in candidates:
+                  try:
+                      response = session.get(
+                          url,
+                          headers={
+                              'Referer': source_page,
+                              'Accept': 'application/pdf,*/*;q=0.8',
+                          },
+                          timeout=180,
+                          allow_redirects=True,
+                      )
+                      print('DOWNLOAD', row.get('orgSName'), row.get('title'), response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF') and len(response.content) > 100_000:
+                          return response.content, response.url, response.headers.get('content-type') or ''
+                      errors.append(f'{url}: status={response.status_code}, bytes={len(response.content)}')
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError(f"下载失败：{row.get('orgSName')}《{row.get('title')}》；{' | '.join(errors)}")
+
+          records = []
+          for index, row in enumerate(selected, start=1):
+              target = row['_target']
+              data, resolved_url, content_type = download_report(row)
+              reader = PdfReader(io.BytesIO(data), strict=False)
+              if reader.is_encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception:
+                      pass
+              page_count = len(reader.pages)
+              if page_count < target['minimum_pages']:
+                  raise RuntimeError(f"报告页数不足：{target['title']} pages={page_count}")
+              api_pages = int(row.get('attachPages') or 0)
+              if api_pages and page_count != api_pages:
+                  raise RuntimeError(f"PDF页数与接口记录不一致：{target['title']} pdf={page_count}, api={api_pages}")
+
+              probe_indices = sorted(set(list(range(min(12, page_count))) + [page_count - 1]))
+              text_parts = []
+              for page_index in probe_indices:
+                  try:
+                      text_parts.append(reader.pages[page_index].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', target['broker'], page_index, repr(exc), flush=True)
+              sample_text = re.sub(r'\s+', ' ', '\n'.join(text_parts)).strip()
+              compact_text = normalize(sample_text)
+
+              if COMPANY not in sample_text and FULL_NAME not in sample_text and CODE not in sample_text:
+                  raise RuntimeError(f"公司身份校验失败：{target['title']}")
+              broker_key = target['broker'].replace('证券', '')
+              if target['broker'] not in sample_text and broker_key not in sample_text:
+                  raise RuntimeError(f"券商身份校验失败：{target['title']}")
+              for token in target['title_tokens']:
+                  if normalize(token) not in compact_text:
+                      raise RuntimeError(f"标题校验失败：{target['title']} token={token}")
+
+              publish_date = str(row.get('publishDate') or '')[:10]
+              safe_title = re.sub(r'[\\/:*?"<>|]+', '_', target['title']).strip(' ._')
+              file_name = f"{index:02d}_{target['broker']}_{publish_date}_{safe_title}.pdf"
+              path = REPORT_DIR / file_name
+              path.write_bytes(data)
+
+              document = pymupdf.open(path)
+              if document.page_count != page_count:
+                  raise RuntimeError(f'双解析器页数不一致：{file_name}')
+              first = document.load_page(0).get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False)
+              last = document.load_page(document.page_count - 1).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+              if min(first.width, first.height, last.width, last.height) < 400:
+                  raise RuntimeError(f'页面渲染异常：{file_name}')
+              first.save(PREVIEW_DIR / f'{Path(file_name).stem}_首页.png')
+              last.save(PREVIEW_DIR / f'{Path(file_name).stem}_末页.png')
+              document.close()
+
+              authors = str(row.get('researcher') or '').replace(',', '、')
+              rating = str(row.get('emRatingName') or row.get('sRatingName') or '').strip()
+              record = {
+                  'broker': target['broker'],
+                  'publish_date': publish_date,
+                  'title': target['title'],
+                  'report_type': target['report_type'],
+                  'rating': rating,
+                  'authors': authors,
+                  'info_code': row.get('infoCode'),
+                  'source_page': f"https://data.eastmoney.com/report/info/{row.get('infoCode')}.html",
+                  'resolved_url': resolved_url,
+                  'file_name': file_name,
+                  'page_count': page_count,
+                  'file_size_bytes': path.stat().st_size,
+                  'content_type': content_type,
+                  'sha256': sha256(path),
+                  'pdf_header_valid': True,
+                  'company_identity_validated': True,
+                  'broker_identity_validated': True,
+                  'title_validated': True,
+                  'dual_parser_page_count_validated': True,
+                  'first_and_last_pages_rendered': True,
+                  'first_pages_text_sample': sample_text[:2600],
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 3:
+              raise RuntimeError(f'报告数量异常：{len(records)}')
+
+          manifest = {
+              'company_short_name': COMPANY,
+              'company_full_name': FULL_NAME,
+              'stock_code': CODE,
+              'cutoff_date': CUTOFF,
+              'selection_note': '精选3份可公开下载并完成完整性核验的原始券商公司深度或首次覆盖报告。',
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'documents': records,
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / '文件清单.txt').write_text('\n'.join(record['file_name'] for record in records) + '\n', encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  报告PDF/{record['file_name']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          readme = [
+              f'# {COMPANY}（{CODE}）券商深度及首次覆盖报告精选',
+              '',
+              f'- 截止日期：{CUTOFF}',
+              f'- 原始完整PDF：{len(records)}份；合计页数：{sum(record["page_count"] for record in records)}页。',
+              '- 选择口径：优先收录篇幅较完整的公司深度、次新股深度或首次覆盖报告。',
+              '- 校验项目：PDF文件头、公司和券商身份、标题、接口页数、双解析器页数、首末页渲染、SHA-256和ZIP CRC。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for number, record in enumerate(records, start=1):
+              readme += [
+                  f'{number}. `{record["file_name"]}`',
+                  f'   - 机构：{record["broker"]}；发布日期：{record["publish_date"]}',
+                  f'   - 标题：{record["title"]}',
+                  f'   - 类型：{record["report_type"]}；评级：{record["rating"] or "未标注"}',
+                  f'   - 研究人员：{record["authors"]}',
+                  f'   - 页数：{record["page_count"]}',
+                  f'   - 原始PDF：{record["resolved_url"]}',
+                  f'   - SHA-256：`{record["sha256"]}`',
+              ]
+          (ROOT / 'README.md').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          cn_zip = DIST / f'{ROOT_NAME}.zip'
+          en_zip = DIST / f'sidea_301629_broker_deep_and_initiation_reports_3_{COMPACT}.zip'
+          with zipfile.ZipFile(cn_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(ROOT.parent)).replace(os.sep, '/'))
+          shutil.copy2(cn_zip, en_zip)
+
+          for zip_path in (cn_zip, en_zip):
+              with zipfile.ZipFile(zip_path, 'r') as archive:
+                  bad_member = archive.testzip()
+                  if bad_member:
+                      raise RuntimeError(f'ZIP CRC校验失败：{bad_member}')
+                  pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+                  if len(pdf_names) != 3:
+                      raise RuntimeError(f'ZIP内PDF数量异常：{len(pdf_names)}')
+              print('ZIP_VERIFIED', zip_path, zip_path.stat().st_size, sha256(zip_path), flush=True)
+
+          print('FINAL_SUMMARY', json.dumps({
+              'chinese_zip': str(cn_zip),
+              'english_zip': str(en_zip),
+              'zip_size_bytes': cn_zip.stat().st_size,
+              'zip_sha256': sha256(cn_zip),
+              'document_count': len(records),
+              'total_pages': sum(record['page_count'] for record in records),
+              'records': records,
+          }, ensure_ascii=False), flush=True)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidea-301629-broker-deep-reports-20261105
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
