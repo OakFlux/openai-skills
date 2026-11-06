@@ -1,0 +1,421 @@
+name: package-fengbei-603334-broker-reports
+
+on:
+  push:
+    branches:
+      - tmp/fengbei-603334-broker-20261106-v1
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY = "苏州丰倍生物科技股份有限公司"
+          SHORT_NAME = "丰倍生物"
+          CODE = "603334"
+          PREPARED = "2026-11-06"
+          ROOT_NAME = "丰倍生物_603334_券商研究报告_2份"
+          ROOT = Path(ROOT_NAME)
+          PDF_DIR = ROOT / "PDF文件"
+          PREVIEW_DIR = ROOT / "首页预览"
+          PDF_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def compact(value: str) -> str:
+              return re.sub(r"\s+", "", value or "")
+
+          def parse_json_response(response: requests.Response) -> dict:
+              text = response.text.strip()
+              try:
+                  return response.json()
+              except Exception:
+                  match = re.search(r"\((\{.*\})\)\s*;?$", text, flags=re.S)
+                  if not match:
+                      raise RuntimeError(f"Unrecognized API response: {text[:300]}")
+                  return json.loads(match.group(1))
+
+          def query_report_api(params: dict) -> list[dict]:
+              api = "https://reportapi.eastmoney.com/report/list"
+              rows_all: list[dict] = []
+              for page in range(1, 50):
+                  payload = {
+                      "industryCode": "*",
+                      "pageSize": "100",
+                      "industry": "*",
+                      "rating": "*",
+                      "ratingChange": "*",
+                      "pageNo": str(page),
+                      "fields": "",
+                      "qType": "0",
+                      "orgCode": "",
+                      "rcode": "",
+                      "p": str(page),
+                      "pageNum": str(page),
+                      "pageNumber": str(page),
+                      **params,
+                  }
+                  response = session.get(
+                      api,
+                      params=payload,
+                      timeout=(30, 180),
+                      headers={"Referer": "https://data.eastmoney.com/report/"},
+                  )
+                  print("API", response.status_code, len(response.content), response.url)
+                  response.raise_for_status()
+                  data = parse_json_response(response)
+                  rows = data.get("data") or []
+                  if page == 1:
+                      print("API_HITS", data.get("hits"), "ROWS", len(rows))
+                  rows_all.extend(rows)
+                  if not rows or len(rows) < 100:
+                      break
+                  time.sleep(0.05)
+              return rows_all
+
+          queries = [
+              {"code": CODE, "beginTime": "2025-01-01", "endTime": PREPARED},
+              {"code": CODE, "beginTime": "20250101", "endTime": "20261106"},
+              {"beginTime": "2026-08-20", "endTime": "2026-08-28"},
+              {"beginTime": "2025-10-15", "endTime": "2025-10-25"},
+          ]
+          rows: list[dict] = []
+          for query in queries:
+              try:
+                  rows.extend(query_report_api(query))
+              except Exception as exc:
+                  print("API_QUERY_WARNING", query, repr(exc))
+
+          dedup: dict[str, dict] = {}
+          for row in rows:
+              key = str(row.get("infoCode") or row.get("infocode") or row.get("id") or json.dumps(row, sort_keys=True, ensure_ascii=False))
+              dedup[key] = row
+          rows = list(dedup.values())
+
+          relevant = []
+          for row in rows:
+              blob = " ".join(str(row.get(k) or "") for k in [
+                  "title", "stockName", "stockCode", "researcher", "orgName", "orgSName",
+                  "publishDate", "infoCode", "infocode"
+              ])
+              if SHORT_NAME in blob or CODE in blob or "废油资源化筑基" in blob:
+                  relevant.append(row)
+                  print("RELEVANT_ROW", json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+
+          def row_title(row: dict) -> str:
+              return str(row.get("title") or row.get("reportTitle") or "")
+
+          long_rows = [row for row in relevant if "废油资源化筑基" in compact(row_title(row))]
+          huajin_rows = [row for row in relevant if (
+              "新股覆盖" in compact(row_title(row)) or
+              "202510221766994161" in str(row.get("infoCode") or "") or
+              "华金" in str(row.get("orgName") or row.get("orgSName") or "")
+          )]
+
+          def info_code(row: dict) -> str:
+              for key in ["infoCode", "infocode", "info_code", "reportId"]:
+                  value = row.get(key)
+                  if value:
+                      return str(value)
+              return ""
+
+          def urls_from_row(row: dict) -> list[str]:
+              urls: list[str] = []
+              for key, value in row.items():
+                  if not isinstance(value, str):
+                      continue
+                  lower = value.lower()
+                  if lower.startswith(("http://", "https://")) and ("pdf" in lower or ".pdf" in lower):
+                      urls.append(html.unescape(value))
+              code = info_code(row)
+              if code:
+                  for prefix in ["H3", "H2", "H1", "H4"]:
+                      urls.append(f"https://pdf.dfcfw.com/pdf/{prefix}_{code}_1.pdf")
+              return list(dict.fromkeys(urls))
+
+          def discover_page_pdf_links(page_url: str) -> list[str]:
+              links: list[str] = []
+              try:
+                  response = session.get(page_url, timeout=(30, 180), allow_redirects=True)
+                  print("PAGE", response.status_code, len(response.content), response.url, response.headers.get("content-type"))
+                  response.raise_for_status()
+                  texts = []
+                  for encoding in [response.encoding, response.apparent_encoding, "utf-8", "gb18030"]:
+                      if not encoding:
+                          continue
+                      try:
+                          texts.append(response.content.decode(encoding, errors="ignore"))
+                      except Exception:
+                          pass
+                  for text in texts:
+                      soup = BeautifulSoup(text, "html.parser")
+                      for tag in soup.find_all(["a", "iframe", "embed", "object"]):
+                          for attr in ["href", "src", "data"]:
+                              value = tag.get(attr)
+                              if value and ".pdf" in str(value).lower():
+                                  links.append(urllib.parse.urljoin(response.url, html.unescape(str(value))))
+                      for match in re.findall(r"https?://[^\"'<>\s]+?\.pdf(?:\?[^\"'<>\s]*)?", text, flags=re.I):
+                          links.append(html.unescape(match))
+              except Exception as exc:
+                  print("PAGE_WARNING", page_url, repr(exc))
+              return list(dict.fromkeys(links))
+
+          long_urls: list[str] = []
+          for row in long_rows:
+              long_urls.extend(urls_from_row(row))
+          if not long_urls:
+              for page_url in [
+                  "https://news.10jqka.com.cn/field/sr/20260824/59403093.shtml",
+                  "https://m.vzkoo.com/document/11504820241500018732bc7a4b1b.html",
+                  "https://www.fxbaogao.com/detail/5635091",
+              ]:
+                  long_urls.extend(discover_page_pdf_links(page_url))
+
+          huajin_urls: list[str] = []
+          for row in huajin_rows:
+              huajin_urls.extend(urls_from_row(row))
+          huajin_urls.extend([
+              "https://pdf.dfcfw.com/pdf/H3_AP202510221766994161_1.pdf?1761160065000.pdf=",
+              "https://pdf.dfcfw.com/pdf/H3_AP202510221766994161_1.pdf",
+          ])
+
+          reports = [
+              {
+                  "sequence": 1,
+                  "date": "2026-08-23",
+                  "broker": "长城证券",
+                  "analyst": "廖浩祥、刘耀齐",
+                  "rating": "增持（首次评级）",
+                  "report_type": "公司深度报告",
+                  "title": "废油资源化筑基，混合油放量驱动成长",
+                  "filename": "01_20260823_长城证券_废油资源化筑基混合油放量驱动成长_公司深度报告.pdf",
+                  "minimum_pages": 25,
+                  "markers": [SHORT_NAME, CODE, "废油资源化筑基", "长城证券"],
+                  "urls": list(dict.fromkeys(long_urls)),
+              },
+              {
+                  "sequence": 2,
+                  "date": "2025-10-19",
+                  "broker": "华金证券",
+                  "analyst": "李蕙；报告联系人：戴筝筝",
+                  "rating": "新股覆盖研究（未评级）",
+                  "report_type": "新股覆盖研究",
+                  "title": "新股覆盖研究：丰倍生物",
+                  "filename": "02_20251019_华金证券_新股覆盖研究丰倍生物.pdf",
+                  "minimum_pages": 8,
+                  "markers": [SHORT_NAME, CODE, "新股覆盖研究", "李蕙"],
+                  "urls": list(dict.fromkeys(huajin_urls)),
+              },
+          ]
+
+          def download_pdf(report: dict) -> tuple[bytes, str, str]:
+              if not report["urls"]:
+                  raise RuntimeError(f"No candidate PDF URLs for {report['title']}")
+              last_error: Exception | None = None
+              variants: list[str] = []
+              for url in report["urls"]:
+                  variants.extend([url, url + ("&download=1" if "?" in url else "?download=1")])
+              for url in dict.fromkeys(variants):
+                  for attempt in range(4):
+                      try:
+                          response = session.get(
+                              url,
+                              timeout=(30, 480),
+                              allow_redirects=True,
+                              headers={
+                                  "Accept": "application/pdf,*/*;q=0.8",
+                                  "Referer": "https://data.eastmoney.com/report/",
+                              },
+                          )
+                          print("DOWNLOAD", report["broker"], response.status_code, len(response.content), response.url, response.headers.get("content-type"))
+                          response.raise_for_status()
+                          if response.content.startswith(b"%PDF-") and len(response.content) > 80_000:
+                              return response.content, response.url, response.headers.get("content-type", "")
+                          last_error = RuntimeError(f"Not a PDF: {response.content[:80]!r}")
+                      except Exception as exc:
+                          last_error = exc
+                          print("DOWNLOAD_ERROR", report["broker"], attempt, url, repr(exc))
+                      time.sleep(1 + attempt)
+              raise RuntimeError(f"Download failed for {report['title']}: {last_error}")
+
+          manifest = []
+          for report in reports:
+              data, final_url, content_type = download_pdf(report)
+              output = PDF_DIR / report["filename"]
+              output.write_bytes(data)
+
+              with output.open("rb") as handle:
+                  if handle.read(5) != b"%PDF-":
+                      raise RuntimeError(f"Invalid PDF header: {output.name}")
+
+              reader = PdfReader(str(output), strict=False)
+              pages = len(reader.pages)
+              if pages < report["minimum_pages"]:
+                  raise RuntimeError(f"Report unexpectedly short: {output.name}: {pages} pages")
+
+              qpdf = subprocess.run(
+                  ["qpdf", "--warning-exit-0", "--check", str(output)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              if qpdf.returncode != 0:
+                  raise RuntimeError(f"qpdf failed for {output.name}: {qpdf.stdout}")
+
+              text_run = subprocess.run(
+                  ["pdftotext", "-f", "1", "-l", str(min(15, pages)), str(output), "-"],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              text_compact = compact(text_run.stdout)
+              marker_hits = [marker for marker in report["markers"] if compact(marker) in text_compact]
+              if len(marker_hits) < 2:
+                  raise RuntimeError(f"Issuer/title validation failed for {output.name}: hits={marker_hits}")
+
+              prefix = PREVIEW_DIR / output.stem
+              render = subprocess.run(
+                  ["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "150", "-singlefile", str(output), str(prefix)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              preview = Path(str(prefix) + ".png")
+              if render.returncode != 0 or not preview.exists() or preview.stat().st_size < 6_000:
+                  raise RuntimeError(f"Preview rendering failed for {output.name}: {render.stdout}")
+
+              item = {
+                  **{k: report[k] for k in ["sequence", "date", "broker", "analyst", "rating", "report_type", "title", "filename"]},
+                  "pages": pages,
+                  "bytes": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "source_url": final_url,
+                  "content_type": content_type,
+                  "marker_hits": marker_hits,
+                  "preview_file": str(Path("首页预览") / preview.name),
+              }
+              manifest.append(item)
+              print("VALIDATED", json.dumps(item, ensure_ascii=False))
+
+          readme = [
+              f"{COMPANY}（{CODE}.SH）券商研究报告资料包",
+              f"整理日期：{PREPARED}",
+              "",
+              "本包收录2份可公开下载并验证的券商原始PDF：1份上市后的公司深度报告，以及1份IPO阶段的新股覆盖研究。",
+              "公司上市时间较短，公开可下载的独立深度覆盖数量有限；未使用网页摘要、付费转载页、索引页或重新排版文件补数。",
+              "",
+          ]
+          for item in manifest:
+              readme.extend([
+                  f"{item['sequence']}. {item['filename']}",
+                  f"   券商：{item['broker']}；研究员：{item['analyst']}",
+                  f"   日期：{item['date']}；评级：{item['rating']}",
+                  f"   类型：{item['report_type']}",
+                  f"   标题：{item['title']}",
+                  f"   页数：{item['pages']}；文件大小：{item['bytes']}字节",
+                  f"   公开来源：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  "",
+              ])
+          readme.extend([
+              "核验项目：PDF文件头、公司名称/证券代码、报告标题、实际页数、qpdf结构、首页渲染、逐文件SHA-256及ZIP CRC。",
+              "报告版权归原券商及作者所有，仅供研究与存档，不构成投资建议。",
+          ])
+          (ROOT / "README_报告清单与核验说明.txt").write_text("\n".join(readme), encoding="utf-8")
+
+          payload = {
+              "company": COMPANY,
+              "stock_code": CODE,
+              "prepared_on": PREPARED,
+              "report_count": len(manifest),
+              "original_pdf_count": len(manifest),
+              "files": manifest,
+          }
+          (ROOT / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          with (ROOT / "manifest.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+              writer = csv.writer(handle)
+              writer.writerow(["序号", "券商", "日期", "研究员", "评级", "类型", "标题", "文件名", "页数", "字节数", "SHA-256", "公开来源", "首页预览"])
+              for item in manifest:
+                  writer.writerow([
+                      item["sequence"], item["broker"], item["date"], item["analyst"], item["rating"],
+                      item["report_type"], item["title"], item["filename"], item["pages"], item["bytes"],
+                      item["sha256"], item["source_url"], item["preview_file"],
+                  ])
+
+          (ROOT / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{item['sha256']}  PDF文件/{item['filename']}" for item in manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("fengbei_603334_broker_research_reports_2.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for file_path in sorted(ROOT.rglob("*")):
+                  if file_path.is_file():
+                      archive.write(file_path, arcname=str(Path(ROOT_NAME) / file_path.relative_to(ROOT)))
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              previews = [name for name in archive.namelist() if name.lower().endswith(".png")]
+              if bad is not None or len(pdf_names) != 2 or len(previews) != 2:
+                  raise RuntimeError(f"ZIP validation failed: bad={bad}, pdfs={len(pdf_names)}, previews={len(previews)}")
+
+          result = {
+              "package": zip_path.name,
+              "zip_bytes": zip_path.stat().st_size,
+              "zip_sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              "report_count": len(manifest),
+              "original_pdf_count": len(manifest),
+              "files": [{k: item[k] for k in ["broker", "date", "analyst", "rating", "report_type", "title", "pages", "bytes", "sha256", "source_url"]} for item in manifest],
+          }
+          Path("result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("PACKAGE_RESULT", json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fengbei-603334-broker-research-reports-2-20261106
+          path: |
+            fengbei_603334_broker_research_reports_2.zip
+            result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
